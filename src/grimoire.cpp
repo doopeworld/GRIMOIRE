@@ -1153,6 +1153,12 @@ struct Grimoire {
         int8_t *a8=nullptr;
         float *a8s=nullptr;
         int32_t *tokens=nullptr, *draft_ids=nullptr;
+        // Muse speculative verifier scratch, reused after the draft pass.
+        float *verify_logits=nullptr;
+        sycl_bf16 *verify_bf=nullptr;
+        int8_t *verify_a8=nullptr;
+        float *verify_a8s=nullptr;
+        int32_t *verify_ids=nullptr;
         int context_pos=0;
         int hidden=0, inter=0, q_heads=0, kv_heads=0, head_dim=0;
         int mask_token=0, sliding_window=0;
@@ -2086,9 +2092,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // the target's MXFP4 projection format shrank it to 0.24 GiB but
         // collapsed draft agreement. Keep original-DFlash weights in BF16;
         // the larger DFlash2 compatibility path retains the requested format.
-        const Fmt dflash_fmt=dflash2.v2?PF:Fmt::BF16;
+        const bool muse_mxfp4=cfg.is_muse&&
+            std::getenv("GRIMOIRE_MUSE_DFLASH_MXFP4")!=nullptr;
+        const Fmt dflash_fmt=(dflash2.v2||muse_mxfp4)?PF:Fmt::BF16;
         auto qload=[&](const std::string& n,const char* what){
             DevQuant d=quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
+            db+=d.w.bytes();return d;
+        };
+        auto qload_as=[&](const std::string& n,const char* what,Fmt fmt){
+            DevQuant d=quantize_upload_t(q,dc,dr(n),fmt,what,&dok);
             db+=d.w.bytes();return d;
         };
         auto bload=[&](const std::string& n,const char* what){
@@ -2098,7 +2110,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const char* fc_name=dr("encoder.fc.weight").ok()?"encoder.fc.weight":"fc.weight";
         const char* hn_name=dr("encoder.output_norm_enc.weight").ok()?
                             "encoder.output_norm_enc.weight":"hidden_norm.weight";
-        dflash2.fc=qload(fc_name,"dflash.fc");
+        // The feature-combiner is the drafter's only view of the target. Keep
+        // it BF16 in the fast Muse mode while the five draft layers use MXFP4.
+        dflash2.fc=muse_mxfp4?qload_as(fc_name,"dflash.fc",Fmt::BF16)
+                              :qload(fc_name,"dflash.fc");
         dflash2.hidden_norm=bload(hn_name,"dflash.hidden_norm");
         dflash2.norm=bload("norm.weight","dflash2.norm");
         if(dflash2.v2){
@@ -2175,6 +2190,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.a8s=sycl::malloc_device<float>(DM,q);
             dflash2.tokens=sycl::malloc_device<int32_t>(DM,q);
             dflash2.draft_ids=sycl::malloc_device<int32_t>(DM-1,q);
+            if(cfg.is_muse){
+                const int VW=std::max({cfg.hidden,cfg.n_heads*cfg.head_dim,
+                    cfg.n_kv_heads*cfg.head_dim,2*cfg.dense_inter});
+                dflash2.verify_logits=dfd(size_t(DM)*cfg.vocab);
+                dflash2.verify_bf=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
+                dflash2.verify_a8=sycl::malloc_device<int8_t>(size_t(DM)*VW,q);
+                dflash2.verify_a8s=sycl::malloc_device<float>(DM,q);
+                dflash2.verify_ids=sycl::malloc_device<int32_t>(DM,q);
+                db+=size_t(DM)*VW*(sizeof(sycl_bf16)+sizeof(int8_t))
+                    +size_t(DM)*(sizeof(float)+sizeof(int32_t));
+                if(!dflash2.verify_logits||!dflash2.verify_bf||
+                   !dflash2.verify_a8||!dflash2.verify_a8s||
+                   !dflash2.verify_ids)dok=false;
+            }
             db+=size_t(DM)*dflash2.target_layers.size()*DH*sizeof(bf16_t)
                 +size_t(DM)*DH+size_t(DM)*sizeof(float)
                 +size_t(2*DM-1)*sizeof(int32_t);
@@ -2556,7 +2585,10 @@ void Grimoire::release() {
                     (void*)dflash2.gate_up, (void*)dflash2.mlp,
                     (void*)dflash2.logits, (void*)dflash2.bf,
                     (void*)dflash2.a8, (void*)dflash2.a8s,
-                    (void*)dflash2.tokens, (void*)dflash2.draft_ids})
+                    (void*)dflash2.tokens, (void*)dflash2.draft_ids,
+                    (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
+                    (void*)dflash2.verify_a8, (void*)dflash2.verify_a8s,
+                    (void*)dflash2.verify_ids})
         if (p) sycl::free(p, q);
     dflash2 = {};
     lm_head.release(q);
@@ -4144,35 +4176,72 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                               &d.o_gate,&d.sh_gu,&d.sh_down};
         for(const auto* w:ws){W=std::max(W,w->w.N);W=std::max(W,w->w.K);}
     }
+    const bool reuse=next_tokens&&M<=kSpecBatch&&dflash2.ok&&
+        dflash2.verify_logits&&dflash2.verify_bf&&dflash2.verify_a8;
     auto df=[&](size_t n){return sycl::malloc_device<float>(n,q);};
-    float* hidden=df(size_t(M)*H);
-    float* normed=df(size_t(M)*H);
-    float* tmp=df(size_t(M)*H);
-    float* qv=df(size_t(M)*QW);
-    float* kv=df(size_t(M)*KVW);
-    float* vv=df(size_t(M)*KVW);
-    float* attn=df(size_t(M)*QW);
-    float* gate=df(size_t(M)*QW);
-    float* proj=df(size_t(M)*H);
-    float* ff=df(size_t(M)*2*I);
-    float* batch_logits=next_tokens?df(size_t(M)*cfg.vocab):nullptr;
-    sycl_bf16* xb=sycl::malloc_device<sycl_bf16>(size_t(M)*W,q);
-    int32_t* dtok=sycl::malloc_device<int32_t>(M,q);
-    int32_t* outtok=next_tokens?sycl::malloc_device<int32_t>(M,q):nullptr;
+    float* hidden=reuse?dflash2.resid:df(size_t(M)*H);
+    float* normed=reuse?dflash2.normed:df(size_t(M)*H);
+    float* tmp=reuse?dflash2.ctx:df(size_t(M)*H);
+    float* qv=reuse?dflash2.q:df(size_t(M)*QW);
+    float* kv=reuse?dflash2.k:df(size_t(M)*KVW);
+    float* vv=reuse?dflash2.v:df(size_t(M)*KVW);
+    float* attn=reuse?dflash2.attn:df(size_t(M)*QW);
+    float* gate=reuse?dflash2.proj:df(size_t(M)*QW);
+    float* proj=reuse?dflash2.mlp:df(size_t(M)*H);
+    float* ff=reuse?dflash2.gate_up:df(size_t(M)*2*I);
+    float* batch_logits=next_tokens?(reuse?dflash2.verify_logits:
+        df(size_t(M)*cfg.vocab)):nullptr;
+    sycl_bf16* xb=reuse?dflash2.verify_bf:
+        sycl::malloc_device<sycl_bf16>(size_t(M)*W,q);
+    int8_t* a8=reuse?dflash2.verify_a8:
+        sycl::malloc_device<int8_t>(size_t(M)*W,q);
+    float* a8s=reuse?dflash2.verify_a8s:sycl::malloc_device<float>(M,q);
+    int32_t* dtok=reuse?dflash2.tokens:sycl::malloc_device<int32_t>(M,q);
+    int32_t* outtok=next_tokens?(reuse?dflash2.verify_ids:
+        sycl::malloc_device<int32_t>(M,q)):nullptr;
     std::vector<void*> mem={(void*)hidden,(void*)normed,(void*)tmp,(void*)qv,
         (void*)kv,(void*)vv,(void*)attn,(void*)gate,(void*)proj,(void*)ff,
-        (void*)batch_logits,(void*)xb,(void*)dtok,(void*)outtok};
-    auto cleanup=[&](){for(void* p:mem)if(p)sycl::free(p,q);};
+        (void*)batch_logits,(void*)xb,(void*)a8,(void*)a8s,
+        (void*)dtok,(void*)outtok};
+    auto cleanup=[&](){if(!reuse)for(void* p:mem)if(p)sycl::free(p,q);};
     if(!hidden||!normed||!tmp||!qv||!kv||!vv||!attn||!gate||!proj||!ff||
-       !xb||!dtok||(next_tokens&&(!batch_logits||!outtok))){cleanup();return false;}
+       !xb||!a8||!a8s||!dtok||(next_tokens&&(!batch_logits||!outtok))){
+        cleanup();return false;
+    }
 
     auto dense=load_xe2_dense_mxfp4_f32();
+    const bool w4n128=std::getenv("GRIMOIRE_W4A8_N128")!=nullptr;
+    auto w4=load_xe2_dense_w4a8(M<=kSpecBatch
+        ?(w4n128?"grimoire_xe2_dense_w4a8_f32_m16n128"
+                 :"grimoire_xe2_dense_w4a8_f32_m16")
+        :"grimoire_xe2_dense_w4a8_f32");
     const bool exact_gemv=std::getenv("GRIMOIRE_MUSE_PREFILL_GEMV")!=nullptr;
     const bool exact_bf16=std::getenv("GRIMOIRE_MUSE_PREFILL_EXACT_BF16")!=nullptr;
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(exact_gemv||(exact_bf16&&w.w.fmt==Fmt::BF16)){
             for(int r=0;r<M;++r)
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
+            return;
+        }
+        if(w.has_i4()){
+            if(M<=kSpecBatch&&w.w.N<=2048){
+                for(int r=0;r<M;r+=4){
+                    const int mb=std::min(4,M-r);
+                    launch_gemv_int4sym_batch(q,w.i4,w.i4s,
+                        x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
+                        w.w.N,w.w.K,mb,{});
+                }
+            }else if(w4){
+                launch_quantize_rows_int8(q,x,a8,a8s,M,w.w.K,{});
+                w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
+            }else{
+                for(int r=0;r<M;r+=4){
+                    const int mb=std::min(4,M-r);
+                    launch_gemv_int4sym_batch(q,w.i4,w.i4s,
+                        x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
+                        w.w.N,w.w.K,mb,{});
+                }
+            }
             return;
         }
         launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);
