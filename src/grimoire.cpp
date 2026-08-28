@@ -1116,11 +1116,17 @@ struct Grimoire {
         float   *resid = nullptr;  // [H]
     } mtp;
 
-    // ---- DFlash2 masked block drafter -----------------------------
-    // Loaded only when GRIMOIRE_DFLASH2_MODEL names the 1.05 GB sidecar.
-    // The target embed/lm_head are shared; the sidecar contains a 6-layer
-    // dense Qwen3 drafter, an 8H->H target-feature projection, grouped-conv
-    // adapters, and the rank-256 block candidate selector.
+    // ---- DFlash masked block drafter ------------------------------
+    // GRIMOIRE_DFLASH_MODEL selects the original 0.4B DFlashDraftModel used
+    // by the proven Ornith SGLang result (6-8 committed tokens/step).  Keep
+    // GRIMOIRE_DFLASH2_MODEL as a compatibility alias for the newer
+    // DFlash2DraftModel, whose grouped-conv and selector tensors are optional
+    // extensions of the same six-layer Qwen3 draft core.
+    //
+    // Both variants share the target embed/lm_head and consume eight target
+    // residual taps through fc.weight.  Each draft layer owns an independent
+    // KV cache: target-derived context K/V is inserted before the 16-query
+    // non-causal block is evaluated.
     struct DFlash2Head {
         struct Layer {
             DevQuant q, k, v, o, gate_up, down;
@@ -1128,8 +1134,10 @@ struct Grimoire {
             bf16_t *in_norm=nullptr, *post_norm=nullptr;
             bf16_t *q_norm=nullptr, *k_norm=nullptr;
             bf16_t *attn_conv_base=nullptr, *mlp_conv_base=nullptr;
+            uint8_t *k_cache=nullptr, *v_cache=nullptr;
+            bool sliding=true;
         };
-        bool ok=false;
+        bool ok=false, v2=false;
         DevQuant fc, selector_hidden;
         bf16_t *hidden_norm=nullptr, *norm=nullptr;
         bf16_t *predecessor=nullptr, *successor=nullptr;
@@ -2010,10 +2018,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
     }
 
-    // ---- DFlash2 sidecar weights ------------------------------------
-    if (const char* dpath=std::getenv("GRIMOIRE_DFLASH2_MODEL");
-        dpath && *dpath) {
-        std::printf("\n  dflash2      ");
+    // ---- DFlash sidecar weights -------------------------------------
+    const char* dpath=std::getenv("GRIMOIRE_DFLASH_MODEL");
+    if(!dpath||!*dpath)dpath=std::getenv("GRIMOIRE_DFLASH2_MODEL");
+    if (dpath && *dpath) {
+        std::printf("\n  dflash       ");
         std::fflush(stdout);
         Qwen35Model dc;
         dc.dir=dpath;
@@ -2040,15 +2049,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             TensorRef r=dr(n);bf16_t* p=dev_copy_t<bf16_t>(q,dc,r,what,&dok);
             if(r.ok())db+=size_t(r.t.numel())*sizeof(bf16_t);return p;
         };
-        dflash2.fc=qload("fc.weight","dflash2.fc");
+        dflash2.v2=dr("candidate_selector.hidden_projection.weight").ok();
+        dflash2.fc=qload("fc.weight","dflash.fc");
         dflash2.hidden_norm=bload("hidden_norm.weight","dflash2.hidden_norm");
         dflash2.norm=bload("norm.weight","dflash2.norm");
-        dflash2.selector_hidden=qload(
-            "candidate_selector.hidden_projection.weight","dflash2.selector_hidden");
-        dflash2.predecessor=bload(
-            "candidate_selector.predecessor_codebook","dflash2.predecessor");
-        dflash2.successor=bload(
-            "candidate_selector.successor_codebook","dflash2.successor");
+        if(dflash2.v2){
+            dflash2.selector_hidden=qload(
+                "candidate_selector.hidden_projection.weight","dflash2.selector_hidden");
+            dflash2.predecessor=bload(
+                "candidate_selector.predecessor_codebook","dflash2.predecessor");
+            dflash2.successor=bload(
+                "candidate_selector.successor_codebook","dflash2.successor");
+        }
+        const size_t draft_kv_bytes=size_t(8)*128*max_seq;
         for(int i=0;i<6;++i){
             auto& d=dflash2.layers[size_t(i)];
             const std::string p="layers."+std::to_string(i)+".";
@@ -2064,22 +2077,32 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 dr(p+"mlp.up_proj.weight"),PF,"dflash2.gate_up",&dok);
             db+=d.gate_up.w.bytes();
             d.down=qload(p+"mlp.down_proj.weight","dflash2.down_proj");
-            d.attn_conv_proj=qload(p+"attention_conv.kernel_projection.weight",
-                                   "dflash2.attn_conv_proj");
-            d.mlp_conv_proj=qload(p+"mlp_conv.kernel_projection.weight",
-                                  "dflash2.mlp_conv_proj");
-            d.attn_conv_base=bload(p+"attention_conv.base_kernel",
-                                   "dflash2.attn_conv_base");
-            d.mlp_conv_base=bload(p+"mlp_conv.base_kernel",
-                                  "dflash2.mlp_conv_base");
+            if(dflash2.v2){
+                d.attn_conv_proj=qload(p+"attention_conv.kernel_projection.weight",
+                                       "dflash2.attn_conv_proj");
+                d.mlp_conv_proj=qload(p+"mlp_conv.kernel_projection.weight",
+                                      "dflash2.mlp_conv_proj");
+                d.attn_conv_base=bload(p+"attention_conv.base_kernel",
+                                       "dflash2.attn_conv_base");
+                d.mlp_conv_base=bload(p+"mlp_conv.base_kernel",
+                                      "dflash2.mlp_conv_base");
+            }
+            // Original DFlash uses sliding attention for layers 0..4 and
+            // full attention for layer 5. DFlash2's six layers are sliding.
+            d.sliding=dflash2.v2||i<5;
+            d.k_cache=sycl::malloc_device<uint8_t>(draft_kv_bytes,q);
+            d.v_cache=sycl::malloc_device<uint8_t>(draft_kv_bytes,q);
+            if(!d.k_cache||!d.v_cache)dok=false;
+            db+=2*draft_kv_bytes;
         }
         dflash2.target_aux=sycl::malloc_device<float>(size_t(8)*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
         db+=size_t(8)*cfg.hidden*sizeof(float);
         dflash2.ok=dok;
-        if(!dok){err="DFlash2 weight upload failed";return false;}
+        if(!dok){err="DFlash weight upload failed";return false;}
         acct(db);
-        std::printf("ok (%.2f GiB device, target taps ready)\n",
+        std::printf("ok (%s, %.2f GiB device, target taps + draft KV ready)\n",
+                    dflash2.v2?"DFlash2DraftModel":"DFlashDraftModel",
                     double(db)/1073741824.0);
     }
 
@@ -2420,7 +2443,7 @@ void Grimoire::release() {
             if (p) sycl::free(p, q);
         mtp = {};
     }
-    // DFlash2 is optional, but release every field unconditionally so a
+    // DFlash is optional, but release every field unconditionally so a
     // partially loaded sidecar cannot leak USM when build() reports an error.
     dflash2.fc.release(q);
     dflash2.selector_hidden.release(q);
@@ -2430,7 +2453,8 @@ void Grimoire::release() {
         d.attn_conv_proj.release(q); d.mlp_conv_proj.release(q);
         for (void* p : {(void*)d.in_norm, (void*)d.post_norm,
                         (void*)d.q_norm, (void*)d.k_norm,
-                        (void*)d.attn_conv_base, (void*)d.mlp_conv_base})
+                        (void*)d.attn_conv_base, (void*)d.mlp_conv_base,
+                        (void*)d.k_cache, (void*)d.v_cache})
             if (p) sycl::free(p, q);
     }
     for (void* p : {(void*)dflash2.hidden_norm, (void*)dflash2.norm,

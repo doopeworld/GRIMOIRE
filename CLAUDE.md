@@ -12,6 +12,11 @@ math, and the 5 other links that were evaluated and rejected are in
 `ORNITH-2026-08-27.md` under "ORNITH TG OPTIMIZATION". Read that section
 in full before starting.
 
+**Latest implementation handoff:** `HANDOFF-2026-08-28-ORNITH-DFLASH.md`.
+The original z-lab DFlash drafter now loads; resume at context ingestion and
+the 16-query block forward described in that file. Do not switch back to Muse
+or the lower-acceptance DFlash2 sidecar.
+
 This supersedes the Muse Glimmer prefill work mentioned later in this file
 and in HANDOFF-2026-08-27-PP-TP-COMPLETE.md, which is real but lower
 priority right now. If you are unsure which task is current, ASK IAN rather
