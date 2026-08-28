@@ -202,7 +202,7 @@ sycl::event launch_rmsnorm_residual_batched(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, int tokens, int hidden, float eps,
     sycl_bf16* out_bf,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps, float weight_offset) {
     constexpr int WG = 256;
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);
@@ -236,7 +236,7 @@ sycl::event launch_rmsnorm_residual_batched(
                 for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
                 const float scale = sycl::rsqrt(total / float(hidden) + eps);
                 for (int i = lid; i < hidden; i += WG) {
-                    const float v=ht[i] * scale * (1.0f + bf16_to_f32(weight[i]));
+                    const float v=ht[i]*scale*(weight_offset+bf16_to_f32(weight[i]));
                     if(ot)ot[i]=v;if(obt)obt[i]=sycl_bf16(v);
                 }
             });
@@ -429,7 +429,7 @@ sycl::event launch_qk_norm_rope_batched(
     sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps, float weight_offset) {
     const int rot = int(dim * partial_factor) & ~1;
     const int heads_per_token = q_heads + k_heads;
     return q.submit([&](sycl::handler& h) {
@@ -453,7 +453,7 @@ sycl::event launch_qk_norm_rope_batched(
                 ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
                 const float scale = sycl::rsqrt(ss / float(dim) + eps);
                 for (int d = lane; d < dim; d += SG_SIZE)
-                    p[d] *= scale * (1.0f + bf16_to_f32(w[d]));
+                    p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
                 sycl::group_barrier(sg);
                 const int pos = start_pos + t;
                 for (int j = lane; j < rot / 2; j += SG_SIZE) {
@@ -788,8 +788,10 @@ sycl::event launch_deltanet_native_gates(sycl::queue& q, const float* ab,
 sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     int tokens, int inter, const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
-        h.parallel_for(sycl::range<2>(size_t(tokens), size_t(inter)), [=](sycl::id<2> id) {
-            const int t = int(id[0]), d = int(id[1]);
+        // DFlash uses inter=6144. Keep large row widths out of an implicit
+        // work-group dimension, whose B70 limit is 1024.
+        h.parallel_for(sycl::range<1>(size_t(tokens) * inter), [=](sycl::id<1> id) {
+            const int t = int(id[0] / inter), d = int(id[0] % inter);
             const int64_t z = int64_t(t) * inter + d;
             const float g = gu[int64_t(t) * 2 * inter + d];
             out[z] = (g / (1.0f + sycl::exp(-g))) * gu[int64_t(t) * 2 * inter + inter + d];
@@ -853,12 +855,15 @@ sycl::event launch_quantize_rows_int8_bf16(sycl::queue& q, const sycl_bf16* x,
 sycl::event launch_swiglu_bf16(sycl::queue& q, const sycl_bf16* gu,
     sycl_bf16* out, int tokens, int inter,
     const std::vector<sycl::event>& deps) {
+    constexpr size_t WG=256;
+    const size_t padded=(size_t(inter)+WG-1)/WG*WG;
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
-        // 2-D range: t and d come from the iteration space.  The flat form
-        // did a 64-bit divide AND modulo per element -- both are emulated in
-        // software on Xe -- 71.3M times per layer, 4.56G per prefill.
-        h.parallel_for(sycl::range<2>(size_t(tokens),size_t(inter)),[=](sycl::id<2> id){
-            const int t=int(id[0]), d=int(id[1]);
+        // Preserve 2-D indexing without letting a 6K-wide row become an
+        // implicit work-group dimension on Level Zero.
+        h.parallel_for(sycl::nd_range<2>({size_t(tokens),padded},{1,WG}),
+          [=](sycl::nd_item<2> it){
+            const int t=int(it.get_global_id(0)), d=int(it.get_global_id(1));
+            if(d>=inter)return;
             const int64_t z=int64_t(t)*inter+d;
             const float g=float(gu[int64_t(t)*2*inter+d]);
             out[z]=sycl_bf16((g/(1.0f+sycl::exp(-g)))*
@@ -894,10 +899,14 @@ sycl::event launch_swiglu_bf16_quant(sycl::queue& q,const sycl_bf16*gu,
 sycl::event launch_scale_by_sigmoid_batched(sycl::queue& q, float* x,
     const float* gate, int tokens, int hidden,
     const std::vector<sycl::event>& deps) {
+    constexpr size_t WG=256;
+    const size_t padded=(size_t(hidden)+WG-1)/WG*WG;
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
-        h.parallel_for(sycl::range<2>(size_t(tokens), size_t(hidden)), [=](sycl::id<2> id) {
-            const int t = int(id[0]);
-            x[int64_t(t) * hidden + int(id[1])] *= 1.0f / (1.0f + sycl::exp(-gate[t]));
+        h.parallel_for(sycl::nd_range<2>({size_t(tokens),padded},{1,WG}),
+          [=](sycl::nd_item<2> it) {
+            const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
+            if(d<hidden)
+                x[int64_t(t)*hidden+d]*=1.0f/(1.0f+sycl::exp(-gate[t]));
         });
     });
 }

@@ -222,8 +222,16 @@ sycl::event launch_flash_decode_batched(
     float softmax_scale, float* partials, float* part_m, float* part_l,
     int splits, const std::vector<sycl::event>& deps) {
     constexpr int KT = SG_SIZE;
+    constexpr int MAX_WG = 512;
     const int q_per_kv = num_heads / num_kv_heads;
-    const int wg = tokens * q_per_kv * SG_SIZE;
+    // One subgroup handles one (row, query-head-within-KV-head).  A 16-row
+    // DFlash verifier block made the old single group 2048 work-items on
+    // Qwen3.5 (q_per_kv=4), beyond B70's 1024 limit. Tile rows while keeping
+    // the proven 512-work-item ceiling used by the block-attention kernel.
+    const int rows_per_wg = std::max(1, std::min(
+        tokens, MAX_WG / (q_per_kv * SG_SIZE)));
+    const int row_tiles = (tokens + rows_per_wg - 1) / rows_per_wg;
+    const int wg = rows_per_wg * q_per_kv * SG_SIZE;
     const int max_seq = base_seq_len + tokens - 1;
 
     sycl::event scan = q.submit([&](sycl::handler& h) {
@@ -231,24 +239,29 @@ sycl::event launch_flash_decode_batched(
         sycl::local_accessor<float, 1> ks(size_t(head_dim) * KT, h);
         sycl::local_accessor<float, 1> vs(size_t(KT) * head_dim, h);
         h.parallel_for(
-            sycl::nd_range<1>(size_t(num_kv_heads) * splits * wg, wg),
+            sycl::nd_range<1>(
+                size_t(num_kv_heads) * splits * row_tiles * wg, wg),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const auto sg = it.get_sub_group();
                 const int lane = int(sg.get_local_id()[0]);
                 const int qslot = int(sg.get_group_id()[0]);
-                const int row = qslot / q_per_kv;
+                const int gid = int(it.get_group(0));
+                const int tile = gid % row_tiles;
+                const int block = gid / row_tiles;
+                const int row = tile * rows_per_wg + qslot / q_per_kv;
+                const bool row_valid = row < tokens;
+                const int safe_row = row_valid ? row : 0;
                 const int q_in_kv = qslot % q_per_kv;
                 const int lid = int(it.get_local_id(0));
-                const int gid = int(it.get_group(0));
-                const int kvh = gid / splits;
-                const int part = gid % splits;
+                const int kvh = block / splits;
+                const int part = block % splits;
                 const int head = kvh * q_per_kv + q_in_kv;
                 const int row_seq = base_seq_len + row;
                 const int per = (max_seq + splits - 1) / splits;
                 const int s_beg = part * per;
                 const int s_end = sycl::min(s_beg + per, max_seq);
                 const float* qh = qv +
-                    (int64_t(row) * num_heads + head) * head_dim;
+                    (int64_t(safe_row) * num_heads + head) * head_dim;
                 const uint8_t* kh = k_cache +
                     int64_t(kvh) * head_dim * seq_cap;
                 const uint8_t* vh = v_cache +
@@ -280,7 +293,7 @@ sycl::event launch_flash_decode_batched(
 
                     const int s = s0 + lane;
                     float score = -std::numeric_limits<float>::infinity();
-                    if (s < s_end && s < row_seq) {
+                    if (row_valid && s < s_end && s < row_seq) {
                         float dot = 0.0f;
                         for (int d = 0; d < head_dim; ++d)
                             dot = sycl::fma(qh[d],
@@ -312,17 +325,19 @@ sycl::event launch_flash_decode_batched(
                     sycl::group_barrier(it.get_group());
                 }
 
-                const int64_t pidx =
-                    (int64_t(row) * num_heads + head) * splits + part;
-                float* po = partials + pidx * head_dim;
-                #pragma unroll
-                for (int d = 0; d < MAX_DPL; ++d)
-                    if (d < dpl) po[lane + d * SG_SIZE] = acc[d];
-                if (lane == 0) {
-                    part_m[pidx] = (s_beg >= s_end || s_beg >= row_seq)
-                        ? -std::numeric_limits<float>::infinity() : m;
-                    part_l[pidx] = (s_beg >= s_end || s_beg >= row_seq)
-                        ? 0.0f : l;
+                if (row_valid) {
+                    const int64_t pidx =
+                        (int64_t(row) * num_heads + head) * splits + part;
+                    float* po = partials + pidx * head_dim;
+                    #pragma unroll
+                    for (int d = 0; d < MAX_DPL; ++d)
+                        if (d < dpl) po[lane + d * SG_SIZE] = acc[d];
+                    if (lane == 0) {
+                        part_m[pidx] = (s_beg >= s_end || s_beg >= row_seq)
+                            ? -std::numeric_limits<float>::infinity() : m;
+                        part_l[pidx] = (s_beg >= s_end || s_beg >= row_seq)
+                            ? 0.0f : l;
+                    }
                 }
             });
     });

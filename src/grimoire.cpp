@@ -2055,15 +2055,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         };
         bool dok=true;
         size_t db=0;
+        dflash2.v2=dr("candidate_selector.hidden_projection.weight").ok();
+        // The original 0.4B drafter is a distilled BF16 checkpoint. Reusing
+        // the target's MXFP4 projection format shrank it to 0.24 GiB but
+        // collapsed draft agreement. Keep original-DFlash weights in BF16;
+        // the larger DFlash2 compatibility path retains the requested format.
+        const Fmt dflash_fmt=dflash2.v2?PF:Fmt::BF16;
         auto qload=[&](const std::string& n,const char* what){
-            DevQuant d=quantize_upload_t(q,dc,dr(n),PF,what,&dok);
+            DevQuant d=quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
             db+=d.w.bytes();return d;
         };
         auto bload=[&](const std::string& n,const char* what){
             TensorRef r=dr(n);bf16_t* p=dev_copy_t<bf16_t>(q,dc,r,what,&dok);
             if(r.ok())db+=size_t(r.t.numel())*sizeof(bf16_t);return p;
         };
-        dflash2.v2=dr("candidate_selector.hidden_projection.weight").ok();
         dflash2.fc=qload("fc.weight","dflash.fc");
         dflash2.hidden_norm=bload("hidden_norm.weight","dflash2.hidden_norm");
         dflash2.norm=bload("norm.weight","dflash2.norm");
@@ -2088,7 +2093,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.v=qload(p+"self_attn.v_proj.weight","dflash2.v_proj");
             d.o=qload(p+"self_attn.o_proj.weight","dflash2.o_proj");
             d.gate_up=concat_upload_t(q,dc,dr(p+"mlp.gate_proj.weight"),
-                dr(p+"mlp.up_proj.weight"),PF,"dflash2.gate_up",&dok);
+                dr(p+"mlp.up_proj.weight"),dflash_fmt,"dflash2.gate_up",&dok);
             db+=d.gate_up.w.bytes();
             d.down=qload(p+"mlp.down_proj.weight","dflash2.down_proj");
             if(dflash2.v2){
@@ -3960,6 +3965,14 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     constexpr int M=16,H=2048,QH=32,KVH=8,HD=128,QW=QH*HD,KVW=KVH*HD,I=6144;
     constexpr int MASK=248077;
     const float eps=1.0e-6f,theta=10000000.0f;
+    const bool trace=std::getenv("GRIMOIRE_DFLASH_TRACE")!=nullptr;
+    auto checkpoint=[&](const char* stage){
+        if(!trace)return;
+        std::fprintf(stderr,"  dflash trace: %s ... ",stage);
+        std::fflush(stderr);
+        q.wait_and_throw();
+        std::fprintf(stderr,"ok\n");
+    };
     auto dense=load_xe2_dense_mxfp4_f32();
     auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
         launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
@@ -3978,17 +3991,18 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         const int rows=std::min(M,position-start);
         mm(dflash2.fc,dflash2.target_aux+int64_t(start)*8*H,dflash2.ctx,rows);
         launch_rmsnorm_residual_batched(q,dflash2.ctx,nullptr,nullptr,
-            dflash2.hidden_norm,dflash2.normed,rows,H,eps);
+            dflash2.hidden_norm,dflash2.normed,rows,H,eps,nullptr,{},0.0f);
         for(auto& d:dflash2.layers){
             mm(d.k,dflash2.normed,dflash2.k,rows);
             mm(d.v,dflash2.normed,dflash2.v,rows);
             // The helper applies the exact per-head Q/K norm and RoPE. Q is
             // scratch here; only the normalized/rotated context K is kept.
             launch_qk_norm_rope_batched(q,dflash2.q,dflash2.k,
-                d.q_norm,d.k_norm,rows,QH,KVH,HD,start,theta,1.0f,eps);
+                d.q_norm,d.k_norm,rows,QH,KVH,HD,start,theta,1.0f,eps,{},0.0f);
             launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
                                      rows,start,KVH,HD,max_seq);
         }
+        checkpoint("context KV");
         dflash2.context_pos+=rows;
     }
 
@@ -3997,34 +4011,38 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
     q.memcpy(dflash2.tokens,host_tokens.data(),sizeof(host_tokens));
     launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
+    checkpoint("block embedding");
 
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
         if(li==0)
             launch_rmsnorm_residual_batched(q,dflash2.resid,nullptr,nullptr,
-                d.in_norm,dflash2.normed,M,H,eps);
+                d.in_norm,dflash2.normed,M,H,eps,nullptr,{},0.0f);
         else
             launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.mlp,nullptr,
-                d.in_norm,dflash2.normed,M,H,eps);
+                d.in_norm,dflash2.normed,M,H,eps,nullptr,{},0.0f);
         mm(d.q,dflash2.normed,dflash2.q,M);
         mm(d.k,dflash2.normed,dflash2.k,M);
         mm(d.v,dflash2.normed,dflash2.v,M);
+        checkpoint("QKV projections");
         launch_qk_norm_rope_batched(q,dflash2.q,dflash2.k,d.q_norm,d.k_norm,
-                                    M,QH,KVH,HD,position,theta,1.0f,eps);
+                                    M,QH,KVH,HD,position,theta,1.0f,eps,{},0.0f);
         launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
                                  M,position,KVH,HD,max_seq);
         launch_dflash2_block_attention(q,dflash2.q,d.k_cache,d.v_cache,
             dflash2.attn,M,position,QH,KVH,HD,max_seq,d.sliding?4096:0,
             1.0f/std::sqrt(float(HD)));
+        checkpoint("block attention");
         mm(d.o,dflash2.attn,dflash2.proj,M);
         launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.proj,nullptr,
-            d.post_norm,dflash2.normed,M,H,eps);
+            d.post_norm,dflash2.normed,M,H,eps,nullptr,{},0.0f);
         mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
         launch_swiglu_batched(q,dflash2.gate_up,dflash2.mlp,M,I);
         mm(d.down,dflash2.mlp,dflash2.mlp,M);
+        checkpoint("MLP");
     }
     launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.mlp,nullptr,
-        dflash2.norm,dflash2.normed,M,H,eps);
+        dflash2.norm,dflash2.normed,M,H,eps,nullptr,{},0.0f);
 
     auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
     if(lm_head.has_i4()&&w4){
@@ -4032,6 +4050,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                                   M-1,H,{});
         w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,dflash2.logits,
            M-1,lm_head.w.N,lm_head.w.K);
+    }else if(lm_head.w.fmt==Fmt::MXFP4&&lm_head.w.payload){
+        // Project all draft rows together.  The old per-row GEMV streamed the
+        // full vocabulary matrix fifteen times per speculative step.
+        mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
     }else{
         for(int r=1;r<M;++r)
             gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
@@ -4045,6 +4067,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     draft_tokens.resize(M-1);
     q.memcpy(draft_tokens.data(),dflash2.draft_ids,
              size_t(M-1)*sizeof(int32_t)).wait();
+    checkpoint("draft logits");
     return true;
 }
 
@@ -5016,10 +5039,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_gemv_int4sym_batch(q, lm_head.i4, lm_head.i4s, bn,
                     batch_logits, lm_head.w.N, lm_head.w.K, M, {});
             }
+        } else if (lm_head.w.fmt == Fmt::MXFP4 && lm_head.w.payload) {
+            // Verification is a matrix multiplication, not M independent
+            // decode GEMVs.  Load the large vocabulary matrix once per batch.
+            mm(lm_head, bn, batch_logits);
         }
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
-            if (!lm_head.has_i4())
+            if (!lm_head.has_i4() && lm_head.w.fmt != Fmt::MXFP4)
                 launch_gemv(q, lm_head.w, bn + int64_t(r) * H, row, {});
             launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));

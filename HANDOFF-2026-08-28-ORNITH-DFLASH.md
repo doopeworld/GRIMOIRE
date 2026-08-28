@@ -1,128 +1,103 @@
-# GRIMOIRE handoff — Ornith original-DFlash implementation
+# GRIMOIRE handoff — Ornith original DFlash
 
 Date: 2026-08-28
 
-## Current priority
+## Current status
 
-Implement block speculative decoding for Ornith-1.5-35B-A3B using the
-**original DFlashDraftModel** from `z-lab/Qwen3.5-35B-A3B-DFlash`.
+Original `z-lab/Qwen3.5-35B-A3B-DFlash` loads and runs end-to-end with
+`ornith-ai/Ornith-1.5-35B-A3B` on Tower GPU0 (`renderD128`). Output is coherent
+and exits cleanly, but performance is unacceptable: the latest result is only
+22.6 tok/s and 2.21 committed tokens per verifier step versus the approximately
+125.5 tok/s non-speculative baseline.
 
-This is the drafter used by `ultimatechris/Ornith-1.5-35B-A3B-DFlash-SGLang`:
-block size 16, 6.1 accepted tokens on GSM8K and 7.7 on HumanEval, with measured
-202.5 -> 470.2 tok/s (2.32x) on 2x A100. It is a better first target than the
-already-downloaded `jzinno/...DFlash2`, which measured 4.02 accepted tokens.
+Do not claim this as a successful DFlash result. Do not run more guessed tuning
+variants. The next session must find the first numerical divergence from the
+Python reference before doing more performance work.
 
-## Updates completed
+GPU1 was not used. All tests used `tools/tune.sh` with `GPU=gpu0`, resolving to
+`renderD128`. No containers remain running.
 
-- Downloaded the exact original drafter to the Tower:
-  `/mnt/storage/Models/Qwen3.5-35B-A3B-DFlash` (771,819,674-byte safetensors).
-- Added `GRIMOIRE_DFLASH_MODEL`; `GRIMOIRE_DFLASH2_MODEL` remains a compatibility
-  alias.
-- The loader now detects original `DFlashDraftModel` versus
-  `DFlash2DraftModel` from the tensor set.
-- DFlash2-only grouped-conv and candidate-selector tensors are optional, so the
-  original z-lab model loads instead of failing on absent tensors.
-- Allocated independent FP8 K/V caches for all six draft layers.
-- Recorded the original model's attention pattern: layers 0-4 use a 4096-token
-  sliding window; layer 5 uses full attention. DFlash2 keeps all six sliding.
-- Release logic now frees every draft K/V cache.
-- Expanded target-tap storage to token-major `[max_seq, 8, hidden]` and added
-  graph-safe kernels for recording all eight residual taps during both decode
-  and batched target verification. The full SYCL build passes.
-- Added a WIP original-DFlash forward in `src/grimoire.cpp`: persistent draft
-  scratch, target-context ingestion into six draft KV caches, a 16-row
-  `[bonus + 15 masks]` forward, batched `lm_head`/argmax, and integration with
-  the existing verifier/rollback loop. `kSpecBatch` is now 16.
-- Fixed the first WIP runtime failure: speculative rollback buffers were only
-  allocated for MTP. They are now allocated for either MTP or DFlash.
-- Fixed the next identified failure in `launch_embed_batched`: its 2-D range
-  used a 2048-wide dimension, exceeding B70's 1024 per-dimension limit. The
-  equivalent token/hidden indexing is now flattened into a 1-D range.
+## Updates and confirmed fixes
 
-## Important status: runtime retest required
+- Original DFlash and DFlash2 are detected separately; the original six-layer
+  forward no longer requires DFlash2 convolution/selector weights.
+- Original DFlash weights now remain BF16 as shipped. Previously target
+  `--proj mxfp4` incorrectly quantized the draft to 0.24 GiB. Correct draft
+  device size is 0.77 GiB.
+- DFlash RMSNorm and Q/K norm use raw Qwen weights (`weight_offset=0`). Target
+  MuseGlimmer keeps its existing baked `1 + weight` convention.
+- Fixed invalid B70 launches: flattened batched embedding and SwiGLU, tiled
+  batched flash decode to a maximum 512-item workgroup, and changed wide
+  verifier SwiGLU/sigmoid kernels to padded 2-D launches with local width 256.
+- Added opt-in `GRIMOIRE_DFLASH_TRACE` and
+  `GRIMOIRE_PREFILL_HOST_PROGRESS` diagnostics.
+- Fixed a confirmed vocabulary-projection throughput bug. Draft and verifier
+  MXFP4 `lm_head` now use one M-row GEMM instead of 15 and 16 separate full
+  vocabulary GEMVs per speculative step.
+- Full AOT SYCL build passes.
 
-The original DFlash model loads, but speculative decoding is **not yet proven
-working**. The latest full run exposed the invalid embed launch described
-above. That launch is fixed and the full build passes, but per user instruction
-the fix has not been run on a GPU. There is no valid DFlash acceptance or TG
-result yet. Treat the committed forward as unfinished WIP.
+Modified files: `src/attention.cpp`, `src/grimoire.cpp`, `src/kernels.hpp`,
+and `src/prefill.cpp`.
 
-## Validation and findings
+## Exact results
 
-Build command passed:
-
-```bash
-docker run --rm --entrypoint bash \
-  -v /mnt/storage/isos/grimoire-fuse:/grimoire \
-  my-vllm-xpu:latest -lc \
-  'bash /grimoire/tools/build_grimoire_only_b70.sh /grimoire'
-```
-
-Original-DFlash load test passed on GPU0 and printed:
+Clean run before batched `lm_head`:
 
 ```text
-dflash       ok (DFlashDraftModel, 0.28 GiB device, target taps + draft KV ready)
-prompt: 11 tokens
-tg 1 tokens in 9 ms -> 110.6 tok/s
+dflash ok (DFlashDraftModel, 0.77 GiB device)
+pp 21 tokens in 1983 ms -> 10.6 tok/s
+DFlash(k=15) tg 64 tokens in 3267 ms -> 19.6 tok/s
+DFlash steps 30, 2.17 committed/step, draft accepts 35/65, rollbacks 30
 ```
 
-Latest WIP result on GPU0 (`renderD128`), using the safe runner and MXFP4:
+Latest clean run after batched draft and verifier `lm_head`:
 
 ```text
-dflash       ok (DFlashDraftModel, 0.24 GiB device, target taps + draft KV ready)
-prompt: 21 tokens
-Xe2 grouped GEMM unavailable; using exact fallback
-terminate called after throwing an instance of 'sycl::_V1::exception'
-what(): The number of work-items in each dimension of a work-group cannot exceed
-        {1024, 1024, 1024} for this device
+dflash ok (DFlashDraftModel, 0.77 GiB device)
+pp 21 tokens in 1955 ms -> 10.7 tok/s
+DFlash(k=15) tg 64 tokens in 2827 ms -> 22.6 tok/s
+DFlash steps 29, 2.21 committed/step, draft accepts 35/64, rollbacks 29
 ```
 
-The failure occurs on the first speculative step. The process exited `134`;
-there was no generated text, acceptance count, or TG measurement. Full log:
-`/tmp/grim-orn-dflash-mxfp4-result.log`.
+Latest log: `/tmp/grim-orn-dflash-batched-result.log`.
 
-Root cause found after the run: `launch_embed_batched(16, 2048)` used a 2-D
-`sycl::range` whose hidden dimension exceeded the B70 limit. It is now a
-flattened 1-D launch with identical indexing. The full build passed after this
-fix. Runtime validation is deliberately deferred to the next session.
+The projection correction improved 19.6 to 22.6 tok/s but did not materially
+change acceptance. It was a real throughput defect, not the main blocker.
 
-An earlier WIP run reached the same point but failed in `snapshot_recurrent`
-with a null-copy argument. That allocation bug is fixed. Its log is
-`/tmp/grim-orn-dflash-e2e16.log`.
+## Reference facts already checked
 
-Verifier graph experiment (do not repeat):
+- Correct pairing is plain Ornith plus `z-lab/Qwen3.5-35B-A3B-DFlash`.
+- The ultimatechris reference reports block 16, accepted length 6.1 on GSM8K /
+  7.7 on HumanEval, and 202.5 to 470.2 tok/s on two A100s with a BF16 target.
+- Original DFlash samples the 15 mask rows, not the anchor row. GRIMOIRE uses
+  rows 1 through 15, matching `ref/dflash_speculator.py`.
+- Query positions are sequential after accepted context.
+- Target taps `[1,6,11,16,22,27,32,37]`, FC then hidden RMSNorm, residual flow,
+  and NeoX RoPE were reviewed against `ref/qwen3_dflash.py`.
 
-- `verify(1)` direct: 184.7 ms / 16 = 11.54 ms.
-- Graph replay itself: about 9.42 ms, confirming roughly 2.1 ms submission cost.
-- Rebuilding/finalizing the graph every step adds about 1.2 ms at M=1.
-- On MTP k=7, per-call graph capture regressed 62.7 -> 55.5 tok/s with identical
-  2.37 committed/step. `GRIMOIRE_PREFILL_GRAPH` is not a production fix; a
-  reusable graph would require persistent scratch and device-dynamic positions.
+## Unresolved findings
 
-Logs:
+- Acceptance is 2.21 instead of the reference 6.1 to 7.7. This is the main
+  blocker. Kernel tuning cannot create the missing accepted tokens.
+- The reference uses a BF16 target; GRIMOIRE uses aggressive target MXFP4
+  (about 17.9 GiB versus roughly 73 GiB). The draft was trained on BF16 target
+  states/logits. This is plausible but unproven.
+- DFlash KV caches are FP8 E4M3; the reference likely uses BF16 KV. This
+  precision difference is also unisolated.
+- The startup W4A16 grouped-GEMM warning is from the legacy loader. The MXFP4
+  grouped library and its M16 symbol exist. Do not call the warning the cause
+  without timing evidence.
 
-- `/tmp/grim-orn-verify1-base.log`
-- `/tmp/grim-orn-verify1-graph.log`
-- `/tmp/grim-orn-mtp7-base64.log`
-- `/tmp/grim-orn-mtp7-graph64.log`
-- `/tmp/grim-orn-dflash-original-load.log`
-- `/tmp/grim-orn-dflash-e2e16.log`
-- `/tmp/grim-orn-dflash-mxfp4-result.log`
+## Next steps — no blind benchmarks
 
-## Next steps — do in this order
-
-1. Rerun the exact 32-token MXFP4 test on GPU0 through `tools/tune.sh`. Confirm
-   the flattened embed launch passes and execution enters the six draft layers.
-2. If another stage fails, add narrow stage markers and fix only that stage;
-   do not infer runtime success from model load or build success.
-3. Validate the WIP context ingestion and six-layer 16-query forward against
-   `ref/qwen3_dflash.py`, including draft-cache positions and the non-causal
-   block-attention mask. Original DFlash does **not** use the DFlash2 grouped
-   convolution or selector path.
-4. Validate coherent generated text and exact target distribution, then report
-   committed tokens/step, draft time, verify time, and sustained TG on the same
-   prompts used for the 125.5 TG baseline.
-
-The exact reference forward and speculator input layout are already extracted
-in `ref/qwen3_dflash.py` and `ref/dflash_speculator.py`. Do not infer the
-original algorithm from the DFlash2 selector path.
+1. Create a one-step comparison using one fixed prompt and checkpoint. Dump the
+   eight target taps, projected/normalized context, first-layer Q/K/V, final
+   draft hidden rows, and 15 draft token IDs from GRIMOIRE and Python.
+2. Identify the first diverging tensor and fix only that divergence. Repeat the
+   same one-step comparison; do not launch full-generation tuning variants.
+3. If BF16 forward intermediates match, isolate DFlash KV BF16 versus FP8, then
+   target BF16/MXFP4 compatibility as separate experiments.
+4. Only once acceptance approaches the reference range, profile draft versus
+   verifier and optimize the measured dominant stage.
+5. Final validation must use GPU0 and report exact speed and acceptance, then
+   update this handoff, commit, and push GitHub.
