@@ -29,13 +29,23 @@ already-downloaded `jzinno/...DFlash2`, which measured 4.02 accepted tokens.
 - Expanded target-tap storage to token-major `[max_seq, 8, hidden]` and added
   graph-safe kernels for recording all eight residual taps during both decode
   and batched target verification. The full SYCL build passes.
+- Added a WIP original-DFlash forward in `src/grimoire.cpp`: persistent draft
+  scratch, target-context ingestion into six draft KV caches, a 16-row
+  `[bonus + 15 masks]` forward, batched `lm_head`/argmax, and integration with
+  the existing verifier/rollback loop. `kSpecBatch` is now 16.
+- Fixed the first WIP runtime failure: speculative rollback buffers were only
+  allocated for MTP. They are now allocated for either MTP or DFlash.
+- Fixed the next identified failure in `launch_embed_batched`: its 2-D range
+  used a 2048-wide dimension, exceeding B70's 1024 per-dimension limit. The
+  equivalent token/hidden indexing is now flattened into a 1-D range.
 
-## Important status: not end-to-end yet
+## Important status: runtime retest required
 
-The original DFlash model **loads but speculative decoding is not working yet**.
-There is no DFlash acceptance or TG result from GRIMOIRE. The missing pieces are
-context K/V projection, the six-layer 16-query draft forward, batched draft
-logits, and connection to the verifier/rollback loop.
+The original DFlash model loads, but speculative decoding is **not yet proven
+working**. The latest full run exposed the invalid embed launch described
+above. That launch is fixed and the full build passes, but per user instruction
+the fix has not been run on a GPU. There is no valid DFlash acceptance or TG
+result yet. Treat the committed forward as unfinished WIP.
 
 ## Validation and findings
 
@@ -56,6 +66,30 @@ prompt: 11 tokens
 tg 1 tokens in 9 ms -> 110.6 tok/s
 ```
 
+Latest WIP result on GPU0 (`renderD128`), using the safe runner and MXFP4:
+
+```text
+dflash       ok (DFlashDraftModel, 0.24 GiB device, target taps + draft KV ready)
+prompt: 21 tokens
+Xe2 grouped GEMM unavailable; using exact fallback
+terminate called after throwing an instance of 'sycl::_V1::exception'
+what(): The number of work-items in each dimension of a work-group cannot exceed
+        {1024, 1024, 1024} for this device
+```
+
+The failure occurs on the first speculative step. The process exited `134`;
+there was no generated text, acceptance count, or TG measurement. Full log:
+`/tmp/grim-orn-dflash-mxfp4-result.log`.
+
+Root cause found after the run: `launch_embed_batched(16, 2048)` used a 2-D
+`sycl::range` whose hidden dimension exceeded the B70 limit. It is now a
+flattened 1-D launch with identical indexing. The full build passed after this
+fix. Runtime validation is deliberately deferred to the next session.
+
+An earlier WIP run reached the same point but failed in `snapshot_recurrent`
+with a null-copy argument. That allocation bug is fixed. Its log is
+`/tmp/grim-orn-dflash-e2e16.log`.
+
 Verifier graph experiment (do not repeat):
 
 - `verify(1)` direct: 184.7 ms / 16 = 11.54 ms.
@@ -72,28 +106,20 @@ Logs:
 - `/tmp/grim-orn-mtp7-base64.log`
 - `/tmp/grim-orn-mtp7-graph64.log`
 - `/tmp/grim-orn-dflash-original-load.log`
+- `/tmp/grim-orn-dflash-e2e16.log`
+- `/tmp/grim-orn-dflash-mxfp4-result.log`
 
 ## Next steps — do in this order
 
-1. Finish original-DFlash context ingestion.
-   - The eight target residual taps are now preserved for every target token.
-   - Apply `fc.weight` to concatenated taps, then `hidden_norm`.
-   - For each draft layer, project/norm/RoPE K plus project V and append them to
-     that layer's draft cache at the target positions.
-2. Implement one 16-query draft forward.
-   - Row 0 is the known bonus token; rows 1-15 use mask token 248077.
-   - Six dense Qwen3 layers, hidden 2048, intermediate 6144, 32 Q heads, 8 KV
-     heads, head_dim 128, theta 1e7.
-   - Attention is non-causal across the whole query block plus context. Use
-     `launch_dflash2_block_attention`; window 4096 for layers 0-4 and unlimited
-     for layer 5.
-   - Original DFlash does **not** use DFlash2 grouped-conv or selector kernels.
-3. Apply target `lm_head` to mask rows 1-15 in one batched projection and choose
-   one token per row. This is the proposed 15-token block.
-4. Feed `[bonus + 15 drafts]` through the existing verifier, acceptance,
-   recurrent snapshot, rollback, and replay machinery. Increase
-   `kSpecBatch` from 8 to 16 first.
-5. Validate coherent generated text and exact target distribution, then report
+1. Rerun the exact 32-token MXFP4 test on GPU0 through `tools/tune.sh`. Confirm
+   the flattened embed launch passes and execution enters the six draft layers.
+2. If another stage fails, add narrow stage markers and fix only that stage;
+   do not infer runtime success from model load or build success.
+3. Validate the WIP context ingestion and six-layer 16-query forward against
+   `ref/qwen3_dflash.py`, including draft-cache positions and the non-causal
+   block-attention mask. Original DFlash does **not** use the DFlash2 grouped
+   convolution or selector path.
+4. Validate coherent generated text and exact target distribution, then report
    committed tokens/step, draft time, verify time, and sustained TG on the same
    prompts used for the 125.5 TG baseline.
 

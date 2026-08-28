@@ -653,8 +653,11 @@ sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
-        h.parallel_for(sycl::range<2>(size_t(count), size_t(hidden)), [=](sycl::id<2> id) {
-            const int t = int(id[0]), d = int(id[1]);
+        // A range dimension is also the implicit work-group dimension on some
+        // Level Zero paths. hidden=2048 exceeds B70's per-dimension limit of
+        // 1024, so flatten the independent token/hidden coordinates.
+        h.parallel_for(sycl::range<1>(size_t(count) * hidden), [=](sycl::id<1> id) {
+            const int t = int(id[0] / hidden), d = int(id[0] % hidden);
             out[int64_t(t) * hidden + d] = bf16_to_f32(table[int64_t(tokens[t]) * hidden + d]);
         });
     });

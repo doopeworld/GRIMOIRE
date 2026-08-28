@@ -1144,6 +1144,16 @@ struct Grimoire {
         // Token-major [max_seq,8,H]. The draft fc consumes the eight taps for
         // each newly verified target token as one contiguous 8H row.
         float *target_aux=nullptr;
+        // Persistent original-DFlash scratch. Fixed addresses are also the
+        // foundation for capturing the 16-query draft in a reusable graph.
+        float *ctx=nullptr, *h=nullptr, *resid=nullptr, *normed=nullptr;
+        float *q=nullptr, *k=nullptr, *v=nullptr, *attn=nullptr;
+        float *proj=nullptr, *gate_up=nullptr, *mlp=nullptr, *logits=nullptr;
+        sycl_bf16 *bf=nullptr;
+        int8_t *a8=nullptr;
+        float *a8s=nullptr;
+        int32_t *tokens=nullptr, *draft_ids=nullptr;
+        int context_pos=0;
         std::array<Layer,6> layers;
         static constexpr std::array<int,8> target_layers={1,6,11,16,22,27,32,37};
     } dflash2;
@@ -1158,7 +1168,7 @@ struct Grimoire {
     float* spec_hidden_steps = nullptr;
     size_t spec_dn_elems = 0, spec_conv_elems = 0;
     size_t spec_conv_input_elems = 0;
-    static constexpr int kSpecBatch = 8;
+    static constexpr int kSpecBatch = 16;
     static bool mtp_enabled() {
         static const bool v = []{ const char* e = std::getenv("GRIMOIRE_MTP");
             return e && *e && std::atoi(e) != 0; }();
@@ -1286,6 +1296,8 @@ struct Grimoire {
     // from_mtp_hidden: chained drafts feed the head its OWN previous hidden
     // state instead of the main model's h_t, which is how depth > 1 works.
     int  mtp_draft(int next_token, int position, bool from_mtp_hidden = false);
+    bool dflash_draft(int bonus_token, int position,
+                      std::vector<int32_t>& draft_tokens);
     int          argmax_token();
     void release();
 };
@@ -2101,6 +2113,34 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             size_t(max_seq)*8*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
         db+=size_t(max_seq)*8*cfg.hidden*sizeof(float);
+        if(!dflash2.v2){
+            constexpr int DM=16,DH=2048,DQ=4096,DKV=1024,DI2=12288;
+            auto dfd=[&](size_t n){db+=n*sizeof(float);return sycl::malloc_device<float>(n,q);};
+            dflash2.ctx=dfd(size_t(DM)*DH);
+            dflash2.h=dfd(size_t(DM)*DH);
+            dflash2.resid=dfd(size_t(DM)*DH);
+            dflash2.normed=dfd(size_t(DM)*DH);
+            dflash2.q=dfd(size_t(DM)*DQ);
+            dflash2.k=dfd(size_t(DM)*DKV);
+            dflash2.v=dfd(size_t(DM)*DKV);
+            dflash2.attn=dfd(size_t(DM)*DQ);
+            dflash2.proj=dfd(size_t(DM)*DH);
+            dflash2.gate_up=dfd(size_t(DM)*DI2);
+            dflash2.mlp=dfd(size_t(DM)*DH);
+            dflash2.logits=dfd(size_t(DM-1)*cfg.vocab);
+            dflash2.bf=sycl::malloc_device<sycl_bf16>(size_t(DM)*8*DH,q);
+            dflash2.a8=sycl::malloc_device<int8_t>(size_t(DM)*DH,q);
+            dflash2.a8s=sycl::malloc_device<float>(DM,q);
+            dflash2.tokens=sycl::malloc_device<int32_t>(DM,q);
+            dflash2.draft_ids=sycl::malloc_device<int32_t>(DM-1,q);
+            db+=size_t(DM)*8*DH*sizeof(bf16_t)+size_t(DM)*DH+size_t(DM)*sizeof(float)
+                +size_t(2*DM-1)*sizeof(int32_t);
+            if(!dflash2.ctx||!dflash2.h||!dflash2.resid||!dflash2.normed||
+               !dflash2.q||!dflash2.k||!dflash2.v||!dflash2.attn||
+               !dflash2.proj||!dflash2.gate_up||!dflash2.mlp||!dflash2.logits||
+               !dflash2.bf||!dflash2.a8||!dflash2.a8s||!dflash2.tokens||
+               !dflash2.draft_ids)dok=false;
+        }
         dflash2.ok=dok;
         if(!dok){err="DFlash weight upload failed";return false;}
         acct(db);
@@ -2114,7 +2154,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         mtp.x     = sycl::malloc_device<float>(size_t(cfg.hidden), q);
         mtp.h2    = sycl::malloc_device<float>(size_t(cfg.hidden), q);
         mtp.resid = sycl::malloc_device<float>(size_t(cfg.hidden), q);
+    }
 
+    if (mtp.ok || dflash2.ok) {
         // One exact rollback image for the hybrid recurrent state. This is
         // about 157 MiB on Qwen3.8-27B and is copied device-to-device.
         for (const auto& d : L) {
@@ -2138,7 +2180,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             (spec_conv_elems && !spec_conv_ring) ||
             (spec_dn_elems && !spec_dn_steps) ||
             (spec_conv_input_elems && !spec_conv_inputs) || !spec_hidden_steps) {
-            err = "MTP rollback-state allocation failed";
+            err = "speculative rollback-state allocation failed";
             return false;
         }
         acct((spec_dn_elems * (1 + kSpecBatch) + spec_conv_elems +
@@ -2253,6 +2295,7 @@ void Grimoire::reset() {
     if (s.d_seq_len) q.memcpy(s.d_seq_len, &one, sizeof(int32_t));
     q.wait();
     dag_tail.clear();
+    dflash2.context_pos = 0;
     pos = 0;
 }
 
@@ -2462,7 +2505,15 @@ void Grimoire::release() {
     }
     for (void* p : {(void*)dflash2.hidden_norm, (void*)dflash2.norm,
                     (void*)dflash2.predecessor, (void*)dflash2.successor,
-                    (void*)dflash2.target_aux})
+                    (void*)dflash2.target_aux, (void*)dflash2.ctx,
+                    (void*)dflash2.h, (void*)dflash2.resid,
+                    (void*)dflash2.normed, (void*)dflash2.q,
+                    (void*)dflash2.k, (void*)dflash2.v,
+                    (void*)dflash2.attn, (void*)dflash2.proj,
+                    (void*)dflash2.gate_up, (void*)dflash2.mlp,
+                    (void*)dflash2.logits, (void*)dflash2.bf,
+                    (void*)dflash2.a8, (void*)dflash2.a8s,
+                    (void*)dflash2.tokens, (void*)dflash2.draft_ids})
         if (p) sycl::free(p, q);
     dflash2 = {};
     lm_head.release(q);
@@ -3899,6 +3950,104 @@ int Grimoire::argmax_token() {
     return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
 }
 
+// Original DFlash: ingest any target taps not yet present in the six draft KV
+// caches, then evaluate [bonus, mask x 15] in one non-causal block. DFlash2
+// has additional grouped-conv/selector stages and deliberately does not enter
+// this path.
+bool Grimoire::dflash_draft(int bonus_token, int position,
+                            std::vector<int32_t>& draft_tokens) {
+    if(!dflash2.ok||dflash2.v2||position<0||position+16>max_seq)return false;
+    constexpr int M=16,H=2048,QH=32,KVH=8,HD=128,QW=QH*HD,KVW=KVH*HD,I=6144;
+    constexpr int MASK=248077;
+    const float eps=1.0e-6f,theta=10000000.0f;
+    auto dense=load_xe2_dense_mxfp4_f32();
+    auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
+        launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
+        if(dense&&w.w.fmt==Fmt::MXFP4&&w.w.payload){
+            dense(&q,dflash2.bf,w.w.payload,
+                  static_cast<const unsigned char*>(w.w.scales),y,
+                  rows,w.w.N,w.w.K);
+        }else launch_gemm_xmx(q,w.w,dflash2.bf,y,rows);
+    };
+
+    // Target context is projected once per newly accepted token. The query
+    // block later overwrites speculative cache slots, so rejected suffixes do
+    // not require a separate draft-cache rollback image.
+    while(dflash2.context_pos<position){
+        const int start=dflash2.context_pos;
+        const int rows=std::min(M,position-start);
+        mm(dflash2.fc,dflash2.target_aux+int64_t(start)*8*H,dflash2.ctx,rows);
+        launch_rmsnorm_residual_batched(q,dflash2.ctx,nullptr,nullptr,
+            dflash2.hidden_norm,dflash2.normed,rows,H,eps);
+        for(auto& d:dflash2.layers){
+            mm(d.k,dflash2.normed,dflash2.k,rows);
+            mm(d.v,dflash2.normed,dflash2.v,rows);
+            // The helper applies the exact per-head Q/K norm and RoPE. Q is
+            // scratch here; only the normalized/rotated context K is kept.
+            launch_qk_norm_rope_batched(q,dflash2.q,dflash2.k,
+                d.q_norm,d.k_norm,rows,QH,KVH,HD,start,theta,1.0f,eps);
+            launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
+                                     rows,start,KVH,HD,max_seq);
+        }
+        dflash2.context_pos+=rows;
+    }
+
+    std::array<int32_t,M> host_tokens{};
+    host_tokens[0]=bonus_token;
+    for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
+    q.memcpy(dflash2.tokens,host_tokens.data(),sizeof(host_tokens));
+    launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
+
+    for(size_t li=0;li<dflash2.layers.size();++li){
+        auto& d=dflash2.layers[li];
+        if(li==0)
+            launch_rmsnorm_residual_batched(q,dflash2.resid,nullptr,nullptr,
+                d.in_norm,dflash2.normed,M,H,eps);
+        else
+            launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.mlp,nullptr,
+                d.in_norm,dflash2.normed,M,H,eps);
+        mm(d.q,dflash2.normed,dflash2.q,M);
+        mm(d.k,dflash2.normed,dflash2.k,M);
+        mm(d.v,dflash2.normed,dflash2.v,M);
+        launch_qk_norm_rope_batched(q,dflash2.q,dflash2.k,d.q_norm,d.k_norm,
+                                    M,QH,KVH,HD,position,theta,1.0f,eps);
+        launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
+                                 M,position,KVH,HD,max_seq);
+        launch_dflash2_block_attention(q,dflash2.q,d.k_cache,d.v_cache,
+            dflash2.attn,M,position,QH,KVH,HD,max_seq,d.sliding?4096:0,
+            1.0f/std::sqrt(float(HD)));
+        mm(d.o,dflash2.attn,dflash2.proj,M);
+        launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.proj,nullptr,
+            d.post_norm,dflash2.normed,M,H,eps);
+        mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
+        launch_swiglu_batched(q,dflash2.gate_up,dflash2.mlp,M,I);
+        mm(d.down,dflash2.mlp,dflash2.mlp,M);
+    }
+    launch_rmsnorm_residual_batched(q,dflash2.resid,dflash2.mlp,nullptr,
+        dflash2.norm,dflash2.normed,M,H,eps);
+
+    auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
+    if(lm_head.has_i4()&&w4){
+        launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
+                                  M-1,H,{});
+        w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,dflash2.logits,
+           M-1,lm_head.w.N,lm_head.w.K);
+    }else{
+        for(int r=1;r<M;++r)
+            gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
+                     dflash2.logits+int64_t(r-1)*cfg.vocab,{});
+    }
+    for(int r=0;r<M-1;++r){
+        launch_argmax(q,dflash2.logits+int64_t(r)*cfg.vocab,cfg.vocab,
+                      s.d_tok,s.d_val,{});
+        q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
+    }
+    draft_tokens.resize(M-1);
+    q.memcpy(draft_tokens.data(),dflash2.draft_ids,
+             size_t(M-1)*sizeof(int32_t)).wait();
+    return true;
+}
+
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens) {
     if (cfg.is_muse) return false;   // dense: sequential forward(), no DeltaNet bufs
@@ -5051,8 +5200,9 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     int n = 0;
     const bool mtp_measure_only = std::getenv("GRIMOIRE_MTP_MEASURE") != nullptr;
     const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok && !mtp_measure_only;
-    if (mtp_spec) {
-        const int configured_k = [] {
+    const bool dflash_spec = e.dflash2.ok && !e.dflash2.v2;
+    if (mtp_spec || dflash_spec) {
+        const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
             int k = v && *v ? std::atoi(v) : 3;
             // Exact verification currently preserves decode summation through
@@ -5086,11 +5236,21 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
             std::vector<int32_t> candidates;
             candidates.reserve(size_t(k) + 1);
             candidates.push_back(tok);
-            int draft = tok;
-            for (int j = 1; j <= k; ++j) {
-                draft = e.mtp_draft(draft, saved_pos + j - 1, j > 1);
-                if (draft < 0) break;
-                candidates.push_back(draft);
+            if(dflash_spec){
+                std::vector<int32_t> block;
+                if(!e.dflash_draft(tok,saved_pos,block)){
+                    std::fprintf(stderr,"\n  DFlash draft failed at position %d\n",saved_pos);
+                    e.release();return 1;
+                }
+                const int take=std::min(k,int(block.size()));
+                candidates.insert(candidates.end(),block.begin(),block.begin()+take);
+            }else{
+                int draft = tok;
+                for (int j = 1; j <= k; ++j) {
+                    draft = e.mtp_draft(draft, saved_pos + j - 1, j > 1);
+                    if (draft < 0) break;
+                    candidates.push_back(draft);
+                }
             }
             if (profile_spec) {
                 e.q.wait();
@@ -5101,7 +5261,8 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
 
             std::vector<int32_t> verified;
             if (!e.prefill(candidates, &verified) || verified.size() != candidates.size()) {
-                std::fprintf(stderr, "\n  MTP verifier failed at position %d\n", saved_pos);
+                std::fprintf(stderr, "\n  %s verifier failed at position %d\n",
+                             dflash_spec?"DFlash":"MTP", saved_pos);
                 e.release();
                 return 1;
             }
@@ -5210,15 +5371,18 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         const double tg_ms = std::chrono::duration<double, std::milli>(g1 - g0).count();
         std::printf("\n\n  pp %zu tokens in %.0f ms -> %.1f tok/s\n",
                     ids.size(), pp_ms, 1000.0 * ids.size() / pp_ms);
-        std::printf("  MTP(k=%d) tg %d tokens in %.0f ms -> %.1f tok/s\n",
-                    configured_k, n, tg_ms, n > 0 ? 1000.0 * n / tg_ms : 0.0);
-        std::printf("  MTP steps %d, %.2f committed/step, draft accepts %d/%d, "
+        std::printf("  %s(k=%d) tg %d tokens in %.0f ms -> %.1f tok/s\n",
+                    dflash_spec?"DFlash":"MTP",configured_k, n, tg_ms,
+                    n > 0 ? 1000.0 * n / tg_ms : 0.0);
+        std::printf("  %s steps %d, %.2f committed/step, draft accepts %d/%d, "
                     "rollbacks %d\n",
-                    steps, steps ? double(committed_total) / steps : 0.0,
+                    dflash_spec?"DFlash":"MTP",steps,
+                    steps ? double(committed_total) / steps : 0.0,
                     accepted_drafts, attempted_drafts, rollbacks);
         if (profile_spec)
-            std::printf("  MTP profile snapshot %.1f ms, draft %.1f ms, verify %.1f ms, "
-                        "commit %.1f ms\n", snapshot_ms, draft_ms, verify_ms, commit_ms);
+            std::printf("  %s profile snapshot %.1f ms, draft %.1f ms, verify %.1f ms, "
+                        "commit %.1f ms\n",dflash_spec?"DFlash":"MTP",
+                        snapshot_ms, draft_ms, verify_ms, commit_ms);
         e.release();
         return 0;
     }
