@@ -61,3 +61,43 @@ line -- possibly even before the PASS/FAIL print).
   b70run.sh-style detached + in-container timeout + graceful TERM pattern.
 - This crash was confirmed host-side (SIGSEGV, error 6, write to unmapped
   address) -- GPU1 was verified `active` after, no bus drop occurred.
+
+## UPDATE: first real baseline (correct binary)
+
+Root cause of the earlier crash: wrong binary. `--prefill-only` is parsed by
+`tools/grimoire_main.cpp` (-> `bin/grimoire`), not `src/main.cpp`
+(-> `b70_native_inference`). The latter has no flag parsing at all -- the
+earlier SIGSEGV at both M=16 and M=64 was garbage argv handling, unrelated to
+Muse/prefill_muse correctness. Not a real bug in the batched Muse path.
+
+Built `bin/grimoire` via `tools/build_grimoire_only_b70.sh` and reran on
+GPU1 (renderD130), Muse-Glimmer-30B-MXFP4:
+
+```
+FULL E2E PP ONLY: PASS, 64  tokens in 1399.7 ms ->  45.7 tok/s
+FULL E2E PP ONLY: PASS, 256 tokens in 1718.8 ms -> 148.9 tok/s
+```
+
+GPU1 confirmed `active`/healthy after both runs.
+
+Both points fit `time = 1.293s + N * 1.662ms`:
+- ~1.29s fixed one-time overhead per run (cold-queue first kernel launch,
+  not part of steady throughput -- amortizes away at longer prompts).
+- **~602 tok/s marginal (steady-state) rate.**
+
+vs. the ~1780-2100 tok/s roofline: **current implementation runs at roughly
+1/3.5 of the theoretical ceiling.** This is the real number to chase, not the
+raw 64-token or 256-token figures above, which are still overhead-dominated.
+
+### Next steps
+1. Get a longer-prompt point (512, 1024) to confirm the marginal rate holds
+   and drop the fixed-overhead term further -- should approach the true
+   steady-state pp more closely.
+2. Given the ~3.5x gap and the FFN-is-DRAM-bound precedent from Ornith/Qwen
+   (weights re-read ~19x/layer), profile the dense FFN GEMM
+   (`load_xe2_dense_mxfp4_f32` dispatch in `prefill_muse`'s `mm` lambda)
+   first -- it's 87% of FLOPs/token, so it is almost certainly the lever.
+3. Compare against `GRIMOIRE_MUSE_PREFILL_GEMV=1` and
+   `GRIMOIRE_MUSE_PREFILL_EXACT_BF16=1` (env flags already in
+   `prefill_muse`) to isolate whether the MXFP4 dense-GEMM dispatch itself
+   is the bottleneck vs. the surrounding per-layer glue kernels.
