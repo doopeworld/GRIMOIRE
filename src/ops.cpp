@@ -1032,25 +1032,26 @@ namespace b70 {
 
 sycl::event launch_dflash_store_tap(
     sycl::queue& q, const float* src, float* taps, int rows, int hidden,
-    int start_pos, int tap, const std::vector<sycl::event>& deps) {
+    int tap_count, int start_pos, int tap, const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(rows) * hidden), [=](sycl::id<1> id) {
             const int64_t z = id[0];
             const int row = int(z / hidden), col = int(z % hidden);
-            taps[(int64_t(start_pos + row) * 8 + tap) * hidden + col] = src[z];
+            taps[(int64_t(start_pos + row) * tap_count + tap) * hidden + col] = src[z];
         });
     });
 }
 
 sycl::event launch_dflash_store_tap_dev(
     sycl::queue& q, const float* src, float* taps, int hidden,
-    const int32_t* position, int tap, const std::vector<sycl::event>& deps) {
+    int tap_count, const int32_t* position, int tap,
+    const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(hidden)), [=](sycl::id<1> id) {
             const int col = int(id[0]);
-            taps[(int64_t(*position) * 8 + tap) * hidden + col] = src[col];
+            taps[(int64_t(*position) * tap_count + tap) * hidden + col] = src[col];
         });
     });
 }

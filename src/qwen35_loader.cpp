@@ -89,6 +89,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.n_kv_heads    = cfg_i(cj, "num_key_value_heads", 0);
     cfg.head_dim      = cfg_i(cj, "head_dim", 0);
     cfg.rms_eps       = cfg_f(cj, "rms_norm_eps", 1e-6f);
+    cfg.post_norm_eps = cfg_f(cj, "post_norm_eps", cfg.rms_eps);
     cfg.rope_theta    = cfg_f(cj, "rope_theta", 1e7f);
     cfg.partial_rope  = cfg_f(j, "partial_rotary_factor", 1.0f);
     cfg.attn_out_gate = cfg_b(j, "attn_output_gate", false);

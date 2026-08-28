@@ -570,19 +570,21 @@ sycl::event launch_flash_prefill(
     });
 }
 
-// DFlash2's draft layers are non-causal: the bonus token and every mask token
-// attend to the entire query block as well as the target-derived context. K/V
-// for both regions use the target's FP8 E4M3 cache layout.
+// DFlash block attention. Full-attention heads are normally non-causal; Muse's
+// sliding-attention head is trained causally. K/V for context and query rows
+// use the target's FP8 E4M3 cache layout.
 sycl::event launch_dflash2_block_attention(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
-    int sliding_window, float softmax_scale,
+    int sliding_window, bool causal, float softmax_scale,
     const std::vector<sycl::event>& deps) {
     constexpr int QT=16, KT=16, WG=QT*SG_SIZE;
     const int qtiles=(tokens+QT-1)/QT;
     const int end=context_len+tokens;
-    const int begin=sliding_window>0 ? std::max(0,end-sliding_window) : 0;
+    const int begin=(causal&&sliding_window>0)
+        ? std::max(0,context_len+1-sliding_window)
+        : (sliding_window>0 ? std::max(0,end-sliding_window) : 0);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         sycl::local_accessor<float,1> ks(size_t(head_dim)*KT,h);
@@ -618,7 +620,10 @@ sycl::event launch_dflash2_block_attention(
                     sycl::group_barrier(it.get_group());
                     const int s=s0+lane;
                     float score=-std::numeric_limits<float>::infinity();
-                    if(t<tokens&&s<end){
+                    const int query_end=causal ? context_len+t+1 : end;
+                    const int query_begin=sliding_window>0
+                        ? sycl::max(0,query_end-sliding_window) : 0;
+                    if(t<tokens&&s>=query_begin&&s<query_end){
                         const float* qr=qv+(int64_t(t)*num_heads+qh0)*head_dim;
                         float dot=0.0f;
                         for(int d=0;d<head_dim;++d)
@@ -907,6 +912,23 @@ sycl::event launch_scale_by_sigmoid_batched(sycl::queue& q, float* x,
             const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
             if(d<hidden)
                 x[int64_t(t)*hidden+d]*=1.0f/(1.0f+sycl::exp(-gate[t]));
+        });
+    });
+}
+
+sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
+    const float* gate, int tokens, int hidden,
+    const std::vector<sycl::event>& deps) {
+    constexpr size_t WG=256;
+    const size_t padded=(size_t(hidden)+WG-1)/WG*WG;
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<2>({size_t(tokens),padded},{1,WG}),
+          [=](sycl::nd_item<2> it) {
+            const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
+            if(d<hidden) {
+                const int64_t i=int64_t(t)*hidden+d;
+                x[i]*=1.0f/(1.0f+sycl::exp(-gate[i]));
+            }
         });
     });
 }

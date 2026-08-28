@@ -51,6 +51,7 @@ struct Qwen35Config {
     int n_kv_heads      = 0;
     int head_dim        = 0;
     float rms_eps       = 1e-6f;
+    float post_norm_eps = 1e-6f;
     float rope_theta    = 1e7f;
     float partial_rope  = 1.0f;   // fraction of head_dim that gets RoPE
     bool  attn_out_gate = false;

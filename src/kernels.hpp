@@ -310,26 +310,27 @@ sycl::event launch_flash_prefill(
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
     float softmax_scale, const std::vector<sycl::event>& deps = {});
 
-// DFlash2 query attention.  The query K/V rows have already been appended at
-// [context_len, context_len + tokens); unlike prompt prefill every query sees
-// the complete query block (the drafter is explicitly non-causal).
+// DFlash query attention. Query K/V rows have already been appended at
+// [context_len, context_len + tokens). Some trained heads use a non-causal
+// block while sliding-attention heads such as Muse are causal.
 sycl::event launch_dflash2_block_attention(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
-    int sliding_window, float softmax_scale,
+    int sliding_window, bool causal, float softmax_scale,
     const std::vector<sycl::event>& deps = {});
 
 // DFlash2-only elementwise and selector kernels.  Activations remain f32 in
 // Grimoire; the explicit bf16 round points mirror the reference model.
-// Target taps are stored token-major as [position, 8, hidden], so fc.weight
-// can consume one token's eight residual streams without a gather.
+// Target taps are stored token-major as [position, tap_count, hidden], so
+// fc.weight can consume one token's residual streams without a gather.
 sycl::event launch_dflash_store_tap(
     sycl::queue& q, const float* src, float* taps, int rows, int hidden,
-    int start_pos, int tap, const std::vector<sycl::event>& deps = {});
+    int tap_count, int start_pos, int tap,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_dflash_store_tap_dev(
     sycl::queue& q, const float* src, float* taps, int hidden,
-    const int32_t* position, int tap,
+    int tap_count, const int32_t* position, int tap,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_dflash2_grouped_conv(
     sycl::queue& q, const float* x, const float* coefficients,
@@ -396,6 +397,9 @@ sycl::event launch_swiglu_bf16_quant(sycl::queue& q, const sycl_bf16* gu,
     sycl_bf16* out, int8_t* out_q, float* out_scale, int tokens, int inter,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_scale_by_sigmoid_batched(sycl::queue& q, float* x,
+    const float* gate, int tokens, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
     const float* gate, int tokens, int hidden,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_permute_rows_bf16(sycl::queue& q, const float* src,
