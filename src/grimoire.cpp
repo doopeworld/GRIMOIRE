@@ -1141,7 +1141,9 @@ struct Grimoire {
         DevQuant fc, selector_hidden;
         bf16_t *hidden_norm=nullptr, *norm=nullptr;
         bf16_t *predecessor=nullptr, *successor=nullptr;
-        float *target_aux=nullptr; // [8,H], residual-completed target taps
+        // Token-major [max_seq,8,H]. The draft fc consumes the eight taps for
+        // each newly verified target token as one contiguous 8H row.
+        float *target_aux=nullptr;
         std::array<Layer,6> layers;
         static constexpr std::array<int,8> target_layers={1,6,11,16,22,27,32,37};
     } dflash2;
@@ -2095,9 +2097,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             if(!d.k_cache||!d.v_cache)dok=false;
             db+=2*draft_kv_bytes;
         }
-        dflash2.target_aux=sycl::malloc_device<float>(size_t(8)*cfg.hidden,q);
+        dflash2.target_aux=sycl::malloc_device<float>(
+            size_t(max_seq)*8*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
-        db+=size_t(8)*cfg.hidden*sizeof(float);
+        db+=size_t(max_seq)*8*cfg.hidden*sizeof(float);
         dflash2.ok=dok;
         if(!dok){err="DFlash weight upload failed";return false;}
         acct(db);
@@ -3452,8 +3455,8 @@ const float* Grimoire::forward(int token) {
         if (dflash2.ok) {
             for (size_t tap = 0; tap < dflash2.target_layers.size(); ++tap) {
                 if (dflash2.target_layers[tap] == i) {
-                    q.memcpy(dflash2.target_aux + tap * size_t(H), s.h,
-                             size_t(H) * sizeof(float));
+                    launch_dflash_store_tap_dev(q,s.h,dflash2.target_aux,H,
+                                                s.d_pos,int(tap),none);
                     break;
                 }
             }
@@ -4442,6 +4445,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(exact_verify && debug && li==probe_layer)
             probe("L0 in_norm",bn,H);
         pp_mark("input norm");
+        // Match decode's target tap exactly: bh is the residual-completed
+        // stream after the previous layer and before layer li. Preserve every
+        // row, not just the final token, because DFlash context K/V must cover
+        // the whole accepted target sequence.
+        if(dflash2.ok){
+            for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
+                if(dflash2.target_layers[tap]==li){
+                    launch_dflash_store_tap(q,bh,dflash2.target_aux,M,H,
+                                            start_pos,int(tap),{});
+                    break;
+                }
+            }
+        }
         if(d.kind==LayerKind::LINEAR_ATTN){
             const int qs=Hk*Dk, vs=Hv*Dv, ch=d.la_qkv.w.N;
             // The fused projection is a separately quantized concat of qkv,

@@ -322,6 +322,15 @@ sycl::event launch_dflash2_block_attention(
 
 // DFlash2-only elementwise and selector kernels.  Activations remain f32 in
 // Grimoire; the explicit bf16 round points mirror the reference model.
+// Target taps are stored token-major as [position, 8, hidden], so fc.weight
+// can consume one token's eight residual streams without a gather.
+sycl::event launch_dflash_store_tap(
+    sycl::queue& q, const float* src, float* taps, int rows, int hidden,
+    int start_pos, int tap, const std::vector<sycl::event>& deps = {});
+sycl::event launch_dflash_store_tap_dev(
+    sycl::queue& q, const float* src, float* taps, int hidden,
+    const int32_t* position, int tap,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_dflash2_grouped_conv(
     sycl::queue& q, const float* x, const float* coefficients,
     const bf16_t* base, float* out, int rows, int hidden, int taps,

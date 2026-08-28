@@ -26,6 +26,16 @@ already-downloaded `jzinno/...DFlash2`, which measured 4.02 accepted tokens.
 - Recorded the original model's attention pattern: layers 0-4 use a 4096-token
   sliding window; layer 5 uses full attention. DFlash2 keeps all six sliding.
 - Release logic now frees every draft K/V cache.
+- Expanded target-tap storage to token-major `[max_seq, 8, hidden]` and added
+  graph-safe kernels for recording all eight residual taps during both decode
+  and batched target verification. The full SYCL build passes.
+
+## Important status: not end-to-end yet
+
+The original DFlash model **loads but speculative decoding is not working yet**.
+There is no DFlash acceptance or TG result from GRIMOIRE. The missing pieces are
+context K/V projection, the six-layer 16-query draft forward, batched draft
+logits, and connection to the verifier/rollback loop.
 
 ## Validation and findings
 
@@ -65,9 +75,8 @@ Logs:
 
 ## Next steps — do in this order
 
-1. Implement original-DFlash context ingestion.
-   - Preserve all eight target residual taps for every newly verified token,
-     not only the last token.
+1. Finish original-DFlash context ingestion.
+   - The eight target residual taps are now preserved for every target token.
    - Apply `fc.weight` to concatenated taps, then `hidden_norm`.
    - For each draft layer, project/norm/RoPE K plus project V and append them to
      that layer's draft cache at the target positions.
