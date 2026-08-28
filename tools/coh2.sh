@@ -1,0 +1,3 @@
+#!/bin/bash
+P="Machine learning systems that run large language models on consumer hardware face a fundamental tension between memory bandwidth and arithmetic throughput. When a model is quantized to four bits, the weights shrink dramatically, but the arithmetic units must now spend cycles unpacking those weights before they can be multiplied. On integrated and discrete GPUs alike, this unpacking often becomes the bottleneck rather than the matrix multiplication itself. Explain in detail why this happens, what the roofline model predicts for such workloads, and which specific optimizations recover the lost throughput."
+exec /mnt/user/isos/grimoire-fuse/tools/qrun.sh "$1" /grimoire/bin/grimoire -m "$2" -p "$P" -n 80

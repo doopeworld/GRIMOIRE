@@ -1,0 +1,56 @@
+# =====================================================================
+#  docker-compose.yml  --  Unraid deployment
+#
+#    cd /mnt/user/appdata/b70
+#    ./tools/preflight.sh                 # get your render GID first
+#    RENDER_GID=<gid> docker compose build
+#    docker compose run --rm b70 bench
+#
+#  Unraid 7.x ships the compose plugin. If you prefer the GUI, the
+#  equivalent Docker template settings are in docs/UNRAID.md.
+# =====================================================================
+services:
+  b70:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # G31 is the big Battlemage die used by the Pro B70 and B65.
+        # bmg_g21 is the SMALLER die (B580, Pro B50/B60) -- building for
+        # g21 runs on a B70 but leaves tuning on the table.
+        B70_TARGET: intel_gpu_bmg_g31
+        RENDER_GID: ${RENDER_GID:-989}
+    image: b70:local
+    container_name: b70
+
+    # Both cards. Do not use --privileged; the render nodes plus the
+    # right supplementary group is all that is needed.
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - ${RENDER_GID:-989}
+
+    volumes:
+      # HuggingFace checkpoints, read-only -- nothing should ever write
+      # back into your model share.
+      - /mnt/user/ai/models:/models:ro
+      # Converted .b70 weights and the SYCL kernel cache.
+      - /mnt/user/appdata/b70/cache:/cache
+
+    environment:
+      ONEAPI_DEVICE_SELECTOR: level_zero:gpu
+      SYCL_CACHE_PERSISTENT: "1"
+      SYCL_CACHE_DIR: /cache/sycl
+      # Uncomment to pin to one card while you are benchmarking:
+      # ONEAPI_DEVICE_SELECTOR: level_zero:0
+
+    # 96 GB system RAM: conversion streams through mmap so it does not
+    # need much, but give it headroom for the page cache.
+    shm_size: 2gb
+
+    # Unraid restarts containers on array start; an inference server
+    # should come back, a one-shot benchmark should not.
+    restart: "no"
+
+    stdin_open: true
+    tty: true

@@ -1,0 +1,11 @@
+  prompt: 21 tokens
+
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Question:** Explain in one paragraph why the sky is blue.
+   - **Constraints:** One paragraph, clear explanation, scientifically accurate.
+
+2.  **Identify Key Scientific Concepts:**
+   - Sunlight appears
+
