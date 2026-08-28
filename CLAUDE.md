@@ -1,5 +1,26 @@
 # Working on GRIMOIRE — read this first
 
+## >>> CURRENT PRIORITY (read this before anything else) <<<
+
+As of 2026-08-28, the top-of-list next task is:
+
+**Implement DFlash speculative decoding for Ornith-1.5-35B-A3B.**
+Reference: ultimatechris/Ornith-1.5-35B-A3B-DFlash-SGLang — block-level
+drafting (whole 16-token block in one pass), 6-8 tokens accepted per step,
+proven 2.32x speedup (202 -> 470 tok/s) on vLLM/SGLang. Full ranked plan,
+math, and the 5 other links that were evaluated and rejected are in
+`ORNITH-2026-08-27.md` under "ORNITH TG OPTIMIZATION". Read that section
+in full before starting.
+
+This supersedes the Muse Glimmer prefill work mentioned later in this file
+and in HANDOFF-2026-08-27-PP-TP-COMPLETE.md, which is real but lower
+priority right now. If you are unsure which task is current, ASK IAN rather
+than picking one — priorities have been shifting fast in this project and
+a stale doc has caused confusion before.
+
+---
+
+
 This file is for any AI assistant (Claude, or otherwise) picking up this
 project. Ian runs multiple assistants on GRIMOIRE at different times — this
 doc exists so none of them re-derive or re-break what's already settled.
