@@ -4210,10 +4210,8 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     }
 
     auto dense=load_xe2_dense_mxfp4_f32();
-    const bool w4n128=std::getenv("GRIMOIRE_W4A8_N128")!=nullptr;
     auto w4=load_xe2_dense_w4a8(M<=kSpecBatch
-        ?(w4n128?"grimoire_xe2_dense_w4a8_f32_m16n128"
-                 :"grimoire_xe2_dense_w4a8_f32_m16")
+        ?"grimoire_xe2_dense_w4a8_f32_m16"
         :"grimoire_xe2_dense_w4a8_f32");
     const bool exact_gemv=std::getenv("GRIMOIRE_MUSE_PREFILL_GEMV")!=nullptr;
     const bool exact_bf16=std::getenv("GRIMOIRE_MUSE_PREFILL_EXACT_BF16")!=nullptr;
@@ -4224,14 +4222,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
             return;
         }
         if(w.has_i4()){
-            if(M<=kSpecBatch&&w.w.N<=2048){
-                for(int r=0;r<M;r+=4){
-                    const int mb=std::min(4,M-r);
-                    launch_gemv_int4sym_batch(q,w.i4,w.i4s,
-                        x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
-                        w.w.N,w.w.K,mb,{});
-                }
-            }else if(w4){
+            if(w4){
                 launch_quantize_rows_int8(q,x,a8,a8s,M,w.w.K,{});
                 w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
             }else{
