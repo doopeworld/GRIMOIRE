@@ -4210,8 +4210,10 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     }
 
     auto dense=load_xe2_dense_mxfp4_f32();
+    const bool w4n128=std::getenv("GRIMOIRE_W4A8_N128")!=nullptr;
     auto w4=load_xe2_dense_w4a8(M<=kSpecBatch
-        ?"grimoire_xe2_dense_w4a8_f32_m16"
+        ?(w4n128?"grimoire_xe2_dense_w4a8_f32_m16n128"
+                 :"grimoire_xe2_dense_w4a8_f32_m16")
         :"grimoire_xe2_dense_w4a8_f32");
     const bool exact_gemv=std::getenv("GRIMOIRE_MUSE_PREFILL_GEMV")!=nullptr;
     const bool exact_bf16=std::getenv("GRIMOIRE_MUSE_PREFILL_EXACT_BF16")!=nullptr;
