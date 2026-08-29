@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.7
+
+# Compile against the exact local vLLM XPU kernel tree supplied as the
+# "xpu-kernels" build context.  That context may contain local/custom kernel
+# changes; it is never copied into the runtime image.
+FROM my-vllm-xpu:latest AS builder
+WORKDIR /grimoire
+COPY . /grimoire
+RUN --mount=type=bind,from=xpu-kernels,target=/src,readonly \
+    bash tools/build_bridges_b70.sh /grimoire
+
+# B70-only runtime.  No Python, PyTorch, compiler, source tree, CUDA, ROCm,
+# TPU, or generic backend dispatch is installed here.
+FROM ubuntu:24.04 AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates gpg gpg-agent wget software-properties-common tini \
+ && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+ && wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+      | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneAPI.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libze-intel-gpu1 libze1 intel-opencl-icd \
+      intel-oneapi-compiler-dpcpp-cpp-runtime-2026.1 \
+ && apt-get purge -y --auto-remove \
+      gpg gpg-agent wget software-properties-common \
+ && rm -rf /var/lib/apt/lists/* /root/.cache
+
+# The Tower's proven B70 stack is the one in my-vllm-xpu:latest
+# (compute-runtime 39122.11 + IGC 2.38.2).  The PPA may publish a newer pair
+# that installs cleanly but enumerates no B70 on the host kernel.  Overlay the
+# exact working user-mode driver files from the discarded builder stage.
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libze_loader.so.1* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libigdgmm.so.12* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/intel-opencl/ /usr/lib/x86_64-linux-gnu/intel-opencl/
+COPY --from=builder /usr/local/lib/libiga64.so.2* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libigc.so.2* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libigdfcl.so.2* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libopencl-clang2.so.17 /usr/local/lib/
+COPY --from=builder /etc/OpenCL/vendors/intel.icd /etc/OpenCL/vendors/intel.icd
+
+COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire
+COPY --from=builder /grimoire/src/libgrimoire_xe2_grouped.so /opt/grimoire/lib/
+COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_raw.so /opt/grimoire/lib/
+COPY --from=builder /grimoire/src/libgrimoire_xe2_gdn_raw.so /opt/grimoire/lib/
+
+RUN find /opt/intel/oneapi/compiler -name 'libsycl.so*' -printf '%h\n' | sort -u \
+      > /etc/ld.so.conf.d/oneapi-b70.conf \
+ && find /opt/intel/oneapi/compiler -name 'libur_loader.so*' -printf '%h\n' | sort -u \
+      >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so*' -printf '%h\n' | sort -u \
+      >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && find /opt/intel/oneapi/umf -name 'libumf.so*' -printf '%h\n' | sort -u \
+      >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && find /opt/intel/oneapi/tcm -name 'libtcm.so*' -printf '%h\n' | sort -u \
+      >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && find /opt/intel/oneapi/tbb -name 'libtbb.so*' -printf '%h\n' | sort -u \
+      >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && echo /opt/grimoire/lib >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && ldconfig \
+ && ! ldd /usr/local/bin/grimoire | grep -q 'not found' \
+ && ! ldd /opt/grimoire/lib/libgrimoire_xe2_grouped.so | grep -q 'not found' \
+ && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_raw.so | grep -q 'not found' \
+ && ! ldd /opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so | grep -q 'not found' \
+ && test -n "$(find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so*' -print -quit)" \
+ && ! ldd "$(find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so.0.*' -print -quit)" | grep -q 'not found' \
+ && ! command -v python >/dev/null 2>&1 \
+ && ! command -v python3 >/dev/null 2>&1 \
+ && ! find /opt /usr/local -type f \( -name 'libtorch*' -o -name 'libc10*' \
+      -o -name 'libur_adapter_cuda*' -o -name 'libur_adapter_hip*' \) \
+      -print -quit | grep -q .
+
+ENV ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+    SYCL_UR_USE_LEVEL_ZERO_V2=0 \
+    UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 \
+    SYCL_CACHE_PERSISTENT=1 \
+    SYCL_CACHE_DIR=/cache/sycl \
+    GRIMOIRE_XE2_GROUPED_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_grouped.so \
+    GRIMOIRE_XE2_ATTN_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_attention_raw.so \
+    GRIMOIRE_XE2_GDN_RAW_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so
+
+VOLUME ["/models", "/cache"]
+WORKDIR /models
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/grimoire"]
