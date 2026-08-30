@@ -209,6 +209,23 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             }
             return r;
         }
+        TensorRef cp = get(base + ".weight_packed");
+        TensorRef cs = get(base + ".weight_scale");
+        if (cp.ok() && cs.ok() && cp.t.dtype == STDtype::I32 &&
+            cs.t.dtype == STDtype::BF16 && cp.t.shape.size() == 2 &&
+            cs.t.shape.size() == 2 && cp.t.shape[0] == cs.t.shape[0]) {
+            const int out = int(cp.t.shape[0]);
+            const int in = int(cp.t.shape[1]) * 8;
+            const int groups = int(cs.t.shape[1]);
+            if (groups > 0 && in % groups == 0) {
+                cp.compressed_int4 = true;
+                cp.scales_shard = cs.shard;
+                cp.scales_t = cs.t;
+                cp.gptq_group = in / groups;
+                cp.t.shape = {out, in};
+                return cp;
+            }
+        }
         TensorRef qw = get(base + ".qweight");
         TensorRef qz = get(base + ".qzeros");
         TensorRef sc = get(base + ".scales");
@@ -236,7 +253,14 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         p.scales_shard = sc.shard;
         p.scales_t = sc.t;
         const int N = int(p.t.shape[0]);
-        const int K = int(p.t.shape[1]) * 2;   // 2 nibbles/byte
+        const bool int4 = p.t.dtype == STDtype::I32 && sc.t.dtype == STDtype::BF16;
+        const int K = int(p.t.shape[1]) * (int4 ? 8 : 2);
+        if (int4) {
+            const int groups = int(sc.t.shape[1]);
+            if (groups <= 0 || K % groups) return TensorRef{};
+            p.compressed_int4 = true;
+            p.gptq_group = K / groups;
+        }
         p.t.shape = {N, K};
         return p;
     };

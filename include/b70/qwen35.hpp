@@ -94,6 +94,10 @@ struct TensorRef {
     // is rewritten to logical [out,in]; the auxiliary tensors retain their
     // physical safetensors descriptors.
     bool     gptq = false;
+    // compressed-tensors symmetric INT4: physical I32 [N,K/8] payload plus
+    // BF16 [N,K/group] scales. Unlike GPTQ this is already output-major and
+    // can be passed directly to oneDNN after exposing the logical [N,K].
+    bool     compressed_int4 = false;
     bool     row_scaled = false; // FP8 payload with separate [N,1] scale
     int      qzeros_shard = -1, scales_shard = -1;
     STTensor qzeros_t, scales_t;

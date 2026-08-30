@@ -706,6 +706,34 @@ bool repack_gptq_ref(const Qwen35Model& ck, const TensorRef& r,
     return true;
 }
 
+bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
+                              PackedWeight& p, std::string& err) {
+    if (!r.compressed_int4 || r.t.shape.size() != 2 || r.gptq_group <= 0)
+        return false;
+    const int N = int(r.t.shape[0]);
+    const int K = int(r.t.shape[1]);
+    if (K % r.gptq_group) { err = "compressed INT4 group mismatch"; return false; }
+    const int groups = K / r.gptq_group;
+    const size_t payload_bytes = size_t(N) * K / 2;
+    const size_t scale_bytes = size_t(N) * groups * sizeof(bf16_t);
+    if (size_t(r.t.end-r.t.begin) != payload_bytes ||
+        size_t(r.scales_t.end-r.scales_t.begin) != scale_bytes) {
+        err = "compressed INT4 physical size mismatch";
+        return false;
+    }
+    p.fmt = Fmt::INT4;
+    p.N = N; p.K = K;
+    p.row_bytes = K / 2;
+    p.row_scales = groups;
+    p.payload.resize(payload_bytes);
+    p.scales_raw.resize(scale_bytes);
+    p.zeros.assign(size_t(N) * groups, uint8_t(8));
+    TensorRef sr; sr.shard = r.scales_shard; sr.t = r.scales_t;
+    if (!ck.read_raw(r,p.payload.data(),err) ||
+        !ck.read_raw(sr,p.scales_raw.data(),err)) return false;
+    return true;
+}
+
 DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
                            const TensorRef& r, Fmt fmt, const char* what,
                            bool* ok) {
@@ -775,7 +803,13 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     std::string rerr;
     PackedWeight p;
-    if (r.gptq && use == Fmt::INT4) {
+    if (r.compressed_int4 && use == Fmt::INT4) {
+        if (!read_compressed_int4_ref(ck, r, p, rerr)) {
+            std::printf("\n  direct compressed INT4 read failed for %s: %s\n",
+                        what, rerr.c_str());
+            *ok = false; return d;
+        }
+    } else if (r.gptq && use == Fmt::INT4) {
         if (!repack_gptq_ref(ck, r, p, rerr)) {
             std::printf("\n  direct GPTQ read failed for %s: %s\n", what, rerr.c_str());
             *ok = false; return d;
@@ -887,7 +921,23 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     std::string rerr;
     PackedWeight p;
-    if (ra.gptq && rb.gptq && use == Fmt::INT4) {
+    if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4) {
+        PackedWeight a,b;
+        if(!read_compressed_int4_ref(ck,ra,a,rerr)||
+           !read_compressed_int4_ref(ck,rb,b,rerr)){
+            std::printf("\n  direct compressed INT4 concatenate failed for %s: %s\n",
+                        what,rerr.c_str());
+            *ok=false;return d;
+        }
+        if(a.K!=b.K||a.row_scales!=b.row_scales){
+            std::printf("\n  compressed INT4 concatenate layout mismatch for %s\n",what);
+            *ok=false;return d;
+        }
+        p=a;p.N=N;
+        p.payload.insert(p.payload.end(),b.payload.begin(),b.payload.end());
+        p.scales_raw.insert(p.scales_raw.end(),b.scales_raw.begin(),b.scales_raw.end());
+        p.zeros.insert(p.zeros.end(),b.zeros.begin(),b.zeros.end());
+    } else if (ra.gptq && rb.gptq && use == Fmt::INT4) {
         PackedWeight a,b;
         if(!repack_gptq_ref(ck,ra,a,rerr)||!repack_gptq_ref(ck,rb,b,rerr)){
             std::printf("\n  direct GPTQ concatenate failed for %s: %s\n",what,rerr.c_str());
@@ -1072,6 +1122,17 @@ struct Grimoire {
     };
     std::vector<LayerDev> L;
 
+    // Cached raw oneDNN W4A16 primitives used by Muse prompt prefill and
+    // DFlash verification. vLLM's XPUwNa16LinearKernel caches the primitive
+    // by shape; rebuilding it for every speculative step discards that path.
+    struct OneDnnPlan {
+        int m=0, n=0, k=0;
+        void* plan=nullptr;
+        void* scratch=nullptr;
+    };
+    std::vector<OneDnnPlan> muse_od_plans;
+    int8_t* muse_od_zp=nullptr;
+
     // Single-entry exact prompt-prefix cache. State stays device-resident so
     // a cache hit restores KV + recurrent state with device-to-device copies.
     struct PrefixLayerCache {
@@ -1155,7 +1216,7 @@ struct Grimoire {
         int32_t *tokens=nullptr, *draft_ids=nullptr;
         // Muse speculative verifier scratch, reused after the draft pass.
         float *verify_logits=nullptr;
-        sycl_bf16 *verify_bf=nullptr;
+        sycl_bf16 *verify_bf=nullptr, *verify_bf_out=nullptr;
         int8_t *verify_a8=nullptr;
         float *verify_a8s=nullptr;
         int32_t *verify_ids=nullptr;
@@ -2195,12 +2256,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     cfg.n_kv_heads*cfg.head_dim,2*cfg.dense_inter});
                 dflash2.verify_logits=dfd(size_t(DM)*cfg.vocab);
                 dflash2.verify_bf=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
+                dflash2.verify_bf_out=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
                 dflash2.verify_a8=sycl::malloc_device<int8_t>(size_t(DM)*VW,q);
                 dflash2.verify_a8s=sycl::malloc_device<float>(DM,q);
                 dflash2.verify_ids=sycl::malloc_device<int32_t>(DM,q);
-                db+=size_t(DM)*VW*(sizeof(sycl_bf16)+sizeof(int8_t))
+                db+=size_t(DM)*VW*(2*sizeof(sycl_bf16)+sizeof(int8_t))
                     +size_t(DM)*(sizeof(float)+sizeof(int32_t));
-                if(!dflash2.verify_logits||!dflash2.verify_bf||
+                if(!dflash2.verify_logits||!dflash2.verify_bf||!dflash2.verify_bf_out||
                    !dflash2.verify_a8||!dflash2.verify_a8s||
                    !dflash2.verify_ids)dok=false;
             }
@@ -2561,6 +2623,15 @@ void Grimoire::release() {
             if (p) sycl::free(p, q);
         mtp = {};
     }
+    OneDnnW4Api muse_od=load_onednn_w4();
+    if(muse_od){
+        for(auto& p:muse_od_plans){
+            if(p.scratch)sycl::free(p.scratch,q);
+            if(p.plan)muse_od.destroy(p.plan);
+        }
+    }
+    muse_od_plans.clear();
+    if(muse_od_zp){sycl::free(muse_od_zp,q);muse_od_zp=nullptr;}
     // DFlash is optional, but release every field unconditionally so a
     // partially loaded sidecar cannot leak USM when build() reports an error.
     dflash2.fc.release(q);
@@ -2587,6 +2658,7 @@ void Grimoire::release() {
                     (void*)dflash2.a8, (void*)dflash2.a8s,
                     (void*)dflash2.tokens, (void*)dflash2.draft_ids,
                     (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
+                    (void*)dflash2.verify_bf_out,
                     (void*)dflash2.verify_a8, (void*)dflash2.verify_a8s,
                     (void*)dflash2.verify_ids})
         if (p) sycl::free(p, q);
@@ -4177,7 +4249,8 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         for(const auto* w:ws){W=std::max(W,w->w.N);W=std::max(W,w->w.K);}
     }
     const bool reuse=next_tokens&&M<=kSpecBatch&&dflash2.ok&&
-        dflash2.verify_logits&&dflash2.verify_bf&&dflash2.verify_a8;
+        dflash2.verify_logits&&dflash2.verify_bf&&dflash2.verify_bf_out&&
+        dflash2.verify_a8;
     auto df=[&](size_t n){return sycl::malloc_device<float>(n,q);};
     float* hidden=reuse?dflash2.resid:df(size_t(M)*H);
     float* normed=reuse?dflash2.normed:df(size_t(M)*H);
@@ -4193,6 +4266,8 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         df(size_t(M)*cfg.vocab)):nullptr;
     sycl_bf16* xb=reuse?dflash2.verify_bf:
         sycl::malloc_device<sycl_bf16>(size_t(M)*W,q);
+    sycl_bf16* yb=reuse?dflash2.verify_bf_out:
+        sycl::malloc_device<sycl_bf16>(size_t(M)*W,q);
     int8_t* a8=reuse?dflash2.verify_a8:
         sycl::malloc_device<int8_t>(size_t(M)*W,q);
     float* a8s=reuse?dflash2.verify_a8s:sycl::malloc_device<float>(M,q);
@@ -4201,15 +4276,20 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         sycl::malloc_device<int32_t>(M,q)):nullptr;
     std::vector<void*> mem={(void*)hidden,(void*)normed,(void*)tmp,(void*)qv,
         (void*)kv,(void*)vv,(void*)attn,(void*)gate,(void*)proj,(void*)ff,
-        (void*)batch_logits,(void*)xb,(void*)a8,(void*)a8s,
+        (void*)batch_logits,(void*)xb,(void*)yb,(void*)a8,(void*)a8s,
         (void*)dtok,(void*)outtok};
     auto cleanup=[&](){if(!reuse)for(void* p:mem)if(p)sycl::free(p,q);};
     if(!hidden||!normed||!tmp||!qv||!kv||!vv||!attn||!gate||!proj||!ff||
-       !xb||!a8||!a8s||!dtok||(next_tokens&&(!batch_logits||!outtok))){
+       !xb||!yb||!a8||!a8s||!dtok||(next_tokens&&(!batch_logits||!outtok))){
         cleanup();return false;
     }
 
     auto dense=load_xe2_dense_mxfp4_f32();
+    OneDnnW4Api od=load_onednn_w4();
+    if(od&&!muse_od_zp){
+        muse_od_zp=sycl::malloc_device<int8_t>(1,q);
+        if(muse_od_zp){const int8_t z=8;q.memcpy(muse_od_zp,&z,1);}
+    }
     const bool w4n128=std::getenv("GRIMOIRE_W4A8_N128")!=nullptr;
     auto w4=load_xe2_dense_w4a8(M<=kSpecBatch
         ?(w4n128?"grimoire_xe2_dense_w4a8_f32_m16n128"
@@ -4222,6 +4302,30 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
             for(int r=0;r<M;++r)
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
+        }
+        // Exact raw oneDNN W4A16 operation selected by vLLM's
+        // XPUwNa16LinearKernel for this symmetric INT4 checkpoint. Keep the
+        // primitive and scratchpad alive across DFlash verification steps.
+        if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales){
+            launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);
+            auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
+                [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
+            if(it==muse_od_plans.end()){
+                void* plan=od.create(&q,M,w.w.N,w.w.K,kInt4Group,1);
+                if(plan){
+                    const size_t bytes=od.scratch_size(plan);
+                    void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
+                    if(!bytes||scratch){
+                        muse_od_plans.push_back({M,w.w.N,w.w.K,plan,scratch});
+                        it=muse_od_plans.end()-1;
+                    }else od.destroy(plan);
+                }
+            }
+            if(it!=muse_od_plans.end()){
+                od.execute(it->plan,xb,w.payload,w.od_scales,muse_od_zp,yb,it->scratch);
+                launch_bf16_to_f32(q,yb,y,size_t(M)*w.w.N);
+                return;
+            }
         }
         if(w.has_i4()){
             if(M<=kSpecBatch&&w.w.N<=2048){
@@ -4263,7 +4367,11 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         LayerDev& d=L[size_t(li)];
         if(dflash2.ok){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
-                if(dflash2.target_layers[tap]==li){
+                // vLLM converts DFlash target_layer_ids with `i + 1` before
+                // collecting auxiliary states.  At the top of this loop,
+                // `hidden` is the output after layer li-1, so capture when
+                // entering target+1 rather than one layer too early.
+                if(dflash2.target_layers[tap]+1==li){
                     launch_dflash_store_tap(q,hidden,dflash2.target_aux,M,H,
                         int(dflash2.target_layers.size()),start_pos,int(tap),{});
                     break;
