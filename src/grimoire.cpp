@@ -607,6 +607,7 @@ struct DevQuant {
     void*    scales  = nullptr;
     uint8_t* zeros   = nullptr;
     void*    od_scales = nullptr;
+    void*    od_scales_fp16 = nullptr;
     bool     od_w4 = false;
     // Symmetric int4 g128 companion.  Same 4.25 bits/weight as MXFP4 g32, so
     // when it exists the MXFP4 payload is FREED, not kept alongside -- the
@@ -621,6 +622,7 @@ struct DevQuant {
         if (scales)  sycl::free(scales, q);
         if (zeros)   sycl::free(zeros, q);
         if (od_scales) sycl::free(od_scales, q);
+        if (od_scales_fp16) sycl::free(od_scales_fp16, q);
     }
 };
 
@@ -866,6 +868,9 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         for (int n=0;n<N;++n) for(int g=0;g<p.row_scales;++g)
             tr[size_t(g)*N+n]=src[size_t(n)*p.row_scales+g];
         d.od_scales=dev_copy<bf16_t>(q,tr.data(),tr.size()*sizeof(bf16_t));
+        std::vector<sycl::half> trh(tr.size());
+        for(size_t i=0;i<tr.size();++i)trh[i]=sycl::half(bf16_to_f32(tr[i]));
+        d.od_scales_fp16=dev_copy<sycl::half>(q,trh.data(),trh.size()*sizeof(sycl::half));
         d.od_w4=d.od_scales!=nullptr;
     }
     return d;
@@ -998,6 +1003,9 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         for(int n=0;n<N;++n)for(int g=0;g<p.row_scales;++g)
             tr[size_t(g)*N+n]=src[size_t(n)*p.row_scales+g];
         d.od_scales=dev_copy<bf16_t>(q,tr.data(),tr.size()*sizeof(bf16_t));
+        std::vector<sycl::half> trh(tr.size());
+        for(size_t i=0;i<tr.size();++i)trh[i]=sycl::half(bf16_to_f32(tr[i]));
+        d.od_scales_fp16=dev_copy<sycl::half>(q,trh.data(),trh.size()*sizeof(sycl::half));
         d.od_w4=d.od_scales!=nullptr;
     }
     return d;
@@ -2181,7 +2189,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // the larger DFlash2 compatibility path retains the requested format.
         const bool muse_mxfp4=cfg.is_muse&&
             std::getenv("GRIMOIRE_MUSE_DFLASH_MXFP4")!=nullptr;
-        const Fmt dflash_fmt=(dflash2.v2||muse_mxfp4)?PF:Fmt::BF16;
+        const Fmt dflash_fmt=dflash2.v2?PF:(muse_mxfp4?Fmt::MXFP4:Fmt::BF16);
         auto qload=[&](const std::string& n,const char* what){
             DevQuant d=quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
             db+=d.w.bytes();return d;
@@ -4355,15 +4363,18 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
         }
-        // DFlash verification must keep the proven m16 W4A8 dispatch.  The
-        // raw oneDNN W4A16 primitive is retained for long prompt prefill,
-        // where it cannot displace the 40-TG verifier kernel.
-        if(M>kSpecBatch&&od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales){
-            launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);
+        // Match vLLM XPU's Muse compressed-INT4 dispatch exactly: FP16
+        // activations/scales through oneDNN W4A16, with plans cached by shape.
+        if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales_fp16){
+            auto* xh=reinterpret_cast<sycl::half*>(xb);
+            auto* yh=reinterpret_cast<sycl::half*>(yb);
+            q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
+                xh[i]=sycl::half(x[i]);
+            });
             auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
                 [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
             if(it==muse_od_plans.end()){
-                void* plan=od.create(&q,M,w.w.N,w.w.K,kInt4Group,1);
+                void* plan=od.create(&q,M,w.w.N,w.w.K,kInt4Group,0);
                 if(plan){
                     const size_t bytes=od.scratch_size(plan);
                     void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
@@ -4374,8 +4385,10 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                 }
             }
             if(it!=muse_od_plans.end()){
-                od.execute(it->plan,xb,w.payload,w.od_scales,muse_od_zp,yb,it->scratch);
-                launch_bf16_to_f32(q,yb,y,size_t(M)*w.w.N);
+                od.execute(it->plan,xh,w.payload,w.od_scales_fp16,muse_od_zp,yh,it->scratch);
+                q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
+                    y[i]=float(yh[i]);
+                });
                 return;
             }
         }
@@ -4415,11 +4428,10 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         LayerDev& d=L[size_t(li)];
         if(dflash2.ok){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
-                // vLLM converts DFlash target_layer_ids with `i + 1` before
-                // collecting auxiliary states.  At the top of this loop,
-                // `hidden` is the output after layer li-1, so capture when
-                // entering target+1 rather than one layer too early.
-                if(dflash2.target_layers[tap]+1==li){
+                // Preserve the established Muse DFlash checkpoint convention:
+                // these IDs name the hidden-state taps consumed by the
+                // assistant and produced the measured coherent 40-TG path.
+                if(dflash2.target_layers[tap]==li){
                     launch_dflash_store_tap(q,hidden,dflash2.target_aux,M,H,
                         int(dflash2.target_layers.size()),start_pos,int(tap),{});
                     break;
