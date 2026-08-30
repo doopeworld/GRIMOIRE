@@ -107,6 +107,46 @@ struct MXPlan {
       {DNNL_ARG_SCRATCHPAD,mx}});
   }
 };
+
+struct BFPlan {
+  engine eng;
+  stream strm;
+  matmul::primitive_desc pd;
+  matmul prim;
+  size_t scratch_bytes;
+  memory ma,mw,mo,mx;
+  bool bound=false;
+
+  BFPlan(sycl::queue& q,int m,int n,int k)
+    : eng(sycl_interop::make_engine(q.get_device(),q.get_context())),
+      strm(sycl_interop::make_stream(eng,q)),
+      pd(make_pd(eng,m,n,k)),prim(pd),
+      scratch_bytes(pd.scratchpad_desc().get_size()) {}
+
+  static matmul::primitive_desc make_pd(const engine& e,int m,int n,int k){
+    memory::desc src({m,k},memory::data_type::bf16,memory::dims{k,1});
+    memory::desc wei({k,n},memory::data_type::bf16,memory::dims{1,k});
+    memory::desc dst({m,n},memory::data_type::f32,memory::dims{n,1});
+    primitive_attr attr;
+    attr.set_scratchpad_mode(scratchpad_mode::user);
+    return matmul::primitive_desc(e,src,wei,dst,attr);
+  }
+  memory wrap(const memory::desc& md,void* p){
+    return sycl_interop::make_memory(md,eng,sycl_interop::memory_kind::usm,p);
+  }
+  void run(void* a,void* b,void* out,void* scratch){
+    if(!bound){
+      ma=wrap(pd.src_desc(),a);mw=wrap(pd.weights_desc(),b);
+      mo=wrap(pd.dst_desc(),out);mx=wrap(pd.scratchpad_desc(),scratch);
+      bound=true;
+    }else{
+      ma.set_data_handle(a);mw.set_data_handle(b);
+      mo.set_data_handle(out);mx.set_data_handle(scratch);
+    }
+    prim.execute(strm,{{DNNL_ARG_SRC,ma},{DNNL_ARG_WEIGHTS,mw},
+      {DNNL_ARG_DST,mo},{DNNL_ARG_SCRATCHPAD,mx}});
+  }
+};
 }
 
 extern "C" void* grimoire_onednn_w4a16_create(
@@ -137,4 +177,19 @@ extern "C" void grimoire_onednn_mxfp4_w4a16_execute(
 }
 extern "C" void grimoire_onednn_mxfp4_w4a16_destroy(void* p){
   delete static_cast<MXPlan*>(p);
+}
+extern "C" void* grimoire_onednn_bf16_f32_create(
+    sycl::queue* q,int m,int n,int k){
+  try{return new BFPlan(*q,m,n,k);}catch(...){return nullptr;}
+}
+extern "C" size_t grimoire_onednn_bf16_f32_scratch_size(void* p){
+  return p?static_cast<BFPlan*>(p)->scratch_bytes:0;
+}
+extern "C" void grimoire_onednn_bf16_f32_execute(
+    void* p,const void* a,const void* b,void* out,void* scratch){
+  static_cast<BFPlan*>(p)->run(const_cast<void*>(a),const_cast<void*>(b),
+    out,scratch);
+}
+extern "C" void grimoire_onednn_bf16_f32_destroy(void* p){
+  delete static_cast<BFPlan*>(p);
 }

@@ -330,6 +330,31 @@ struct OneDnnW4Api {
     explicit operator bool() const { return create && scratch_size && execute && destroy; }
 };
 
+struct OneDnnBF16Api {
+    void* (*create)(sycl::queue*,int,int,int) = nullptr;
+    size_t (*scratch_size)(void*) = nullptr;
+    void (*execute)(void*,const void*,const void*,void*,void*) = nullptr;
+    void (*destroy)(void*) = nullptr;
+    explicit operator bool() const { return create && scratch_size && execute && destroy; }
+};
+
+static OneDnnBF16Api load_onednn_bf16() {
+    static OneDnnBF16Api api{}; static bool attempted=false; static void* handle=nullptr;
+    if(attempted)return api; attempted=true;
+    const char* env=std::getenv("GRIMOIRE_ONEDNN_BRIDGE");
+    const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
+        "/bridge/libgrimoire_onednn.so"};
+    for(const char* path:paths){
+        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_bf16_f32_create"));
+        api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_bf16_f32_scratch_size"));
+        api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_bf16_f32_execute"));
+        api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_bf16_f32_destroy"));
+        if(api)break; api={}; dlclose(handle); handle=nullptr;
+    }
+    return api;
+}
+
 static OneDnnW4Api load_onednn_w4() {
     static OneDnnW4Api api{}; static bool attempted=false; static void* handle=nullptr;
     if(attempted)return api; attempted=true;
@@ -1220,6 +1245,7 @@ struct Grimoire {
         int8_t *verify_a8=nullptr;
         float *verify_a8s=nullptr;
         int32_t *verify_ids=nullptr;
+        void *fc_plan=nullptr, *fc_scratch=nullptr;
         int context_pos=0;
         int hidden=0, inter=0, q_heads=0, kv_heads=0, head_dim=0;
         int mask_token=0, sliding_window=0;
@@ -2265,6 +2291,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 if(!dflash2.verify_logits||!dflash2.verify_bf||!dflash2.verify_bf_out||
                    !dflash2.verify_a8||!dflash2.verify_a8s||
                    !dflash2.verify_ids)dok=false;
+                if(std::getenv("GRIMOIRE_DFLASH_ONEDNN_BF16")&&
+                   dflash2.fc.w.fmt==Fmt::BF16){
+                    auto od=load_onednn_bf16();
+                    if(od){
+                        dflash2.fc_plan=od.create(&q,DM,dflash2.fc.w.N,dflash2.fc.w.K);
+                        if(dflash2.fc_plan){
+                            const size_t sb=od.scratch_size(dflash2.fc_plan);
+                            dflash2.fc_scratch=sycl::malloc_device<uint8_t>(std::max<size_t>(1,sb),q);
+                            db+=std::max<size_t>(1,sb);
+                            if(!dflash2.fc_scratch)dok=false;
+                        }
+                    }
+                }
             }
             db+=size_t(DM)*dflash2.target_layers.size()*DH*sizeof(bf16_t)
                 +size_t(DM)*DH+size_t(DM)*sizeof(float)
@@ -2583,6 +2622,11 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
 }
 
 void Grimoire::release() {
+    if(dflash2.fc_plan){
+        auto od=load_onednn_bf16();
+        if(od)od.destroy(dflash2.fc_plan);
+        dflash2.fc_plan=nullptr;
+    }
     if (pp_fd >= 0) { ::close(pp_fd); pp_fd = -1; }
     if (comm_rank() == 1 && !pp_socket.empty()) ::unlink(pp_socket.c_str());
     if (pipe_host) { sycl::free(pipe_host, q); pipe_host = nullptr; }
@@ -2660,7 +2704,7 @@ void Grimoire::release() {
                     (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
                     (void*)dflash2.verify_bf_out,
                     (void*)dflash2.verify_a8, (void*)dflash2.verify_a8s,
-                    (void*)dflash2.verify_ids})
+                    (void*)dflash2.verify_ids, (void*)dflash2.fc_scratch})
         if (p) sycl::free(p, q);
     dflash2 = {};
     lm_head.release(q);
@@ -4140,6 +4184,14 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                   rows,w.w.N,w.w.K);
         }else launch_gemm_xmx(q,w.w,dflash2.bf,y,rows);
     };
+    auto fc_mm=[&](const float* x,float* y,int rows){
+        if(dflash2.fc_plan&&dflash2.fc_scratch){
+            launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*dflash2.fc.w.K);
+            auto od=load_onednn_bf16();
+            od.execute(dflash2.fc_plan,dflash2.bf,dflash2.fc.w.payload,y,
+                       dflash2.fc_scratch);
+        }else mm(dflash2.fc,x,y,rows);
+    };
 
     // Target context is projected once per newly accepted token. The query
     // block later overwrites speculative cache slots, so rejected suffixes do
@@ -4147,7 +4199,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     while(dflash2.context_pos<position){
         const int start=dflash2.context_pos;
         const int rows=std::min(M,position-start);
-        mm(dflash2.fc,dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
+        fc_mm(dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
         launch_rmsnorm_residual_batched(q,dflash2.ctx,nullptr,nullptr,
             dflash2.hidden_norm,dflash2.normed,rows,H,eps,nullptr,{},0.0f);
         for(auto& d:dflash2.layers){
@@ -4303,10 +4355,10 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
         }
-        // Exact raw oneDNN W4A16 operation selected by vLLM's
-        // XPUwNa16LinearKernel for this symmetric INT4 checkpoint. Keep the
-        // primitive and scratchpad alive across DFlash verification steps.
-        if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales){
+        // DFlash verification must keep the proven m16 W4A8 dispatch.  The
+        // raw oneDNN W4A16 primitive is retained for long prompt prefill,
+        // where it cannot displace the 40-TG verifier kernel.
+        if(M>kSpecBatch&&od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales){
             launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);
             auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
                 [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
@@ -4328,14 +4380,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
             }
         }
         if(w.has_i4()){
-            if(M<=kSpecBatch&&w.w.N<=2048){
-                for(int r=0;r<M;r+=4){
-                    const int mb=std::min(4,M-r);
-                    launch_gemv_int4sym_batch(q,w.i4,w.i4s,
-                        x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
-                        w.w.N,w.w.K,mb,{});
-                }
-            }else if(w4){
+            if(w4){
                 launch_quantize_rows_int8(q,x,a8,a8s,M,w.w.K,{});
                 w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
             }else{
@@ -4354,6 +4399,9 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                   y,M,w.w.N,w.w.K);
         else
             launch_gemm_xmx(q,w.w,xb,y,M);
+    };
+    auto mm_w4_prequant=[&](const DevQuant& w,float* y){
+        w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
     };
 
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
@@ -4380,14 +4428,26 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         }
         launch_rmsnorm_residual_batched(q,hidden,nullptr,nullptr,d.in_norm,normed,
                                         M,H,cfg.rms_eps,nullptr,{});
-        mm(d.q_proj,normed,qv);mm(d.k_proj,normed,kv);mm(d.v_proj,normed,vv);
+        const bool shared_attn_a8=w4&&d.q_proj.has_i4()&&d.k_proj.has_i4()&&
+            d.v_proj.has_i4()&&d.o_gate.has_i4();
+        if(shared_attn_a8){
+            // Q, K, V and the output gate consume the identical normalized
+            // activation.  Quantize it once instead of four times per layer.
+            launch_quantize_rows_int8(q,normed,a8,a8s,M,H,{});
+            mm_w4_prequant(d.q_proj,qv);
+            mm_w4_prequant(d.k_proj,kv);
+            mm_w4_prequant(d.v_proj,vv);
+            mm_w4_prequant(d.o_gate,gate);
+        }else{
+            mm(d.q_proj,normed,qv);mm(d.k_proj,normed,kv);
+            mm(d.v_proj,normed,vv);mm(d.o_gate,normed,gate);
+        }
         launch_qk_norm_rope_batched(q,qv,kv,muse_zero,muse_zero,M,QH,KVH,HD,
             start_pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps,{});
         launch_kv_append_batched(q,kv,vv,d.k_cache,d.v_cache,M,start_pos,
                                  KVH,HD,max_seq,{});
         launch_flash_prefill(q,qv,d.k_cache,d.v_cache,attn,M,start_pos,QH,KVH,
                              HD,max_seq,sm_scale,{});
-        mm(d.o_gate,normed,gate);
         launch_gate_sigmoid_mul_batched(q,attn,gate,M,QW,{});
         mm(d.o_proj,attn,proj);
         launch_rmsnorm_residual_batched(q,proj,nullptr,nullptr,d.post_norm,tmp,
