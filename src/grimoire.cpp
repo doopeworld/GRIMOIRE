@@ -208,7 +208,7 @@ using Xe2ChunkPrefill = void (*)(sycl::queue*, const void*, const void*,
 using Xe2DFlashPagedF16 = int (*)(
     sycl::queue*, const void*, const void*, const void*, void*, int, int, int,
     int, int, int, int, const int*, const int*, const int*, const int*, float,
-    int, int);
+    int, int, bool);
 
 static Xe2DFlashPagedF16 load_xe2_dflash_paged_f16() {
     static Xe2DFlashPagedF16 fn=nullptr;
@@ -471,6 +471,8 @@ sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
                                  float, bool, const std::vector<sycl::event>&);
 sycl::event launch_add(sycl::queue&, float*, const float*, int,
                        const std::vector<sycl::event>&);
+sycl::event launch_add_f16_round(sycl::queue&, float*, const float*, int,
+                                 const std::vector<sycl::event>&);
 sycl::event launch_kv_append(sycl::queue&, const float*, const float*, float*,
                              float*, int, int, int, int,
                              const std::vector<sycl::event>&);
@@ -1156,6 +1158,54 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     return d;
 }
 
+DevQuant concat_upload_many_int4_t(sycl::queue& q,const Qwen35Model& ck,
+                                    const std::vector<TensorRef>& refs,
+                                    const char* what,bool* ok){
+    DevQuant d;
+    if(refs.empty()){*ok=false;return d;}
+    PackedWeight p;
+    int N=0,K=-1;
+    std::string err;
+    for(size_t i=0;i<refs.size();++i){
+        PackedWeight part;
+        if(!refs[i].ok()||refs[i].t.shape.size()!=2||
+           !read_compressed_int4_ref(ck,refs[i],part,err)){
+            std::printf("\n  direct compressed INT4 concatenate failed for %s: %s\n",
+                what,err.c_str());*ok=false;return d;
+        }
+        if(K>=0&&(part.K!=K||part.row_scales!=p.row_scales)){
+            std::printf("\n  compressed INT4 concatenate layout mismatch for %s\n",what);
+            *ok=false;return d;
+        }
+        if(i==0){p=std::move(part);K=p.K;N=p.N;}
+        else{
+            N+=part.N;
+            p.payload.insert(p.payload.end(),part.payload.begin(),part.payload.end());
+            p.scales_raw.insert(p.scales_raw.end(),part.scales_raw.begin(),
+                                part.scales_raw.end());
+            p.zeros.insert(p.zeros.end(),part.zeros.begin(),part.zeros.end());
+        }
+    }
+    p.N=N;
+    d.payload=dev_copy<uint8_t>(q,p.payload.data(),p.payload.size());
+    d.scales=dev_copy<uint8_t>(q,p.scales_raw.data(),p.scales_raw.size());
+    d.zeros=dev_copy<uint8_t>(q,p.zeros.data(),p.zeros.size());
+    d.w=p.view();d.w.payload=d.payload;d.w.scales=d.scales;d.w.zeros=d.zeros;
+    if(!d.payload||!d.scales||!d.zeros){*ok=false;return d;}
+    std::vector<bf16_t> tr(size_t(N)*p.row_scales);
+    const auto* src=reinterpret_cast<const bf16_t*>(p.scales_raw.data());
+    for(int n=0;n<N;++n)for(int g=0;g<p.row_scales;++g)
+        tr[size_t(g)*N+n]=src[size_t(n)*p.row_scales+g];
+    d.od_scales=dev_copy<bf16_t>(q,tr.data(),tr.size()*sizeof(bf16_t));
+    std::vector<sycl::half> trh(tr.size());
+    for(size_t i=0;i<tr.size();++i)trh[i]=sycl::half(bf16_to_f32(tr[i]));
+    d.od_scales_fp16=dev_copy<sycl::half>(q,trh.data(),
+        trh.size()*sizeof(sycl::half));
+    d.od_w4=d.od_scales&&d.od_scales_fp16;
+    if(!d.od_w4)*ok=false;
+    return d;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------
@@ -1274,7 +1324,7 @@ struct Grimoire {
         DevQuant sh_gu;                              // gate|up concatenated
         bf16_t  *la_conv = nullptr, *la_Alog = nullptr, *la_dtb = nullptr, *la_norm = nullptr;
 
-        DevQuant q_proj, k_proj, v_proj, o_proj;
+        DevQuant q_proj, k_proj, v_proj, qkv_proj, o_proj;
         bf16_t  *q_norm = nullptr, *k_norm = nullptr;
         bf16_t  *pre_ff_norm = nullptr, *post_ff_norm = nullptr;  // Muse sandwich
         DevQuant o_gate;                                          // Muse attn output gate
@@ -1297,6 +1347,8 @@ struct Grimoire {
 
         float *dn_state = nullptr, *conv_ring = nullptr;
         uint8_t *k_cache = nullptr, *v_cache = nullptr;
+        sycl::half *k_cache_f16 = nullptr, *v_cache_f16 = nullptr;
+        bool muse_sliding = false;
     };
     std::vector<LayerDev> L;
 
@@ -1395,6 +1447,7 @@ struct Grimoire {
         sycl::half *q_f16=nullptr, *k_f16=nullptr, *v_f16=nullptr;
         sycl::half *attn_f16=nullptr;
         sycl::half *linear_in_f16=nullptr, *linear_out_f16=nullptr;
+        sycl::half *draft_logits_f16=nullptr;
         sycl::half *context_k_all_f16=nullptr, *context_v_all_f16=nullptr;
         bf16_t *k_norm_all=nullptr;
         sycl_bf16 *bf=nullptr;
@@ -1823,6 +1876,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
         LayerDev& d = L[i];
         d.kind = src.kind;
+        d.muse_sliding = cfg.is_muse &&
+            i < int(cfg.muse_sliding_attention.size()) &&
+            cfg.muse_sliding_attention[size_t(i)];
         if (pp_enabled() && (i < pp_begin || i >= pp_end)) continue;
 
         d.in_norm   = dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok);
@@ -1865,6 +1921,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.q_proj = quantize_upload_t(lq, ck, src.q_proj, PF, "self_attn.q_proj", &ok);
             d.k_proj = quantize_upload_t(lq, ck, src.k_proj, PF, "self_attn.k_proj", &ok);
             d.v_proj = quantize_upload_t(lq, ck, src.v_proj, PF, "self_attn.v_proj", &ok);
+            if(cfg.is_muse&&PF==Fmt::INT4){
+                d.qkv_proj=concat_upload_many_int4_t(lq,ck,
+                    {src.q_proj,src.k_proj,src.v_proj},"self_attn.qkv_proj",&ok);
+            }
             d.o_proj = quantize_upload_t(lq, ck, src.o_proj, PF, "self_attn.o_proj", &ok);
             // Per-head q/k RMSNorm, applied before RoPE. These were
             // resolved from the checkpoint but never uploaded or used.
@@ -1879,12 +1939,23 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     d.o_gate = quantize_upload_t(lq, ck, src.attn_gate, PF, "self_attn.gate_proj", &ok);
             }
             acct(size_t(d.q_proj.w.bytes() + d.k_proj.w.bytes()
-                      + d.v_proj.w.bytes() + d.o_proj.w.bytes()));
+                      + d.v_proj.w.bytes() + d.qkv_proj.w.bytes()
+                      + d.o_proj.w.bytes()));
 
             // FP8 E4M3 KV: K is D-major for coalesced scoring, V is D-minor.
             d.k_cache = sycl::malloc_device<uint8_t>(size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq, lq);
             d.v_cache = sycl::malloc_device<uint8_t>(size_t(cfg.n_kv_heads) * max_seq * cfg.head_dim, lq);
             acct(2 * size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq);
+            if(cfg.is_muse){
+                constexpr int block_size=64;
+                const int blocks=(max_seq+block_size-1)/block_size;
+                const size_t elems=size_t(blocks)*block_size*cfg.n_kv_heads*
+                    cfg.head_dim;
+                d.k_cache_f16=sycl::malloc_device<sycl::half>(elems,lq);
+                d.v_cache_f16=sycl::malloc_device<sycl::half>(elems,lq);
+                if(!d.k_cache_f16||!d.v_cache_f16)ok=false;
+                acct(2*elems*sizeof(sycl::half));
+            }
         }
 
         // ---- FFN ------------------------------------------------------
@@ -2501,6 +2572,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     int(dflash2.layers.size())*2*DKV});
                 dflash2.linear_in_f16=df16(size_t(DM)*linear_in_width);
                 dflash2.linear_out_f16=df16(size_t(DM)*linear_out_width);
+                dflash2.draft_logits_f16=df16(size_t(DM-1)*cfg.vocab);
                 dflash2.block_table=sycl::malloc_device<int32_t>(dflash2.num_blocks,q);
                 dflash2.cu_q=sycl::malloc_device<int32_t>(2,q);
                 dflash2.cu_k=sycl::malloc_device<int32_t>(2,q);
@@ -2508,7 +2580,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 db+=size_t(dflash2.num_blocks+5)*sizeof(int32_t);
                 if(!dflash2.q_f16||!dflash2.k_f16||!dflash2.v_f16||
                    !dflash2.attn_f16||!dflash2.linear_in_f16||
-                   !dflash2.linear_out_f16||!dflash2.block_table||!dflash2.cu_q||
+                   !dflash2.linear_out_f16||!dflash2.draft_logits_f16||
+                   !dflash2.block_table||!dflash2.cu_q||
                    !dflash2.cu_k||!dflash2.seqused_k)dok=false;
                 if(dok){
                     std::vector<int32_t> blocks(size_t(dflash2.num_blocks));
@@ -2887,7 +2960,7 @@ void Grimoire::release() {
     for (auto& d : L) {
         d.la_qkv.release(q); d.la_z.release(q); d.la_out.release(q); d.la_all.release(q);
         d.q_proj.release(q); d.k_proj.release(q);
-        d.v_proj.release(q); d.o_proj.release(q);
+        d.v_proj.release(q); d.qkv_proj.release(q); d.o_proj.release(q);
         d.sh_gu.release(q); d.sh_down.release(q);
         d.la_ab.release(q); d.sh_gate_q.release(q);
         d.router.release(q);
@@ -2896,7 +2969,8 @@ void Grimoire::release() {
                         (void*)d.gu_scale, (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
                         (void*)d.dn_state, (void*)d.conv_ring,
-                        (void*)d.k_cache, (void*)d.v_cache})
+                        (void*)d.k_cache, (void*)d.v_cache,
+                        (void*)d.k_cache_f16, (void*)d.v_cache_f16})
             if (p) sycl::free(p, q);
     }
     if (mtp.ok) {
@@ -2963,6 +3037,7 @@ void Grimoire::release() {
                     (void*)dflash2.v_f16, (void*)dflash2.attn_f16,
                     (void*)dflash2.linear_in_f16,
                     (void*)dflash2.linear_out_f16,
+                    (void*)dflash2.draft_logits_f16,
                     (void*)dflash2.context_k_all_f16,
                     (void*)dflash2.context_v_all_f16,
                     (void*)dflash2.k_norm_all,
@@ -4586,7 +4661,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 d.v_cache_f16,dflash2.attn_f16,M,used,QH,KVH,HD,
                 dflash2.block_size,dflash2.num_blocks,dflash2.block_table,
                 dflash2.cu_q,dflash2.cu_k,dflash2.seqused_k,
-                1.0f/std::sqrt(float(HD)),window,window);
+                1.0f/std::sqrt(float(HD)),window,window,false);
             if(rc)return false;
             launch_f16_to_f32(q,dflash2.attn_f16,dflash2.attn,
                 size_t(M)*QW,{});
@@ -4612,20 +4687,38 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }
     norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.normed,M);
 
-    auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
-    if(lm_head.has_i4()&&w4){
-        launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
-                                  M-1,H,{});
-        w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,dflash2.logits,
-           M-1,lm_head.w.N,lm_head.w.K);
-    }else if(lm_head.w.fmt==Fmt::MXFP4&&lm_head.w.payload){
-        // Project all draft rows together.  The old per-row GEMV streamed the
-        // full vocabulary matrix fifteen times per speculative step.
-        mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
+    if(cfg.is_muse){
+        auto od=load_onednn_w4();
+        if(!od||!muse_od_zp||!lm_head.od_w4||!lm_head.payload||
+           !lm_head.od_scales_fp16||!dflash2.draft_logits_f16)return false;
+        constexpr int rows=M-1;
+        launch_f32_to_f16(q,dflash2.normed+H,dflash2.linear_in_f16,
+                          size_t(rows)*H,{});
+        auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
+            [&](const OneDnnPlan& p){return p.m==rows&&p.n==lm_head.w.N&&
+                                            p.k==lm_head.w.K;});
+        if(it==muse_od_plans.end()){
+            void* plan=od.create(&q,rows,lm_head.w.N,lm_head.w.K,kInt4Group,0);
+            if(!plan)return false;
+            const size_t bytes=od.scratch_size(plan);
+            void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
+            if(bytes&&!scratch){od.destroy(plan);return false;}
+            muse_od_plans.push_back({rows,lm_head.w.N,lm_head.w.K,plan,scratch});
+            it=muse_od_plans.end()-1;
+        }
+        od.execute(it->plan,dflash2.linear_in_f16,lm_head.payload,
+            lm_head.od_scales_fp16,muse_od_zp,dflash2.draft_logits_f16,
+            it->scratch);
+        launch_f16_to_f32(q,dflash2.draft_logits_f16,dflash2.logits,
+                          size_t(rows)*cfg.vocab,{});
     }else{
-        for(int r=1;r<M;++r)
-            gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
-                     dflash2.logits+int64_t(r-1)*cfg.vocab,{});
+        auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
+        if(lm_head.has_i4()&&w4){
+            launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,
+                dflash2.a8s,M-1,H,{});
+            w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,
+               dflash2.logits,M-1,lm_head.w.N,lm_head.w.K);
+        }else mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
     }
     for(int r=0;r<M-1;++r){
         launch_argmax(q,dflash2.logits+int64_t(r)*cfg.vocab,cfg.vocab,
@@ -4683,13 +4776,22 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     int32_t* dtok=reuse?dflash2.tokens:sycl::malloc_device<int32_t>(M,q);
     int32_t* outtok=next_tokens?(reuse?dflash2.verify_ids:
         sycl::malloc_device<int32_t>(M,q)):nullptr;
+    sycl::half* qh=reuse?dflash2.q_f16:
+        sycl::malloc_device<sycl::half>(size_t(M)*QW,q);
+    sycl::half* kh=reuse?dflash2.k_f16:
+        sycl::malloc_device<sycl::half>(size_t(M)*KVW,q);
+    sycl::half* vh=reuse?dflash2.v_f16:
+        sycl::malloc_device<sycl::half>(size_t(M)*KVW,q);
+    sycl::half* oh=reuse?dflash2.attn_f16:
+        sycl::malloc_device<sycl::half>(size_t(M)*QW,q);
     std::vector<void*> mem={(void*)hidden,(void*)normed,(void*)tmp,(void*)qv,
         (void*)kv,(void*)vv,(void*)attn,(void*)gate,(void*)proj,(void*)ff,
         (void*)batch_logits,(void*)xb,(void*)yb,(void*)a8,(void*)a8s,
-        (void*)dtok,(void*)outtok};
+        (void*)dtok,(void*)outtok,(void*)qh,(void*)kh,(void*)vh,(void*)oh};
     auto cleanup=[&](){if(!reuse)for(void* p:mem)if(p)sycl::free(p,q);};
     if(!hidden||!normed||!tmp||!qv||!kv||!vv||!attn||!gate||!proj||!ff||
-       !xb||!yb||!a8||!a8s||!dtok||(next_tokens&&(!batch_logits||!outtok))){
+       !xb||!yb||!a8||!a8s||!dtok||!qh||!kh||!vh||!oh||
+       (next_tokens&&(!batch_logits||!outtok))){
         cleanup();return false;
     }
 
@@ -4706,6 +4808,39 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         :"grimoire_xe2_dense_w4a8_f32");
     const bool exact_gemv=std::getenv("GRIMOIRE_MUSE_PREFILL_GEMV")!=nullptr;
     const bool exact_bf16=std::getenv("GRIMOIRE_MUSE_PREFILL_EXACT_BF16")!=nullptr;
+    const auto fa2_paged=load_xe2_dflash_paged_f16();
+    const bool exact_attn=fa2_paged&&dflash2.block_table&&dflash2.cu_q&&
+        dflash2.cu_k&&dflash2.seqused_k;
+    if(!exact_attn){cleanup();return false;}
+    const int32_t cuq[2]={0,M};
+    q.memcpy(dflash2.cu_q,cuq,sizeof(cuq));
+    auto mm_w4_f16=[&](const DevQuant& w,const float* x)->sycl::half*{
+        if(!od||!muse_od_zp||!w.od_w4||!w.payload||!w.od_scales_fp16)
+            throw std::runtime_error("Muse target W4A16 parity path unavailable");
+        auto* xh=reinterpret_cast<sycl::half*>(xb);
+        auto* yh=reinterpret_cast<sycl::half*>(yb);
+        q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
+            xh[i]=sycl::half(x[i]);
+        });
+        auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
+            [&](const OneDnnPlan& p){
+                return p.m==M&&p.n==w.w.N&&p.k==w.w.K;
+            });
+        if(it==muse_od_plans.end()){
+            void* plan=od.create(&q,M,w.w.N,w.w.K,kInt4Group,0);
+            if(!plan)throw std::runtime_error(
+                "Muse target W4A16 plan creation failed");
+            const size_t bytes=od.scratch_size(plan);
+            void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
+            if(bytes&&!scratch){od.destroy(plan);throw std::runtime_error(
+                "Muse target W4A16 scratch allocation failed");}
+            muse_od_plans.push_back({M,w.w.N,w.w.K,plan,scratch});
+            it=muse_od_plans.end()-1;
+        }
+        od.execute(it->plan,xh,w.payload,w.od_scales_fp16,muse_od_zp,yh,
+                   it->scratch);
+        return yh;
+    };
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(exact_gemv||(exact_bf16&&w.w.fmt==Fmt::BF16)){
             for(int r=0;r<M;++r)
@@ -4715,31 +4850,11 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         // Match vLLM XPU's Muse compressed-INT4 dispatch exactly: FP16
         // activations/scales through oneDNN W4A16, with plans cached by shape.
         if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales_fp16){
-            auto* xh=reinterpret_cast<sycl::half*>(xb);
-            auto* yh=reinterpret_cast<sycl::half*>(yb);
-            q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
-                xh[i]=sycl::half(x[i]);
+            sycl::half* yh=mm_w4_f16(w,x);
+            q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
+                y[i]=float(yh[i]);
             });
-            auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
-                [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
-            if(it==muse_od_plans.end()){
-                void* plan=od.create(&q,M,w.w.N,w.w.K,kInt4Group,0);
-                if(plan){
-                    const size_t bytes=od.scratch_size(plan);
-                    void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
-                    if(!bytes||scratch){
-                        muse_od_plans.push_back({M,w.w.N,w.w.K,plan,scratch});
-                        it=muse_od_plans.end()-1;
-                    }else od.destroy(plan);
-                }
-            }
-            if(it!=muse_od_plans.end()){
-                od.execute(it->plan,xh,w.payload,w.od_scales_fp16,muse_od_zp,yh,it->scratch);
-                q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
-                    y[i]=float(yh[i]);
-                });
-                return;
-            }
+            return;
         }
         if(w.has_i4()){
             if(w4){
@@ -4768,10 +4883,12 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
     launch_embed_batched(q,embed,dtok,hidden,M,H,{});
-    launch_rmsnorm_residual_batched(q,hidden,nullptr,nullptr,muse_zero,normed,
-                                    M,H,cfg.rms_eps,nullptr,{});
+    launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,muse_zero,normed,
+                                        M,H,cfg.rms_eps,{},1.0f);
     std::swap(hidden,normed);
-    const float sm_scale=cfg.query_prescale/std::sqrt(float(HD));
+    // vLLM applies scale_query_by to Q after QK-norm, then uses the standard
+    // attention scale independently. Do not fold the query scale twice.
+    const float sm_scale=1.0f/std::sqrt(float(HD));
 
     for(int li=0;li<cfg.n_layers;++li){
         LayerDev& d=L[size_t(li)];
@@ -4786,46 +4903,43 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                 }
             }
         }
-        launch_rmsnorm_residual_batched(q,hidden,nullptr,nullptr,d.in_norm,normed,
-                                        M,H,cfg.rms_eps,nullptr,{});
-        const bool shared_attn_a8=w4&&d.q_proj.has_i4()&&d.k_proj.has_i4()&&
-            d.v_proj.has_i4()&&d.o_gate.has_i4();
-        if(shared_attn_a8){
-            // Q, K, V and the output gate consume the identical normalized
-            // activation.  Quantize it once instead of four times per layer.
-            launch_quantize_rows_int8(q,normed,a8,a8s,M,H,{});
-            mm_w4_prequant(d.q_proj,qv);
-            mm_w4_prequant(d.k_proj,kv);
-            mm_w4_prequant(d.v_proj,vv);
-            mm_w4_prequant(d.o_gate,gate);
-        }else{
-            mm(d.q_proj,normed,qv);mm(d.k_proj,normed,kv);
-            mm(d.v_proj,normed,vv);mm(d.o_gate,normed,gate);
-        }
-        launch_qk_norm_rope_batched(q,qv,kv,muse_zero,muse_zero,M,QH,KVH,HD,
-            start_pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps,{});
-        launch_kv_append_batched(q,kv,vv,d.k_cache,d.v_cache,M,start_pos,
-                                 KVH,HD,max_seq,{});
-        launch_flash_prefill(q,qv,d.k_cache,d.v_cache,attn,M,start_pos,QH,KVH,
-                             HD,max_seq,sm_scale,{});
+        launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,d.in_norm,normed,
+                                            M,H,cfg.rms_eps,{},1.0f);
+        sycl::half* qkvh=mm_w4_f16(d.qkv_proj,normed);
+        launch_qkv_norm_rope_f16_fused(q,qkvh,qh,kh,vh,muse_zero,muse_zero,
+            M,QH,KVH,HD,start_pos,cfg.rope_theta,cfg.rms_eps,{},
+            d.muse_sliding,cfg.query_prescale,1.0f);
+        mm(d.o_gate,normed,gate);
+        launch_kv_append_f16_paged(q,kh,vh,d.k_cache_f16,d.v_cache_f16,M,
+            start_pos,KVH,HD,dflash2.block_size,{});
+        const int32_t used=start_pos+M;
+        q.memcpy(dflash2.seqused_k,&used,sizeof(used));
+        const int window_left=d.muse_sliding?2047:-1;
+        const int window_right=d.muse_sliding?0:-1;
+        const int rc=fa2_paged(&q,qh,d.k_cache_f16,d.v_cache_f16,oh,M,used,
+            QH,KVH,HD,dflash2.block_size,dflash2.num_blocks,
+            dflash2.block_table,dflash2.cu_q,dflash2.cu_k,
+            dflash2.seqused_k,sm_scale,window_left,window_right,true);
+        if(rc){cleanup();return false;}
+        launch_f16_to_f32(q,oh,attn,size_t(M)*QW,{});
         launch_gate_sigmoid_mul_batched(q,attn,gate,M,QW,{});
         mm(d.o_proj,attn,proj);
-        launch_rmsnorm_residual_batched(q,proj,nullptr,nullptr,d.post_norm,tmp,
-                                        M,H,cfg.post_norm_eps,nullptr,{});
-        launch_add(q,hidden,tmp,M*H,{});
+        launch_rmsnorm_residual_f16_batched(q,proj,nullptr,d.post_norm,tmp,
+                                            M,H,cfg.post_norm_eps,{},1.0f);
+        launch_add_f16_round(q,hidden,tmp,M*H,{});
 
-        launch_rmsnorm_residual_batched(q,hidden,nullptr,nullptr,d.pre_ff_norm,
-                                        normed,M,H,cfg.rms_eps,nullptr,{});
+        launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,d.pre_ff_norm,
+                                            normed,M,H,cfg.rms_eps,{},1.0f);
         mm(d.sh_gu,normed,ff);
-        launch_swiglu_batched(q,ff,ff,M,I,{});
+        launch_swiglu_f16_batched(q,ff,ff,M,I,{});
         mm(d.sh_down,ff,proj);
-        launch_rmsnorm_residual_batched(q,proj,nullptr,nullptr,d.post_ff_norm,tmp,
-                                        M,H,cfg.post_norm_eps,nullptr,{});
-        launch_add(q,hidden,tmp,M*H,{});
+        launch_rmsnorm_residual_f16_batched(q,proj,nullptr,d.post_ff_norm,tmp,
+                                            M,H,cfg.post_norm_eps,{},1.0f);
+        launch_add_f16_round(q,hidden,tmp,M*H,{});
     }
 
-    launch_rmsnorm_residual_batched(q,hidden,nullptr,nullptr,fnorm,normed,M,H,
-                                    cfg.rms_eps,nullptr,{},0.0f);
+    launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,fnorm,normed,M,H,
+                                        cfg.rms_eps,{},0.0f);
     if(next_tokens){
         mm(lm_head,normed,batch_logits);
         for(int r=0;r<M;++r){

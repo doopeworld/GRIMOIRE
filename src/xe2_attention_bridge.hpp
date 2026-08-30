@@ -16,7 +16,7 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
     int q_heads, int kv_heads, int head_dim, int block_size, int num_blocks,
     const int* block_table, const int* cu_q, const int* dummy_cu_k,
     const int* seqused_k, float softmax_scale, int window_left,
-    int window_right);
+    int window_right, bool causal);
 
 extern "C" void grimoire_xe2_chunk_gdn_bf16(
     sycl::queue* queue, void* output, const void* query, const void* key,

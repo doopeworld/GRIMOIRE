@@ -29,7 +29,7 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
     int q_heads, int kv_heads, int head_dim, int block_size, int num_blocks,
     const int* block_table, const int* cu_q, const int* dummy_cu_k,
     const int* seqused_k, float softmax_scale, int window_left,
-    int window_right) {
+    int window_right, bool causal) {
   if(head_dim!=128||block_size!=64||!q||!query||!key_cache||!value_cache||
      !output||!block_table||!cu_q||!dummy_cu_k||!seqused_k)return 1;
   chunk_prefill_args_t a{};
@@ -57,7 +57,7 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
   a.window_size_right=window_right;
   a.is_varlen=true;
   a.is_paged=true;
-  a.is_causal=false;
+  a.is_causal=causal;
   a.is_local=window_left>=0||window_right>=0;
   a.q_stride_seq=q_heads*head_dim;
   a.q_stride_heads=head_dim;
@@ -69,7 +69,20 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
   a.o_stride_heads=head_dim;
   a.page_stride_elements=block_size*kv_heads*head_dim;
   CutlassQKType types{CutlassDType::half};
-  policy_dispatch_impl<chunk_policy_head128,true,false,true,false,false>(
-      *q,types,a);
+  if(causal){
+    if(a.is_local)
+      policy_dispatch_impl<chunk_policy_head128,true,true,true,false,false>(
+          *q,types,a);
+    else
+      policy_dispatch_impl<chunk_policy_head128,true,true,false,false,false>(
+          *q,types,a);
+  }else{
+    if(a.is_local)
+      policy_dispatch_impl<chunk_policy_head128,true,false,true,false,false>(
+          *q,types,a);
+    else
+      policy_dispatch_impl<chunk_policy_head128,true,false,false,false,false>(
+          *q,types,a);
+  }
   return 0;
 }

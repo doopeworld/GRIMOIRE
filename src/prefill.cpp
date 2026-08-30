@@ -246,7 +246,7 @@ sycl::event launch_rmsnorm_residual_batched(
 sycl::event launch_rmsnorm_residual_f16_batched(
     sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
     float* out, int tokens, int hidden, float eps,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps, float weight_offset) {
     constexpr int WG=256;
     return q.submit([&](sycl::handler& hd){
         hd.depends_on(deps);
@@ -277,7 +277,8 @@ sycl::event launch_rmsnorm_residual_f16_batched(
                 const float scale=sycl::rsqrt(total/float(hidden)+eps);
                 for(int i=lid;i<hidden;i+=WG)
                     dst[i]=float(sycl::half(hr[i]*scale*
-                        float(sycl::half(bf16_to_f32(weight[i])))));
+                        float(sycl::half(weight_offset+
+                            bf16_to_f32(weight[i])))));
             });
     });
 }
@@ -552,7 +553,8 @@ sycl::event launch_qk_norm_rope_f16_batched(
     sycl::queue& q, const float* q_src, const float* k_src, sycl::half* q_dst,
     sycl::half* k_dst, const bf16_t* q_weight, const bf16_t* k_weight,
     int tokens, int q_heads, int k_heads, int head_dim, int start_pos,
-    float theta, float eps, const std::vector<sycl::event>& deps) {
+    float theta, float eps, const std::vector<sycl::event>& deps,
+    bool use_rope, float query_scale, float weight_offset) {
     const int heads_per_token = q_heads + k_heads;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
@@ -587,13 +589,16 @@ sycl::event launch_qk_norm_rope_f16_batched(
                 const float scale = sycl::rsqrt(sum_sq / float(head_dim) + eps);
                 for (int d = lane; d < head_dim; d += SG_SIZE) {
                     const float x = float(sycl::half(src[d]));
-                    dst[d] = sycl::half(x * scale * bf16_to_f32(weight[d]));
+                    const float w=weight_offset+bf16_to_f32(weight[d]);
+                    dst[d] = sycl::half(x * scale * w *
+                        (is_q?query_scale:1.0f));
                 }
                 sycl::group_barrier(sg);
 
                 // Muse uses NEOX half-split RoPE over the complete 128-wide
                 // head. RMSNorm output is FP16 before RoPE, and RoPE writes
                 // FP16 again.
+                if(!use_rope)return;
                 const int pos = start_pos + row;
                 for (int j = lane; j < head_dim / 2; j += SG_SIZE) {
                     const float a = float(dst[j]);
@@ -614,7 +619,8 @@ sycl::event launch_qkv_norm_rope_f16_fused(
     sycl::half* k_dst, sycl::half* v_dst, const bf16_t* q_weight,
     const bf16_t* k_weight, int tokens, int q_heads, int k_heads,
     int head_dim, int start_pos, float theta, float eps,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps, bool use_rope,
+    float query_scale, float weight_offset) {
     const int q_width=q_heads*head_dim;
     const int k_width=k_heads*head_dim;
     const int row_width=q_width+2*k_width;
@@ -647,8 +653,20 @@ sycl::event launch_qkv_norm_rope_f16_fused(
                 const float scale=sycl::rsqrt(sum_sq/float(head_dim)+eps);
                 for(int d=lane;d<head_dim;d+=SG_SIZE)
                     dst[d]=sycl::half(float(qkv_src[src_base+d])*scale*
-                        bf16_to_f32(weight[d]));
+                        (weight_offset+bf16_to_f32(weight[d]))*
+                        (is_q?query_scale:1.0f));
                 sycl::group_barrier(sg);
+                if(!use_rope){
+                    if(!is_q){
+                        const int64_t v_src=int64_t(row)*row_width+q_width+
+                            k_width+int64_t(head)*head_dim;
+                        const int64_t v_dst_base=(int64_t(row)*k_heads+head)*
+                            head_dim;
+                        for(int d=lane;d<head_dim;d+=SG_SIZE)
+                            v_dst[v_dst_base+d]=qkv_src[v_src+d];
+                    }
+                    return;
+                }
                 const int pos=start_pos+row;
                 for(int j=lane;j<head_dim/2;j+=SG_SIZE){
                     const float a=float(dst[j]);
@@ -1201,7 +1219,9 @@ sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
             const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
             if(d<hidden) {
                 const int64_t i=int64_t(t)*hidden+d;
-                x[i]*=1.0f/(1.0f+sycl::exp(-gate[i]));
+                const float xv=float(sycl::half(x[i]));
+                const float gv=float(sycl::half(gate[i]));
+                x[i]=float(sycl::half(xv/(1.0f+sycl::exp(-gv))));
             }
         });
     });

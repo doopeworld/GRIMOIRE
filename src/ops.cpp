@@ -624,6 +624,16 @@ sycl::event launch_add(sycl::queue& q, float* dst, const float* src, int n,
     });
 }
 
+sycl::event launch_add_f16_round(sycl::queue& q,float* dst,const float* src,
+    int n,const std::vector<sycl::event>& deps){
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n)),[=](sycl::id<1> id){
+            dst[id[0]]=float(sycl::half(dst[id[0]]+src[id[0]]));
+        });
+    });
+}
+
 // Copy a projected K/V vector into the paged cache at `pos`.
 // K is stored D-major so the attention kernel's 16-lane score step reads
 // contiguous floats; V stays D-minor because its accumulator is

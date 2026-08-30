@@ -269,7 +269,7 @@ sycl::event launch_rmsnorm_residual_batched(
 sycl::event launch_rmsnorm_residual_f16_batched(
     sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
     float* out, int tokens, int hidden, float eps,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, float weight_offset = 0.0f);
 sycl::event launch_rmsnorm_residual_batched_quant(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, sycl_bf16* out_bf,
@@ -312,13 +312,16 @@ sycl::event launch_qk_norm_rope_f16_batched(
     sycl::queue& q, const float* q_src, const float* k_src, sycl::half* q_dst,
     sycl::half* k_dst, const bf16_t* q_weight, const bf16_t* k_weight,
     int tokens, int q_heads, int k_heads, int head_dim, int start_pos,
-    float theta, float eps, const std::vector<sycl::event>& deps = {});
+    float theta, float eps, const std::vector<sycl::event>& deps = {},
+    bool use_rope = true, float query_scale = 1.0f,
+    float weight_offset = 0.0f);
 sycl::event launch_qkv_norm_rope_f16_fused(
     sycl::queue& q, const sycl::half* qkv_src, sycl::half* q_dst,
     sycl::half* k_dst, sycl::half* v_dst, const bf16_t* q_weight,
     const bf16_t* k_weight, int tokens, int q_heads, int k_heads,
     int head_dim, int start_pos, float theta, float eps,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, bool use_rope = true,
+    float query_scale = 1.0f, float weight_offset = 0.0f);
 sycl::event launch_f32_to_f16(sycl::queue& q, const float* src,
     sycl::half* dst, size_t count,
     const std::vector<sycl::event>& deps = {});
