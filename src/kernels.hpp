@@ -266,6 +266,10 @@ sycl::event launch_rmsnorm_residual_batched(
     const bf16_t* weight, float* out, int tokens, int hidden, float eps,
     sycl_bf16* out_bf = nullptr,
     const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
+sycl::event launch_rmsnorm_residual_f16_batched(
+    sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
+    float* out, int tokens, int hidden, float eps,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_rmsnorm_residual_batched_quant(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, sycl_bf16* out_bf,
@@ -304,6 +308,33 @@ sycl::event launch_kv_append_batched(
     sycl::queue& q, const float* k, const float* v, uint8_t* k_cache,
     uint8_t* v_cache, int tokens, int start_pos, int n_kv_heads,
     int head_dim, int seq_cap, const std::vector<sycl::event>& deps = {});
+sycl::event launch_qk_norm_rope_f16_batched(
+    sycl::queue& q, const float* q_src, const float* k_src, sycl::half* q_dst,
+    sycl::half* k_dst, const bf16_t* q_weight, const bf16_t* k_weight,
+    int tokens, int q_heads, int k_heads, int head_dim, int start_pos,
+    float theta, float eps, const std::vector<sycl::event>& deps = {});
+sycl::event launch_qkv_norm_rope_f16_fused(
+    sycl::queue& q, const sycl::half* qkv_src, sycl::half* q_dst,
+    sycl::half* k_dst, sycl::half* v_dst, const bf16_t* q_weight,
+    const bf16_t* k_weight, int tokens, int q_heads, int k_heads,
+    int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_f32_to_f16(sycl::queue& q, const float* src,
+    sycl::half* dst, size_t count,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_f16_to_f32(sycl::queue& q, const sycl::half* src,
+    float* dst, size_t count,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_kv_append_f16_paged(
+    sycl::queue& q, const sycl::half* k, const sycl::half* v,
+    sycl::half* k_cache, sycl::half* v_cache, int tokens, int start_pos,
+    int n_kv_heads, int head_dim, int block_size,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_dflash_context_kv_f16(
+    sycl::queue& q, const float* fused_kv, sycl::half* all_k,
+    sycl::half* all_v, const bf16_t* stacked_k_norm, int layers, int tokens,
+    int kv_heads, int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_flash_prefill(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int start_pos,
@@ -327,11 +358,11 @@ sycl::event launch_dflash2_block_attention(
 sycl::event launch_dflash_store_tap(
     sycl::queue& q, const float* src, float* taps, int rows, int hidden,
     int tap_count, int start_pos, int tap,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, bool fp16_round = false);
 sycl::event launch_dflash_store_tap_dev(
     sycl::queue& q, const float* src, float* taps, int hidden,
     int tap_count, const int32_t* position, int tap,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, bool fp16_round = false);
 sycl::event launch_dflash2_grouped_conv(
     sycl::queue& q, const float* x, const float* coefficients,
     const bf16_t* base, float* out, int rows, int hidden, int taps,
@@ -387,6 +418,9 @@ sycl::event launch_l2norm_heads_pair_bf16_io(sycl::queue& q,sycl_bf16* qv,
     sycl_bf16* kv,int n_heads,int dim,const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     int tokens, int inter, const std::vector<sycl::event>& deps = {});
+sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
+    float* out, int tokens, int inter,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_bf16_split(sycl::queue& q, const sycl_bf16* gate,
     const sycl_bf16* up, sycl_bf16* out, int tokens, int inter,
     const std::vector<sycl::event>& deps = {});

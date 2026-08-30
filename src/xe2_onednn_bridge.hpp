@@ -27,4 +27,10 @@ void grimoire_onednn_bf16_f32_execute(void* plan, const void* activations,
                                       const void* weight, void* output,
                                       void* scratch);
 void grimoire_onednn_bf16_f32_destroy(void* plan);
+void* grimoire_onednn_f16_create(sycl::queue* queue, int m, int n, int k);
+size_t grimoire_onednn_f16_scratch_size(void* plan);
+void grimoire_onednn_f16_execute(void* plan, const void* activations,
+                                 const void* weight, void* output,
+                                 void* scratch);
+void grimoire_onednn_f16_destroy(void* plan);
 }
