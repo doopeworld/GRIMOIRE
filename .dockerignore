@@ -2,6 +2,9 @@
 .gitignore
 .dockerignore
 docker/
+!docker/Dockerfile.b70-fusion
+!docker/patches/
+!docker/patches/vllm-dflash-b70-compact.patch
 tools/build_b70_native_image.sh
 bin/
 runtime-b70/

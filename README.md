@@ -1,5 +1,9 @@
 # b70 — bare-metal LLM inference engine for Intel Arc Pro B70 (Battlemage G31)
 
+The validated Muse Glimmer W4A16/DFlash runtime is documented in
+[B70-FUSION-MUSE-2026-08-30.md](B70-FUSION-MUSE-2026-08-30.md). It provides
+separate target-only prefill and DFlash launch modes.
+
 An implementation of the blueprint, extended to the seven weight formats you asked for,
 with the blueprint's numerical and API bugs fixed. No Python, no PyTorch, no OpenVINO —
 SYCL, USM device pointers, and AOT-compiled kernels.
