@@ -4613,6 +4613,32 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         q.wait_and_throw();
         std::fprintf(stderr,"ok\n");
     };
+    const char* dump_dir=std::getenv("GRIMOIRE_DFLASH_DUMP");
+    static int dflash_dump_call=0;
+    const bool dumping=dump_dir&&*dump_dir&&dflash_dump_call==0;
+    ++dflash_dump_call;
+    auto dump_write=[&](const std::string& name,const std::vector<float>& h){
+        std::string fn=std::string(dump_dir)+"/g_"+name+".f32";
+        std::FILE* f=std::fopen(fn.c_str(),"wb");
+        if(!f){std::fprintf(stderr,"  dflash dump: cannot open %s\n",fn.c_str());return;}
+        std::fwrite(h.data(),sizeof(float),h.size(),f);
+        std::fclose(f);
+        std::fprintf(stderr,"  dflash dump: %s [%zu]\n",name.c_str(),h.size());
+    };
+    auto dump_f32=[&](const std::string& name,const float* p,size_t n){
+        if(!dumping||!p||!n)return;
+        std::vector<float> h(n);
+        q.memcpy(h.data(),p,n*sizeof(float)).wait();
+        dump_write(name,h);
+    };
+    auto dump_f16=[&](const std::string& name,const sycl::half* p,size_t n){
+        if(!dumping||!p||!n)return;
+        std::vector<sycl::half> hh(n);
+        q.memcpy(hh.data(),p,n*sizeof(sycl::half)).wait();
+        std::vector<float> h(n);
+        for(size_t i=0;i<n;++i)h[i]=float(hh[i]);
+        dump_write(name,h);
+    };
     auto dense=load_xe2_dense_mxfp4_f32();
     auto mm_f16_raw=[&](const DevQuant& w,const float* x,int rows){
         auto od=load_onednn_f16();
@@ -4680,19 +4706,29 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     while(dflash2.context_pos<position){
         const int start=dflash2.context_pos;
         const int rows=std::min(M,position-start);
+        dump_f32("01_aux_"+std::to_string(start),
+                 dflash2.target_aux+int64_t(start)*NT*H,size_t(rows)*NT*H);
         fc_mm(dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
         norm(dflash2.ctx,nullptr,dflash2.hidden_norm,dflash2.hidden_norm_f16,
              dflash2.normed,rows);
+        dump_f32("02_fc_"+std::to_string(start),dflash2.ctx,size_t(rows)*H);
+        dump_f32("03_ctxnorm_"+std::to_string(start),dflash2.normed,size_t(rows)*H);
         if(cfg.is_muse){
             // Exact vLLM context path: one [H -> L*2*KV] projection, one
             // contiguous [row,L,2,KV] -> [2,L,row,KV] transform, grouped K
             // RMSNorm, one logical RoPE batch, then per-layer cache inserts.
             mm(dflash2.fused_context_kv,dflash2.normed,
                dflash2.context_kv_all,rows);
+            dump_f32("04_ctxkv_"+std::to_string(start),dflash2.context_kv_all,
+                     size_t(rows)*dflash2.fused_context_kv.w.N);
             launch_dflash_context_kv_f16w(q,dflash2.context_kv_all,
                 dflash2.context_k_all_f16,dflash2.context_v_all_f16,
                 dflash2.k_norm_all_f16,int(dflash2.layers.size()),rows,KVH,HD,
                 start,theta,eps,{});
+            dump_f16("05_ctxk_"+std::to_string(start),dflash2.context_k_all_f16,
+                     dflash2.layers.size()*size_t(rows)*KVW);
+            dump_f16("06_ctxv_"+std::to_string(start),dflash2.context_v_all_f16,
+                     dflash2.layers.size()*size_t(rows)*KVW);
             for(size_t li=0;li<dflash2.layers.size();++li){
                 auto& d=dflash2.layers[li];
                 const size_t off=li*size_t(rows)*KVW;
@@ -4721,6 +4757,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
                              dflash2.resid,M,H);
     checkpoint("block embedding");
+    dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
 
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
@@ -4729,11 +4766,17 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         else
             norm(dflash2.resid,dflash2.mlp,d.in_norm,d.in_norm_f16,
                  dflash2.normed,M);
+        dump_f32("08_L"+std::to_string(li)+"_innorm",dflash2.normed,size_t(M)*H);
         if(cfg.is_muse){
             const sycl::half* qkv=mm_f16_raw(d.qkv,dflash2.normed,M);
             launch_qkv_norm_rope_f16w_fused(q,qkv,dflash2.q_f16,
                 dflash2.k_f16,dflash2.v_f16,d.q_norm_f16,d.k_norm_f16,M,QH,KVH,HD,
                 position,theta,eps,{});
+            dump_f16("09_L"+std::to_string(li)+"_qkv",qkv,
+                     size_t(M)*d.qkv.w.N);
+            dump_f16("10_L"+std::to_string(li)+"_q",dflash2.q_f16,size_t(M)*QW);
+            dump_f16("11_L"+std::to_string(li)+"_k",dflash2.k_f16,size_t(M)*KVW);
+            dump_f16("12_L"+std::to_string(li)+"_v",dflash2.v_f16,size_t(M)*KVW);
         }else{
             mm(d.q,dflash2.normed,dflash2.q,M);
             mm(d.k,dflash2.normed,dflash2.k,M);
@@ -4766,7 +4809,9 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 1.0f/std::sqrt(float(HD)));
         }
         checkpoint("block attention");
+        dump_f32("13_L"+std::to_string(li)+"_attn",dflash2.attn,size_t(M)*QW);
         mm(d.o,dflash2.attn,dflash2.proj,M);
+        dump_f32("14_L"+std::to_string(li)+"_o",dflash2.proj,size_t(M)*H);
         norm(dflash2.resid,dflash2.proj,d.post_norm,d.post_norm_f16,
              dflash2.normed,M);
         mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
@@ -4775,11 +4820,13 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         else launch_swiglu_batched(q,dflash2.gate_up,dflash2.h,M,I);
         mm(d.down,dflash2.h,dflash2.mlp,M);
         checkpoint("MLP");
+        dump_f32("15_L"+std::to_string(li)+"_mlp",dflash2.mlp,size_t(M)*H);
     }
     norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.norm_f16,
          dflash2.normed,M);
 
     auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
+    dump_f32("16_finalnorm",dflash2.normed,size_t(M)*H);
     if(cfg.is_muse){
         mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
            dflash2.logits,M-1);
@@ -4800,9 +4847,16 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                       s.d_tok,s.d_val,{});
         q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
     }
+    dump_f32("17_logits",dflash2.logits,size_t(M-1)*cfg.vocab);
     draft_tokens.resize(M-1);
     q.memcpy(draft_tokens.data(),dflash2.draft_ids,
              size_t(M-1)*sizeof(int32_t)).wait();
+    if(dumping){
+        std::fprintf(stderr,"  dflash dump: draft_ids");
+        for(int r=0;r<M-1;++r)
+            std::fprintf(stderr," %d",draft_tokens[size_t(r)]);
+        std::fprintf(stderr,"\n");
+    }
     checkpoint("draft logits");
     return true;
 }
@@ -6208,6 +6262,14 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     const std::string templated = tk.apply_chat_template(prompt);
     const std::vector<int32_t> ids = tk.encode(templated);
     std::printf("\n  prompt: %zu tokens\n\n", ids.size());
+    if(const char* dd=std::getenv("GRIMOIRE_DFLASH_DUMP")){
+        std::string fn=std::string(dd)+"/g_00_prompt_ids.txt";
+        if(std::FILE* f=std::fopen(fn.c_str(),"w")){
+            for(size_t i=0;i<ids.size();++i)
+                std::fprintf(f,"%d%s",ids[i],i+1<ids.size()?",":"\n");
+            std::fclose(f);
+        }
+    }
 
     e.reset();
 
