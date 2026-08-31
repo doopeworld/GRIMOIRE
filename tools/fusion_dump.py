@@ -87,6 +87,36 @@ def precompute_and_store_context_kv(self, context_states, context_positions,
     if context_slot_mapping is not None:
         save("00b_ctxstates", context_states)
         save("00c_ctxpositions", context_positions.to(torch.float32))
+    if _armed[0] and _cycle[0] == 0 and context_slot_mapping is not None:
+        # Recompute the per-layer context K/V exactly as the real path does,
+        # on clones, purely to observe the post-RoPE [L, num_ctx, nkv, hd]
+        # result. Grimoire produces this in one fused kernel and its layers
+        # 1-4 diverge, so the reference has to be per layer.
+        try:
+            if not hasattr(self, "_num_attn_layers"):
+                self._build_fused_kv_buffers()
+            n = context_states.shape[0]
+            Lc = self._num_attn_layers
+            kv, hd, nkv = self._kv_size, self._head_dim, self._num_kv_heads
+            ak, av = self._project_context_kv(context_states.clone(), n, Lc,
+                                              nkv, hd)
+            akn = self._normalize_context_k(ak)
+            save("05_ctxk_pre_rope", akn)
+            flat = akn.view(Lc * n, kv)
+            pos = context_positions[:n].repeat(Lc)
+            csc = self._rope_cos_sin_cache
+            if csc.dtype != flat.dtype:
+                csc = csc.to(dtype=flat.dtype)
+            vops.rotary_embedding(pos, flat, None, self._rope_head_size, csc,
+                                  self._rope_is_neox)
+            save("05_ctxk_all", flat.view(Lc, n, nkv, hd))
+            save("06_ctxv_all", av)
+            print("  fusion dump: context K/V per layer %s neox=%s theta_head=%d"
+                  % ((Lc, n, nkv, hd), self._rope_is_neox,
+                     self._rope_head_size), flush=True)
+        except Exception as e:
+            print("  fusion dump: context kv recompute failed: %r" % (e,),
+                  flush=True)
     return _orig_precompute(self, context_states, context_positions,
                             context_slot_mapping)
 

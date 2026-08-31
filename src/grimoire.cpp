@@ -2596,9 +2596,27 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 dflash2.layers.size()*dflash2.head_dim,q);
             if(!dflash2.k_norm_all_f16)dok=false;
             else{
+                // BUG-COMPATIBILITY WITH FUSION, NOT MODEL SEMANTICS.
+                // vLLM builds _k_norm_weights as a [num_layers, head_dim]
+                // stack and hands it to ops.rms_norm, whose weight must be
+                // [head_dim]. The kernel therefore reads only the first
+                // head_dim values and applies LAYER 0's k_norm to every draft
+                // layer in the context precompute, despite the comment there
+                // claiming the weight is selected per layer. Verified against
+                // the running reference: the effective weight recovered from
+                // Fusion's own pre-RoPE context K is identical for all five
+                // layers (pairwise cos 1.0000, rms 1.08547) and equals
+                // layers.0.self_attn.k_norm.weight, while the checkpoint's
+                // five k_norm tensors genuinely differ (rms 1.085, 1.349,
+                // 0.895, 1.381, 0.955). Applying the per-layer weights here -
+                // the model-faithful thing - puts Grimoire's context K at
+                // cos 0.93-0.97 against Fusion; layer 0's weight for all
+                // raises every layer to ~0.99.
+                // The draft QUERY path is unaffected and keeps its correct
+                // per-layer d.k_norm_f16, which already matches Fusion.
                 for(size_t i=0;i<dflash2.layers.size();++i)
                     q.memcpy(dflash2.k_norm_all_f16+i*dflash2.head_dim,
-                        dflash2.layers[i].k_norm_f16,
+                        dflash2.layers[0].k_norm_f16,
                         size_t(dflash2.head_dim)*sizeof(sycl::half));
                 db+=dflash2.layers.size()*dflash2.head_dim*sizeof(sycl::half);
             }
@@ -2688,8 +2706,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.tokens=sycl::malloc_device<int32_t>(DM,q);
             dflash2.draft_ids=sycl::malloc_device<int32_t>(DM-1,q);
             if(cfg.is_muse){
+                // The verify batch projects the shared lm_head through the
+                // same xb/yb staging buffers, so they must hold a vocab-wide
+                // row. Sizing from the layer weights alone overflows yb by
+                // ~5x (16*202048 halves into 16*39936) and smashes megabytes
+                // of device memory past it, which corrupts the target's own
+                // decode whenever the drafter is loaded.
                 const int VW=std::max({cfg.hidden,cfg.n_heads*cfg.head_dim,
-                    cfg.n_kv_heads*cfg.head_dim,2*cfg.dense_inter});
+                    cfg.n_kv_heads*cfg.head_dim,2*cfg.dense_inter,cfg.vocab});
                 dflash2.verify_logits=dfd(size_t(DM)*cfg.vocab);
                 dflash2.verify_bf=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
                 dflash2.verify_bf_out=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
@@ -4926,11 +4950,15 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     const int H=cfg.hidden,HD=cfg.head_dim,QH=cfg.n_heads,KVH=cfg.n_kv_heads;
     const int QW=QH*HD,KVW=KVH*HD,I=cfg.dense_inter;
     int W=std::max({H,QW,KVW,2*I});
-    for(const auto& d:L){
+    for(const auto&d:L){
         const DevQuant* ws[]={&d.q_proj,&d.k_proj,&d.v_proj,&d.o_proj,
                               &d.o_gate,&d.sh_gu,&d.sh_down};
         for(const auto* w:ws){W=std::max(W,w->w.N);W=std::max(W,w->w.K);}
     }
+    // The verifier also projects the shared lm_head through xb/yb. lm_head is
+    // not in the layer list above, so W must account for the vocabulary or the
+    // staging buffers overflow by ~5x on every verify batch.
+    if(next_tokens)W=std::max(W,cfg.vocab);
     const bool reuse=next_tokens&&M<=kSpecBatch&&dflash2.ok&&
         dflash2.verify_logits&&dflash2.verify_bf&&dflash2.verify_bf_out&&
         dflash2.verify_a8;
@@ -6420,6 +6448,22 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
                 phase0 = now;
             }
 
+            if (std::getenv("GRIMOIRE_DFLASH_DUMP")) {
+                static int vdump = 0;
+                if (vdump++ < 2) {
+                    // The committed token each step is verified[0]. If that is
+                    // wrong the target's batched verify forward is broken,
+                    // independent of draft quality.
+                    std::fprintf(stderr, "  verify@%d candidates:", saved_pos);
+                    for (size_t i = 0; i < candidates.size(); ++i)
+                        std::fprintf(stderr, " %d", candidates[i]);
+                    std::fprintf(stderr, "\n  verify@%d verified  :", saved_pos);
+                    for (size_t i = 0; i < verified.size(); ++i)
+                        std::fprintf(stderr, " %d", verified[i]);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
             int accepted = 1;
             for (; accepted < int(candidates.size()); ++accepted) {
                 ++attempted_drafts;
