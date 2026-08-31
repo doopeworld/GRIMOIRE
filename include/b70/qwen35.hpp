@@ -74,6 +74,10 @@ struct Qwen35Config {
     int dense_inter     = 0;      // dense variant FFN width
 
     std::vector<LayerKind> layer_types;
+    // Muse uses sliding RoPE attention for three layers followed by one
+    // full NoPE layer. Keep the checkpoint distinction; both map to the
+    // generic FULL_ATTN execution kind elsewhere.
+    std::vector<bool> muse_sliding_attention;
 
     bool is_moe() const { return n_experts > 0; }
 

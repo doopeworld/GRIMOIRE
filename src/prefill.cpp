@@ -243,6 +243,85 @@ sycl::event launch_rmsnorm_residual_batched(
     });
 }
 
+sycl::event launch_rmsnorm_residual_f16_batched(
+    sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
+    float* out, int tokens, int hidden, float eps,
+    const std::vector<sycl::event>& deps, float weight_offset) {
+    constexpr int WG=256;
+    return q.submit([&](sycl::handler& hd){
+        hd.depends_on(deps);
+        sycl::local_accessor<float,1> partial(WG/SG_SIZE,hd);
+        hd.parallel_for(sycl::nd_range<1>(size_t(tokens)*WG,WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int row=int(it.get_group(0));
+                const int lid=int(it.get_local_id(0));
+                const int lane=int(sg.get_local_id()[0]);
+                const int sgid=int(sg.get_group_id()[0]);
+                float* hr=h+int64_t(row)*hidden;
+                const float* rr=residual?residual+int64_t(row)*hidden:nullptr;
+                float* dst=out+int64_t(row)*hidden;
+                float ss=0.0f;
+                for(int i=lid;i<hidden;i+=WG){
+                    const float v=float(sycl::half(hr[i]+(rr?rr[i]:0.0f)));
+                    hr[i]=v;
+                    ss=sycl::fma(v,v,ss);
+                }
+                ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
+                float* p=partial.template get_multi_ptr<
+                    sycl::access::decorated::no>().get();
+                if(lane==0)p[sgid]=ss;
+                sycl::group_barrier(it.get_group());
+                float total=0.0f;
+                for(int i=0;i<WG/SG_SIZE;++i)total+=p[i];
+                const float scale=sycl::rsqrt(total/float(hidden)+eps);
+                for(int i=lid;i<hidden;i+=WG)
+                    dst[i]=float(sycl::half(hr[i]*scale*
+                        float(sycl::half(weight_offset+
+                            bf16_to_f32(weight[i])))));
+            });
+    });
+}
+
+sycl::event launch_rmsnorm_residual_f16w_batched(
+    sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
+    float* out, int tokens, int hidden, float eps,
+    const std::vector<sycl::event>& deps, float weight_offset) {
+    constexpr int WG=256;
+    return q.submit([&](sycl::handler& hd){
+        hd.depends_on(deps);
+        sycl::local_accessor<float,1> partial(WG/SG_SIZE,hd);
+        hd.parallel_for(sycl::nd_range<1>(size_t(tokens)*WG,WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int row=int(it.get_group(0));
+                const int lid=int(it.get_local_id(0));
+                const int lane=int(sg.get_local_id()[0]);
+                const int sgid=int(sg.get_group_id()[0]);
+                float* hr=h+int64_t(row)*hidden;
+                const float* rr=residual?residual+int64_t(row)*hidden:nullptr;
+                float* dst=out+int64_t(row)*hidden;
+                float ss=0.0f;
+                for(int i=lid;i<hidden;i+=WG){
+                    const float v=float(sycl::half(hr[i]+(rr?rr[i]:0.0f)));
+                    hr[i]=v;
+                    ss=sycl::fma(v,v,ss);
+                }
+                ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
+                float* p=partial.template get_multi_ptr<
+                    sycl::access::decorated::no>().get();
+                if(lane==0)p[sgid]=ss;
+                sycl::group_barrier(it.get_group());
+                float total=0.0f;
+                for(int i=0;i<WG/SG_SIZE;++i)total+=p[i];
+                const float scale=sycl::rsqrt(total/float(hidden)+eps);
+                for(int i=lid;i<hidden;i+=WG)
+                    dst[i]=float(sycl::half(hr[i]*scale*
+                        (weight_offset+float(weight[i]))));
+            });
+    });
+}
+
 sycl::event launch_rmsnorm_residual_batched_quant(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, sycl_bf16* out_bf,
@@ -491,6 +570,370 @@ sycl::event launch_kv_append_batched(
     });
 }
 
+sycl::event launch_f32_to_f16(sycl::queue& q, const float* src,
+    sycl::half* dst, size_t count, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(count),
+            [=](sycl::id<1> id) { dst[id[0]] = sycl::half(src[id[0]]); });
+    });
+}
+
+sycl::event launch_f16_to_f32(sycl::queue& q, const sycl::half* src,
+    float* dst, size_t count, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(count),
+            [=](sycl::id<1> id) { dst[id[0]] = float(src[id[0]]); });
+    });
+}
+
+sycl::event launch_qk_norm_rope_f16_batched(
+    sycl::queue& q, const float* q_src, const float* k_src, sycl::half* q_dst,
+    sycl::half* k_dst, const bf16_t* q_weight, const bf16_t* k_weight,
+    int tokens, int q_heads, int k_heads, int head_dim, int start_pos,
+    float theta, float eps, const std::vector<sycl::event>& deps,
+    bool use_rope, float query_scale, float weight_offset) {
+    const int heads_per_token = q_heads + k_heads;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens) * heads_per_token * SG_SIZE,
+                              SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int gh = int(it.get_group(0));
+                const int row = gh / heads_per_token;
+                const int packed_head = gh % heads_per_token;
+                const bool is_q = packed_head < q_heads;
+                const int head = is_q ? packed_head : packed_head - q_heads;
+                const float* src = is_q
+                    ? q_src + (int64_t(row) * q_heads + head) * head_dim
+                    : k_src + (int64_t(row) * k_heads + head) * head_dim;
+                sycl::half* dst = is_q
+                    ? q_dst + (int64_t(row) * q_heads + head) * head_dim
+                    : k_dst + (int64_t(row) * k_heads + head) * head_dim;
+                const bf16_t* weight = is_q ? q_weight : k_weight;
+
+                // vLLM's W4A16/F.linear result is FP16 before native RMSNorm.
+                // Round the projected value first, then accumulate variance in
+                // FP32 exactly as the native RMSNorm implementation does.
+                float sum_sq = 0.0f;
+                for (int d = lane; d < head_dim; d += SG_SIZE) {
+                    const float x = float(sycl::half(src[d]));
+                    sum_sq = sycl::fma(x, x, sum_sq);
+                }
+                sum_sq = sycl::reduce_over_group(sg, sum_sq, sycl::plus<float>());
+                const float scale = sycl::rsqrt(sum_sq / float(head_dim) + eps);
+                for (int d = lane; d < head_dim; d += SG_SIZE) {
+                    const float x = float(sycl::half(src[d]));
+                    const float w=weight_offset+bf16_to_f32(weight[d]);
+                    dst[d] = sycl::half(x * scale * w *
+                        (is_q?query_scale:1.0f));
+                }
+                sycl::group_barrier(sg);
+
+                // Muse uses NEOX half-split RoPE over the complete 128-wide
+                // head. RMSNorm output is FP16 before RoPE, and RoPE writes
+                // FP16 again.
+                if(!use_rope)return;
+                const int pos = start_pos + row;
+                for (int j = lane; j < head_dim / 2; j += SG_SIZE) {
+                    const float a = float(dst[j]);
+                    const float b = float(dst[j + head_dim / 2]);
+                    const float inv = sycl::exp(-float(2 * j) / float(head_dim)
+                                                * sycl::log(theta));
+                    const float angle = float(pos) * inv;
+                    const float cs = sycl::cos(angle), sn = sycl::sin(angle);
+                    dst[j] = sycl::half(a * cs - b * sn);
+                    dst[j + head_dim / 2] = sycl::half(a * sn + b * cs);
+                }
+            });
+    });
+}
+
+sycl::event launch_qkv_norm_rope_f16_fused(
+    sycl::queue& q, const sycl::half* qkv_src, sycl::half* q_dst,
+    sycl::half* k_dst, sycl::half* v_dst, const bf16_t* q_weight,
+    const bf16_t* k_weight, int tokens, int q_heads, int k_heads,
+    int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps, bool use_rope,
+    float query_scale, float weight_offset) {
+    const int q_width=q_heads*head_dim;
+    const int k_width=k_heads*head_dim;
+    const int row_width=q_width+2*k_width;
+    const int heads_per_token=q_heads+k_heads;
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens)*heads_per_token*SG_SIZE,SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int lane=int(sg.get_local_id()[0]);
+                const int gh=int(it.get_group(0));
+                const int row=gh/heads_per_token;
+                const int packed_head=gh%heads_per_token;
+                const bool is_q=packed_head<q_heads;
+                const int head=is_q?packed_head:packed_head-q_heads;
+                const int64_t src_base=int64_t(row)*row_width+
+                    (is_q?int64_t(head)*head_dim:
+                     int64_t(q_width)+int64_t(head)*head_dim);
+                const int64_t dst_base=(int64_t(row)*(is_q?q_heads:k_heads)+head)
+                    *head_dim;
+                sycl::half* dst=is_q?q_dst+dst_base:k_dst+dst_base;
+                const bf16_t* weight=is_q?q_weight:k_weight;
+                float sum_sq=0.0f;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float x=float(qkv_src[src_base+d]);
+                    sum_sq=sycl::fma(x,x,sum_sq);
+                }
+                sum_sq=sycl::reduce_over_group(sg,sum_sq,sycl::plus<float>());
+                const float scale=sycl::rsqrt(sum_sq/float(head_dim)+eps);
+                for(int d=lane;d<head_dim;d+=SG_SIZE)
+                    dst[d]=sycl::half(float(qkv_src[src_base+d])*scale*
+                        (weight_offset+bf16_to_f32(weight[d]))*
+                        (is_q?query_scale:1.0f));
+                sycl::group_barrier(sg);
+                if(!use_rope){
+                    if(!is_q){
+                        const int64_t v_src=int64_t(row)*row_width+q_width+
+                            k_width+int64_t(head)*head_dim;
+                        const int64_t v_dst_base=(int64_t(row)*k_heads+head)*
+                            head_dim;
+                        for(int d=lane;d<head_dim;d+=SG_SIZE)
+                            v_dst[v_dst_base+d]=qkv_src[v_src+d];
+                    }
+                    return;
+                }
+                const int pos=start_pos+row;
+                for(int j=lane;j<head_dim/2;j+=SG_SIZE){
+                    const float a=float(dst[j]);
+                    const float b=float(dst[j+head_dim/2]);
+                    const float inv=sycl::exp(-float(2*j)/float(head_dim)*
+                                              sycl::log(theta));
+                    const float angle=float(pos)*inv;
+                    const float cs=sycl::cos(angle),sn=sycl::sin(angle);
+                    dst[j]=sycl::half(a*cs-b*sn);
+                    dst[j+head_dim/2]=sycl::half(a*sn+b*cs);
+                }
+                if(!is_q){
+                    const int64_t v_src=int64_t(row)*row_width+q_width+k_width+
+                        int64_t(head)*head_dim;
+                    const int64_t v_dst_base=(int64_t(row)*k_heads+head)*head_dim;
+                    for(int d=lane;d<head_dim;d+=SG_SIZE)
+                        v_dst[v_dst_base+d]=qkv_src[v_src+d];
+                }
+            });
+    });
+}
+
+sycl::event launch_qkv_norm_rope_f16w_fused(
+    sycl::queue& q, const sycl::half* qkv_src, sycl::half* q_dst,
+    sycl::half* k_dst, sycl::half* v_dst, const sycl::half* q_weight,
+    const sycl::half* k_weight, int tokens, int q_heads, int k_heads,
+    int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps, bool use_rope,
+    float query_scale, float weight_offset) {
+    const int q_width=q_heads*head_dim;
+    const int k_width=k_heads*head_dim;
+    const int row_width=q_width+2*k_width;
+    const int heads_per_token=q_heads+k_heads;
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens)*heads_per_token*SG_SIZE,SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int lane=int(sg.get_local_id()[0]);
+                const int gh=int(it.get_group(0));
+                const int row=gh/heads_per_token;
+                const int packed_head=gh%heads_per_token;
+                const bool is_q=packed_head<q_heads;
+                const int head=is_q?packed_head:packed_head-q_heads;
+                const int64_t src_base=int64_t(row)*row_width+
+                    (is_q?int64_t(head)*head_dim:
+                     int64_t(q_width)+int64_t(head)*head_dim);
+                const int64_t dst_base=(int64_t(row)*(is_q?q_heads:k_heads)+head)
+                    *head_dim;
+                sycl::half* dst=is_q?q_dst+dst_base:k_dst+dst_base;
+                const sycl::half* weight=is_q?q_weight:k_weight;
+                float sum_sq=0.0f;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float x=float(qkv_src[src_base+d]);
+                    sum_sq=sycl::fma(x,x,sum_sq);
+                }
+                sum_sq=sycl::reduce_over_group(sg,sum_sq,sycl::plus<float>());
+                const float scale=sycl::rsqrt(sum_sq/float(head_dim)+eps);
+                for(int d=lane;d<head_dim;d+=SG_SIZE)
+                    dst[d]=sycl::half(float(qkv_src[src_base+d])*scale*
+                        (weight_offset+float(weight[d]))*
+                        (is_q?query_scale:1.0f));
+                sycl::group_barrier(sg);
+                if(!use_rope){
+                    if(!is_q){
+                        const int64_t v_src=int64_t(row)*row_width+q_width+
+                            k_width+int64_t(head)*head_dim;
+                        const int64_t v_dst_base=(int64_t(row)*k_heads+head)*
+                            head_dim;
+                        for(int d=lane;d<head_dim;d+=SG_SIZE)
+                            v_dst[v_dst_base+d]=qkv_src[v_src+d];
+                    }
+                    return;
+                }
+                const int pos=start_pos+row;
+                for(int j=lane;j<head_dim/2;j+=SG_SIZE){
+                    const float a=float(dst[j]);
+                    const float b=float(dst[j+head_dim/2]);
+                    const float inv=sycl::exp(-float(2*j)/float(head_dim)*
+                                              sycl::log(theta));
+                    const float angle=float(pos)*inv;
+                    const float cs=sycl::cos(angle),sn=sycl::sin(angle);
+                    dst[j]=sycl::half(a*cs-b*sn);
+                    dst[j+head_dim/2]=sycl::half(a*sn+b*cs);
+                }
+                if(!is_q){
+                    const int64_t v_src=int64_t(row)*row_width+q_width+k_width+
+                        int64_t(head)*head_dim;
+                    const int64_t v_dst_base=(int64_t(row)*k_heads+head)*head_dim;
+                    for(int d=lane;d<head_dim;d+=SG_SIZE)
+                        v_dst[v_dst_base+d]=qkv_src[v_src+d];
+                }
+            });
+    });
+}
+
+sycl::event launch_kv_append_f16_paged(
+    sycl::queue& q, const sycl::half* k, const sycl::half* v,
+    sycl::half* k_cache, sycl::half* v_cache, int tokens, int start_pos,
+    int n_kv_heads, int head_dim, int block_size,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(tokens) * n_kv_heads * head_dim),
+            [=](sycl::id<1> id) {
+                const int64_t z = int64_t(id[0]);
+                const int d = int(z % head_dim);
+                const int64_t th = z / head_dim;
+                const int kh = int(th % n_kv_heads);
+                const int row = int(th / n_kv_heads);
+                const int pos = start_pos + row;
+                const int block = pos / block_size;
+                const int offset = pos % block_size;
+                const int64_t src = (int64_t(row) * n_kv_heads + kh) * head_dim + d;
+                const int64_t dst = ((int64_t(block) * block_size + offset)
+                                     * n_kv_heads + kh) * head_dim + d;
+                k_cache[dst] = k[src];
+                v_cache[dst] = v[src];
+            });
+    });
+}
+
+sycl::event launch_dflash_context_kv_f16(
+    sycl::queue& q, const float* fused_kv, sycl::half* all_k,
+    sycl::half* all_v, const bf16_t* stacked_k_norm, int layers, int tokens,
+    int kv_heads, int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps) {
+    const int kv_width=kv_heads*head_dim;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(layers)*tokens*kv_heads*SG_SIZE,SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int lane=int(sg.get_local_id()[0]);
+                const int group=int(it.get_group(0));
+                const int kh=group%kv_heads;
+                const int tr=group/kv_heads;
+                const int row=tr%tokens;
+                const int layer=tr/tokens;
+                const int64_t fused_base=(int64_t(row)*layers*2+
+                    int64_t(layer)*2)*kv_width+int64_t(kh)*head_dim;
+                const int64_t out_base=(int64_t(layer)*tokens+row)*kv_width+
+                    int64_t(kh)*head_dim;
+                float sum_sq=0.0f;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float kval=float(sycl::half(fused_kv[fused_base+d]));
+                    sum_sq=sycl::fma(kval,kval,sum_sq);
+                    all_v[out_base+d]=sycl::half(
+                        fused_kv[fused_base+kv_width+d]);
+                }
+                sum_sq=sycl::reduce_over_group(sg,sum_sq,sycl::plus<float>());
+                const float scale=sycl::rsqrt(sum_sq/float(head_dim)+eps);
+                const bf16_t* weight=stacked_k_norm+int64_t(layer)*head_dim;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float kval=float(sycl::half(fused_kv[fused_base+d]));
+                    all_k[out_base+d]=sycl::half(
+                        kval*scale*bf16_to_f32(weight[d]));
+                }
+                sycl::group_barrier(sg);
+                const int pos=start_pos+row;
+                for(int j=lane;j<head_dim/2;j+=SG_SIZE){
+                    const float a=float(all_k[out_base+j]);
+                    const float b=float(all_k[out_base+j+head_dim/2]);
+                    const float inv=sycl::exp(-float(2*j)/float(head_dim)*
+                                              sycl::log(theta));
+                    const float angle=float(pos)*inv;
+                    const float cs=sycl::cos(angle),sn=sycl::sin(angle);
+                    all_k[out_base+j]=sycl::half(a*cs-b*sn);
+                    all_k[out_base+j+head_dim/2]=sycl::half(a*sn+b*cs);
+                }
+            });
+    });
+}
+
+sycl::event launch_dflash_context_kv_f16w(
+    sycl::queue& q, const float* fused_kv, sycl::half* all_k,
+    sycl::half* all_v, const sycl::half* stacked_k_norm, int layers, int tokens,
+    int kv_heads, int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps) {
+    const int kv_width=kv_heads*head_dim;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(layers)*tokens*kv_heads*SG_SIZE,SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int lane=int(sg.get_local_id()[0]);
+                const int group=int(it.get_group(0));
+                const int kh=group%kv_heads;
+                const int tr=group/kv_heads;
+                const int row=tr%tokens;
+                const int layer=tr/tokens;
+                const int64_t fused_base=(int64_t(row)*layers*2+
+                    int64_t(layer)*2)*kv_width+int64_t(kh)*head_dim;
+                const int64_t out_base=(int64_t(layer)*tokens+row)*kv_width+
+                    int64_t(kh)*head_dim;
+                float sum_sq=0.0f;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float kval=float(sycl::half(fused_kv[fused_base+d]));
+                    sum_sq=sycl::fma(kval,kval,sum_sq);
+                    all_v[out_base+d]=sycl::half(
+                        fused_kv[fused_base+kv_width+d]);
+                }
+                sum_sq=sycl::reduce_over_group(sg,sum_sq,sycl::plus<float>());
+                const float scale=sycl::rsqrt(sum_sq/float(head_dim)+eps);
+                const sycl::half* weight=stacked_k_norm+int64_t(layer)*head_dim;
+                for(int d=lane;d<head_dim;d+=SG_SIZE){
+                    const float kval=float(sycl::half(fused_kv[fused_base+d]));
+                    all_k[out_base+d]=sycl::half(kval*scale*float(weight[d]));
+                }
+                sycl::group_barrier(sg);
+                const int pos=start_pos+row;
+                for(int j=lane;j<head_dim/2;j+=SG_SIZE){
+                    const float a=float(all_k[out_base+j]);
+                    const float b=float(all_k[out_base+j+head_dim/2]);
+                    const float inv=sycl::exp(-float(2*j)/float(head_dim)*
+                                              sycl::log(theta));
+                    const float angle=float(pos)*inv;
+                    const float cs=sycl::cos(angle),sn=sycl::sin(angle);
+                    all_k[out_base+j]=sycl::half(a*cs-b*sn);
+                    all_k[out_base+j+head_dim/2]=sycl::half(a*sn+b*cs);
+                }
+            });
+    });
+}
+
 // Causal chunk-prefill attention. One work-group owns a 16-query tile for one
 // head. Its 16 subgroups each own one query, while all of them reuse the same
 // 16-key K/V tile staged in SLM. The former one-subgroup-per-query kernel read
@@ -668,6 +1111,19 @@ sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     });
 }
 
+sycl::event launch_embed_f16_batched(sycl::queue& q, const sycl::half* table,
+    const int32_t* tokens, float* out, int count, int hidden,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(count)*hidden), [=](sycl::id<1> id) {
+            const size_t i=id[0];
+            const int row=int(i/hidden), col=int(i%hidden);
+            out[i]=float(table[int64_t(tokens[row])*hidden+col]);
+        });
+    });
+}
+
 sycl::event launch_split_deltanet_qkv_batched(sycl::queue& q, const float* src,
     float* qv, float* kv, float* vv, int tokens, int qk_size, int v_size,
     const std::vector<sycl::event>& deps) {
@@ -806,6 +1262,21 @@ sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
 
 // SwiGLU over SEPARATE gate and up buffers, for the BesTLA prefill path (BesTLA has
 // no fused 2*inter weight, so it produces gate and up as two [M,inter] results).
+sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
+    float* out, int tokens, int inter,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(tokens)*inter),[=](sycl::id<1> id){
+            const int64_t z=id[0];
+            const int row=int(z/inter),d=int(z%inter);
+            const float gate=float(sycl::half(gu[int64_t(row)*2*inter+d]));
+            const float up=float(sycl::half(
+                gu[int64_t(row)*2*inter+inter+d]));
+            out[z]=float(sycl::half((gate/(1.0f+sycl::exp(-gate)))*up));
+        });
+    });
+}
+
 sycl::event launch_swiglu_bf16_split(sycl::queue& q, const sycl_bf16* gate,
     const sycl_bf16* up, sycl_bf16* out, int tokens, int inter,
     const std::vector<sycl::event>& deps) {
@@ -927,7 +1398,9 @@ sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
             const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
             if(d<hidden) {
                 const int64_t i=int64_t(t)*hidden+d;
-                x[i]*=1.0f/(1.0f+sycl::exp(-gate[i]));
+                const float xv=float(sycl::half(x[i]));
+                const float gv=float(sycl::half(gate[i]));
+                x[i]=float(sycl::half(xv/(1.0f+sycl::exp(-gv))));
             }
         });
     });

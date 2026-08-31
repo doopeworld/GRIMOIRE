@@ -120,6 +120,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
 
     // ---- layer_types -------------------------------------------------
     cfg.layer_types.assign(cfg.n_layers, LayerKind::FULL_ATTN);
+    cfg.muse_sliding_attention.assign(cfg.n_layers, false);
     {
         const size_t p = j.find("\"layer_types\"");
         if (p != std::string::npos) {
@@ -134,8 +135,11 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     const size_t e = arr.find('"', s + 1);
                     if (e == std::string::npos) break;
                     const std::string v = arr.substr(s + 1, e - s - 1);
-                    cfg.layer_types[i++] = (v == "linear_attention")
-                                         ? LayerKind::LINEAR_ATTN : LayerKind::FULL_ATTN;
+                    cfg.layer_types[i] = (v == "linear_attention")
+                                      ? LayerKind::LINEAR_ATTN : LayerKind::FULL_ATTN;
+                    cfg.muse_sliding_attention[i] =
+                        (v == "sliding_attention");
+                    ++i;
                     q = e + 1;
                 }
             }
