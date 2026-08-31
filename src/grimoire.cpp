@@ -5065,10 +5065,11 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     if(!exact_attn){cleanup();return false;}
     const int32_t cuq[2]={0,M};
     q.memcpy(dflash2.cu_q,cuq,sizeof(cuq)).wait();
-    auto mm_w4_f16=[&](const DevQuant& w,const sycl::half* x)->sycl::half*{
+    auto mm_w4_f16=[&](const DevQuant& w,const sycl::half* x,
+                       sycl::half* dst=nullptr)->sycl::half*{
         if(!od||!muse_od_zp||!w.od_w4||!w.payload||!w.od_scales_fp16)
             throw std::runtime_error("Muse target W4A16 parity path unavailable");
-        auto* yh=reinterpret_cast<sycl::half*>(yb);
+        auto* yh=dst?dst:reinterpret_cast<sycl::half*>(yb);
         const sycl::half* xh=x;   // activations are already FP16
         auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
             [&](const OneDnnPlan& p){
@@ -5119,15 +5120,16 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     auto mm=[&](const DevQuant& w,const sycl::half* x,sycl::half* y){
         if(w.fp16){
             sycl::half* yh=mm_f16_raw(w,x);
-            q.memcpy(y,yh,size_t(M)*w.w.N*sizeof(sycl::half));
+            if(yh!=y)q.memcpy(y,yh,size_t(M)*w.w.N*sizeof(sycl::half));
             return;
         }
         // Match vLLM XPU's Muse compressed-INT4 dispatch exactly: FP16
         // activations/scales through oneDNN W4A16, with plans cached by shape.
         if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales_fp16){
-            sycl::half* yh=mm_w4_f16(w,x);
-            q.memcpy(y,yh,size_t(M)*w.w.N*sizeof(sycl::half));
-            mt_mark("  w4 copy-out");
+            // Write the GEMM result straight into the destination; the shared
+            // yb scratch would cost a full extra pass over the output (293 MB
+            // per layer for gate_up alone).
+            mm_w4_f16(w,x,y);
             return;
         }
         throw std::runtime_error(
