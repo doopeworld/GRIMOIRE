@@ -2643,8 +2643,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 dflash2.attn_f16=df16(size_t(DM)*DQ);
                 const int linear_in_width=std::max(DH,
                     int(dflash2.target_layers.size())*DH);
+                // The shared lm_head runs through this same FP16 linear, so
+                // the destination must hold a full vocab-wide row. Sizing this
+                // from the drafter's own projections alone overflows the
+                // buffer by ~5x at the draft-logits step: the first rows land
+                // in valid memory and every later row reads back inf/nan,
+                // which collapses draft acceptance to zero with no error.
                 const int linear_out_width=std::max({DH,DQ,DKV,DI2,
-                    int(dflash2.layers.size())*2*DKV});
+                    int(dflash2.layers.size())*2*DKV,cfg.vocab});
                 dflash2.linear_in_f16=df16(size_t(DM)*linear_in_width);
                 dflash2.linear_out_f16=df16(size_t(DM)*linear_out_width);
                 dflash2.block_table=sycl::malloc_device<int32_t>(dflash2.num_blocks,q);
