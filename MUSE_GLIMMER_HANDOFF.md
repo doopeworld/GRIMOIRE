@@ -1,51 +1,93 @@
 # Muse Glimmer / DFlash handoff
 
-Branch: `pp-muse`
+Branch: `pp-muse`. Speculative decoding WORKS as of 2026-08-31.
 
-## Runtime reference
+## Current measured state
 
-- Tower: `root@192.168.8.225`
-- Fusion reference: container `VLLM-XPU-FUSION`, image `my-vllm-xpu:latest`
-- Fusion runs on GPU1 (`ZE_AFFINITY_MASK=1`) at port 3559. Do not modify or restart it.
-- Grimoire tests run on GPU0 (`/dev/dri/renderD129`).
-- Target: `/models/Muse-Glimmer-30B-INT4-W4A16`
-- Assistant: `/models/Muse-Glimmer-assistant`, DFlash K=15
-- Fusion version: vLLM `0.28.1.dev8+ga4f0b85eb.d20260831`, V2 runner enabled.
+| prompt | accepts | committed/step | decode | prefill |
+|---|---|---|---|---|
+| 64 tok | 9/11 (82%) | 5.50 | 55.5 tok/s | 363.8 tok/s |
+| 3672 tok | 18/64 (28%) | 1.39 | 20.3 tok/s | 1384.5 tok/s |
 
-## Confirmed Fusion semantics copied into Grimoire
+Was 0/8 accepts, 1.00 committed/step, 16.8 tok/s before this session.
+Verifier now reproduces Fusion's token stream exactly: verify@64 emits
+19669 200023 10064 262 ... against Fusion's OUTPUT TOKENS
+328 19669 200023 10064 262 2818 17001 1509.
 
-- Harmony prompt tokenization matches 64/64 token IDs.
-- DFlash uses one bonus token plus 15 mask tokens, mask ID 201818.
-- Query positions are `[last_valid_position + 1, ..., +16]`; sampling uses the 15 mask rows.
-- Target auxiliary source IDs are `[1, 13, 25, 37, 49]`, captured after target layers `[1, 13, 25, 37, 49]` as Fusion reports layers `(2, 14, 26, 38, 50)`.
-- Assistant uses five non-causal sliding layers, window 2048, block size 64, NeoX RoPE, theta 500000.
-- Assistant parameters and shared target embedding/lm-head run as FP16.
-- Fusion's `F.linear` oneDNN trace is FP16 src/weights/dst with `ab`/`ba`/`ab` descriptors and user scratchpad; it has no explicit FP16 fast-math attribute. The extra Grimoire attribute was removed.
-- Muse RMSNorm adds the weight offset in FP32 and casts only the final result. Grimoire's premature FP16 cast was removed.
+vLLM baseline for reference is ~2016 tok/s prefill on one B70, so Grimoire
+prefill is at ~69% of vLLM.
 
-## Current measured state (not a successful result)
+## Fixed this session (all confirmed by measurement)
 
-Identical 64-token prompt: `Write a haiku about the ocean.`
+1. `linear_out_f16` undersized in the drafter (bd2422f). The shared lm_head
+   wrote 15*202048 halves into a 16*39936 buffer. Draft logits were inf/nan on
+   10 of 15 rows.
+2. `page_stride_elements` passed in ELEMENTS, not sequence positions
+   (0f93472). vLLM computes it as key_cache.stride(0)/key_cache.stride(1) =
+   block_size. Grimoire passed block_size*kv_heads*head_dim, inflating every
+   page address by 1024x, so page 0 read correctly and every later page
+   returned zeros. This broke the TARGET as well as the drafter: with it, the
+   target generated garbage past position 64; without the drafter loaded the
+   target took the sequential path and looked fine, which masked it.
+3. `VW` / `W` undersized in the verify path (87c673e). Same class as (1):
+   prefill_muse projects the shared lm_head through xb/yb, whose widths
+   enumerate only the layer projections. 16*202048 halves into 16*39936 - a
+   5.06x overrun smashing ~5.2 MB of device memory every verify step. THIS was
+   the 0/8 cause.
+4. Stale `cu_q` (prefill_muse left {0,64}, draft needs {0,M}) plus four memcpys
+   sourcing host stack values into async device copies. Real UB, verified NOT
+   causal for 0/8. Kept as hygiene.
 
-- Fusion first 8 tokens: ` to`, `=self`, `<|message|>`, `Write`, ` a`, ` ha`, `iku`, ` about`.
-- Grimoire after the latest two parity corrections: ` to shakes shakes shakes shakes sää smell smell`.
-- Both produce the same first target-prefill token (` to`). The first demonstrated divergence is token 2, inside the initial DFlash proposal/verification cycle.
-- Grimoire check: 8 tokens, 17.0 tok/s, 0/8 draft accepts. This is invalid for performance evaluation.
-- Prior 64-token check before the oneDNN descriptor correction: 16.9 tok/s, 0/8 accepts. The descriptor correction changed draft output but did not restore parity.
-- GPU0 is idle after each exited test. GPU1 Fusion remains running.
+## Known-open
 
-## Required next step
+- **Acceptance collapses with context length: 82% at 64 tokens, 28% at 3672.**
+  Prime suspect is the draft sliding window. Grimoire passes
+  window_left = window_right = 2047 for the draft layers; at 64 tokens the
+  window never binds, at 3672 it does. Same shape as every bug above: correct
+  below a boundary, wrong above it. THIS IS THE NEXT THING TO FIX.
+- `k_norm` bug-compatibility is in but NOT A/B tested. vLLM stacks
+  `_k_norm_weights` as [num_layers, head_dim] and hands it to ops.rms_norm,
+  whose weight must be [head_dim], so the kernel applies layer 0's weight to
+  all five layers despite its comment claiming per-layer selection. Verified by
+  recovering the effective weight from Fusion's own pre-RoPE context K:
+  identical across layers (pairwise cos 1.0000, rms 1.08547) and equal to
+  layers.0.self_attn.k_norm.weight, while the checkpoint's five k_norm tensors
+  genuinely differ (rms 1.085, 1.349, 0.895, 1.381, 0.955). Revert and re-measure
+  now that the verifier is correct; it may be unnecessary.
+- Target aux states still differ from Fusion at rel_l2 0.032 (cos 0.99947).
+  That is INT4 target numerics and bounds achievable acceptance.
+- llama-benchy (`--pp 4096`) cannot drive Grimoire: it needs an
+  OpenAI-compatible HTTP endpoint and Grimoire is CLI-only. A single-stream
+  /v1/chat/completions wrapper around grimoire_generate would make Grimoire and
+  Fusion benchmarkable with the identical tool.
 
-Do not run another full benchmark or tune parameters. Instrument a temporary Fusion clone on GPU0 and Grimoire to dump the first DFlash-cycle tensors, then compare in this order:
+## Lesson
 
-1. concatenated target auxiliary states `[64, 5 * 6656]`;
-2. `fc` output and hidden RMSNorm output;
-3. fused context K/V projection, K norm, and RoPE output;
-4. bonus/mask embeddings;
-5. each assistant layer's input norm, Q/K/V, attention output, residual, and MLP output;
-6. final norm and 15 draft logits/argmax IDs.
+All four bugs were width/stride errors that only manifest past a boundary -
+page 0, or a buffer sized for layer widths rather than vocab. A 64-token prompt
+hid every one of them. Test at the size you benchmark at.
 
-Patch only the first unequal stage. The active Fusion source is under `/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/spec_decode/dflash/` and `/opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py`.
+## Tooling built this session
+
+- `GRIMOIRE_DFLASH_DUMP=<dir>` dumps the first DFlash cycle's tensors as raw f32
+  (`g_*.f32`) and prints the first two verify steps' candidate/verified vectors.
+- `tools/fusion_dump.py` mirrors those dump points into Fusion (`f_*.f32`),
+  plus slot mappings and per-layer context K/V. Needs `ENFORCE_EAGER=1` only for
+  in-model tensor capture; everything else runs graph-enabled.
+- `tools/compare_dumps.py` pairs `g_*`/`f_*` and reports the first divergent
+  stage.
+- `tools/fusion_verify_ref.py` runs Fusion's target over Grimoire's exact
+  candidate sequence and reports its argmax per position - ground truth for
+  `verified[]`.
+
+## Runtime
+
+- Tower `root@192.168.8.225`. Fusion on GPU1 = 35:00.0 = renderD130, port 3559.
+- Grimoire on the free B70 = 03:00.0. **Render node numbers change on reboot** -
+  resolve by PCI via `/dev/dri/by-path`. A run on the iGPU loads fine then dies
+  with "No kernel named ... was found"; check the device line says 256 EUs /
+  31.9 GiB.
+- Never use `enforce_eager` for performance numbers.
 
 ## Build
 
@@ -55,12 +97,13 @@ docker run --rm --entrypoint bash \
   my-vllm-xpu:latest -lc 'bash build_b70.sh'
 ```
 
-Build only the oneDNN bridge:
+Attention bridge only (needs the kernel sources mounted at /src):
 
 ```bash
-docker run --rm --entrypoint bash -e GRIMOIRE_BRIDGE_ONLY=onednn \
-  -v /mnt/storage/isos/grimoire-fuse:/grimoire -w /grimoire \
-  my-vllm-xpu:latest -lc 'bash tools/build_bridges_b70.sh /grimoire'
+docker run --rm --entrypoint bash -e GRIMOIRE_BRIDGE_ONLY=attention \
+  -v /mnt/storage/isos/grimoire-fuse:/grimoire \
+  -v /mnt/user/appdata/vllm-xpu-kernels:/src \
+  -w /grimoire my-vllm-xpu:latest -lc 'bash tools/build_bridges_b70.sh /grimoire'
 ```
 
-Keep image `my-vllm-xpu:latest` (ID `a5044994417a`). It contains the working Fusion reference and the compiler/runtime used for Grimoire builds.
+Keep image `my-vllm-xpu:latest`.
