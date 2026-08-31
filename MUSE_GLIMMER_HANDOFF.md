@@ -2,6 +2,50 @@
 
 Branch: `pp-muse`. Speculative decoding WORKS as of 2026-08-31.
 
+## PREFILL: the GEMMs are NOT the gap (settled 2026-08-31, do not re-derive)
+
+Ran the exact five Muse projection shapes at M=3672 through Fusion's own op
+(torch.ops._xpu_C.int4_gemm_w4a16) and compared against Grimoire's split
+profile, summed over 52 layers:
+
+    Grimoire pure oneDNN GEMM : 1345.5 ms
+    Fusion   pure oneDNN GEMM : 1309.4 ms   <- within 3%
+
+Both are the same dnnl::matmul with the same configuration, verified at source
+level: vLLM's trans_type_t::nt gives wei_strides = {1, ldb} with
+ldb = mat2.strides()[last]*8 = K, identical to Grimoire's
+memory::desc wei({k,n}, u4, dims{1,k}); same scales mask 3 with {group_size,1},
+same s8 zero-points mask 0, same fpmath_mode::f16(true), same
+scratchpad_mode::user. See vllm-xpu-kernels csrc/xpu/onednn/int4_gemm_w4a16.h
+and onednn_ext.h.
+
+**Do not spend time tuning the GEMMs or the oneDNN descriptors.** The gap is:
+
+    Fusion  : 1702 total - 1309 GEMM =  393 ms non-GEMM
+    Grimoire: 2412 total - 1345 GEMM = 1067 ms non-GEMM   <- ~670 ms excess
+
+Grimoire dispatches ~11 kernels per layer x 52 layers with no overlap:
+in_norm, qkv GEMM, qkv-norm-rope, o_gate GEMM, kv-append, attention, attn copy,
+gate-sigmoid-mul, o_proj GEMM, post_norm, add, pre_ff_norm, gate_up GEMM,
+swiglu, down GEMM, post_ff_norm, add. vLLM fuses most of that elementwise work
+into its compiled graph. **The remaining lever is kernel fusion and dispatch
+count.** Candidates: merge post_norm+add into one pass, fold swiglu into the
+gate_up epilogue, fold gate-sigmoid-mul into the attention epilogue.
+
+Prefill progress this session, all correctness-verified (output stays
+byte-identical to Fusion's " to=selfWrite a haiku about"):
+
+| build | prefill 3672 tok | tok/s | vs Fusion |
+|---|---|---|---|
+| session start | 2676 ms | 1372 | 65% |
+| FP16 activations (a3ac518) | 2470 ms | 1486 | 70% |
+| GEMM direct-to-dst (d13d8d7) | 2412 ms | 1523 | 72% |
+
+Fusion reference: 1702.5 ms / 2129.3 tok/s, measured against the live server on
+GPU1 with a UNIQUE PREFIX PER REQUEST. Without cache-busting the server returns
+a cached prefill and reports ~28,000 tok/s, which is meaningless. That number
+matches llama-benchy pp4096 (2144 +/- 28), so the method is sound.
+
 ## Current measured state (llama-benchy-comparable, 3 runs each)
 
 | test | Fusion (llama-benchy) | Grimoire | ratio |
@@ -41,6 +85,19 @@ wrong once already this session.
 4. Stale `cu_q` (prefill_muse left {0,64}, draft needs {0,M}) plus four memcpys
    sourcing host stack values into async device copies. Real UB, verified NOT
    causal for 0/8. Kept as hygiene.
+
+## Profiling notes
+
+- `GRIMOIRE_MUSE_TIME_LAYER=all` (and `=<n>`) profiles prefill_muse per stage.
+  It drains the queue at each mark, so it INFLATES small frequently-called
+  stages: it attributed 546 ms to the fp32<->fp16 conversions but removing them
+  recovered only ~230 ms. Use it for RANKING stages, not absolute cost.
+- Any Grimoire Muse run WITHOUT GRIMOIRE_DFLASH_MODEL silently takes the
+  sequential prefill fallback (exact_attn is false without the dflash2 buffers)
+  and is 10x slower. It is not representative of anything. Watch for
+  "batched prefill unavailable, using sequential fallback".
+- Never time Grimoire while another container holds GPU0. Fusion on GPU1 is
+  fine and does not contend.
 
 ## Retracted this session - read before re-deriving
 
