@@ -808,6 +808,25 @@ DevQuant upload_f16_t(sycl::queue& q,const Qwen35Model& ck,const TensorRef& r,
     return d;
 }
 
+sycl::half* upload_f16_vector_t(sycl::queue& q,const Qwen35Model& ck,
+                                const TensorRef& r,const char* what,bool* ok){
+    if(!r.ok()){
+        std::printf("\n  invalid FP16 tensor: %s\n",what);*ok=false;return nullptr;
+    }
+    const size_t count=size_t(r.t.numel());
+    std::vector<float> f32(count);
+    std::string err;
+    if(!ck.shards[r.shard]->read_f32(r.t,f32.data(),err)){
+        std::printf("\n  conversion failed for %s: %s\n",what,err.c_str());
+        *ok=false;return nullptr;
+    }
+    std::vector<sycl::half> h(count);
+    for(size_t i=0;i<count;++i)h[i]=sycl::half(f32[i]);
+    sycl::half* d=dev_copy<sycl::half>(q,h.data(),h.size()*sizeof(sycl::half));
+    if(!d)*ok=false;
+    return d;
+}
+
 DevQuant concat_upload_many_f16_t(sycl::queue& q,const Qwen35Model& ck,
                                   const std::vector<TensorRef>& refs,
                                   const char* what,bool* ok){
@@ -1327,6 +1346,8 @@ struct Grimoire {
         DevQuant q_proj, k_proj, v_proj, qkv_proj, o_proj;
         bf16_t  *q_norm = nullptr, *k_norm = nullptr;
         bf16_t  *pre_ff_norm = nullptr, *post_ff_norm = nullptr;  // Muse sandwich
+        sycl::half *in_norm_f16=nullptr, *post_norm_f16=nullptr;
+        sycl::half *pre_ff_norm_f16=nullptr, *post_ff_norm_f16=nullptr;
         DevQuant o_gate;                                          // Muse attn output gate
         DevQuant sh_gate, sh_up, sh_down;
         DevQuant sh_gate_q;                          // shared_expert_gate [1][H]
@@ -1385,6 +1406,7 @@ struct Grimoire {
 
     bf16_t*  embed = nullptr;
     bf16_t*  fnorm = nullptr;
+    sycl::half* fnorm_f16 = nullptr;
     DevQuant lm_head;
 
     // ---- MTP (multi-token prediction) head ------------------------
@@ -1425,6 +1447,8 @@ struct Grimoire {
             DevQuant attn_conv_proj, mlp_conv_proj;
             bf16_t *in_norm=nullptr, *post_norm=nullptr;
             bf16_t *q_norm=nullptr, *k_norm=nullptr;
+            sycl::half *in_norm_f16=nullptr, *post_norm_f16=nullptr;
+            sycl::half *q_norm_f16=nullptr, *k_norm_f16=nullptr;
             bf16_t *attn_conv_base=nullptr, *mlp_conv_base=nullptr;
             uint8_t *k_cache=nullptr, *v_cache=nullptr;
             sycl::half *k_cache_f16=nullptr, *v_cache_f16=nullptr;
@@ -1433,7 +1457,9 @@ struct Grimoire {
         bool ok=false, v2=false;
         DevQuant fc, selector_hidden;
         DevQuant fused_context_kv;
+        DevQuant shared_embed_f16, shared_lm_head_f16;
         bf16_t *hidden_norm=nullptr, *norm=nullptr;
+        sycl::half *hidden_norm_f16=nullptr, *norm_f16=nullptr;
         bf16_t *predecessor=nullptr, *successor=nullptr;
         // Token-major [max_seq,n_taps,H]. The draft fc consumes one
         // contiguous concatenated target-feature row per verified token.
@@ -1447,9 +1473,9 @@ struct Grimoire {
         sycl::half *q_f16=nullptr, *k_f16=nullptr, *v_f16=nullptr;
         sycl::half *attn_f16=nullptr;
         sycl::half *linear_in_f16=nullptr, *linear_out_f16=nullptr;
-        sycl::half *draft_logits_f16=nullptr;
         sycl::half *context_k_all_f16=nullptr, *context_v_all_f16=nullptr;
         bf16_t *k_norm_all=nullptr;
+        sycl::half *k_norm_all_f16=nullptr;
         sycl_bf16 *bf=nullptr;
         int8_t *a8=nullptr;
         float *a8s=nullptr;
@@ -1466,6 +1492,9 @@ struct Grimoire {
         int context_pos=0;
         int hidden=0, inter=0, q_heads=0, kv_heads=0, head_dim=0;
         int mask_token=0, sliding_window=0;
+        // Fusion resolves the XPU FlashAttention kernel block size from the
+        // live KV-cache group. With --block-size 64 and MultipleOf(16)
+        // backend support, both target and DFlash drafter use 64 here.
         int block_size=64, num_blocks=0;
         float rope_theta=0.0f;
         std::vector<Layer> layers;
@@ -1830,15 +1859,24 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::printf("  final_norm    ... ");
     std::fflush(stdout);
     fnorm = dev_copy_t<bf16_t>(q, ck, ck.final_norm, "model.norm.weight", &ok);
+    if(cfg.is_muse)
+        fnorm_f16=upload_f16_vector_t(q,ck,ck.final_norm,
+                                      "model.norm.weight.fp16",&ok);
     if (!ok) { err = "final_norm upload failed"; return false; }
     std::printf("ok\n");
 
     // ---- lm_head: the single biggest bf16 tensor ----------------------
-    std::printf("  lm_head       quantizing to %s ... ", fmt_name(opt.lm_head_fmt));
+    // compressed-tensors explicitly excludes Muse's untied lm_head.  vLLM
+    // therefore executes the checkpoint BF16 tensor even though the decoder
+    // Linear layers are W4A16.  Do not let --proj int4 requantize this head.
+    const bool preserve_muse_lm_head = cfg.is_muse;
+    std::printf("  lm_head       %s ... ", preserve_muse_lm_head
+        ? "preserving checkpoint bf16" : fmt_name(opt.lm_head_fmt));
     std::fflush(stdout);
     if (ck.lm_head.ok() && ck.lm_head.t.shape.size() == 2) {
         const int V = int(ck.lm_head.t.shape[0]);
-        if (opt.quantize_lm_head && opt.lm_head_fmt != Fmt::BF16) {
+        if (!preserve_muse_lm_head && opt.quantize_lm_head &&
+            opt.lm_head_fmt != Fmt::BF16) {
             lm_head = quantize_upload_t(q, ck, ck.lm_head, opt.lm_head_fmt, "lm_head", &ok);
             acct(size_t(double(V) * H * bits_per_elem(opt.lm_head_fmt) / 8.0));
         } else {
@@ -1865,7 +1903,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     pipe_split, pipe_split, cfg.n_layers);
     }
     L.resize(cfg.n_layers);
-    const Fmt PF = opt.lm_head_fmt;      // same format for projections
+    // Muse decoder projections remain checkpoint INT4-W4A16 while its
+    // excluded lm_head stays BF16; these formats are intentionally distinct.
+    const Fmt PF = cfg.is_muse ? Fmt::INT4 : opt.lm_head_fmt;
 
     for (int i = 0; i < cfg.n_layers; ++i) {
         const Qwen35Layer& src = ck.layers[i];
@@ -1883,6 +1923,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
         d.in_norm   = dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok);
         d.post_norm = dev_copy_t<bf16_t>(lq, ck, src.post_attn_norm, "post_attention_layernorm", &ok);
+        if(cfg.is_muse){
+            d.in_norm_f16=upload_f16_vector_t(lq,ck,src.input_norm,
+                                               "input_layernorm.fp16",&ok);
+            d.post_norm_f16=upload_f16_vector_t(lq,ck,src.post_attn_norm,
+                                                 "post_attention_layernorm.fp16",&ok);
+        }
 
         if (d.kind == LayerKind::LINEAR_ATTN) {
             // The three big ones. 67 MB/layer in bf16 -> ~18 MB at int4.
@@ -1935,6 +1981,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             if (cfg.is_muse) {
                 d.pre_ff_norm  = dev_copy_t<bf16_t>(lq, ck, src.pre_ff_norm,  "mlp.pre_ff_norm",  &ok);
                 d.post_ff_norm = dev_copy_t<bf16_t>(lq, ck, src.post_ff_norm, "mlp.post_ff_norm", &ok);
+                d.pre_ff_norm_f16=upload_f16_vector_t(lq,ck,src.pre_ff_norm,
+                                                       "mlp.pre_ff_norm.fp16",&ok);
+                d.post_ff_norm_f16=upload_f16_vector_t(lq,ck,src.post_ff_norm,
+                                                        "mlp.post_ff_norm.fp16",&ok);
                 if (src.attn_gate.ok())
                     d.o_gate = quantize_upload_t(lq, ck, src.attn_gate, PF, "self_attn.gate_proj", &ok);
             }
@@ -1947,6 +1997,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.v_cache = sycl::malloc_device<uint8_t>(size_t(cfg.n_kv_heads) * max_seq * cfg.head_dim, lq);
             acct(2 * size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq);
             if(cfg.is_muse){
+                // Match Fusion's XPU FlashAttention KV-cache group.
                 constexpr int block_size=64;
                 const int blocks=(max_seq+block_size-1)/block_size;
                 const size_t elems=size_t(blocks)*block_size*cfg.n_kv_heads*
@@ -2403,6 +2454,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.mask_token=201818;
             dflash2.rope_theta=500000.0f;
             dflash2.sliding_window=2048;
+            dflash2.shared_embed_f16=upload_f16_t(
+                q,ck,ck.embed,"dflash2.shared_embed",&dok);
+            dflash2.shared_lm_head_f16=upload_f16_t(
+                q,ck,ck.lm_head,"dflash2.shared_lm_head",&dok);
+            db+=dflash2.shared_embed_f16.w.bytes();
+            db+=dflash2.shared_lm_head_f16.w.bytes();
         }else{
             dflash2.layers.resize(6);
             dflash2.target_layers={1,6,11,16,22,27,32,37};
@@ -2425,12 +2482,23 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             TensorRef r=dr(n);bf16_t* p=dev_copy_t<bf16_t>(q,dc,r,what,&dok);
             if(r.ok())db+=size_t(r.t.numel())*sizeof(bf16_t);return p;
         };
+        auto hload=[&](const std::string& n,const char* what){
+            TensorRef r=dr(n);
+            sycl::half* p=upload_f16_vector_t(q,dc,r,what,&dok);
+            if(r.ok())db+=size_t(r.t.numel())*sizeof(sycl::half);
+            return p;
+        };
         const char* fc_name=dr("encoder.fc.weight").ok()?"encoder.fc.weight":"fc.weight";
         const char* hn_name=dr("encoder.output_norm_enc.weight").ok()?
                             "encoder.output_norm_enc.weight":"hidden_norm.weight";
         dflash2.fc=qload(fc_name,"dflash.fc");
-        dflash2.hidden_norm=bload(hn_name,"dflash.hidden_norm");
-        dflash2.norm=bload("norm.weight","dflash2.norm");
+        if(cfg.is_muse){
+            dflash2.hidden_norm_f16=hload(hn_name,"dflash.hidden_norm");
+            dflash2.norm_f16=hload("norm.weight","dflash2.norm");
+        }else{
+            dflash2.hidden_norm=bload(hn_name,"dflash.hidden_norm");
+            dflash2.norm=bload("norm.weight","dflash2.norm");
+        }
         if(dflash2.v2){
             dflash2.selector_hidden=qload(
                 "candidate_selector.hidden_projection.weight","dflash2.selector_hidden");
@@ -2444,10 +2512,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         for(size_t i=0;i<dflash2.layers.size();++i){
             auto& d=dflash2.layers[size_t(i)];
             const std::string p="layers."+std::to_string(i)+".";
-            d.in_norm=bload(p+"input_layernorm.weight","dflash2.input_norm");
-            d.post_norm=bload(p+"post_attention_layernorm.weight","dflash2.post_norm");
-            d.q_norm=bload(p+"self_attn.q_norm.weight","dflash2.q_norm");
-            d.k_norm=bload(p+"self_attn.k_norm.weight","dflash2.k_norm");
+            if(cfg.is_muse){
+                d.in_norm_f16=hload(p+"input_layernorm.weight","dflash2.input_norm");
+                d.post_norm_f16=hload(p+"post_attention_layernorm.weight","dflash2.post_norm");
+                d.q_norm_f16=hload(p+"self_attn.q_norm.weight","dflash2.q_norm");
+                d.k_norm_f16=hload(p+"self_attn.k_norm.weight","dflash2.k_norm");
+            }else{
+                d.in_norm=bload(p+"input_layernorm.weight","dflash2.input_norm");
+                d.post_norm=bload(p+"post_attention_layernorm.weight","dflash2.post_norm");
+                d.q_norm=bload(p+"self_attn.q_norm.weight","dflash2.q_norm");
+                d.k_norm=bload(p+"self_attn.k_norm.weight","dflash2.k_norm");
+            }
             if(cfg.is_muse){
                 std::vector<TensorRef> qkv={dr(p+"self_attn.q_proj.weight"),
                     dr(p+"self_attn.k_proj.weight"),
@@ -2509,15 +2584,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.fused_context_kv=concat_upload_many_f16_t(
                 q,dc,fused_refs,"dflash2.fused_context_kv",&dok);
             db+=dflash2.fused_context_kv.w.bytes();
-            dflash2.k_norm_all=sycl::malloc_device<bf16_t>(
+            dflash2.k_norm_all_f16=sycl::malloc_device<sycl::half>(
                 dflash2.layers.size()*dflash2.head_dim,q);
-            if(!dflash2.k_norm_all)dok=false;
+            if(!dflash2.k_norm_all_f16)dok=false;
             else{
                 for(size_t i=0;i<dflash2.layers.size();++i)
-                    q.memcpy(dflash2.k_norm_all+i*dflash2.head_dim,
-                        dflash2.layers[i].k_norm,
-                        size_t(dflash2.head_dim)*sizeof(bf16_t));
-                db+=dflash2.layers.size()*dflash2.head_dim*sizeof(bf16_t);
+                    q.memcpy(dflash2.k_norm_all_f16+i*dflash2.head_dim,
+                        dflash2.layers[i].k_norm_f16,
+                        size_t(dflash2.head_dim)*sizeof(sycl::half));
+                db+=dflash2.layers.size()*dflash2.head_dim*sizeof(sycl::half);
             }
         }
         dflash2.target_aux=sycl::malloc_device<float>(
@@ -2572,7 +2647,6 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     int(dflash2.layers.size())*2*DKV});
                 dflash2.linear_in_f16=df16(size_t(DM)*linear_in_width);
                 dflash2.linear_out_f16=df16(size_t(DM)*linear_out_width);
-                dflash2.draft_logits_f16=df16(size_t(DM-1)*cfg.vocab);
                 dflash2.block_table=sycl::malloc_device<int32_t>(dflash2.num_blocks,q);
                 dflash2.cu_q=sycl::malloc_device<int32_t>(2,q);
                 dflash2.cu_k=sycl::malloc_device<int32_t>(2,q);
@@ -2580,8 +2654,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 db+=size_t(dflash2.num_blocks+5)*sizeof(int32_t);
                 if(!dflash2.q_f16||!dflash2.k_f16||!dflash2.v_f16||
                    !dflash2.attn_f16||!dflash2.linear_in_f16||
-                   !dflash2.linear_out_f16||!dflash2.draft_logits_f16||
-                   !dflash2.block_table||!dflash2.cu_q||
+                   !dflash2.linear_out_f16||!dflash2.block_table||!dflash2.cu_q||
                    !dflash2.cu_k||!dflash2.seqused_k)dok=false;
                 if(dok){
                     std::vector<int32_t> blocks(size_t(dflash2.num_blocks));
@@ -2964,7 +3037,10 @@ void Grimoire::release() {
         d.sh_gu.release(q); d.sh_down.release(q);
         d.la_ab.release(q); d.sh_gate_q.release(q);
         d.router.release(q);
-        for (void* p : {(void*)d.in_norm, (void*)d.post_norm,                         (void*)d.la_conv, (void*)d.la_Alog, (void*)d.la_dtb,
+        for (void* p : {(void*)d.in_norm, (void*)d.post_norm,
+                        (void*)d.in_norm_f16, (void*)d.post_norm_f16,
+                        (void*)d.pre_ff_norm_f16, (void*)d.post_ff_norm_f16,
+                        (void*)d.la_conv, (void*)d.la_Alog, (void*)d.la_dtb,
                         (void*)d.la_norm,  (void*)d.q_norm, (void*)d.k_norm, (void*)d.gu_pack,
                         (void*)d.gu_scale, (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
@@ -3013,6 +3089,8 @@ void Grimoire::release() {
     dflash2.fc.release(q);
     dflash2.selector_hidden.release(q);
     dflash2.fused_context_kv.release(q);
+    dflash2.shared_embed_f16.release(q);
+    dflash2.shared_lm_head_f16.release(q);
     for (auto& d : dflash2.layers) {
         d.q.release(q); d.k.release(q); d.v.release(q); d.qkv.release(q);
         d.o.release(q);
@@ -3020,12 +3098,15 @@ void Grimoire::release() {
         d.attn_conv_proj.release(q); d.mlp_conv_proj.release(q);
         for (void* p : {(void*)d.in_norm, (void*)d.post_norm,
                         (void*)d.q_norm, (void*)d.k_norm,
+                        (void*)d.in_norm_f16, (void*)d.post_norm_f16,
+                        (void*)d.q_norm_f16, (void*)d.k_norm_f16,
                         (void*)d.attn_conv_base, (void*)d.mlp_conv_base,
                         (void*)d.k_cache, (void*)d.v_cache,
                         (void*)d.k_cache_f16, (void*)d.v_cache_f16})
             if (p) sycl::free(p, q);
     }
     for (void* p : {(void*)dflash2.hidden_norm, (void*)dflash2.norm,
+                    (void*)dflash2.hidden_norm_f16, (void*)dflash2.norm_f16,
                     (void*)dflash2.predecessor, (void*)dflash2.successor,
                     (void*)dflash2.target_aux, (void*)dflash2.ctx,
                     (void*)dflash2.context_kv_all,
@@ -3037,10 +3118,9 @@ void Grimoire::release() {
                     (void*)dflash2.v_f16, (void*)dflash2.attn_f16,
                     (void*)dflash2.linear_in_f16,
                     (void*)dflash2.linear_out_f16,
-                    (void*)dflash2.draft_logits_f16,
                     (void*)dflash2.context_k_all_f16,
                     (void*)dflash2.context_v_all_f16,
-                    (void*)dflash2.k_norm_all,
+                    (void*)dflash2.k_norm_all, (void*)dflash2.k_norm_all_f16,
                     (void*)dflash2.gate_up, (void*)dflash2.mlp,
                     (void*)dflash2.logits, (void*)dflash2.bf,
                     (void*)dflash2.a8, (void*)dflash2.a8s,
@@ -3056,6 +3136,7 @@ void Grimoire::release() {
     lm_head.release(q);
     if (embed) sycl::free(embed, q);
     if (fnorm) sycl::free(fnorm, q);
+    if (fnorm_f16) sycl::free(fnorm_f16, q);
     if (spec_dn_state) sycl::free(spec_dn_state, q);
     if (spec_conv_ring) sycl::free(spec_conv_ring, q);
     if (spec_dn_steps) sycl::free(spec_dn_steps, q);
@@ -3959,8 +4040,14 @@ const float* Grimoire::forward_muse(int token) {
         // scaleless QK-norm over head_dim (zero weight -> (1+0)), BEFORE RoPE.
         launch_rmsnorm_heads(q, s.qkv,  muse_zero, QH,  HD, eps, true, none);
         launch_rmsnorm_heads(q, s.zbuf, muse_zero, KVH, HD, eps, true, none);
-        launch_rope_dev(q, s.qkv,  QH,  HD, s.d_pos, cfg.rope_theta, cfg.partial_rope, none);
-        launch_rope_dev(q, s.zbuf, KVH, HD, s.d_pos, cfg.rope_theta, cfg.partial_rope, none);
+        // Muse iRoPE: sliding layers use NeoX RoPE; every fourth full-
+        // attention layer is NoPE.  vLLM keys this from no_rope_layers.
+        if (d.muse_sliding) {
+            launch_rope_dev(q, s.qkv,  QH,  HD, s.d_pos, cfg.rope_theta,
+                            cfg.partial_rope, none);
+            launch_rope_dev(q, s.zbuf, KVH, HD, s.d_pos, cfg.rope_theta,
+                            cfg.partial_rope, none);
+        }
         launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
                              s.d_pos, KVH, HD, max_seq, none);
         AttnParams ap{};
@@ -4578,10 +4665,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         }else mm(dflash2.fc,x,y,rows);
     };
     auto norm=[&](float* h,const float* residual,const bf16_t* weight,
-                  float* out,int rows){
+                  const sycl::half* weight_f16,float* out,int rows){
         if(cfg.is_muse)
-            launch_rmsnorm_residual_f16_batched(
-                q,h,residual,weight,out,rows,H,eps,{});
+            launch_rmsnorm_residual_f16w_batched(
+                q,h,residual,weight_f16,out,rows,H,eps,{});
         else
             launch_rmsnorm_residual_batched(
                 q,h,residual,nullptr,weight,out,rows,H,eps,nullptr,{},0.0f);
@@ -4594,16 +4681,17 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         const int start=dflash2.context_pos;
         const int rows=std::min(M,position-start);
         fc_mm(dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
-        norm(dflash2.ctx,nullptr,dflash2.hidden_norm,dflash2.normed,rows);
+        norm(dflash2.ctx,nullptr,dflash2.hidden_norm,dflash2.hidden_norm_f16,
+             dflash2.normed,rows);
         if(cfg.is_muse){
             // Exact vLLM context path: one [H -> L*2*KV] projection, one
             // contiguous [row,L,2,KV] -> [2,L,row,KV] transform, grouped K
             // RMSNorm, one logical RoPE batch, then per-layer cache inserts.
             mm(dflash2.fused_context_kv,dflash2.normed,
                dflash2.context_kv_all,rows);
-            launch_dflash_context_kv_f16(q,dflash2.context_kv_all,
+            launch_dflash_context_kv_f16w(q,dflash2.context_kv_all,
                 dflash2.context_k_all_f16,dflash2.context_v_all_f16,
-                dflash2.k_norm_all,int(dflash2.layers.size()),rows,KVH,HD,
+                dflash2.k_norm_all_f16,int(dflash2.layers.size()),rows,KVH,HD,
                 start,theta,eps,{});
             for(size_t li=0;li<dflash2.layers.size();++li){
                 auto& d=dflash2.layers[li];
@@ -4630,19 +4718,21 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     host_tokens[0]=bonus_token;
     for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
     q.memcpy(dflash2.tokens,host_tokens.data(),sizeof(host_tokens));
-    launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
+    launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
+                             dflash2.resid,M,H);
     checkpoint("block embedding");
 
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
         if(li==0)
-            norm(dflash2.resid,nullptr,d.in_norm,dflash2.normed,M);
+            norm(dflash2.resid,nullptr,d.in_norm,d.in_norm_f16,dflash2.normed,M);
         else
-            norm(dflash2.resid,dflash2.mlp,d.in_norm,dflash2.normed,M);
+            norm(dflash2.resid,dflash2.mlp,d.in_norm,d.in_norm_f16,
+                 dflash2.normed,M);
         if(cfg.is_muse){
             const sycl::half* qkv=mm_f16_raw(d.qkv,dflash2.normed,M);
-            launch_qkv_norm_rope_f16_fused(q,qkv,dflash2.q_f16,
-                dflash2.k_f16,dflash2.v_f16,d.q_norm,d.k_norm,M,QH,KVH,HD,
+            launch_qkv_norm_rope_f16w_fused(q,qkv,dflash2.q_f16,
+                dflash2.k_f16,dflash2.v_f16,d.q_norm_f16,d.k_norm_f16,M,QH,KVH,HD,
                 position,theta,eps,{});
         }else{
             mm(d.q,dflash2.normed,dflash2.q,M);
@@ -4677,7 +4767,8 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         }
         checkpoint("block attention");
         mm(d.o,dflash2.attn,dflash2.proj,M);
-        norm(dflash2.resid,dflash2.proj,d.post_norm,dflash2.normed,M);
+        norm(dflash2.resid,dflash2.proj,d.post_norm,d.post_norm_f16,
+             dflash2.normed,M);
         mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
         if(cfg.is_muse)
             launch_swiglu_f16_batched(q,dflash2.gate_up,dflash2.h,M,I,{});
@@ -4685,41 +4776,25 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         mm(d.down,dflash2.h,dflash2.mlp,M);
         checkpoint("MLP");
     }
-    norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.normed,M);
+    norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.norm_f16,
+         dflash2.normed,M);
 
+    auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
     if(cfg.is_muse){
-        auto od=load_onednn_w4();
-        if(!od||!muse_od_zp||!lm_head.od_w4||!lm_head.payload||
-           !lm_head.od_scales_fp16||!dflash2.draft_logits_f16)return false;
-        constexpr int rows=M-1;
-        launch_f32_to_f16(q,dflash2.normed+H,dflash2.linear_in_f16,
-                          size_t(rows)*H,{});
-        auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
-            [&](const OneDnnPlan& p){return p.m==rows&&p.n==lm_head.w.N&&
-                                            p.k==lm_head.w.K;});
-        if(it==muse_od_plans.end()){
-            void* plan=od.create(&q,rows,lm_head.w.N,lm_head.w.K,kInt4Group,0);
-            if(!plan)return false;
-            const size_t bytes=od.scratch_size(plan);
-            void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
-            if(bytes&&!scratch){od.destroy(plan);return false;}
-            muse_od_plans.push_back({rows,lm_head.w.N,lm_head.w.K,plan,scratch});
-            it=muse_od_plans.end()-1;
-        }
-        od.execute(it->plan,dflash2.linear_in_f16,lm_head.payload,
-            lm_head.od_scales_fp16,muse_od_zp,dflash2.draft_logits_f16,
-            it->scratch);
-        launch_f16_to_f32(q,dflash2.draft_logits_f16,dflash2.logits,
-                          size_t(rows)*cfg.vocab,{});
-    }else{
-        auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
-        if(lm_head.has_i4()&&w4){
-            launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,
-                dflash2.a8s,M-1,H,{});
-            w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,
-               dflash2.logits,M-1,lm_head.w.N,lm_head.w.K);
-        }else mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
-    }
+        mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
+           dflash2.logits,M-1);
+    }else if(lm_head.has_i4()&&w4){
+        launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
+                                  M-1,H,{});
+        w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,dflash2.logits,
+           M-1,lm_head.w.N,lm_head.w.K);
+    }else if(lm_head.w.fmt==Fmt::MXFP4&&lm_head.w.payload){
+        // Project all draft rows together.  The old per-row GEMV streamed the
+        // full vocabulary matrix fifteen times per speculative step.
+        mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
+    }else for(int r=1;r<M;++r)
+        gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
+                 dflash2.logits+int64_t(r-1)*cfg.vocab,{});
     for(int r=0;r<M-1;++r){
         launch_argmax(q,dflash2.logits+int64_t(r)*cfg.vocab,cfg.vocab,
                       s.d_tok,s.d_val,{});
@@ -4841,7 +4916,38 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                    it->scratch);
         return yh;
     };
+    auto mm_f16_raw=[&](const DevQuant& w,const float* x)->sycl::half*{
+        OneDnnF16Api f16=load_onednn_f16();
+        if(!f16||!w.fp16)throw std::runtime_error(
+            "Muse FP16 linear parity path unavailable");
+        auto* xh=reinterpret_cast<sycl::half*>(xb);
+        auto* yh=reinterpret_cast<sycl::half*>(yb);
+        q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
+            xh[i]=sycl::half(x[i]);
+        });
+        auto it=std::find_if(dflash_f16_plans.begin(),dflash_f16_plans.end(),
+            [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
+        if(it==dflash_f16_plans.end()){
+            void* plan=f16.create(&q,M,w.w.N,w.w.K);
+            if(!plan)throw std::runtime_error("Muse FP16 plan creation failed");
+            const size_t bytes=f16.scratch_size(plan);
+            void* scratch=bytes?sycl::malloc_device<uint8_t>(bytes,q):nullptr;
+            if(bytes&&!scratch){f16.destroy(plan);throw std::runtime_error(
+                "Muse FP16 scratch allocation failed");}
+            dflash_f16_plans.push_back({M,w.w.N,w.w.K,plan,scratch});
+            it=dflash_f16_plans.end()-1;
+        }
+        f16.execute(it->plan,xh,w.fp16,yh,it->scratch);
+        return yh;
+    };
     auto mm=[&](const DevQuant& w,const float* x,float* y){
+        if(w.fp16){
+            sycl::half* yh=mm_f16_raw(w,x);
+            q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
+                y[i]=float(yh[i]);
+            });
+            return;
+        }
         if(exact_gemv||(exact_bf16&&w.w.fmt==Fmt::BF16)){
             for(int r=0;r<M;++r)
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
@@ -4882,20 +4988,21 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     };
 
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
-    launch_embed_batched(q,embed,dtok,hidden,M,H,{});
+    launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dtok,hidden,M,H,{});
     launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,muse_zero,normed,
                                         M,H,cfg.rms_eps,{},1.0f);
     std::swap(hidden,normed);
-    // vLLM applies scale_query_by to Q after QK-norm, then uses the standard
-    // attention scale independently. Do not fold the query scale twice.
+    // launch_qkv_norm_rope_f16_fused already multiplies Q by
+    // query_prescale.  Fusion's Attention then applies only 1/sqrt(HD).
+    // Including query_prescale here applied 3.87 twice.
     const float sm_scale=1.0f/std::sqrt(float(HD));
 
     for(int li=0;li<cfg.n_layers;++li){
         LayerDev& d=L[size_t(li)];
         if(dflash2.ok){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
-                // Muse records target layer n after that layer; this loop sees
-                // the identical residual stream at entry to layer n+1.
+                // vLLM converts DFlash target IDs with i+1, producing Muse
+                // auxiliary layers (2,14,26,38,50).
                 if(dflash2.target_layers[tap]+1==li){
                     launch_dflash_store_tap(q,hidden,dflash2.target_aux,M,H,
                         int(dflash2.target_layers.size()),start_pos,int(tap),{},true);
@@ -4903,45 +5010,47 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
                 }
             }
         }
-        launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,d.in_norm,normed,
-                                            M,H,cfg.rms_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,d.in_norm_f16,normed,
+                                             M,H,cfg.rms_eps,{},1.0f);
         sycl::half* qkvh=mm_w4_f16(d.qkv_proj,normed);
         launch_qkv_norm_rope_f16_fused(q,qkvh,qh,kh,vh,muse_zero,muse_zero,
             M,QH,KVH,HD,start_pos,cfg.rope_theta,cfg.rms_eps,{},
             d.muse_sliding,cfg.query_prescale,1.0f);
         mm(d.o_gate,normed,gate);
+        constexpr int target_block_size=64;
+        const int target_num_blocks=(max_seq+target_block_size-1)/target_block_size;
         launch_kv_append_f16_paged(q,kh,vh,d.k_cache_f16,d.v_cache_f16,M,
-            start_pos,KVH,HD,dflash2.block_size,{});
+            start_pos,KVH,HD,target_block_size,{});
         const int32_t used=start_pos+M;
         q.memcpy(dflash2.seqused_k,&used,sizeof(used));
         const int window_left=d.muse_sliding?2047:-1;
         const int window_right=d.muse_sliding?0:-1;
         const int rc=fa2_paged(&q,qh,d.k_cache_f16,d.v_cache_f16,oh,M,used,
-            QH,KVH,HD,dflash2.block_size,dflash2.num_blocks,
+            QH,KVH,HD,target_block_size,target_num_blocks,
             dflash2.block_table,dflash2.cu_q,dflash2.cu_k,
             dflash2.seqused_k,sm_scale,window_left,window_right,true);
         if(rc){cleanup();return false;}
         launch_f16_to_f32(q,oh,attn,size_t(M)*QW,{});
         launch_gate_sigmoid_mul_batched(q,attn,gate,M,QW,{});
         mm(d.o_proj,attn,proj);
-        launch_rmsnorm_residual_f16_batched(q,proj,nullptr,d.post_norm,tmp,
-                                            M,H,cfg.post_norm_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_batched(q,proj,nullptr,d.post_norm_f16,tmp,
+                                             M,H,cfg.post_norm_eps,{},1.0f);
         launch_add_f16_round(q,hidden,tmp,M*H,{});
 
-        launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,d.pre_ff_norm,
-                                            normed,M,H,cfg.rms_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,d.pre_ff_norm_f16,
+                                             normed,M,H,cfg.rms_eps,{},1.0f);
         mm(d.sh_gu,normed,ff);
         launch_swiglu_f16_batched(q,ff,ff,M,I,{});
         mm(d.sh_down,ff,proj);
-        launch_rmsnorm_residual_f16_batched(q,proj,nullptr,d.post_ff_norm,tmp,
-                                            M,H,cfg.post_norm_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_batched(q,proj,nullptr,d.post_ff_norm_f16,tmp,
+                                             M,H,cfg.post_norm_eps,{},1.0f);
         launch_add_f16_round(q,hidden,tmp,M*H,{});
     }
 
-    launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,fnorm,normed,M,H,
-                                        cfg.rms_eps,{},0.0f);
+    launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,fnorm_f16,normed,M,H,
+                                         cfg.rms_eps,{},0.0f);
     if(next_tokens){
-        mm(lm_head,normed,batch_logits);
+        mm(dflash2.shared_lm_head_f16,normed,batch_logits);
         for(int r=0;r<M;++r){
             launch_argmax(q,batch_logits+int64_t(r)*cfg.vocab,cfg.vocab,
                           s.d_tok,s.d_val,{});

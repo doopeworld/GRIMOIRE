@@ -134,3 +134,77 @@ extern "C" void grimoire_xe2_fa2_prefill_bf16(
     // No synchronize: the kernel was enqueued on GRIMOIRE's queue, so the caller's
     // subsequent work on that same in-order queue is already correctly ordered.
 }
+
+extern "C" int grimoire_xe2_dflash_paged_f16(
+    sycl::queue* queue, const void* query, const void* key_cache,
+    const void* value_cache, void* output, int q_tokens, int kv_tokens,
+    int q_heads, int kv_heads, int head_dim, int block_size, int num_blocks,
+    const int* block_table, const int* cu_q, const int* dummy_cu_k,
+    const int* seqused_k, float softmax_scale, int window_left,
+    int window_right) {
+    if (!grimoire_fa2_load_ext()) return 1;
+    auto handle = c10::Dispatcher::singleton().findSchema(
+        {"_vllm_fa2_C::varlen_fwd", ""});
+    if (!handle.has_value()) return 2;
+
+    auto fp16 = at::TensorOptions().dtype(at::kHalf).device(at::kXPU);
+    auto i32 = at::TensorOptions().dtype(at::kInt).device(at::kXPU);
+    auto q = at::from_blob(const_cast<void*>(query),
+        {q_tokens, q_heads, head_dim}, fp16);
+    auto k = at::from_blob(const_cast<void*>(key_cache),
+        {num_blocks, block_size, kv_heads, head_dim}, fp16);
+    auto v = at::from_blob(const_cast<void*>(value_cache),
+        {num_blocks, block_size, kv_heads, head_dim}, fp16);
+    auto o = at::from_blob(output, {q_tokens, q_heads, head_dim}, fp16);
+    auto bt = at::from_blob(const_cast<int*>(block_table),
+        {1, num_blocks}, i32);
+    auto cq = at::from_blob(const_cast<int*>(cu_q), {2}, i32);
+    auto ck = at::from_blob(const_cast<int*>(dummy_cu_k), {2}, i32);
+    auto used = at::from_blob(const_cast<int*>(seqused_k), {1}, i32);
+
+    c10::xpu::XPUStream ext = c10::xpu::getStreamFromExternal(queue, 0);
+    c10::xpu::XPUStream prev = c10::xpu::getCurrentXPUStream(0);
+    c10::xpu::setCurrentXPUStream(ext);
+    struct StreamRestore {
+        c10::xpu::XPUStream s;
+        ~StreamRestore() { c10::xpu::setCurrentXPUStream(s); }
+    } restore{prev};
+
+    std::vector<c10::IValue> stack;
+    stack.reserve(28);
+    stack.emplace_back(q);                       // q
+    stack.emplace_back(k);                       // paged K cache
+    stack.emplace_back(v);                       // paged V cache
+    stack.emplace_back(o);                       // output
+    stack.emplace_back(cq);                      // query start locations [0,16]
+    stack.emplace_back(ck);                      // required dummy K starts [0,0]
+    stack.emplace_back(used);                    // used KV length [context+16]
+    stack.emplace_back(c10::IValue());           // leftpad_k
+    stack.emplace_back(bt);                      // sequential block table
+    stack.emplace_back(c10::IValue());           // alibi slopes
+    stack.emplace_back((int64_t)q_tokens);       // max query length
+    stack.emplace_back((int64_t)kv_tokens);      // max used KV length
+    stack.emplace_back(0.0);                     // dropout
+    stack.emplace_back(c10::IValue());           // K descale (FP16 cache)
+    stack.emplace_back(c10::IValue());           // V descale (FP16 cache)
+    stack.emplace_back((double)softmax_scale);
+    stack.emplace_back(c10::IValue());           // attention sinks
+    stack.emplace_back(false);                   // zero tensors
+    stack.emplace_back(false);                   // Muse DFlash is noncausal
+    stack.emplace_back((int64_t)window_left);    // 2048 - 1
+    stack.emplace_back((int64_t)window_right);   // symmetric for noncausal
+    stack.emplace_back(0.0);                     // softcap disabled
+    stack.emplace_back(false);                   // no softmax LSE return
+    stack.emplace_back(c10::IValue());           // generator
+    stack.emplace_back(c10::IValue());           // num_splits_kv
+    stack.emplace_back(true);                    // vLLM default is_mix_batch
+    stack.emplace_back(c10::IValue());           // splits_per_seq
+    stack.emplace_back(c10::IValue());           // work_list
+    try {
+        handle->callBoxed(&stack);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  DFlash FA2 call failed: %s\n", e.what());
+        return 3;
+    }
+    return 0;
+}

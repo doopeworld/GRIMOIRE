@@ -169,7 +169,6 @@ struct F16Plan {
     memory::desc dst({m,n},memory::data_type::f16,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
-    attr.set_fpmath_mode(fpmath_mode::f16,true);
     return matmul::primitive_desc(e,src,wei,dst,attr);
   }
   memory wrap(const memory::desc& md,void* p){

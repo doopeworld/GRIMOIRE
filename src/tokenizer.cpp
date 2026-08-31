@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cctype>
+#include <ctime>
 
 namespace b70 {
 namespace {
@@ -273,7 +274,7 @@ std::vector<std::string> Tokenizer::bpe_word(const std::string& word) const {
 //
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
 //   |[^\r\n\p{L}\p{N}]?\p{L}+
-//   |\p{N}
+//   |\p{N}{1,3}
 //   | ?[^\s\p{L}\p{N}]+[\r\n]*
 //   |\s*[\r\n]+
 //   |\s+(?!\S)
@@ -371,10 +372,13 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             }
         }
 
-        // \p{N}  -- single digit per token, as the regex has no +
+        // \p{N}{1,3} -- the Muse tokenizer groups decimal runs in chunks of
+        // at most three digits.  Splitting every digit changes prompt IDs.
         if (is_digit(c)) {
-            out.push_back(text.substr(i, 1));
-            ++i;
+            size_t j = i;
+            while (j < n && is_digit((unsigned char)text[j]) && j - i < 3) ++j;
+            out.push_back(text.substr(i, j - i));
+            i = j;
             continue;
         }
 
@@ -506,6 +510,31 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
 
 std::string Tokenizer::apply_chat_template(const std::string& user,
                                            const std::string& system) const {
+    // Muse-Glimmer's current tokenizer is Harmony-style, not ChatML.  Keep
+    // this branch keyed to a checkpoint token so Qwen/Ornith retain their
+    // existing template.  This mirrors transformers/vLLM's default template,
+    // including the date-dependent default system message.
+    if (special_by_text_.count("<|begin_of_text|>")) {
+        char date[11] = {};
+        const std::time_t now = std::time(nullptr);
+        std::tm tm{};
+#if defined(_WIN32)
+        localtime_s(&tm, &now);
+#else
+        localtime_r(&now, &tm);
+#endif
+        std::strftime(date, sizeof(date), "%Y-%m-%d", &tm);
+        const std::string default_system =
+            "You are a helpful AI assistant.\n"
+            "Knowledge cutoff: 2026-01-04.\n"
+            "Current date: " + std::string(date) + ".\n\n"
+            "Reasoning strength: high.\n\n"
+            "# Valid recipients: \"self\", \"user\".";
+        return "<|begin_of_text|><|start|>system<|message|>" +
+            (system.empty() ? default_system : system) +
+            "<|eot|><|start|>user<|message|>" + user +
+            "<|eot|><|start|>assistant";
+    }
     std::string out;
     if (!system.empty())
         out += "<|im_start|>system\n" + system + "<|im_end|>\n";

@@ -30,7 +30,7 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
     const int* block_table, const int* cu_q, const int* dummy_cu_k,
     const int* seqused_k, float softmax_scale, int window_left,
     int window_right, bool causal) {
-  if(head_dim!=128||block_size!=64||!q||!query||!key_cache||!value_cache||
+  if(head_dim!=128||(block_size!=16&&block_size!=64)||!q||!query||!key_cache||!value_cache||
      !output||!block_table||!cu_q||!dummy_cu_k||!seqused_k)return 1;
   chunk_prefill_args_t a{};
   a.query=const_cast<void*>(query);

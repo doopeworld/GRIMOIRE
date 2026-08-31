@@ -270,6 +270,10 @@ sycl::event launch_rmsnorm_residual_f16_batched(
     sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
     float* out, int tokens, int hidden, float eps,
     const std::vector<sycl::event>& deps = {}, float weight_offset = 0.0f);
+sycl::event launch_rmsnorm_residual_f16w_batched(
+    sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
+    float* out, int tokens, int hidden, float eps,
+    const std::vector<sycl::event>& deps = {}, float weight_offset = 0.0f);
 sycl::event launch_rmsnorm_residual_batched_quant(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, sycl_bf16* out_bf,
@@ -322,6 +326,13 @@ sycl::event launch_qkv_norm_rope_f16_fused(
     int head_dim, int start_pos, float theta, float eps,
     const std::vector<sycl::event>& deps = {}, bool use_rope = true,
     float query_scale = 1.0f, float weight_offset = 0.0f);
+sycl::event launch_qkv_norm_rope_f16w_fused(
+    sycl::queue& q, const sycl::half* qkv_src, sycl::half* q_dst,
+    sycl::half* k_dst, sycl::half* v_dst, const sycl::half* q_weight,
+    const sycl::half* k_weight, int tokens, int q_heads, int k_heads,
+    int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps = {}, bool use_rope = true,
+    float query_scale = 1.0f, float weight_offset = 0.0f);
 sycl::event launch_f32_to_f16(sycl::queue& q, const float* src,
     sycl::half* dst, size_t count,
     const std::vector<sycl::event>& deps = {});
@@ -336,6 +347,11 @@ sycl::event launch_kv_append_f16_paged(
 sycl::event launch_dflash_context_kv_f16(
     sycl::queue& q, const float* fused_kv, sycl::half* all_k,
     sycl::half* all_v, const bf16_t* stacked_k_norm, int layers, int tokens,
+    int kv_heads, int head_dim, int start_pos, float theta, float eps,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_dflash_context_kv_f16w(
+    sycl::queue& q, const float* fused_kv, sycl::half* all_k,
+    sycl::half* all_v, const sycl::half* stacked_k_norm, int layers, int tokens,
     int kv_heads, int head_dim, int start_pos, float theta, float eps,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_flash_prefill(
@@ -386,6 +402,9 @@ sycl::event launch_dflash2_path_walk(
     int32_t* tokens, int steps, int top_k,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
+    const int32_t* tokens, float* out, int count, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_embed_f16_batched(sycl::queue& q, const sycl::half* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_split_deltanet_qkv_batched(sycl::queue& q, const float* src,
