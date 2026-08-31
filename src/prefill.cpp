@@ -283,6 +283,127 @@ sycl::event launch_rmsnorm_residual_f16_batched(
     });
 }
 
+// ---------------------------------------------------------------------------
+// FP16-storage activation variants.
+//
+// The f32 kernels above already round every intermediate through sycl::half
+// before storing (dst = float(half(...))) to match Fusion's float16 dataflow,
+// so the f32 buffers only ever hold fp16-representable values. Keeping the
+// activations in fp16 storage is therefore numerically identical and halves
+// the traffic, and removes the fp32<->fp16 conversion that otherwise wraps
+// every oneDNN W4A16 GEMM (measured: 546 ms of a 2198 ms Muse prefill).
+// ---------------------------------------------------------------------------
+sycl::event launch_embed_f16_h(sycl::queue& q, const sycl::half* table,
+    const int32_t* tokens, sycl::half* out, int count, int hidden,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(count)*hidden), [=](sycl::id<1> id) {
+            const size_t i=id[0];
+            const int row=int(i/hidden), col=int(i%hidden);
+            out[i]=table[int64_t(tokens[row])*hidden+col];
+        });
+    });
+}
+
+sycl::event launch_add_f16_round_h(sycl::queue& q, sycl::half* dst,
+    const sycl::half* src, int n, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n)),[=](sycl::id<1> id){
+            dst[id[0]]=sycl::half(float(dst[id[0]])+float(src[id[0]]));
+        });
+    });
+}
+
+sycl::event launch_gate_sigmoid_mul_h(sycl::queue& q, sycl::half* x,
+    const sycl::half* gate, int tokens, int hidden,
+    const std::vector<sycl::event>& deps) {
+    constexpr size_t WG=256;
+    const size_t padded=(size_t(hidden)+WG-1)/WG*WG;
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<2>({size_t(tokens),padded},{1,WG}),
+          [=](sycl::nd_item<2> it) {
+            const int t=int(it.get_global_id(0)),d=int(it.get_global_id(1));
+            if(d<hidden) {
+                const int64_t i=int64_t(t)*hidden+d;
+                const float xv=float(x[i]);
+                const float gv=float(gate[i]);
+                x[i]=sycl::half(xv/(1.0f+sycl::exp(-gv)));
+            }
+        });
+    });
+}
+
+sycl::event launch_swiglu_h(sycl::queue& q, const sycl::half* gu,
+    sycl::half* out, int tokens, int inter,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(tokens)*inter),[=](sycl::id<1> id){
+            const int64_t z=id[0];
+            const int row=int(z/inter),d=int(z%inter);
+            const float gate=float(gu[int64_t(row)*2*inter+d]);
+            const float up=float(gu[int64_t(row)*2*inter+inter+d]);
+            out[z]=sycl::half((gate/(1.0f+sycl::exp(-gate)))*up);
+        });
+    });
+}
+
+sycl::event launch_dflash_store_tap_h(
+    sycl::queue& q, const sycl::half* src, float* taps, int rows, int hidden,
+    int tap_count, int start_pos, int tap,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows)*hidden), [=](sycl::id<1> id) {
+            const int64_t z=id[0];
+            const int row=int(z/hidden), col=int(z%hidden);
+            taps[(int64_t(start_pos+row)*tap_count+tap)*hidden+col]=
+                float(src[z]);
+        });
+    });
+}
+
+sycl::event launch_rmsnorm_residual_f16w_h(
+    sycl::queue& q, sycl::half* hbuf, const sycl::half* residual,
+    const sycl::half* weight, sycl::half* out, int tokens, int hidden,
+    float eps, const std::vector<sycl::event>& deps, float weight_offset) {
+    constexpr int WG=256;
+    return q.submit([&](sycl::handler& hd){
+        hd.depends_on(deps);
+        sycl::local_accessor<float,1> partial(WG/SG_SIZE,hd);
+        hd.parallel_for(sycl::nd_range<1>(size_t(tokens)*WG,WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int row=int(it.get_group(0));
+                const int lid=int(it.get_local_id(0));
+                const int lane=int(sg.get_local_id()[0]);
+                const int sgid=int(sg.get_group_id()[0]);
+                sycl::half* hr=hbuf+int64_t(row)*hidden;
+                const sycl::half* rr=residual?residual+int64_t(row)*hidden:nullptr;
+                sycl::half* dst=out+int64_t(row)*hidden;
+                float ss=0.0f;
+                for(int i=lid;i<hidden;i+=WG){
+                    const float v=float(sycl::half(float(hr[i])+
+                        (rr?float(rr[i]):0.0f)));
+                    hr[i]=sycl::half(v);
+                    ss=sycl::fma(v,v,ss);
+                }
+                ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
+                float* pp=partial.template get_multi_ptr<
+                    sycl::access::decorated::no>().get();
+                if(lane==0)pp[sgid]=ss;
+                sycl::group_barrier(it.get_group());
+                float total=0.0f;
+                for(int i=0;i<WG/SG_SIZE;++i)total+=pp[i];
+                const float scale=sycl::rsqrt(total/float(hidden)+eps);
+                for(int i=lid;i<hidden;i+=WG)
+                    dst[i]=sycl::half(float(hr[i])*scale*
+                        (weight_offset+float(weight[i])));
+            });
+    });
+}
+
 sycl::event launch_rmsnorm_residual_f16w_batched(
     sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
     float* out, int tokens, int hidden, float eps,

@@ -1636,6 +1636,7 @@ struct Grimoire {
     const float* forward(int token);      // returns device logits
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
+    sycl::half* muse_zero_f16 = nullptr;   // same, for the FP16 activation path
     const float* forward_dag(int token);  // out-of-order queue + true dependencies
     bool prefill(const std::vector<int32_t>& tokens,
                  std::vector<int32_t>* next_tokens = nullptr);
@@ -1902,6 +1903,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     if (cfg.is_muse) {
         muse_zero = sycl::malloc_device<bf16_t>(cfg.hidden, q);
         q.memset(muse_zero, 0, size_t(cfg.hidden) * sizeof(bf16_t)).wait();
+        muse_zero_f16 = sycl::malloc_device<sycl::half>(cfg.hidden, q);
+        q.memset(muse_zero_f16, 0, size_t(cfg.hidden) * sizeof(sycl::half)).wait();
     }
 
     if (pipeline) {
@@ -4962,17 +4965,28 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     const bool reuse=next_tokens&&M<=kSpecBatch&&dflash2.ok&&
         dflash2.verify_logits&&dflash2.verify_bf&&dflash2.verify_bf_out&&
         dflash2.verify_a8;
+    // Activations are carried in FP16, matching Fusion's float16 dataflow. The
+    // f32 kernels this replaces already rounded every intermediate through
+    // sycl::half before storing, so this is numerically identical and removes
+    // the fp32<->fp16 conversion around every oneDNN GEMM. The dflash2 reuse
+    // buffers are f32 allocations, i.e. twice the bytes an fp16 view needs, so
+    // reinterpreting them here is always in-bounds.
     auto df=[&](size_t n){return sycl::malloc_device<float>(n,q);};
-    float* hidden=reuse?dflash2.resid:df(size_t(M)*H);
-    float* normed=reuse?dflash2.normed:df(size_t(M)*H);
-    float* tmp=reuse?dflash2.ctx:df(size_t(M)*H);
+    auto dh=[&](size_t n){return sycl::malloc_device<sycl::half>(n,q);};
+    auto asH=[](float* p){return reinterpret_cast<sycl::half*>(p);};
+    sycl::half* hidden=reuse?asH(dflash2.resid):dh(size_t(M)*H);
+    sycl::half* normed=reuse?asH(dflash2.normed):dh(size_t(M)*H);
+    sycl::half* tmp=reuse?asH(dflash2.ctx):dh(size_t(M)*H);
     float* qv=reuse?dflash2.q:df(size_t(M)*QW);
     float* kv=reuse?dflash2.k:df(size_t(M)*KVW);
     float* vv=reuse?dflash2.v:df(size_t(M)*KVW);
-    float* attn=reuse?dflash2.attn:df(size_t(M)*QW);
-    float* gate=reuse?dflash2.proj:df(size_t(M)*QW);
-    float* proj=reuse?dflash2.mlp:df(size_t(M)*H);
-    float* ff=reuse?dflash2.gate_up:df(size_t(M)*2*I);
+    sycl::half* attn=reuse?asH(dflash2.attn):dh(size_t(M)*QW);
+    sycl::half* gate=reuse?asH(dflash2.proj):dh(size_t(M)*QW);
+    sycl::half* proj=reuse?asH(dflash2.mlp):dh(size_t(M)*H);
+    sycl::half* ff=reuse?asH(dflash2.gate_up):dh(size_t(M)*2*I);
+    // Scratch for the DFlash tap, which still writes f32 target_aux.
+    float* tapbuf=(dflash2.ok&&!reuse)?df(size_t(M)*H):nullptr;
+    float* lastrow=df(size_t(H));
     float* batch_logits=next_tokens?(reuse?dflash2.verify_logits:
         df(size_t(M)*cfg.vocab)):nullptr;
     sycl_bf16* xb=reuse?dflash2.verify_bf:
@@ -4995,6 +5009,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         sycl::malloc_device<sycl::half>(size_t(M)*QW,q);
     std::vector<void*> mem={(void*)hidden,(void*)normed,(void*)tmp,(void*)qv,
         (void*)kv,(void*)vv,(void*)attn,(void*)gate,(void*)proj,(void*)ff,
+        (void*)tapbuf,(void*)lastrow,
         (void*)batch_logits,(void*)xb,(void*)yb,(void*)a8,(void*)a8s,
         (void*)dtok,(void*)outtok,(void*)qh,(void*)kh,(void*)vh,(void*)oh};
     auto cleanup=[&](){if(!reuse)for(void* p:mem)if(p)sycl::free(p,q);};
@@ -5003,6 +5018,33 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
        (next_tokens&&(!batch_logits||!outtok))){
         cleanup();return false;
     }
+
+    // Host-side region timing for the Muse prefill path, same drain-and-clock
+    // approach as GRIMOIRE_TIME_LAYER in the generic prefill(): retains no
+    // sycl::events and needs no profiling-enabled queue, so it does not hit
+    // the M>=64 host-spin documented in the generic path above.
+    //   GRIMOIRE_MUSE_TIME_LAYER=<n>   time only layer n
+    //   GRIMOIRE_MUSE_TIME_LAYER=all   time every layer, print per-region sums
+    int mt_layer=-1; bool mt_all=false;
+    if(const char* v=std::getenv("GRIMOIRE_MUSE_TIME_LAYER")){
+        if(std::strcmp(v,"all")==0){mt_all=true;} else {mt_layer=std::atoi(v);}
+    }
+    const bool mt_on=mt_all||mt_layer>=0;
+    std::chrono::high_resolution_clock::time_point mt_prev;
+    std::map<std::string,double> mt_sums;
+    std::vector<std::string> mt_order;
+    int mt_cur=-1;
+    auto mt_mark=[&](const char* region){
+        if(!mt_on||!(mt_all||mt_cur==mt_layer))return;
+        q.wait();
+        const auto now=std::chrono::high_resolution_clock::now();
+        const double ms=std::chrono::duration<double,std::milli>(now-mt_prev).count();
+        if(mt_sums.find(region)==mt_sums.end())mt_order.push_back(region);
+        mt_sums[region]+=ms;
+        if(!mt_all)std::fprintf(stderr,"      [layer %d] %-24s %9.3f ms\n",
+                                 mt_cur,region,ms);
+        mt_prev=now;
+    };
 
     auto dense=load_xe2_dense_mxfp4_f32();
     OneDnnW4Api od=load_onednn_w4();
@@ -5023,14 +5065,11 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     if(!exact_attn){cleanup();return false;}
     const int32_t cuq[2]={0,M};
     q.memcpy(dflash2.cu_q,cuq,sizeof(cuq)).wait();
-    auto mm_w4_f16=[&](const DevQuant& w,const float* x)->sycl::half*{
+    auto mm_w4_f16=[&](const DevQuant& w,const sycl::half* x)->sycl::half*{
         if(!od||!muse_od_zp||!w.od_w4||!w.payload||!w.od_scales_fp16)
             throw std::runtime_error("Muse target W4A16 parity path unavailable");
-        auto* xh=reinterpret_cast<sycl::half*>(xb);
         auto* yh=reinterpret_cast<sycl::half*>(yb);
-        q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
-            xh[i]=sycl::half(x[i]);
-        });
+        const sycl::half* xh=x;   // activations are already FP16
         auto it=std::find_if(muse_od_plans.begin(),muse_od_plans.end(),
             [&](const OneDnnPlan& p){
                 return p.m==M&&p.n==w.w.N&&p.k==w.w.K;
@@ -5046,19 +5085,18 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
             muse_od_plans.push_back({M,w.w.N,w.w.K,plan,scratch});
             it=muse_od_plans.end()-1;
         }
+        mt_mark("  w4 convert-in");
         od.execute(it->plan,xh,w.payload,w.od_scales_fp16,muse_od_zp,yh,
                    it->scratch);
+        mt_mark("  w4 gemm");
         return yh;
     };
-    auto mm_f16_raw=[&](const DevQuant& w,const float* x)->sycl::half*{
+    auto mm_f16_raw=[&](const DevQuant& w,const sycl::half* x)->sycl::half*{
         OneDnnF16Api f16=load_onednn_f16();
         if(!f16||!w.fp16)throw std::runtime_error(
             "Muse FP16 linear parity path unavailable");
-        auto* xh=reinterpret_cast<sycl::half*>(xb);
         auto* yh=reinterpret_cast<sycl::half*>(yb);
-        q.parallel_for(sycl::range<1>(size_t(M)*w.w.K),[=](sycl::id<1> i){
-            xh[i]=sycl::half(x[i]);
-        });
+        const sycl::half* xh=x;   // activations are already FP16
         auto it=std::find_if(dflash_f16_plans.begin(),dflash_f16_plans.end(),
             [&](const OneDnnPlan& p){return p.m==M&&p.n==w.w.N&&p.k==w.w.K;});
         if(it==dflash_f16_plans.end()){
@@ -5074,89 +5112,78 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         f16.execute(it->plan,xh,w.fp16,yh,it->scratch);
         return yh;
     };
-    auto mm=[&](const DevQuant& w,const float* x,float* y){
+    // FP16 in, FP16 out. The previous version converted the activation to
+    // half on the way in and the result back to f32 on the way out; those two
+    // conversions cost 546 ms of a 2198 ms Muse prefill (25%) and are pure
+    // overhead now that activations are carried as half throughout.
+    auto mm=[&](const DevQuant& w,const sycl::half* x,sycl::half* y){
         if(w.fp16){
             sycl::half* yh=mm_f16_raw(w,x);
-            q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
-                y[i]=float(yh[i]);
-            });
-            return;
-        }
-        if(exact_gemv||(exact_bf16&&w.w.fmt==Fmt::BF16)){
-            for(int r=0;r<M;++r)
-                gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
+            q.memcpy(y,yh,size_t(M)*w.w.N*sizeof(sycl::half));
             return;
         }
         // Match vLLM XPU's Muse compressed-INT4 dispatch exactly: FP16
         // activations/scales through oneDNN W4A16, with plans cached by shape.
         if(od&&muse_od_zp&&w.od_w4&&w.payload&&w.od_scales_fp16){
             sycl::half* yh=mm_w4_f16(w,x);
-            q.parallel_for(sycl::range<1>(size_t(M)*w.w.N),[=](sycl::id<1> i){
-                y[i]=float(yh[i]);
-            });
+            q.memcpy(y,yh,size_t(M)*w.w.N*sizeof(sycl::half));
+            mt_mark("  w4 copy-out");
             return;
         }
-        if(w.has_i4()){
-            if(w4){
-                launch_quantize_rows_int8(q,x,a8,a8s,M,w.w.K,{});
-                w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
-            }else{
-                for(int r=0;r<M;r+=4){
-                    const int mb=std::min(4,M-r);
-                    launch_gemv_int4sym_batch(q,w.i4,w.i4s,
-                        x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
-                        w.w.N,w.w.K,mb,{});
-                }
-            }
-            return;
-        }
-        launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);
-        if(dense&&w.w.fmt==Fmt::MXFP4&&w.w.payload)
-            dense(&q,xb,w.w.payload,static_cast<const unsigned char*>(w.w.scales),
-                  y,M,w.w.N,w.w.K);
-        else
-            launch_gemm_xmx(q,w.w,xb,y,M);
+        throw std::runtime_error(
+            "Muse prefill FP16 path requires the oneDNN W4A16 or FP16 weights");
     };
     auto mm_w4_prequant=[&](const DevQuant& w,float* y){
         w4(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
     };
 
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
-    launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dtok,hidden,M,H,{});
-    launch_rmsnorm_residual_f16_batched(q,hidden,nullptr,muse_zero,normed,
-                                        M,H,cfg.rms_eps,{},1.0f);
+    launch_embed_f16_h(q,dflash2.shared_embed_f16.fp16,dtok,hidden,M,H,{});
+    launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,muse_zero_f16,normed,
+                                   M,H,cfg.rms_eps,{},1.0f);
     std::swap(hidden,normed);
     // launch_qkv_norm_rope_f16_fused already multiplies Q by
     // query_prescale.  Fusion's Attention then applies only 1/sqrt(HD).
     // Including query_prescale here applied 3.87 twice.
     const float sm_scale=1.0f/std::sqrt(float(HD));
+    // seqused_k is start_pos+M for every layer of this call -- it does not
+    // vary with li. Writing it inside the loop forced a blocking host
+    // round-trip and full queue drain on every one of the 52 layers, which
+    // serializes what should be back-to-back GPU submissions. Hoisted to a
+    // single write before the loop.
+    const int32_t used=start_pos+M;
+    q.memcpy(dflash2.seqused_k,&used,sizeof(used)).wait();
 
     for(int li=0;li<cfg.n_layers;++li){
+        mt_cur=li;
+        if(mt_on&&(mt_all||li==mt_layer))mt_prev=std::chrono::high_resolution_clock::now();
         LayerDev& d=L[size_t(li)];
         if(dflash2.ok){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
                 // vLLM converts DFlash target IDs with i+1, producing Muse
                 // auxiliary layers (2,14,26,38,50).
                 if(dflash2.target_layers[tap]+1==li){
-                    launch_dflash_store_tap(q,hidden,dflash2.target_aux,M,H,
-                        int(dflash2.target_layers.size()),start_pos,int(tap),{},true);
+                    launch_dflash_store_tap_h(q,hidden,dflash2.target_aux,M,H,
+                        int(dflash2.target_layers.size()),start_pos,int(tap),{});
                     break;
                 }
             }
         }
-        launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,d.in_norm_f16,normed,
-                                             M,H,cfg.rms_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,d.in_norm_f16,normed,
+                                       M,H,cfg.rms_eps,{},1.0f);
         sycl::half* qkvh=mm_w4_f16(d.qkv_proj,normed);
+        mt_mark("qkv proj");
         launch_qkv_norm_rope_f16_fused(q,qkvh,qh,kh,vh,muse_zero,muse_zero,
             M,QH,KVH,HD,start_pos,cfg.rope_theta,cfg.rms_eps,{},
             d.muse_sliding,cfg.query_prescale,1.0f);
+        mt_mark("qkv norm+rope");
         mm(d.o_gate,normed,gate);
+        mt_mark("o_gate proj");
         constexpr int target_block_size=64;
         const int target_num_blocks=(max_seq+target_block_size-1)/target_block_size;
         launch_kv_append_f16_paged(q,kh,vh,d.k_cache_f16,d.v_cache_f16,M,
             start_pos,KVH,HD,target_block_size,{});
-        const int32_t used=start_pos+M;
-        q.memcpy(dflash2.seqused_k,&used,sizeof(used)).wait();
+        mt_mark("kv append");
         const int window_left=d.muse_sliding?2047:-1;
         const int window_right=d.muse_sliding?0:-1;
         const int rc=fa2_paged(&q,qh,d.k_cache_f16,d.v_cache_f16,oh,M,used,
@@ -5164,38 +5191,57 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
             dflash2.block_table,dflash2.cu_q,dflash2.cu_k,
             dflash2.seqused_k,sm_scale,window_left,window_right,true);
         if(rc){cleanup();return false;}
-        launch_f16_to_f32(q,oh,attn,size_t(M)*QW,{});
-        launch_gate_sigmoid_mul_batched(q,attn,gate,M,QW,{});
+        mt_mark("attention");
+        q.memcpy(attn,oh,size_t(M)*QW*sizeof(sycl::half));
+        launch_gate_sigmoid_mul_h(q,attn,gate,M,QW,{});
         mm(d.o_proj,attn,proj);
-        launch_rmsnorm_residual_f16w_batched(q,proj,nullptr,d.post_norm_f16,tmp,
-                                             M,H,cfg.post_norm_eps,{},1.0f);
-        launch_add_f16_round(q,hidden,tmp,M*H,{});
+        mt_mark("o_proj");
+        launch_rmsnorm_residual_f16w_h(q,proj,nullptr,d.post_norm_f16,tmp,
+                                       M,H,cfg.post_norm_eps,{},1.0f);
+        launch_add_f16_round_h(q,hidden,tmp,M*H,{});
+        mt_mark("post-attn norm+add");
 
-        launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,d.pre_ff_norm_f16,
-                                             normed,M,H,cfg.rms_eps,{},1.0f);
+        launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,d.pre_ff_norm_f16,
+                                       normed,M,H,cfg.rms_eps,{},1.0f);
         mm(d.sh_gu,normed,ff);
-        launch_swiglu_f16_batched(q,ff,ff,M,I,{});
+        mt_mark("FFN gate_up");
+        launch_swiglu_h(q,ff,ff,M,I,{});
+        mt_mark("FFN swiglu");
         mm(d.sh_down,ff,proj);
-        launch_rmsnorm_residual_f16w_batched(q,proj,nullptr,d.post_ff_norm_f16,tmp,
-                                             M,H,cfg.post_norm_eps,{},1.0f);
-        launch_add_f16_round(q,hidden,tmp,M*H,{});
+        mt_mark("FFN down");
+        launch_rmsnorm_residual_f16w_h(q,proj,nullptr,d.post_ff_norm_f16,tmp,
+                                       M,H,cfg.post_norm_eps,{},1.0f);
+        launch_add_f16_round_h(q,hidden,tmp,M*H,{});
+        mt_mark("post-ff norm+add");
+    }
+    if(mt_all){
+        double tot=0;for(auto&kv:mt_sums)tot+=kv.second;
+        std::fprintf(stderr,"  GRIMOIRE_MUSE_TIME_LAYER=all over %d layers, %d tokens:\n",cfg.n_layers,M);
+        for(const auto&name:mt_order)
+            std::fprintf(stderr,"    %-24s %10.2f ms  (%5.1f%%)\n",
+                         name.c_str(),mt_sums[name],100.0*mt_sums[name]/tot);
+        std::fprintf(stderr,"    %-24s %10.2f ms\n","TOTAL",tot);
     }
 
-    launch_rmsnorm_residual_f16w_batched(q,hidden,nullptr,fnorm_f16,normed,M,H,
-                                         cfg.rms_eps,{},0.0f);
+    launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,fnorm_f16,normed,M,H,
+                                   cfg.rms_eps,{},0.0f);
+    // The decode path and the argmax kernel still consume f32, so convert only
+    // at these boundaries rather than throughout the layer stack.
     if(next_tokens){
-        mm(dflash2.shared_lm_head_f16,normed,batch_logits);
+        sycl::half* lg=mm_f16_raw(dflash2.shared_lm_head_f16,normed);
+        launch_f16_to_f32(q,lg,batch_logits,size_t(M)*cfg.vocab,{});
         for(int r=0;r<M;++r){
             launch_argmax(q,batch_logits+int64_t(r)*cfg.vocab,cfg.vocab,
                           s.d_tok,s.d_val,{});
             q.memcpy(outtok+r,s.d_tok,sizeof(int32_t));
         }
     }else{
-        gemv_any(lm_head,normed+int64_t(M-1)*H,s.logits,{});
+        launch_f16_to_f32(q,normed+int64_t(M-1)*H,lastrow,size_t(H),{});
+        gemv_any(lm_head,lastrow,s.logits,{});
     }
     if(next_tokens&&M<=kSpecBatch&&spec_hidden_steps)
-        q.memcpy(spec_hidden_steps,hidden,size_t(M)*H*sizeof(float));
-    q.memcpy(s.h,hidden+int64_t(M-1)*H,size_t(H)*sizeof(float));
+        launch_f16_to_f32(q,hidden,spec_hidden_steps,size_t(M)*H,{});
+    launch_f16_to_f32(q,hidden+int64_t(M-1)*H,s.h,size_t(H),{});
     pos+=M;
     q.memcpy(s.d_pos,&pos,sizeof(int32_t));
     q.memcpy(s.d_seq_len,&pos,sizeof(int32_t));

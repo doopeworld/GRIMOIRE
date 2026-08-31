@@ -270,6 +270,21 @@ sycl::event launch_rmsnorm_residual_f16_batched(
     sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
     float* out, int tokens, int hidden, float eps,
     const std::vector<sycl::event>& deps = {}, float weight_offset = 0.0f);
+// FP16-storage activation variants; see prefill.cpp for why these are
+// numerically identical to the f32 versions.
+sycl::event launch_embed_f16_h(sycl::queue&, const sycl::half*, const int32_t*,
+    sycl::half*, int, int, const std::vector<sycl::event>& = {});
+sycl::event launch_add_f16_round_h(sycl::queue&, sycl::half*, const sycl::half*,
+    int, const std::vector<sycl::event>& = {});
+sycl::event launch_gate_sigmoid_mul_h(sycl::queue&, sycl::half*,
+    const sycl::half*, int, int, const std::vector<sycl::event>& = {});
+sycl::event launch_swiglu_h(sycl::queue&, const sycl::half*, sycl::half*, int,
+    int, const std::vector<sycl::event>& = {});
+sycl::event launch_dflash_store_tap_h(sycl::queue&, const sycl::half*, float*,
+    int, int, int, int, int, const std::vector<sycl::event>& = {});
+sycl::event launch_rmsnorm_residual_f16w_h(sycl::queue&, sycl::half*,
+    const sycl::half*, const sycl::half*, sycl::half*, int, int, float,
+    const std::vector<sycl::event>& = {}, float weight_offset = 0.0f);
 sycl::event launch_rmsnorm_residual_f16w_batched(
     sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
     float* out, int tokens, int hidden, float eps,
