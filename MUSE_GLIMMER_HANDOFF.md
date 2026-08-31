@@ -2,20 +2,24 @@
 
 Branch: `pp-muse`. Speculative decoding WORKS as of 2026-08-31.
 
-## Current measured state
+## Current measured state (llama-benchy-comparable, 3 runs each)
 
-| prompt | accepts | committed/step | decode | prefill |
-|---|---|---|---|---|
-| 64 tok | 9/11 (82%) | 5.50 | 55.5 tok/s | 363.8 tok/s |
-| 3672 tok | 18/64 (28%) | 1.39 | 20.3 tok/s | 1384.5 tok/s |
+| test | Fusion (llama-benchy) | Grimoire | ratio |
+|---|---|---|---|
+| tg32  | 44.23 ± 7.57 (peak 48.97) | 83.5 ± 7.7 (peak 92.4) | **1.9x faster** |
+| tg128 | 44.49 ± 4.69 (peak 54.00) | 51.5 avg (49.0/54.6/51.0) | on par |
+| pp4096 | 2144-2195 | 1384.5 @3672 tok | ~65% |
 
-Was 0/8 accepts, 1.00 committed/step, 16.8 tok/s before this session.
+Was 0/8 accepts, 1.00 committed/step, 16.8 tok/s at session start.
 Verifier now reproduces Fusion's token stream exactly: verify@64 emits
 19669 200023 10064 262 ... against Fusion's OUTPUT TOKENS
 328 19669 200023 10064 262 2818 17001 1509.
 
-vLLM baseline for reference is ~2016 tok/s prefill on one B70, so Grimoire
-prefill is at ~69% of vLLM.
+**Grimoire's decode is now AHEAD of Fusion; prefill is the real gap (~65%),
+and it is a GEMM-kernel-throughput gap, not a correctness bug.** Do not
+re-litigate decode without a llama-benchy-comparable measurement (matched
+prompt length AND repeat count) - see "Retracted" below for how this went
+wrong once already this session.
 
 ## Fixed this session (all confirmed by measurement)
 
@@ -38,13 +42,29 @@ prefill is at ~69% of vLLM.
    sourcing host stack values into async device copies. Real UB, verified NOT
    causal for 0/8. Kept as hygiene.
 
+## Retracted this session - read before re-deriving
+
+- **"Acceptance collapses with context length" / sliding-window theory: WRONG,
+  retracted.** An early measurement (random-word prompts) showed 82% accepts
+  at 64 tokens vs 28% at 3672 and pointed at the draft window (2047) binding
+  above ~2048 tokens. A coherent-prose control at the same lengths killed it:
+  59% @2662, 53% @3662, no cliff at 2048, and 3210-token random-word landed at
+  44% (recovered, not worse than 2420's 25%). The random-word prompts were
+  measuring prompt-entropy / drafter-predictability, not a Grimoire defect.
+  There is no known long-context acceptance bug. Do not re-open this without a
+  coherent-prompt sweep.
+- **"Grimoire is at ~40% of vLLM decode": WRONG, retracted.** That number
+  compared a random-word-prompt speculative run against vLLM's short-context
+  tg32 figure - not the same workload. The correct comparison (tg32-vs-tg32,
+  3 repeats each) has Grimoire at 1.9x Fusion. See "Current measured state".
+- Do not trust a decode/prefill number produced while more than one container
+  holds the GPU. Confirmed this session: three concurrent runs on the same
+  B70 produced garbage timings (a build even crashed under contention). Always
+  `docker ps` and confirm only Fusion (GPU1) is running before timing Grimoire
+  runs on GPU0.
+
 ## Known-open
 
-- **Acceptance collapses with context length: 82% at 64 tokens, 28% at 3672.**
-  Prime suspect is the draft sliding window. Grimoire passes
-  window_left = window_right = 2047 for the draft layers; at 64 tokens the
-  window never binds, at 3672 it does. Same shape as every bug above: correct
-  below a boundary, wrong above it. THIS IS THE NEXT THING TO FIX.
 - `k_norm` bug-compatibility is in but NOT A/B tested. vLLM stacks
   `_k_norm_weights` as [num_layers, head_dim] and hands it to ops.rms_norm,
   whose weight must be [head_dim], so the kernel applies layer 0's weight to
@@ -55,17 +75,26 @@ prefill is at ~69% of vLLM.
   genuinely differ (rms 1.085, 1.349, 0.895, 1.381, 0.955). Revert and re-measure
   now that the verifier is correct; it may be unnecessary.
 - Target aux states still differ from Fusion at rel_l2 0.032 (cos 0.99947).
-  That is INT4 target numerics and bounds achievable acceptance.
+  That is INT4 target numerics; may bound achievable acceptance somewhat but
+  acceptance is already comparable to Fusion so this is low priority.
+- **Prefill is the real remaining gap: ~65% of Fusion (1384.5 vs 2144-2195
+  tok/s at ~3700-4096 tokens).** This is a GEMM-kernel-throughput question
+  (CUTLASS/oneDNN vs Grimoire's hand-written kernels), consistent with prior
+  project findings that the PP gap is "kernel+format, not tuning". This is
+  where effort should go next, NOT decode.
 - llama-benchy (`--pp 4096`) cannot drive Grimoire: it needs an
   OpenAI-compatible HTTP endpoint and Grimoire is CLI-only. A single-stream
   /v1/chat/completions wrapper around grimoire_generate would make Grimoire and
-  Fusion benchmarkable with the identical tool.
+  Fusion benchmarkable with the identical tool and remove the need for manual
+  CLI-vs-llama-benchy comparisons like the ones in this handoff.
 
 ## Lesson
 
-All four bugs were width/stride errors that only manifest past a boundary -
-page 0, or a buffer sized for layer widths rather than vocab. A 64-token prompt
-hid every one of them. Test at the size you benchmark at.
+All four bugs fixed this session were width/stride errors that only manifest
+past a boundary - page 0, or a buffer sized for layer widths rather than
+vocab. A 64-token prompt hid every one of them. Test at the size you
+benchmark at - and when comparing to a benchmark tool's numbers, match its
+exact test (prompt length, repeat count), not an approximation of it.
 
 ## Tooling built this session
 
