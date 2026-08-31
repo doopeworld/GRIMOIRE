@@ -1492,9 +1492,17 @@ struct Grimoire {
         int context_pos=0;
         int hidden=0, inter=0, q_heads=0, kv_heads=0, head_dim=0;
         int mask_token=0, sliding_window=0;
-        // Fusion resolves the XPU FlashAttention kernel block size from the
-        // live KV-cache group. With --block-size 64 and MultipleOf(16)
-        // backend support, both target and DFlash drafter use 64 here.
+        // Fusion pages the DRAFT KV cache at 16, not at the target's 64.
+        // Verified against the running reference: its context slots for
+        // positions 0..63 are 368..431 and its query slots for 64..79 are
+        // 432..447, i.e. base 368 = block 23 * 16, which is not a multiple of
+        // 64. The drafter's own config.json also declares "block_size": 16.
+        // At 64 the 80-key draft sequence is one whole page plus a 16-key
+        // partial page, and the paged kernel returns zeros for that trailing
+        // partial page: the appends land correctly (cache[64:80] is
+        // bit-identical to the source K/V) but attention reads them as zero,
+        // so the 16 draft rows see only the 64 context keys and never the
+        // bonus token. At 16 the same 80 keys are exactly 5 whole pages.
         int block_size=64, num_blocks=0;
         float rope_theta=0.0f;
         std::vector<Layer> layers;
@@ -4765,6 +4773,19 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     checkpoint("block embedding");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
 
+    if(cfg.is_muse){
+        // The paged FA2 kernel reads the query batch layout from cu_q.
+        // prefill_muse leaves it describing its own 64-token prefill, and the
+        // draft never restored it, so the kernel bounded the key range by a
+        // 64-row query length and never read the query block's own K/V: the
+        // 16 draft rows attended to the 64 context keys only, never to the
+        // bonus token or each other. Both copies source host stack values, so
+        // they must complete before the value dies.
+        const int32_t cuq[2]={0,M};
+        const int32_t used_all=position+M;
+        q.memcpy(dflash2.cu_q,cuq,sizeof(cuq)).wait();
+        q.memcpy(dflash2.seqused_k,&used_all,sizeof(used_all)).wait();
+    }
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
         if(li==0)
@@ -4794,8 +4815,33 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 d.k_cache_f16,d.v_cache_f16,M,position,KVH,HD,
                 dflash2.block_size,{});
             const int32_t used=position+M;
-            q.memcpy(dflash2.seqused_k,&used,sizeof(used));
             const int window=d.sliding?dflash2.sliding_window-1:-1;
+            if(dumping&&li==0){
+                // Read the KV cache back through the same linear indexing the
+                // append uses, for the 64 context slots and the 16 query slots.
+                dump_f16("18_cache_ctx_k",d.k_cache_f16,size_t(position)*KVW);
+                dump_f16("19_cache_qry_k",
+                         d.k_cache_f16+size_t(position)*KVW,size_t(M)*KVW);
+                dump_f16("20_cache_qry_v",
+                         d.v_cache_f16+size_t(position)*KVW,size_t(M)*KVW);
+            }
+            if(dumping&&li==0){
+                // Read back exactly what the paged kernel will see. The
+                // memcpy above sources a stack local asynchronously, and
+                // cu_q is shared with prefill_muse, so neither value can be
+                // assumed from the code alone.
+                int32_t sk=-1,cq[2]={-1,-1},ck2[2]={-1,-1};
+                q.memcpy(&sk,dflash2.seqused_k,sizeof(sk)).wait();
+                q.memcpy(cq,dflash2.cu_q,sizeof(cq)).wait();
+                q.memcpy(ck2,dflash2.cu_k,sizeof(ck2)).wait();
+                std::fprintf(stderr,
+                    "  dflash probe: position=%d M=%d used=%d | device "
+                    "seqused_k=%d cu_q=[%d,%d] cu_k=[%d,%d] | block_size=%d "
+                    "num_blocks=%d window=%d causal=0\n",
+                    position,M,used,sk,cq[0],cq[1],ck2[0],ck2[1],
+                    dflash2.block_size,dflash2.num_blocks,window);
+                std::fflush(stderr);
+            }
             const int rc=fa2_paged(&q,dflash2.q_f16,d.k_cache_f16,
                 d.v_cache_f16,dflash2.attn_f16,M,used,QH,KVH,HD,
                 dflash2.block_size,dflash2.num_blocks,dflash2.block_table,
@@ -4948,7 +4994,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         dflash2.cu_k&&dflash2.seqused_k;
     if(!exact_attn){cleanup();return false;}
     const int32_t cuq[2]={0,M};
-    q.memcpy(dflash2.cu_q,cuq,sizeof(cuq));
+    q.memcpy(dflash2.cu_q,cuq,sizeof(cuq)).wait();
     auto mm_w4_f16=[&](const DevQuant& w,const float* x)->sycl::half*{
         if(!od||!muse_od_zp||!w.od_w4||!w.payload||!w.od_scales_fp16)
             throw std::runtime_error("Muse target W4A16 parity path unavailable");
@@ -5082,7 +5128,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         launch_kv_append_f16_paged(q,kh,vh,d.k_cache_f16,d.v_cache_f16,M,
             start_pos,KVH,HD,target_block_size,{});
         const int32_t used=start_pos+M;
-        q.memcpy(dflash2.seqused_k,&used,sizeof(used));
+        q.memcpy(dflash2.seqused_k,&used,sizeof(used)).wait();
         const int window_left=d.muse_sliding?2047:-1;
         const int window_right=d.muse_sliding?0:-1;
         const int rc=fa2_paged(&q,qh,d.k_cache_f16,d.v_cache_f16,oh,M,used,

@@ -67,7 +67,17 @@ extern "C" int grimoire_xe2_dflash_paged_f16(
   a.v_stride_heads=head_dim;
   a.o_stride_seq=q_heads*head_dim;
   a.o_stride_heads=head_dim;
-  a.page_stride_elements=block_size*kv_heads*head_dim;
+  // page_stride_elements is in SEQUENCE-POSITION units, not elements, despite
+  // the name. vLLM computes it as key_cache.stride(0)/key_cache.stride(1),
+  // which for the contiguous [num_blocks, block_size, heads, head_size] layout
+  // is exactly block_size (see csrc/xpu/attn/paged_kv_utils.h). Passing
+  // block_size*kv_heads*head_dim scales every page address by kv_heads*head_dim
+  // too, so page 0 still resolves to offset 0 and reads correctly while every
+  // later page lands far outside the cache and the 2D block load returns
+  // zeros. That is why draft attention saw the 64 context keys (page 0) but
+  // read the 16 query rows (page 1) as zero even though the appends had
+  // written them correctly.
+  a.page_stride_elements=block_size;
   CutlassQKType types{CutlassDType::half};
   if(causal){
     if(a.is_local)
