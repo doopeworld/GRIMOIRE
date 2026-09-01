@@ -1470,11 +1470,6 @@ struct Grimoire {
         float *context_kv_all=nullptr;
         float *q=nullptr, *k=nullptr, *v=nullptr, *attn=nullptr;
         float *proj=nullptr, *gate_up=nullptr, *mlp=nullptr, *logits=nullptr;
-        // DFlash2 grouped-conv and rank-selector scratch.  The convolution
-        // coefficients must survive the attention/MLP body until finish(),
-        // so they cannot alias the projection buffers.
-        float *conv_coeff=nullptr, *selector_proj=nullptr;
-        float *candidate_values=nullptr, *candidate_scores=nullptr;
         sycl::half *q_f16=nullptr, *k_f16=nullptr, *v_f16=nullptr;
         sycl::half *attn_f16=nullptr;
         sycl::half *linear_in_f16=nullptr, *linear_out_f16=nullptr;
@@ -1484,7 +1479,7 @@ struct Grimoire {
         sycl_bf16 *bf=nullptr;
         int8_t *a8=nullptr;
         float *a8s=nullptr;
-        int32_t *tokens=nullptr, *draft_ids=nullptr, *candidate_ids=nullptr;
+        int32_t *tokens=nullptr, *draft_ids=nullptr;
         int32_t *block_table=nullptr, *cu_q=nullptr, *cu_k=nullptr;
         int32_t *seqused_k=nullptr;
         // Muse speculative verifier scratch, reused after the draft pass.
@@ -2633,7 +2628,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
         db+=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
-        {
+        if(!dflash2.v2){
             constexpr int DM=16;
             const int DH=dflash2.hidden;
             const int DQ=dflash2.q_heads*dflash2.head_dim;
@@ -2666,17 +2661,6 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.gate_up=dfd(size_t(DM)*DI2);
             dflash2.mlp=dfd(size_t(DM)*DH);
             dflash2.logits=dfd(size_t(DM-1)*cfg.vocab);
-            if(dflash2.v2){
-                constexpr int TAPS=2,GROUP=16,TOPK=16,RANK=256;
-                const int groups=DH/GROUP;
-                dflash2.conv_coeff=dfd(size_t(DM)*2*TAPS*groups);
-                dflash2.selector_proj=dfd(size_t(DM-1)*RANK);
-                dflash2.candidate_values=dfd(size_t(DM-1)*TOPK);
-                dflash2.candidate_scores=dfd(size_t(DM-1)*TOPK*TOPK);
-                dflash2.candidate_ids=sycl::malloc_device<int32_t>(
-                    size_t(DM-1)*TOPK,q);
-                db+=size_t(DM-1)*TOPK*sizeof(int32_t);
-            }
             if(cfg.is_muse){
                 auto df16=[&](size_t n){
                     db+=n*sizeof(sycl::half);
@@ -2766,9 +2750,6 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                !dflash2.proj||!dflash2.gate_up||!dflash2.mlp||!dflash2.logits||
                !dflash2.bf||!dflash2.a8||!dflash2.a8s||!dflash2.tokens||
                !dflash2.draft_ids)dok=false;
-            if(dflash2.v2&&(!dflash2.conv_coeff||!dflash2.selector_proj||
-               !dflash2.candidate_values||!dflash2.candidate_scores||
-               !dflash2.candidate_ids))dok=false;
         }
         dflash2.ok=dok;
         if(!dok){err="DFlash weight upload failed";return false;}
@@ -3174,10 +3155,6 @@ void Grimoire::release() {
                     (void*)dflash2.normed, (void*)dflash2.q,
                     (void*)dflash2.k, (void*)dflash2.v,
                     (void*)dflash2.attn, (void*)dflash2.proj,
-                    (void*)dflash2.conv_coeff,
-                    (void*)dflash2.selector_proj,
-                    (void*)dflash2.candidate_values,
-                    (void*)dflash2.candidate_scores,
                     (void*)dflash2.q_f16, (void*)dflash2.k_f16,
                     (void*)dflash2.v_f16, (void*)dflash2.attn_f16,
                     (void*)dflash2.linear_in_f16,
@@ -3189,7 +3166,6 @@ void Grimoire::release() {
                     (void*)dflash2.logits, (void*)dflash2.bf,
                     (void*)dflash2.a8, (void*)dflash2.a8s,
                     (void*)dflash2.tokens, (void*)dflash2.draft_ids,
-                    (void*)dflash2.candidate_ids,
                     (void*)dflash2.block_table, (void*)dflash2.cu_q,
                     (void*)dflash2.cu_k, (void*)dflash2.seqused_k,
                     (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
@@ -4661,13 +4637,13 @@ int Grimoire::argmax_token() {
     return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
 }
 
-// DFlash: ingest any target taps not yet present in the six draft KV caches,
-// then evaluate [bonus, mask x 15] in one non-causal block.  DFlash2 extends
-// the same core with dynamic grouped convolutions around attention/MLP and a
-// rank-256 candidate selector.
+// Original DFlash: ingest any target taps not yet present in the six draft KV
+// caches, then evaluate [bonus, mask x 15] in one non-causal block. DFlash2
+// has additional grouped-conv/selector stages and deliberately does not enter
+// this path.
 bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens) {
-    if(!dflash2.ok||position<0||position+16>max_seq)return false;
+    if(!dflash2.ok||dflash2.v2||position<0||position+16>max_seq)return false;
     constexpr int M=16;
     const int H=dflash2.hidden,QH=dflash2.q_heads,KVH=dflash2.kv_heads;
     const int HD=dflash2.head_dim,QW=QH*HD,KVW=KVH*HD,I=dflash2.inter;
@@ -4826,11 +4802,8 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     host_tokens[0]=bonus_token;
     for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
     q.memcpy(dflash2.tokens,host_tokens.data(),sizeof(host_tokens));
-    if(cfg.is_muse)
-        launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
-                                 dflash2.resid,M,H);
-    else
-        launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
+    launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
+                             dflash2.resid,M,H);
     checkpoint("block embedding");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
 
@@ -4849,23 +4822,14 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
-        const float* previous=li==0?nullptr:
-            (dflash2.v2?dflash2.proj:dflash2.mlp);
         if(li==0)
             norm(dflash2.resid,nullptr,d.in_norm,d.in_norm_f16,dflash2.normed,M);
         else
-            norm(dflash2.resid,previous,d.in_norm,d.in_norm_f16,
+            norm(dflash2.resid,dflash2.mlp,d.in_norm,d.in_norm_f16,
                  dflash2.normed,M);
         dump_f32("08_L"+std::to_string(li)+"_innorm",dflash2.normed,size_t(M)*H);
-        const float* attn_input=dflash2.normed;
-        if(dflash2.v2){
-            mm(d.attn_conv_proj,dflash2.normed,dflash2.conv_coeff,M);
-            launch_dflash2_grouped_conv(q,dflash2.normed,dflash2.conv_coeff,
-                d.attn_conv_base,dflash2.ctx,M,H,2,16,M,0,{});
-            attn_input=dflash2.ctx;
-        }
         if(cfg.is_muse){
-            const sycl::half* qkv=mm_f16_raw(d.qkv,attn_input,M);
+            const sycl::half* qkv=mm_f16_raw(d.qkv,dflash2.normed,M);
             launch_qkv_norm_rope_f16w_fused(q,qkv,dflash2.q_f16,
                 dflash2.k_f16,dflash2.v_f16,d.q_norm_f16,d.k_norm_f16,M,QH,KVH,HD,
                 position,theta,eps,{});
@@ -4875,9 +4839,9 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             dump_f16("11_L"+std::to_string(li)+"_k",dflash2.k_f16,size_t(M)*KVW);
             dump_f16("12_L"+std::to_string(li)+"_v",dflash2.v_f16,size_t(M)*KVW);
         }else{
-            mm(d.q,attn_input,dflash2.q,M);
-            mm(d.k,attn_input,dflash2.k,M);
-            mm(d.v,attn_input,dflash2.v,M);
+            mm(d.q,dflash2.normed,dflash2.q,M);
+            mm(d.k,dflash2.normed,dflash2.k,M);
+            mm(d.v,dflash2.normed,dflash2.v,M);
         }
         checkpoint("QKV projections");
         if(cfg.is_muse){
@@ -4934,34 +4898,17 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         dump_f32("13_L"+std::to_string(li)+"_attn",dflash2.attn,size_t(M)*QW);
         mm(d.o,dflash2.attn,dflash2.proj,M);
         dump_f32("14_L"+std::to_string(li)+"_o",dflash2.proj,size_t(M)*H);
-        const float* attn_output=dflash2.proj;
-        if(dflash2.v2){
-            launch_dflash2_grouped_conv(q,dflash2.proj,dflash2.conv_coeff,
-                d.attn_conv_base,dflash2.ctx,M,H,2,16,M,1,{});
-            attn_output=dflash2.ctx;
-        }
-        norm(dflash2.resid,attn_output,d.post_norm,d.post_norm_f16,
+        norm(dflash2.resid,dflash2.proj,d.post_norm,d.post_norm_f16,
              dflash2.normed,M);
-        const float* mlp_input=dflash2.normed;
-        if(dflash2.v2){
-            mm(d.mlp_conv_proj,dflash2.normed,dflash2.conv_coeff,M);
-            launch_dflash2_grouped_conv(q,dflash2.normed,dflash2.conv_coeff,
-                d.mlp_conv_base,dflash2.ctx,M,H,2,16,M,0,{});
-            mlp_input=dflash2.ctx;
-        }
-        mm(d.gate_up,mlp_input,dflash2.gate_up,M);
+        mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
         if(cfg.is_muse)
             launch_swiglu_f16_batched(q,dflash2.gate_up,dflash2.h,M,I,{});
         else launch_swiglu_batched(q,dflash2.gate_up,dflash2.h,M,I);
         mm(d.down,dflash2.h,dflash2.mlp,M);
-        if(dflash2.v2)
-            launch_dflash2_grouped_conv(q,dflash2.mlp,dflash2.conv_coeff,
-                d.mlp_conv_base,dflash2.proj,M,H,2,16,M,1,{});
         checkpoint("MLP");
         dump_f32("15_L"+std::to_string(li)+"_mlp",dflash2.mlp,size_t(M)*H);
     }
-    norm(dflash2.resid,dflash2.v2?dflash2.proj:dflash2.mlp,
-         dflash2.norm,dflash2.norm_f16,
+    norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.norm_f16,
          dflash2.normed,M);
 
     auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
@@ -4981,19 +4928,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else for(int r=1;r<M;++r)
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                  dflash2.logits+int64_t(r-1)*cfg.vocab,{});
-    if(dflash2.v2){
-        constexpr int TOPK=16,RANK=256;
-        launch_topk16_rows(q,dflash2.logits,M-1,cfg.vocab,
-            dflash2.candidate_ids,dflash2.candidate_values,{});
-        mm(dflash2.selector_hidden,dflash2.normed+H,
-           dflash2.selector_proj,M-1);
-        launch_dflash2_selector_edges(q,dflash2.predecessor,
-            dflash2.successor,dflash2.candidate_ids,
-            dflash2.candidate_values,dflash2.selector_proj,bonus_token,
-            dflash2.candidate_scores,M-1,TOPK,RANK,{});
-        launch_dflash2_path_walk(q,dflash2.candidate_scores,
-            dflash2.candidate_ids,dflash2.draft_ids,M-1,TOPK,{});
-    }else for(int r=0;r<M-1;++r){
+    for(int r=0;r<M-1;++r){
         launch_argmax(q,dflash2.logits+int64_t(r)*cfg.vocab,cfg.vocab,
                       s.d_tok,s.d_val,{});
         q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
@@ -6540,7 +6475,7 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     int n = 0;
     const bool mtp_measure_only = std::getenv("GRIMOIRE_MTP_MEASURE") != nullptr;
     const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok && !mtp_measure_only;
-    const bool dflash_spec = e.dflash2.ok;
+    const bool dflash_spec = e.dflash2.ok && !e.dflash2.v2;
     if (mtp_spec || dflash_spec) {
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");

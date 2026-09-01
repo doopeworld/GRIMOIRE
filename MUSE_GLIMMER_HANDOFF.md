@@ -2,31 +2,6 @@
 
 Branch: `pp-muse`. Speculative decoding WORKS as of 2026-08-31.
 
-## Ornith DFlash2 forward is live (2026-09-01)
-
-`GRIMOIRE_DFLASH2_MODEL=/models/Ornith-1.5-35B-A3B-DFlash2` now enters the
-16-query speculative loop instead of being hard-disabled.  The existing
-six-layer draft core is extended with the reference DFlash2 operations:
-dynamic grouped-conv prepare/finish around attention and MLP, top-16 unary
-candidates, the rank-256 predecessor/successor edge selector, and path walk.
-The sidecar loads at 1.04 GiB and all buffers are persistent.
-
-First smoke test (`n=16`, 17-token prompt): coherent output, 16/18 draft
-accepts, 9.00 committed/step, 53.3 tok/s.  A harder 128-token prose test:
-86/132 accepts, 2.87 committed/step, 18.7 tok/s.  Profile over 46 steps:
-snapshot 15.1 ms total, draft 3379.0 ms, verify 3420.8 ms, commit 34.1 ms.
-This proves the architecture and selector work, but it is NOT the performance
-target: the run used the exact fallback target path, not Ornith's production
-W4A8 setup.  Next: test `GRIMOIRE_W4A8=1` with exact verification, require PP
-to remain near the 10,350 record, then separately profile/accelerate the
-~73 ms draft pass.
-
-The decode graph was also validated at matched conditions.  Greedy output was
-byte-identical (SHA-256 equal) with graph off/on for both 128 and 256 tokens.
-TG improved 114.1 -> 117.5 and 108.1 -> 111.4 tok/s, consistently about 3%.
-Keep `GRIMOIRE_DECODE_GRAPH=1` opt-in for now: the gain is real but too small
-to make default before validating Qwen/Muse and server lifetimes.
-
 ## PREFILL: at parity with Fusion (settled 2026-09-01)
 
 Measured with BOTH engines treated identically - one discarded call to build the
