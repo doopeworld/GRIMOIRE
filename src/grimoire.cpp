@@ -6401,6 +6401,19 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
 
     e.reset();
 
+    // GRIMOIRE_PREFILL_WARMUP=1 runs the prefill once and discards it, then
+    // times the second run. oneDNN keys its matmul primitives on (m,n,k), so a
+    // cold process JIT-compiles a fresh plan set for every distinct prompt
+    // length -- measured at ~181 ms in layer 0 alone (33.8 ms for qkv, 147.0 ms
+    // for the FFN down shape). A long-running server pays that once and
+    // amortises it; a fresh CLI process pays it on every invocation. Use this
+    // when comparing against the Fusion server, which has warm plans.
+    if (std::getenv("GRIMOIRE_PREFILL_WARMUP")) {
+        if (e.prefill(ids)) {
+            e.reset();
+        }
+    }
+
     const auto p0 = std::chrono::high_resolution_clock::now();
     if (!e.prefill(ids)) {
         std::printf("batched prefill unavailable, using sequential fallback\n");
