@@ -4742,7 +4742,14 @@ int Grimoire::argmax_token() {
 bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens) {
     constexpr int MMAX=16;
-    const int M=dflash2.draft_head_rows?8:MMAX;
+    // Ornith's verify slope is ~2.95 ms per extra verified token, so the
+    // profitable block is far shorter than the drafter's native 16. Let the
+    // depth be tuned; M is the block INCLUDING the bonus row, so M=4 verifies
+    // 3 drafts.
+    static const int m_env=[]{const char* v=std::getenv("GRIMOIRE_DFLASH_M");
+        return v&&*v?std::atoi(v):0;}();
+    int M=dflash2.draft_head_rows?8:MMAX;
+    if(m_env>=2&&m_env<=MMAX)M=m_env;
     if(!dflash2.ok||position<0||position+M>max_seq){
         static bool once2=false;
         if(!once2){once2=true;std::fprintf(stderr,
@@ -4916,8 +4923,15 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     host_tokens[0]=bonus_token;
     for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
     q.memcpy(dflash2.tokens,host_tokens.data(),size_t(M)*sizeof(int32_t));
-    launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
-                             dflash2.resid,M,H);
+    // shared_embed_f16 is populated for Muse ONLY. On a non-Muse target it is
+    // a null device pointer, and feeding it to the embed kernel faults the
+    // GPU (UR_RESULT_ERROR_DEVICE_LOST) rather than failing cleanly. The
+    // non-Muse drafter shares the target's own bf16 embedding table.
+    if(cfg.is_muse)
+        launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
+                                 dflash2.resid,M,H);
+    else
+        launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
     checkpoint("block embedding");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
 
