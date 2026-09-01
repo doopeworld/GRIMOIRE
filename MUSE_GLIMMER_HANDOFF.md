@@ -2,49 +2,57 @@
 
 Branch: `pp-muse`. Speculative decoding WORKS as of 2026-08-31.
 
-## PREFILL: the GEMMs are NOT the gap (settled 2026-08-31, do not re-derive)
+## PREFILL: at parity with Fusion (settled 2026-09-01)
 
-Ran the exact five Muse projection shapes at M=3672 through Fusion's own op
-(torch.ops._xpu_C.int4_gemm_w4a16) and compared against Grimoire's split
-profile, summed over 52 layers:
+Measured with BOTH engines treated identically - one discarded call to build the
+oneDNN plans for that shape, then time the second:
 
-    Grimoire pure oneDNN GEMM : 1345.5 ms
-    Fusion   pure oneDNN GEMM : 1309.4 ms   <- within 3%
+| tokens | Fusion | Grimoire warm |
+|---|---|---|
+| ~400  |  199.4 ms |  204 ms (2138 tok/s) |
+| ~800  |  389.5 ms |  418 ms (2001 tok/s) |
+| ~1650 |  771.4 ms |  808 ms (2058 tok/s) |
+| ~3150 | 1446.9 ms | 1531 ms (2066 tok/s) |
+| ~3650 | 1701.2 ms | 1782 ms (2061 tok/s) |
 
-Both are the same dnnl::matmul with the same configuration, verified at source
-level: vLLM's trans_type_t::nt gives wei_strides = {1, ldb} with
-ldb = mat2.strides()[last]*8 = K, identical to Grimoire's
+**Grimoire 2061 tok/s vs Fusion 2129 tok/s = 97%**, within ~4% of llama-benchy
+pp4096 (2144 +/- 28). Run Grimoire with `GRIMOIRE_PREFILL_WARMUP=1` for any
+comparison against a warm server.
+
+Scaling fits:
+
+    Fusion          0.4607 ms/token +  24.4 ms fixed
+    Grimoire cold   0.486  ms/token + 620   ms fixed
+    Grimoire warm   ~0.47  ms/token + ~15   ms fixed
+
+**Per-token compute was always within 5% of Fusion.** The GEMMs match too:
+1345.5 ms (Grimoire) vs 1309.4 ms (Fusion) over 52 layers at the same shapes,
+with descriptors verified identical in vllm-xpu-kernels source
+(csrc/xpu/onednn/int4_gemm_w4a16.h, onednn_ext.h): trans_type_t::nt gives
+wei_strides {1, ldb} with ldb = strides[last]*8 = K, same as Grimoire's
 memory::desc wei({k,n}, u4, dims{1,k}); same scales mask 3 with {group_size,1},
-same s8 zero-points mask 0, same fpmath_mode::f16(true), same
-scratchpad_mode::user. See vllm-xpu-kernels csrc/xpu/onednn/int4_gemm_w4a16.h
-and onednn_ext.h.
+same s8 zero-points mask 0, same fpmath_mode::f16(true), same user scratchpad.
 
-**Do not spend time tuning the GEMMs or the oneDNN descriptors.** The gap is:
+**Do NOT tune the GEMMs and do NOT chase per-stage kernel fusion for prefill.**
+Per-token compute is already at parity.
 
-    Fusion  : 1702 total - 1309 GEMM =  393 ms non-GEMM
-    Grimoire: 2412 total - 1345 GEMM = 1067 ms non-GEMM   <- ~670 ms excess
+### The cold-start cost (real, but a server never pays it)
 
-Grimoire dispatches ~11 kernels per layer x 52 layers with no overlap:
-in_norm, qkv GEMM, qkv-norm-rope, o_gate GEMM, kv-append, attention, attn copy,
-gate-sigmoid-mul, o_proj GEMM, post_norm, add, pre_ff_norm, gate_up GEMM,
-swiglu, down GEMM, post_ff_norm, add. vLLM fuses most of that elementwise work
-into its compiled graph. **The remaining lever is kernel fusion and dispatch
-count.** Candidates: merge post_norm+add into one pass, fold swiglu into the
-gate_up epilogue, fold gate-sigmoid-mul into the attention epilogue.
+oneDNN keys matmul primitives on (m,n,k), so a fresh process JIT-compiles a new
+plan set for every distinct prompt length. Measured in layer 0 at M=3672:
+33.8 ms for the qkv shape, 147.0 ms for the FFN-down shape, versus ~0.1 ms for
+the same marks in layers 1-51. Total ~600 ms per fresh invocation. That is the
+whole of the apparent prefill gap, and it amortises to nothing in any
+long-running process.
 
-Prefill progress this session, all correctness-verified (output stays
+Prefill work that DID help this session (all correctness-verified, output stays
 byte-identical to Fusion's " to=selfWrite a haiku about"):
 
-| build | prefill 3672 tok | tok/s | vs Fusion |
-|---|---|---|---|
-| session start | 2676 ms | 1372 | 65% |
-| FP16 activations (a3ac518) | 2470 ms | 1486 | 70% |
-| GEMM direct-to-dst (d13d8d7) | 2412 ms | 1523 | 72% |
-
-Fusion reference: 1702.5 ms / 2129.3 tok/s, measured against the live server on
-GPU1 with a UNIQUE PREFIX PER REQUEST. Without cache-busting the server returns
-a cached prefill and reports ~28,000 tok/s, which is meaningless. That number
-matches llama-benchy pp4096 (2144 +/- 28), so the method is sound.
+| change | cold prefill 3672 | tok/s |
+|---|---|---|
+| session start | 2676 ms | 1372 |
+| FP16 activations (a3ac518) | 2470 ms | 1486 |
+| GEMM direct-to-dst (d13d8d7) | 2412 ms | 1523 |
 
 ## Current measured state (llama-benchy-comparable, 3 runs each)
 
@@ -99,7 +107,15 @@ wrong once already this session.
 - Never time Grimoire while another container holds GPU0. Fusion on GPU1 is
   fine and does not contend.
 
-## Retracted this session - read before re-deriving
+## Retracted - read before re-deriving
+
+- **"Grimoire prefill is 65% of Fusion": WRONG, retracted 2026-09-01.** Cold
+  Grimoire process vs warm Fusion server. Matched properly it is 97%. Always
+  use GRIMOIRE_PREFILL_WARMUP=1, and remember my Fusion measurements warmed
+  each shape with a throwaway request first.
+- **"Grimoire GEMMs are 1.85x slower on FFN down / o_proj": WRONG, retracted.**
+  Compared instrumented Grimoire stages (GEMM + conversions + profiler drain)
+  against Fusion's pure GEMM. Measured properly they match within 3%.
 
 - **"Acceptance collapses with context length" / sliding-window theory: WRONG,
   retracted.** An early measurement (random-word prompts) showed 82% accepts
