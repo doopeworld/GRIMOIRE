@@ -5584,9 +5584,17 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             static const bool dbg=std::getenv("GRIMOIRE_W4A8_DEBUG")!=nullptr;
             if(dbg){std::printf("    [mm] N=%d K=%d M=%d quantize...",
                                 w.w.N,w.w.K,M);std::fflush(stdout);}
-            if (a8_cached_src != x || a8_cached_k != w.w.K) {
+            // The cache is keyed on the SOURCE POINTER. Verify reuses the
+            // t0..t4 scratch buffers, so a different tensor can land at the
+            // same address with the same K and silently reuse stale int8
+            // rows. GRIMOIRE_W4A8_NO_CACHE=1 disables the reuse to test
+            // whether that -- rather than int8 precision -- is what collapses
+            // MTP acceptance to 0 when W4A8 is on without EXACT_VERIFY.
+            static const bool a8_no_cache =
+                std::getenv("GRIMOIRE_W4A8_NO_CACHE") != nullptr;
+            if (a8_no_cache || a8_cached_src != x || a8_cached_k != w.w.K) {
                 launch_quantize_rows_int8(q,x,a8,a8s,M,w.w.K,{});
-                a8_cached_src = x;
+                a8_cached_src = a8_no_cache ? nullptr : x;
                 a8_cached_k = w.w.K;
                 a8_cached_bf = nullptr;
             }
