@@ -73,3 +73,28 @@ shisa's claimed 3.078 for their own head, and the measured verify slope
 dominates: see [[grimoire-verify-wall]] -- each extra verified token costs
 2.95 ms (MoE expert fan-out), so even a perfect drafter caps out near
 130 TG at the current verify cost. Fix MoE verify batching first.
+
+
+## Qwen: opposite bottleneck (measured 2026-09-01, n=128)
+
+    decode(1)          33.2 ms  (30.1 tok/s, no MTP)
+    verify(M=4) k=3    47.5 ms/step, 2.74 committed, 51.5 TG, accept 82/113
+    verify(M=8) k=7    54.0 ms/step, 3.05 committed, 46.9 TG, accept 86/128
+    fit: verify(M) ~= 42.6 + 1.63*(M-1) ms
+
+Qwen slope 1.63 ms = 4.9% of its decode -> ACCEPTANCE-limited.
+Ornith slope 2.95 ms = 34.9% of its decode -> VERIFY-limited.
+
+On Qwen a better drafter pays off directly: at k=3 (step 52.9 ms fixed),
+2.74 committed = 51.5 TG, 3.4 -> 64 TG, 4.0 perfect -> 76 TG. k=7 is
+currently worse than k=3 because acceptance decays with depth faster than
+the cheap extra verify is repaid.
+
+But no published artifact supplies a better head. NInfer Build 1
+(Qwen3.8-27B) uses the head included in the base checkpoint -- ours.
+mudler/Ornith-1.5-35B-A3B-APEX-MTP-GGUF is a GGUF requantization of the same
+ornith-ai checkpoint. ALWAYS check base_model before pulling one.
+
+And vLLM reaches 58.1 TG on this model with this same native head vs our
+51.5 -- speculation multipliers are close (1.71x vs 1.78x), the gap is mostly
+baseline decode (30.1 vs 32.7). Fix that first; it needs no new model.
