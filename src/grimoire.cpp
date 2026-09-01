@@ -2484,11 +2484,63 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             db+=dflash2.shared_embed_f16.w.bytes();
             db+=dflash2.shared_lm_head_f16.w.bytes();
         }else{
+            // Non-Muse DFlash/DFlash2 geometry (layer count, target-layer
+            // taps, mask token, rope theta, sliding window) is specific to
+            // the DRAFT checkpoint, not the target model. Every published
+            // DFlash2 checkpoint (Ornith's, Qwen's) ships a config.json with
+            // this exact shape, so read it instead of hardcoding one
+            // model's numbers -- a fixed 6-layer/40-target-layer draft
+            // silently truncated Qwen's 5-layer/64-target-layer one to 6
+            // layers and read past its last real layer.
             dflash2.layers.resize(6);
             dflash2.target_layers={1,6,11,16,22,27,32,37};
             dflash2.mask_token=248077;
             dflash2.rope_theta=10000000.0f;
             dflash2.sliding_window=4096;
+            const std::string dcfg_path=std::string(dpath)+"/config.json";
+            std::ifstream dcfg_f(dcfg_path);
+            if(dcfg_f){
+                std::string dcfg((std::istreambuf_iterator<char>(dcfg_f)),
+                                 std::istreambuf_iterator<char>());
+                auto find_int=[&](const char* key,long dflt)->long{
+                    const std::string pat=std::string("\"")+key+"\":";
+                    const size_t p0=dcfg.find(pat);
+                    if(p0==std::string::npos)return dflt;
+                    size_t p1=p0+pat.size();
+                    while(p1<dcfg.size()&&(dcfg[p1]==' '||dcfg[p1]=='\n'))++p1;
+                    if(p1>=dcfg.size()||dcfg[p1]=='n')return dflt;
+                    return std::strtol(dcfg.c_str()+p1,nullptr,10);
+                };
+                auto find_int_arr=[&](const char* key)->std::vector<int>{
+                    std::vector<int> out;
+                    const std::string pat=std::string("\"")+key+"\":";
+                    size_t p0=dcfg.find(pat);
+                    if(p0==std::string::npos)return out;
+                    p0=dcfg.find('[',p0);
+                    if(p0==std::string::npos)return out;
+                    const size_t p1=dcfg.find(']',p0);
+                    if(p1==std::string::npos)return out;
+                    const char* c=dcfg.c_str()+p0+1;
+                    const char* end=dcfg.c_str()+p1;
+                    while(c<end){
+                        char* nx=nullptr;
+                        const long v=std::strtol(c,&nx,10);
+                        if(nx==c)break;
+                        out.push_back(int(v));c=nx;
+                        while(c<end&&(*c==','||*c==' '||*c=='\n'))++c;
+                    }
+                    return out;
+                };
+                const long nl=find_int("num_hidden_layers",6);
+                if(nl>0)dflash2.layers.resize(size_t(nl));
+                const std::vector<int> tl=find_int_arr("target_layer_ids");
+                if(!tl.empty())dflash2.target_layers=tl;
+                dflash2.mask_token=int(find_int("mask_token_id",dflash2.mask_token));
+                dflash2.rope_theta=float(find_int("rope_theta",
+                    long(dflash2.rope_theta)));
+                dflash2.sliding_window=int(find_int("sliding_window",
+                    dflash2.sliding_window));
+            }
         }
         if(dflash2.q_heads<=0||dflash2.kv_heads<=0||dflash2.inter<=0)dok=false;
         // The Muse assistant checkpoint is BF16 and vLLM casts it to FP16 at
