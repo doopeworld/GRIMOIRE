@@ -52,6 +52,33 @@ if [[ "${GRIMOIRE_BRIDGE_ONLY:-all}" == "all" ||
   icpx "${COMMON[@]}" src/xe2_attention_raw_bridge.cpp \
     -o src/libgrimoire_xe2_attention_raw.so.new -lze_loader
 fi
+# libgrimoire_xe2_attention_bridge.so is NOT interchangeable with
+# attention_raw: it is the only bridge exporting grimoire_xe2_chunk_gdn_bf16,
+# the chunked DeltaNet kernel Qwen needs in every layer. Both are loaded
+# through the SAME env var (GRIMOIRE_XE2_ATTN_BRIDGE), so pointing that at
+# attention_raw silently drops chunk GDN AND chunk prefill to slow fallbacks.
+# Measured impact is on PREFILL, not decode: with this bridge loading,
+# Qwen FULL E2E PP 4096 goes 1032 -> 2540 tok/s. MTP decode is unchanged
+# (49.8 tok/s, verify ~4.6 s either way) -- an earlier note here blamed a
+# 3x verify regression on chunk GDN; that was wrong, the decode cost was
+# Ornith flags leaking into Qwen runs via qrun.sh.
+# This target was missing, so the .so on disk was stale (Aug 23) and failed to
+# dlopen at all; it also needs libtorch/vllm_xpu_kernels linked in (below),
+# otherwise it only loads under LD_PRELOAD.
+if [[ "${GRIMOIRE_BRIDGE_ONLY:-all}" == "all" ||
+      "${GRIMOIRE_BRIDGE_ONLY:-all}" == "attention" ]]; then
+  # This bridge calls into libtorch and the vllm_xpu_kernels chunk kernels.
+  # Link them with an rpath so it dlopens on its own; without this it has no
+  # DT_NEEDED for libc10 and only loads under LD_PRELOAD.
+  TORCHLIB=/opt/venv/lib/python3.12/site-packages/torch/lib
+  XPUKERN=/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels
+  icpx "${COMMON[@]}" src/xe2_attention_bridge.cpp \
+    -L"$TORCHLIB" -L"$XPUKERN" \
+    -lc10 -ltorch_cpu \
+    -l:libgdn_attn_kernels_xe_2.so -l:libattn_kernels_xe_2.so \
+    -Wl,--disable-new-dtags -Wl,-rpath,"$TORCHLIB" -Wl,-rpath,"$XPUKERN" \
+    -o src/libgrimoire_xe2_attention_bridge.so.new -lze_loader
+fi
 if [[ "${GRIMOIRE_BRIDGE_ONLY:-all}" == "all" ||
       "${GRIMOIRE_BRIDGE_ONLY:-all}" == "gdn" ]]; then
   icpx "${COMMON[@]}" src/xe2_gdn_raw_bridge.cpp \
@@ -70,7 +97,7 @@ if [[ "${GRIMOIRE_BRIDGE_ONLY:-all}" == "all" ||
     -ldnnl -lze_loader -o src/libgrimoire_onednn.so.new
 fi
 
-for bridge in grouped attention_raw gdn_raw; do
+for bridge in grouped attention_raw attention_bridge gdn_raw; do
   [[ -f "src/libgrimoire_xe2_${bridge}.so.new" ]] || continue
   mv "src/libgrimoire_xe2_${bridge}.so.new" \
      "src/libgrimoire_xe2_${bridge}.so"
