@@ -252,6 +252,18 @@ extern "C" void grimoire_xe2_dense_w4a8_f32_m8(
       static_cast<float*>(d),m,n,k);
 }
 
+// NInfer Build-2's dedicated 131072-row proposal head is symmetric signed
+// Q4 with one FP16 scale per 64 K values.  Its byte plane is already the
+// native low-nibble-first s4 layout consumed by the B70 DPAS kernel; only the
+// scale plane is widened to float when the artifact is loaded.
+extern "C" void grimoire_xe2_dense_w4a8_f32_m8g64(
+    sycl::queue* q,const void* a,const unsigned char* b,
+    const float* wscale,const float* ascale,void* d,int m,int n,int k){
+  grimoire_moe_raw::launch_dense_w4a8<m8x256,64,float>(
+      *q,static_cast<const int8_t*>(a),b,wscale,ascale,
+      static_cast<float*>(d),m,n,k);
+}
+
 extern "C" void grimoire_xe2_dense_w4a8_bf16_m8(
     sycl::queue* q,const void* a,const unsigned char* b,
     const float* wscale,const float* ascale,void* d,int m,int n,int k){

@@ -1480,6 +1480,13 @@ struct Grimoire {
         int8_t *a8=nullptr;
         float *a8s=nullptr;
         int32_t *tokens=nullptr, *draft_ids=nullptr;
+        // NInfer Build-2 proposal vocabulary.  The Q4G64 byte plane is
+        // already native signed-s4 DPAS layout; scales are widened from FP16
+        // once at load, and argmax rows are remapped through token_ids.
+        uint8_t *draft_head_i4=nullptr;
+        float *draft_head_i4s=nullptr;
+        int32_t *draft_head_token_ids=nullptr;
+        int draft_head_rows=0;
         int32_t *block_table=nullptr, *cu_q=nullptr, *cu_k=nullptr;
         int32_t *seqused_k=nullptr;
         // Muse speculative verifier scratch, reused after the draft pass.
@@ -2624,6 +2631,61 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 db+=dflash2.layers.size()*dflash2.head_dim*sizeof(sycl::half);
             }
         }
+        // Optional exact NInfer Build-2 proposal head.  Files are headerless
+        // extracts of text/draft_head (Q4G64_F16S row-split: base plane then
+        // FP16 scale plane) and text/draft_head_token_ids (I32).  Keeping the
+        // loader explicit prevents silently pairing this model-specific head
+        // with an unrelated target.
+        const char* dh_path=std::getenv("GRIMOIRE_DFLASH_HEAD_Q4G64");
+        const char* di_path=std::getenv("GRIMOIRE_DFLASH_HEAD_TOKEN_IDS");
+        if(dh_path&&*dh_path){
+            constexpr int DN=131072,DK=2048,DG=64;
+            constexpr size_t code_bytes=size_t(DN)*DK/2;
+            constexpr size_t scale_count=size_t(DN)*DK/DG;
+            constexpr size_t head_bytes=code_bytes+scale_count*sizeof(uint16_t);
+            constexpr size_t ids_bytes=size_t(DN)*sizeof(int32_t);
+            if(!di_path||!*di_path){
+                std::fprintf(stderr,"\n  DFlash NInfer head requires "
+                    "GRIMOIRE_DFLASH_HEAD_TOKEN_IDS\n");
+                dok=false;
+            }else{
+                std::vector<uint8_t> head(head_bytes);
+                std::vector<int32_t> ids(DN);
+                auto read_exact=[](const char* path,void* dst,size_t bytes){
+                    std::FILE* f=std::fopen(path,"rb");
+                    if(!f)return false;
+                    const size_t got=std::fread(dst,1,bytes,f);
+                    const int extra=std::fgetc(f);
+                    std::fclose(f);
+                    return got==bytes&&extra==EOF;
+                };
+                if(!read_exact(dh_path,head.data(),head.size())||
+                   !read_exact(di_path,ids.data(),ids_bytes)){
+                    std::fprintf(stderr,"\n  DFlash NInfer head extract has "
+                        "the wrong size or cannot be read\n");
+                    dok=false;
+                }else{
+                    std::vector<float> scales(scale_count);
+                    const auto* hs=reinterpret_cast<const uint16_t*>(
+                        head.data()+code_bytes);
+                    for(size_t i=0;i<scale_count;++i)scales[i]=f16_to_f32(hs[i]);
+                    dflash2.draft_head_i4=sycl::malloc_device<uint8_t>(code_bytes,q);
+                    dflash2.draft_head_i4s=sycl::malloc_device<float>(scale_count,q);
+                    dflash2.draft_head_token_ids=
+                        sycl::malloc_device<int32_t>(DN,q);
+                    if(!dflash2.draft_head_i4||!dflash2.draft_head_i4s||
+                       !dflash2.draft_head_token_ids)dok=false;
+                    else{
+                        q.memcpy(dflash2.draft_head_i4,head.data(),code_bytes);
+                        q.memcpy(dflash2.draft_head_i4s,scales.data(),
+                                 scale_count*sizeof(float));
+                        q.memcpy(dflash2.draft_head_token_ids,ids.data(),ids_bytes).wait();
+                        dflash2.draft_head_rows=DN;
+                        db+=code_bytes+scale_count*sizeof(float)+ids_bytes;
+                    }
+                }
+            }
+        }
         dflash2.target_aux=sycl::malloc_device<float>(
             size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
@@ -2660,7 +2722,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.proj=dfd(size_t(DM)*DH);
             dflash2.gate_up=dfd(size_t(DM)*DI2);
             dflash2.mlp=dfd(size_t(DM)*DH);
-            dflash2.logits=dfd(size_t(DM-1)*cfg.vocab);
+            const int draft_vocab=dflash2.draft_head_rows?
+                dflash2.draft_head_rows:cfg.vocab;
+            dflash2.logits=dfd(size_t(DM-1)*draft_vocab);
             if(cfg.is_muse){
                 auto df16=[&](size_t n){
                     db+=n*sizeof(sycl::half);
@@ -3166,6 +3230,9 @@ void Grimoire::release() {
                     (void*)dflash2.logits, (void*)dflash2.bf,
                     (void*)dflash2.a8, (void*)dflash2.a8s,
                     (void*)dflash2.tokens, (void*)dflash2.draft_ids,
+                    (void*)dflash2.draft_head_i4,
+                    (void*)dflash2.draft_head_i4s,
+                    (void*)dflash2.draft_head_token_ids,
                     (void*)dflash2.block_table, (void*)dflash2.cu_q,
                     (void*)dflash2.cu_k, (void*)dflash2.seqused_k,
                     (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
@@ -4643,8 +4710,9 @@ int Grimoire::argmax_token() {
 // this path.
 bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens) {
-    if(!dflash2.ok||dflash2.v2||position<0||position+16>max_seq)return false;
-    constexpr int M=16;
+    constexpr int MMAX=16;
+    const int M=dflash2.draft_head_rows?8:MMAX;
+    if(!dflash2.ok||dflash2.v2||position<0||position+M>max_seq)return false;
     const int H=dflash2.hidden,QH=dflash2.q_heads,KVH=dflash2.kv_heads;
     const int HD=dflash2.head_dim,QW=QH*HD,KVW=KVH*HD,I=dflash2.inter;
     const int MASK=dflash2.mask_token;
@@ -4798,10 +4866,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         dflash2.context_pos+=rows;
     }
 
-    std::array<int32_t,M> host_tokens{};
+    std::array<int32_t,MMAX> host_tokens{};
     host_tokens[0]=bonus_token;
     for(int i=1;i<M;++i)host_tokens[size_t(i)]=MASK;
-    q.memcpy(dflash2.tokens,host_tokens.data(),sizeof(host_tokens));
+    q.memcpy(dflash2.tokens,host_tokens.data(),size_t(M)*sizeof(int32_t));
     launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
                              dflash2.resid,M,H);
     checkpoint("block embedding");
@@ -4913,7 +4981,16 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
 
     auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
     dump_f32("16_finalnorm",dflash2.normed,size_t(M)*H);
-    if(cfg.is_muse){
+    if(dflash2.draft_head_rows){
+        auto head_w4=load_xe2_dense_w4a8(
+            "grimoire_xe2_dense_w4a8_f32_m8g64");
+        if(!head_w4)return false;
+        launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
+                                  M-1,H,{});
+        head_w4(&q,dflash2.a8,dflash2.draft_head_i4,
+                dflash2.draft_head_i4s,dflash2.a8s,dflash2.logits,
+                M-1,dflash2.draft_head_rows,H);
+    }else if(cfg.is_muse){
         mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
            dflash2.logits,M-1);
     }else if(lm_head.has_i4()&&w4){
@@ -4928,12 +5005,19 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else for(int r=1;r<M;++r)
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                  dflash2.logits+int64_t(r-1)*cfg.vocab,{});
+    const int draft_vocab=dflash2.draft_head_rows?
+        dflash2.draft_head_rows:cfg.vocab;
     for(int r=0;r<M-1;++r){
-        launch_argmax(q,dflash2.logits+int64_t(r)*cfg.vocab,cfg.vocab,
+        launch_argmax(q,dflash2.logits+int64_t(r)*draft_vocab,draft_vocab,
                       s.d_tok,s.d_val,{});
-        q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
+        if(dflash2.draft_head_rows){
+            const int32_t* map=dflash2.draft_head_token_ids;
+            int32_t* src=s.d_tok;
+            int32_t* dst=dflash2.draft_ids+r;
+            q.single_task([=](){*dst=map[*src];});
+        }else q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
     }
-    dump_f32("17_logits",dflash2.logits,size_t(M-1)*cfg.vocab);
+    dump_f32("17_logits",dflash2.logits,size_t(M-1)*draft_vocab);
     draft_tokens.resize(M-1);
     q.memcpy(draft_tokens.data(),dflash2.draft_ids,
              size_t(M-1)*sizeof(int32_t)).wait();
