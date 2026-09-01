@@ -144,7 +144,7 @@ icpx -O2 -std=c++20 -I include tools/inspect_native_model.cpp \
 # reference, so it needs neither the target model nor a loaded engine.
 #   bin/test_dflash_head HEAD.q4g64 IDS.i32 src/libgrimoire_xe2_grouped.so
 icpx -fsycl -fsycl-targets="$TARGET" \
-     -Xsycl-target-backend="$TARGET" "-device bmg-g31-a0" \
+
      -O2 -std=c++20 -fno-fast-math -I include -I src \
      tools/test_dflash_head.cpp -o bin/test_dflash_head -ldl \
   && echo "built  : bin/test_dflash_head" || echo "warn: dflash head test failed"

@@ -1489,6 +1489,11 @@ struct Grimoire {
         int draft_head_rows=0;
         int32_t *block_table=nullptr, *cu_q=nullptr, *cu_k=nullptr;
         int32_t *seqused_k=nullptr;
+        // DFlash2 dynamic grouped convolution.  Geometry is derived from the
+        // artifact, not the config: base_kernel is [2,taps,hidden] and
+        // kernel_projection is [2*taps*groups, hidden].
+        float *conv_delta=nullptr, *conv_scratch=nullptr;
+        int conv_taps=0, conv_groups=0, conv_block=16;
         // Muse speculative verifier scratch, reused after the draft pass.
         float *verify_logits=nullptr;
         sycl_bf16 *verify_bf=nullptr, *verify_bf_out=nullptr;
@@ -2565,6 +2570,23 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             db+=d.gate_up.w.bytes();
             d.down=qload(p+"mlp.down_proj.weight","dflash2.down_proj");
             if(dflash2.v2){
+                if(!dflash2.conv_taps){
+                    const TensorRef kb=dr(p+"attention_conv.base_kernel");
+                    const TensorRef kp=dr(p+"attention_conv.kernel_projection.weight");
+                    if(kb.ok()&&kb.t.shape.size()>=2&&kp.ok()){
+                        dflash2.conv_taps=int(kb.t.shape[1]);
+                        const int outw=int(kp.t.shape[0]);
+                        if(dflash2.conv_taps>0)
+                            dflash2.conv_groups=outw/(2*dflash2.conv_taps);
+                    }
+                    if(dflash2.conv_taps<=0||dflash2.conv_groups<=0||
+                       dflash2.hidden%dflash2.conv_groups){
+                        std::fprintf(stderr,"\n  DFlash2 conv geometry unusable "
+                            "(taps %d groups %d hidden %d)\n",dflash2.conv_taps,
+                            dflash2.conv_groups,dflash2.hidden);
+                        dok=false;
+                    }
+                }
                 d.attn_conv_proj=qload(p+"attention_conv.kernel_projection.weight",
                                        "dflash2.attn_conv_proj");
                 d.mlp_conv_proj=qload(p+"mlp_conv.kernel_projection.weight",
@@ -2690,7 +2712,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
         db+=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
-        if(!dflash2.v2){
+        // v2 was skipped here entirely, so a DFlash2 checkpoint loaded its
+        // weights and then had no scratch to run in. The draft geometry is the
+        // same for both versions; v2 only adds the convolution buffers below.
+        if(!dflash2.v2||dflash2.conv_taps>0){
             constexpr int DM=16;
             const int DH=dflash2.hidden;
             const int DQ=dflash2.q_heads*dflash2.head_dim;
@@ -2722,6 +2747,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.proj=dfd(size_t(DM)*DH);
             dflash2.gate_up=dfd(size_t(DM)*DI2);
             dflash2.mlp=dfd(size_t(DM)*DH);
+            if(dflash2.v2&&dflash2.conv_taps>0){
+                dflash2.conv_delta=dfd(size_t(DM)*2*dflash2.conv_taps*
+                                       dflash2.conv_groups);
+                dflash2.conv_scratch=dfd(size_t(DM)*DH);
+            }
             const int draft_vocab=dflash2.draft_head_rows?
                 dflash2.draft_head_rows:cfg.vocab;
             dflash2.logits=dfd(size_t(DM-1)*draft_vocab);
@@ -3233,6 +3263,7 @@ void Grimoire::release() {
                     (void*)dflash2.draft_head_i4,
                     (void*)dflash2.draft_head_i4s,
                     (void*)dflash2.draft_head_token_ids,
+                    (void*)dflash2.conv_delta, (void*)dflash2.conv_scratch,
                     (void*)dflash2.block_table, (void*)dflash2.cu_q,
                     (void*)dflash2.cu_k, (void*)dflash2.seqused_k,
                     (void*)dflash2.verify_logits, (void*)dflash2.verify_bf,
@@ -4712,7 +4743,22 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens) {
     constexpr int MMAX=16;
     const int M=dflash2.draft_head_rows?8:MMAX;
-    if(!dflash2.ok||dflash2.v2||position<0||position+M>max_seq)return false;
+    if(!dflash2.ok||position<0||position+M>max_seq){
+        static bool once2=false;
+        if(!once2){once2=true;std::fprintf(stderr,
+            "  DFlash2: entry guard ok=%d pos=%d M=%d max_seq=%d\n",
+            int(dflash2.ok),position,M,max_seq);}
+        return false;}
+    // DFlash2 needs its dynamic convolutions; without them the draft is the
+    // wrong function and acceptance collapses silently.
+    if(dflash2.v2&&(!dflash2.conv_delta||!dflash2.conv_scratch)){
+        static bool once=false;
+        if(!once){once=true;std::fprintf(stderr,
+            "  DFlash2: conv buffers missing (taps %d groups %d delta %p scratch %p)\n",
+            dflash2.conv_taps,dflash2.conv_groups,
+            (void*)dflash2.conv_delta,(void*)dflash2.conv_scratch);}
+        return false;}
+    if(dflash2.v2&&cfg.is_muse)return false;
     const int H=dflash2.hidden,QH=dflash2.q_heads,KVH=dflash2.kv_heads;
     const int HD=dflash2.head_dim,QW=QH*HD,KVW=KVH*HD,I=dflash2.inter;
     const int MASK=dflash2.mask_token;
@@ -4888,6 +4934,37 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         q.memcpy(dflash2.cu_q,cuq,sizeof(cuq)).wait();
         q.memcpy(dflash2.seqused_k,&used_all,sizeof(used_all)).wait();
     }
+    // DFlash2 grouped dynamic convolution.  coefficient[tap] is the layer's
+    // base kernel (per channel) plus a per-token, per-group delta produced by
+    // kernel_projection; the sum is a causal FIR over positions WITHIN the
+    // draft block, so tap t only contributes where (row % block) >= t.
+    // `prepare` runs side 0 and hands its side-1 coefficients to `finish`,
+    // which is why both sides read the same delta buffer.
+    auto dyn_conv=[&](const float* x,const bf16_t* base,float* out,int side){
+        const int HH=dflash2.hidden,T=dflash2.conv_taps,G=dflash2.conv_groups;
+        const int GS=HH/G,BS=dflash2.conv_block;
+        const float* delta=dflash2.conv_delta;
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::range<1>(size_t(M)*size_t(HH)),
+                [=](sycl::id<1> id){
+                    const int m=int(id[0]/HH),c=int(id[0]%HH),g=c/GS;
+                    const int posb=m%BS;
+                    float acc=0.0f;
+                    for(int t=0;t<T;++t){
+                        if(t>posb)break;
+                        const float b=bf16_to_f32(
+                            base[(size_t(side)*T+size_t(t))*HH+c]);
+                        const float dv=delta[((size_t(m)*2+size_t(side))*T+
+                                              size_t(t))*G+g];
+                        acc+=(b+dv)*x[size_t(m-t)*HH+c];
+                    }
+                    out[size_t(m)*HH+c]=acc;
+                });
+        });
+    };
+    auto conv_back=[&](float* dst){
+        q.memcpy(dst,dflash2.conv_scratch,size_t(M)*dflash2.hidden*sizeof(float));
+    };
     for(size_t li=0;li<dflash2.layers.size();++li){
         auto& d=dflash2.layers[li];
         if(li==0)
@@ -4896,6 +4973,11 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             norm(dflash2.resid,dflash2.mlp,d.in_norm,d.in_norm_f16,
                  dflash2.normed,M);
         dump_f32("08_L"+std::to_string(li)+"_innorm",dflash2.normed,size_t(M)*H);
+        if(dflash2.v2){
+            mm(d.attn_conv_proj,dflash2.normed,dflash2.conv_delta,M);
+            dyn_conv(dflash2.normed,d.attn_conv_base,dflash2.conv_scratch,0);
+            conv_back(dflash2.normed);
+        }
         if(cfg.is_muse){
             const sycl::half* qkv=mm_f16_raw(d.qkv,dflash2.normed,M);
             launch_qkv_norm_rope_f16w_fused(q,qkv,dflash2.q_f16,
@@ -4965,14 +5047,27 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         checkpoint("block attention");
         dump_f32("13_L"+std::to_string(li)+"_attn",dflash2.attn,size_t(M)*QW);
         mm(d.o,dflash2.attn,dflash2.proj,M);
+        if(dflash2.v2){
+            dyn_conv(dflash2.proj,d.attn_conv_base,dflash2.conv_scratch,1);
+            conv_back(dflash2.proj);
+        }
         dump_f32("14_L"+std::to_string(li)+"_o",dflash2.proj,size_t(M)*H);
         norm(dflash2.resid,dflash2.proj,d.post_norm,d.post_norm_f16,
              dflash2.normed,M);
+        if(dflash2.v2){
+            mm(d.mlp_conv_proj,dflash2.normed,dflash2.conv_delta,M);
+            dyn_conv(dflash2.normed,d.mlp_conv_base,dflash2.conv_scratch,0);
+            conv_back(dflash2.normed);
+        }
         mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
         if(cfg.is_muse)
             launch_swiglu_f16_batched(q,dflash2.gate_up,dflash2.h,M,I,{});
         else launch_swiglu_batched(q,dflash2.gate_up,dflash2.h,M,I);
         mm(d.down,dflash2.h,dflash2.mlp,M);
+        if(dflash2.v2){
+            dyn_conv(dflash2.mlp,d.mlp_conv_base,dflash2.conv_scratch,1);
+            conv_back(dflash2.mlp);
+        }
         checkpoint("MLP");
         dump_f32("15_L"+std::to_string(li)+"_mlp",dflash2.mlp,size_t(M)*H);
     }
@@ -6559,7 +6654,8 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     int n = 0;
     const bool mtp_measure_only = std::getenv("GRIMOIRE_MTP_MEASURE") != nullptr;
     const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok && !mtp_measure_only;
-    const bool dflash_spec = e.dflash2.ok && !e.dflash2.v2;
+    const bool dflash_spec = e.dflash2.ok &&
+        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
     if (mtp_spec || dflash_spec) {
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
