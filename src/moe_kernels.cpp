@@ -278,13 +278,22 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                         const int64_t d_row = int64_t(e) * H + o;
                         for (int c = (I / GEMV_STEP) * GEMV_STEP + lane; c < I; c += SG_SIZE)
                             acc[r] = sycl::fma(w.at(int(d_row), c), slmh[slot * I + c], acc[r]);
-                        total[r] += rw * sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+                        // Keep the routed sum in per-lane registers. The
+                        // sub-group reduction is linear, so scaling each
+                        // expert partial by its router weight and reducing
+                        // ONCE at the end is identical arithmetic with K
+                        // times fewer shuffles. down has only I=512 of
+                        // reduction depth, so a reduce per expert slot cost
+                        // more than the MACs between them.
+                        total[r] = sycl::fma(rw, acc[r], total[r]);
                     }
                 }
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const int o = o_base + r;
-                    if (lane == 0 && o < H) y[int64_t(token) * H + o] = total[r];
+                    const float t = sycl::reduce_over_group(
+                        sg, total[r], sycl::plus<float>());
+                    if (lane == 0 && o < H) y[int64_t(token) * H + o] = t;
                 }
             });
     });
