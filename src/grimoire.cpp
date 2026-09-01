@@ -4150,6 +4150,13 @@ const float* Grimoire::forward(int token) {
             std::fprintf(stderr, "PP rank 1: hidden receive failed\n");
             return nullptr;
         }
+    } else if (recording) {
+        // Graph capture bakes every argument into the recorded node, so a
+        // host-side token would pin the replay to the captured token.
+        // s.d_tok is the same buffer argmax_token() writes, so reading the
+        // embedding through it makes one recorded graph valid for every
+        // subsequent token.
+        launch_embed_batched(q, embed, s.d_tok, s.h, 1, H, none);
     } else {
         launch_embed(q, embed, token, s.h, H, none);
     }
@@ -6336,7 +6343,15 @@ bool Grimoire::build_graph() {
             g(q.get_context(), q.get_device());
 
         // Record against a scratch position so the recording itself does
-        // not advance the real sequence state.
+        // not advance the real sequence state.  The host-side pos and the
+        // device counters are saved and restored: build_graph() is called
+        // AFTER prefill in the generate path, so the live sequence state
+        // must survive capture untouched.
+        int32_t saved_pos = 0, saved_seq = 0;
+        q.memcpy(&saved_pos, s.d_pos, sizeof(int32_t)).wait();
+        q.memcpy(&saved_seq, s.d_seq_len, sizeof(int32_t)).wait();
+        const int host_pos = pos;
+
         const int32_t zero = 0;
         q.memcpy(s.d_pos, &zero, sizeof(int32_t)).wait();
         const int32_t one = 1;
@@ -6347,6 +6362,10 @@ bool Grimoire::build_graph() {
         forward(1);
         g.end_recording(q);
         recording = false;
+
+        q.memcpy(s.d_pos, &saved_pos, sizeof(int32_t)).wait();
+        q.memcpy(s.d_seq_len, &saved_seq, sizeof(int32_t)).wait();
+        pos = host_pos;
 
         gexec = std::make_unique<
             sycl_ext::command_graph<sycl_ext::graph_state::executable>>(g.finalize());
@@ -6441,6 +6460,17 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     if(gen_progress){std::fprintf(stderr,"    generate: first token id=%d\n",tok);
         std::fflush(stderr);}
     std::string out;
+    // Opt-in device-resident decode. The recorded graph submits all ~800
+    // per-token launches as one command list; its embed node reads s.d_tok,
+    // which argmax_token() has already written, so replay needs no rebind.
+    // Speculative paths call forward() directly and are unaffected.
+    if (std::getenv("GRIMOIRE_DECODE_GRAPH")) {
+        std::printf("  recording decode graph ... ");
+        std::fflush(stdout);
+        const bool ok = e.build_graph();
+        std::printf("%s\n", ok ? "ok" : "unavailable");
+        std::fflush(stdout);
+    }
     const auto g0 = std::chrono::high_resolution_clock::now();
     int n = 0;
     const bool mtp_measure_only = std::getenv("GRIMOIRE_MTP_MEASURE") != nullptr;
@@ -6680,7 +6710,9 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         const std::string piece = tk.decode_one(tok);
         out += piece;
         std::printf("%s", piece.c_str());
-        e.forward(tok);
+        // argmax_token() left this token in s.d_tok, which is exactly what
+        // the recorded graph's embed node reads, so replay needs no rebind.
+        if (e.graph_ok) e.step(); else e.forward(tok);
         tok = e.argmax_token();
         if (mtp_meas) {
             int t = tok;
