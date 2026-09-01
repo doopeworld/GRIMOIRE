@@ -6722,6 +6722,57 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     return 0;
 }
 
+// =====================================================================
+//  grimoire-server support -- keep one Grimoire resident across requests
+// =====================================================================
+// The server (tools/grimoire_server.cpp) only needs an opaque handle plus
+// these three calls; it never sees the Grimoire struct definition.
+Grimoire* grimoire_new() { return new Grimoire(); }
+
+bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
+                    int max_seq, std::string& err) {
+    UploadOptions opt;
+    opt.lm_head_fmt = proj_fmt;
+    opt.quantize_lm_head = (proj_fmt != Fmt::BF16);
+    opt.max_seq = max_seq;
+    return e.build(dir, opt, err);
+}
+
+// Plain greedy decode: no MTP/DFlash speculation. This mirrors the fallback
+// loop at the tail of grimoire_generate() above (e.forward + argmax_token),
+// which is the simplest and most exercised decode path in this codebase.
+// Speculative decode is NOT wired into the server yet -- it needs the
+// snapshot/rollback machinery from the CLI's spec branch, which is
+// intricate enough that it deserves its own verified change rather than a
+// hand-copy done without a GPU available to test it. Track this as the
+// server's known follow-up, not a silent gap.
+int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
+                             int n_predict, int eos_id, std::vector<int32_t>& out_ids) {
+    e.reset();
+    if (!e.prefill(prompt_ids)) {
+        for (size_t i = 0; i < prompt_ids.size(); ++i) {
+            e.forward(prompt_ids[i]);
+            if ((i & 63) == 63) e.sync();
+        }
+    }
+    e.sync();
+    int tok = e.argmax_token();
+    out_ids.clear();
+    out_ids.reserve(size_t(n_predict));
+    int n = 0;
+    for (; n < n_predict; ++n) {
+        if (tok == eos_id) break;
+        out_ids.push_back(tok);
+        e.forward(tok);
+        tok = e.argmax_token();
+    }
+    // Deliberately no e.release() here: the engine stays resident across
+    // requests. release() is only correct at process shutdown, which this
+    // server does not currently hook (process exit reclaims the GPU context
+    // regardless).
+    return n;
+}
+
 } // namespace b70
 
 namespace b70 {

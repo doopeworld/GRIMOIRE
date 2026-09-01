@@ -45,6 +45,7 @@ COPY --from=builder /usr/local/lib/libopencl-clang2.so.17 /usr/local/lib/
 COPY --from=builder /etc/OpenCL/vendors/intel.icd /etc/OpenCL/vendors/intel.icd
 
 COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire
+COPY --from=builder /grimoire/bin/grimoire-server /usr/local/bin/grimoire-server
 COPY --from=builder /grimoire/src/libgrimoire_xe2_grouped.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_raw.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_gdn_raw.so /opt/grimoire/lib/
@@ -66,6 +67,7 @@ RUN find /opt/intel/oneapi/compiler -name 'libsycl.so*' -printf '%h\n' | sort -u
  && echo /opt/grimoire/lib >> /etc/ld.so.conf.d/oneapi-b70.conf \
  && ldconfig \
  && ! ldd /usr/local/bin/grimoire | grep -q 'not found' \
+ && ! ldd /usr/local/bin/grimoire-server | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_grouped.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_raw.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so | grep -q 'not found' \

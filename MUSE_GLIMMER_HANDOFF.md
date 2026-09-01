@@ -209,3 +209,45 @@ docker run --rm --entrypoint bash -e GRIMOIRE_BRIDGE_ONLY=attention \
 ```
 
 Keep image `my-vllm-xpu:latest`.
+
+## Qwen MTP + W4A8: the EXACT_VERIFY requirement (2026-09-01)
+
+Verified working recipe, measured on one B70:
+
+    -m /models/Qwen3.8-27B-MXFP4-GRIMOIRE --proj mxfp4 --ctx 8192
+    GRIMOIRE_MTP=1
+    GRIMOIRE_W4A8=1
+    GRIMOIRE_MTP_EXACT_VERIFY=1
+    GRIMOIRE_XE2_ATTN_BRIDGE=<...>/libgrimoire_xe2_attention_raw.so
+
+    pp 4070 tokens in 1628 ms -> 2499.4 tok/s
+    MTP(k=3) tg 128 tokens in 3420 ms -> 37.4 tok/s
+    MTP steps 37, 3.51 committed/step, draft accepts 93/101 (92%), rollbacks 8
+
+vs the 2026-08-26 record of TG 31.0 / PP 2516.7: TG +21%, PP unchanged.
+
+**GRIMOIRE_W4A8=1 WITHOUT GRIMOIRE_MTP_EXACT_VERIFY=1 SILENTLY DESTROYS MTP.**
+Measured, same prompt and build:
+
+| flags | PP | TG | accepts |
+|---|---|---|---|
+| MTP only | 1685 | 22.1 | 93/102 (91%) |
+| MTP + W4A8 | 2711 | 13.4 | **0/128 (0%)** |
+| MTP + W4A8 + EXACT_VERIFY | 2499 | **37.4** | 93/101 (92%) |
+
+Cause (src/grimoire.cpp, the `if (!exact_verify && xe2_w4a8_f32 && a8 && a8s)`
+branch in the generic prefill's `next_tokens` block): with W4A8 the VERIFY pass
+quantizes activations to int8 before the lm_head projection. That perturbs the
+logits enough to flip argmax, so the verifier disagrees with the drafter on
+every token -- 0 accepts, 1.00 committed/step, a rollback every step. The
+symptom looks exactly like a broken drafter but the drafter is fine.
+GRIMOIRE_MTP_EXACT_VERIFY=1 forces the accurate lm_head path for verification
+only; W4A8 still accelerates everything else. This pairing was never documented.
+
+**GRIMOIRE_PREFILL_WARMUP=1 HANGS QWEN.** That flag (added 2026-08-31 for the
+Muse cold-start measurement) runs a throwaway prefill then reset() before the
+timed one. On Qwen it stalls at 100% CPU on one core with the GPU idle, right
+after "lm_head mxfp4 ... ok" and before the 64 layers load. It is Muse-safe but
+NOT Qwen-safe -- Qwen's prefill carries DeltaNet recurrent state that the extra
+prefill+reset leaves inconsistent. Do not use it on Qwen or Ornith. It is not
+deterministic: one earlier Qwen run with the flag did complete (PP 2711).
