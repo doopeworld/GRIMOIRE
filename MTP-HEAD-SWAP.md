@@ -98,3 +98,29 @@ ornith-ai checkpoint. ALWAYS check base_model before pulling one.
 And vLLM reaches 58.1 TG on this model with this same native head vs our
 51.5 -- speculation multipliers are close (1.71x vs 1.78x), the gap is mostly
 baseline decode (30.1 vs 32.7). Fix that first; it needs no new model.
+
+
+## CORRECTION: Ornith speculation is 6% below break-even, not doomed
+
+Measured GRIMOIRE_MTP_ROUTE_DIAG at M=4: ~860-950 unique of 1280 selections
+across 40 layers (1.49x reuse, ~22 unique experts/layer vs 8 in decode).
+Union batching ALREADY EXISTS (grimoire.cpp:6224+, the M<32 branch). There is
+no batching win; 22 of 32 is the model's routing.
+
+GRIMOIRE_MTP_DRAFT_VOCAB=131072 was never applied to Ornith. It is free:
+draft 2.53 -> 1.85 ms/step, acceptance unchanged (79/120), TG 106.9 -> 110.2.
+65536 is worse (2.24 committed, 96.3 TG).
+
+    decode(1)                      8.45 ms
+    step = verify 19.34 + draft 1.85 + snapshot .33 + commit .51 = 22.8 ms
+    break-even = 22.8 / 8.45      = 2.70 accepted/step
+    we accept                       2.55       <- short by 6%
+
+Above break-even: 2.70 -> 118 TG, 3.5 -> 154, 4.0 -> 175. DFlash2 reports
+4.02 accepted/round -> ~150-190 TG, which beats vLLM 138.7 on this card.
+THE DRAFTER IS THE LEVER. An earlier note in this file said otherwise; wrong.
+
+vLLM Ornith baseline is 33.7 TG, ~4x slower than our 125 -- that is why their
+speculation multiplier is 4.12x and ours cannot be. Their 138.7 speculative is
+11% above our 125 non-speculative. NInfer 593 on a 1792 GB/s 5090 is 199
+B70-equivalent vs our 125 = 1.6x, not 3x.
