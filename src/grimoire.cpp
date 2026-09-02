@@ -2478,11 +2478,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.mask_token=201818;
             dflash2.rope_theta=500000.0f;
             dflash2.sliding_window=2048;
-            dflash2.shared_embed_f16=upload_f16_t(
-                q,ck,ck.embed,"dflash2.shared_embed",&dok);
+            // shared_embed_f16 was an fp16 copy of the target's embedding
+            // table -- 2.50 GiB of exact duplication on Muse. The draft paths
+            // now read the target's bf16 table directly (bit-identical after
+            // conversion), so only the lm_head copy remains.
             dflash2.shared_lm_head_f16=upload_f16_t(
                 q,ck,ck.lm_head,"dflash2.shared_lm_head",&dok);
-            db+=dflash2.shared_embed_f16.w.bytes();
             db+=dflash2.shared_lm_head_f16.w.bytes();
         }else{
             // Non-Muse DFlash/DFlash2 geometry (layer count, target-layer
@@ -3277,7 +3278,6 @@ void Grimoire::release() {
     dflash2.fc.release(q);
     dflash2.selector_hidden.release(q);
     dflash2.fused_context_kv.release(q);
-    dflash2.shared_embed_f16.release(q);
     dflash2.shared_lm_head_f16.release(q);
     for (auto& d : dflash2.layers) {
         d.q.release(q); d.k.release(q); d.v.release(q); d.qkv.release(q);
@@ -4981,8 +4981,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // GPU (UR_RESULT_ERROR_DEVICE_LOST) rather than failing cleanly. The
     // non-Muse drafter shares the target's own bf16 embedding table.
     if(cfg.is_muse)
-        launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
-                                 dflash2.resid,M,H);
+        launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
     else
         launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
     checkpoint("block embedding");
@@ -5393,7 +5392,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     };
 
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
-    launch_embed_f16_h(q,dflash2.shared_embed_f16.fp16,dtok,hidden,M,H,{});
+    launch_embed_bf16_h(q,embed,dtok,hidden,M,H,{});
     launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,muse_zero_f16,normed,
                                    M,H,cfg.rms_eps,{},1.0f);
     std::swap(hidden,normed);
