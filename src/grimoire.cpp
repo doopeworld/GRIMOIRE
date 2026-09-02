@@ -7033,7 +7033,9 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
 // hand-copy done without a GPU available to test it. Track this as the
 // server's known follow-up, not a silent gap.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
-                             int n_predict, int eos_id, std::vector<int32_t>& out_ids) {
+                             int n_predict, int eos_id, std::vector<int32_t>& out_ids,
+                             int eot_id) {
+    auto is_stop = [&](int t) { return t == eos_id || (eot_id >= 0 && t == eot_id); };
     e.reset();
     if (!e.prefill(prompt_ids)) {
         for (size_t i = 0; i < prompt_ids.size(); ++i) {
@@ -7064,7 +7066,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         }();
         bool stop = false;
         while (n < n_predict && !stop) {
-            if (tok == eos_id || e.pos >= e.max_seq) break;
+            if (is_stop(tok) || e.pos >= e.max_seq) break;
             const int k = std::min(configured_k, e.max_seq - e.pos - 1);
             if (k <= 0) break;
             const int saved_pos = e.pos;
@@ -7103,7 +7105,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
 
             for (int i = 0; i < accepted; ++i) {
                 const int t = candidates[i];
-                if (t == eos_id || n >= n_predict) { stop = true; break; }
+                if (is_stop(t) || n >= n_predict) { stop = true; break; }
                 out_ids.push_back(t);
                 ++n;
             }
@@ -7113,7 +7115,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     }
 
     for (; n < n_predict; ++n) {
-        if (tok == eos_id) break;
+        if (is_stop(tok)) break;
         out_ids.push_back(tok);
         e.forward(tok);
         tok = e.argmax_token();

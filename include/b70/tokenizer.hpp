@@ -47,6 +47,13 @@ public:
     bool    is_special(int32_t id) const {
         return special_ids_.count(id) != 0;
     }
+    // Id of a special token by its literal text, or -1. Harmony models end an
+    // assistant turn with <|eot|>, which is NOT eos_ -- a server that stops
+    // only on eos() runs past the answer and keeps talking to itself.
+    int32_t special_id(const std::string& text) const {
+        auto it = special_by_text_.find(text);
+        return it == special_by_text_.end() ? -1 : it->second;
+    }
 
     // Apply the chat template. Qwen uses the ChatML form; the exact
     // strings come from tokenizer_config.json when present.

@@ -36,8 +36,33 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
 // this file; this call only prefills+decodes already-tokenized ids.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              int n_predict, int eos_id,
-                             std::vector<int32_t>& out_ids);
+                             std::vector<int32_t>& out_ids, int eot_id);
 }  // namespace b70
+
+// Harmony channel extraction. Muse-Glimmer emits its chain of thought in a
+// "to=self" channel and the user-facing answer in "to=user"; vLLM strips this
+// with --reasoning-parser. Without it open-webui shows the whole monologue.
+// Returns the LAST complete to=user segment, or the input unchanged when the
+// markers are absent (Qwen/Ornith, which do not use channels).
+static std::string harmony_final(const std::string& text) {
+    static const std::string kUser = "to=user";
+    const size_t last = text.rfind(kUser);
+    if (last == std::string::npos) return text;
+    size_t b = last + kUser.size();
+    // A channel body may begin right after the marker or after a separator.
+    while (b < text.size() && (text[b] == ' ' || text[b] == '\n')) ++b;
+    // The segment ends at the next channel marker ("assistant to=" / "to=self").
+    size_t end = text.size();
+    for (const char* m : {"assistant to=", "to=self"}) {
+        const size_t p = text.find(m, b);
+        if (p != std::string::npos && p < end) end = p;
+    }
+    std::string out = text.substr(b, end - b);
+    // Trim the "assistant" prefix the turn marker leaves behind.
+    while (!out.empty() && (out.front() == ' ' || out.front() == '\n')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\n')) out.pop_back();
+    return out.empty() ? text : out;
+}
 
 // ---- tiny JSON helpers (only what an OpenAI request/response needs) ------
 static std::string json_escape(const std::string& s) {
@@ -258,10 +283,11 @@ int main(int argc, char** argv) {
         std::vector<int32_t> out_ids;
         const int n_predict = max_tokens > 0 ? max_tokens : 128;
         const int completion_tokens = b70::grimoire_serve_generate(
-            *e, ids, n_predict, tk.eos(), out_ids);
+            *e, ids, n_predict, tk.eos(), out_ids, tk.special_id("<|eot|>"));
         const double dt = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
         std::string text = tk.decode(out_ids);
+        if (chat_shape) text = harmony_final(text);
         std::fprintf(stderr, "[req] prompt=%zu completion=%d %.2fs\n",
                      ids.size(), completion_tokens, dt);
 
