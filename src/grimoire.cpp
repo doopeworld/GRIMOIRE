@@ -7046,6 +7046,72 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     out_ids.clear();
     out_ids.reserve(size_t(n_predict));
     int n = 0;
+
+    // Speculative decode, same accept/reject contract as the CLI path: draft a
+    // block, verify it with one batched forward, accept the matching prefix,
+    // and on partial rejection restore the recurrent state to the accepted
+    // prefix (commit_spec_prefix) so the next step starts from exact state.
+    // Falls through to plain greedy below when no drafter is loaded.
+    const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok;
+    const bool dflash_spec = e.dflash2.ok &&
+        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
+    if (mtp_spec || dflash_spec) {
+        const int configured_k = dflash_spec ? 15 : [] {
+            const char* v = std::getenv("GRIMOIRE_MTP_K");
+            int k = v && *v ? std::atoi(v) : 3;
+            const int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
+            return std::max(0, std::min(max_k, k));
+        }();
+        bool stop = false;
+        while (n < n_predict && !stop) {
+            if (tok == eos_id || e.pos >= e.max_seq) break;
+            const int k = std::min(configured_k, e.max_seq - e.pos - 1);
+            if (k <= 0) break;
+            const int saved_pos = e.pos;
+            e.snapshot_recurrent();
+
+            std::vector<int32_t> candidates;
+            candidates.reserve(size_t(k) + 1);
+            candidates.push_back(tok);
+            if (dflash_spec) {
+                std::vector<int32_t> block;
+                if (!e.dflash_draft(tok, saved_pos, block)) break;
+                const int take = std::min(k, int(block.size()));
+                candidates.insert(candidates.end(), block.begin(),
+                                  block.begin() + take);
+            } else {
+                int draft = tok;
+                for (int j = 1; j <= k; ++j) {
+                    draft = e.mtp_draft(draft, saved_pos + j - 1, j > 1);
+                    if (draft < 0) break;
+                    candidates.push_back(draft);
+                }
+            }
+            if (candidates.size() < 2) break;   // drafter produced nothing
+
+            std::vector<int32_t> verified;
+            if (!e.prefill(candidates, &verified) ||
+                verified.size() != candidates.size()) break;
+
+            int accepted = 1;
+            for (; accepted < int(candidates.size()); ++accepted)
+                if (candidates[accepted] != verified[accepted - 1]) break;
+            const int next = verified[accepted - 1];
+
+            if (accepted < int(candidates.size()))
+                e.commit_spec_prefix(saved_pos, accepted);
+
+            for (int i = 0; i < accepted; ++i) {
+                const int t = candidates[i];
+                if (t == eos_id || n >= n_predict) { stop = true; break; }
+                out_ids.push_back(t);
+                ++n;
+            }
+            tok = next;
+        }
+        return n;
+    }
+
     for (; n < n_predict; ++n) {
         if (tok == eos_id) break;
         out_ids.push_back(tok);

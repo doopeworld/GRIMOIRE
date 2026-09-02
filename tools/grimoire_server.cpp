@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
                 "grimoire-server -- OpenAI-compatible front end\n\n"
                 "  grimoire-server --model <dir> [--proj FORMAT] [--ctx N]\n"
                 "                  [--port N] [--host ADDR]\n"
-                "                  [--dflash-model <dir>]         (NOT SUPPORTED YET -- rejected)\n"
+                "                  [--dflash-model <dir>]         speculative decode drafter\n"
                 "                  [--defer-moe-gather]           (Ornith only)\n"
                 "                  [--bf16-qkv] [--bf16-dn-qkv]   (Ornith only)\n\n"
                 "  Do NOT pass --defer-moe-gather/--bf16-qkv/--bf16-dn-qkv for Qwen:\n"
@@ -195,21 +195,12 @@ int main(int argc, char** argv) {
     // operator-set shell env into first-class launch flags, so the whole
     // configuration lives on one command line like `vllm serve`.
     // Loading the drafter switches prefill onto the batched prefill_muse path,
-    // which expects the speculative verify/rollback loop. This server does
-    // plain greedy decode (see grimoire_serve_generate), and mixing the two
-    // silently corrupts output from the second token onward -- verified:
-    // with --dflash-model the haiku prompt returns
-    //   " to impressive - Location: Location: Location"
-    // instead of the correct " to=selfWrite a haiku about".
-    // Refuse rather than serve garbage. Remove this once speculative decode
-    // is wired into the server.
-    if (!dflash_model.empty()) {
-        std::fprintf(stderr,
-            "--dflash-model is not supported yet: this server does plain greedy\n"
-            "decode and the drafter's batched prefill path would corrupt output\n"
-            "after the first token. Re-run without it.\n");
-        return 1;
-    }
+    // which requires the speculative verify/rollback loop. That loop now lives
+    // in grimoire_serve_generate (same accept/reject contract as the CLI), so
+    // the drafter is safe to load: it is selected by GRIMOIRE_DFLASH_MODEL,
+    // which the engine reads during build().
+    if (!dflash_model.empty())
+        setenv("GRIMOIRE_DFLASH_MODEL", dflash_model.c_str(), 1);
     if (defer_moe_gather) setenv("GRIMOIRE_DEFER_MOE_GATHER", "1", 1);
     if (bf16_qkv) setenv("GRIMOIRE_BF16_QKV", "1", 1);
     if (bf16_dn_qkv) setenv("GRIMOIRE_BF16_DN_QKV", "1", 1);
@@ -232,6 +223,21 @@ int main(int argc, char** argv) {
     std::mutex engine_mu;  // serializes requests; see file header
 
     httplib::Server svr;
+    // Without this, any C++ exception inside a handler surfaces as a bare
+    // HTTP 500 with an empty body and nothing in the log -- indistinguishable
+    // from a hang. Report what actually threw.
+    svr.set_exception_handler([](const httplib::Request&, httplib::Response& res,
+                                 std::exception_ptr ep) {
+        std::string what = "unknown exception";
+        try { std::rethrow_exception(ep); }
+        catch (const std::exception& ex) { what = ex.what(); }
+        catch (...) {}
+        std::fprintf(stderr, "[error] %s\n", what.c_str());
+        std::fflush(stderr);
+        res.status = 500;
+        res.set_content(std::string("{\"error\":\"") + what + "\"}",
+                        "application/json");
+    });
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
