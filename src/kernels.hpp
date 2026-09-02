@@ -285,6 +285,9 @@ sycl::event launch_dflash_store_tap_h(sycl::queue&, const sycl::half*, float*,
 sycl::event launch_rmsnorm_residual_f16w_h(sycl::queue&, sycl::half*,
     const sycl::half*, const sycl::half*, sycl::half*, int, int, float,
     const std::vector<sycl::event>& = {}, float weight_offset = 0.0f);
+sycl::event launch_muse_post_attn_pre_ff_h(sycl::queue&, sycl::half*,
+    sycl::half*, const sycl::half*, const sycl::half*, sycl::half*, int, int,
+    float, float, const std::vector<sycl::event>& = {});
 sycl::event launch_rmsnorm_residual_f16w_batched(
     sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
     float* out, int tokens, int hidden, float eps,

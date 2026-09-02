@@ -404,6 +404,67 @@ sycl::event launch_rmsnorm_residual_f16w_h(
     });
 }
 
+// Muse sandwich block transition:
+//   hidden = half(hidden + rmsnorm(proj, post_weight))
+//   normed = rmsnorm(hidden, pre_ff_weight)
+// Keeping both reductions in one work-group preserves the two FP16 rounding
+// boundaries while removing the temporary tensor and two extra submissions.
+sycl::event launch_muse_post_attn_pre_ff_h(
+    sycl::queue& q, sycl::half* hidden, sycl::half* proj,
+    const sycl::half* post_weight, const sycl::half* pre_ff_weight,
+    sycl::half* normed, int tokens, int width, float post_eps, float pre_ff_eps,
+    const std::vector<sycl::event>& deps) {
+    constexpr int WG=256;
+    return q.submit([&](sycl::handler& hd){
+        hd.depends_on(deps);
+        sycl::local_accessor<float,1> partial(WG/SG_SIZE,hd);
+        hd.parallel_for(sycl::nd_range<1>(size_t(tokens)*WG,WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int row=int(it.get_group(0));
+                const int lid=int(it.get_local_id(0));
+                const int lane=int(sg.get_local_id()[0]);
+                const int sgid=int(sg.get_group_id()[0]);
+                sycl::half* hr=hidden+int64_t(row)*width;
+                sycl::half* pr=proj+int64_t(row)*width;
+                sycl::half* nr=normed+int64_t(row)*width;
+                float* pp=partial.template get_multi_ptr<
+                    sycl::access::decorated::no>().get();
+
+                float ss=0.0f;
+                for(int i=lid;i<width;i+=WG){
+                    const float v=float(pr[i]);
+                    ss=sycl::fma(v,v,ss);
+                }
+                ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
+                if(lane==0)pp[sgid]=ss;
+                sycl::group_barrier(it.get_group());
+                float total=0.0f;
+                for(int i=0;i<WG/SG_SIZE;++i)total+=pp[i];
+                const float post_scale=sycl::rsqrt(total/float(width)+post_eps);
+
+                ss=0.0f;
+                for(int i=lid;i<width;i+=WG){
+                    const sycl::half residual=sycl::half(
+                        float(pr[i])*post_scale*(1.0f+float(post_weight[i])));
+                    const sycl::half v=sycl::half(float(hr[i])+float(residual));
+                    hr[i]=v;
+                    const float vf=float(v);
+                    ss=sycl::fma(vf,vf,ss);
+                }
+                ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
+                if(lane==0)pp[sgid]=ss;
+                sycl::group_barrier(it.get_group());
+                total=0.0f;
+                for(int i=0;i<WG/SG_SIZE;++i)total+=pp[i];
+                const float pre_scale=sycl::rsqrt(total/float(width)+pre_ff_eps);
+                for(int i=lid;i<width;i+=WG)
+                    nr[i]=sycl::half(float(hr[i])*pre_scale*
+                                     (1.0f+float(pre_ff_weight[i])));
+            });
+    });
+}
+
 sycl::event launch_rmsnorm_residual_f16w_batched(
     sycl::queue& q, float* h, const float* residual, const sycl::half* weight,
     float* out, int tokens, int hidden, float eps,

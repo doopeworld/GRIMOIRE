@@ -271,6 +271,41 @@ sycl::event launch_mxfp4_to_int4sym(sycl::queue& q, const uint8_t* payload,
     });
 }
 
+// FP16 [N,K] -> symmetric signed int4, group 128. This is the quality path
+// for proposal-only weights that are available from the original checkpoint:
+// quantize once from the same FP16 values used by the reference drafter.
+sycl::event launch_f16_to_int4sym(sycl::queue& q, const sycl::half* src,
+                                  uint8_t* out, float* ws, int N, int K,
+                                  const std::vector<sycl::event>& deps) {
+    constexpr int G = 128;
+    const int kg = K / G;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<2>(size_t(N), size_t(kg)),
+            [=](sycl::id<2> id) {
+                const int n = int(id[0]);
+                const int g = int(id[1]);
+                const int k0 = g * G;
+                const sycl::half* row = src + int64_t(n) * K;
+                float amax = 0.0f;
+                for (int j = 0; j < G; ++j)
+                    amax = sycl::fmax(amax, sycl::fabs(float(row[k0 + j])));
+                const float sc = (amax > 0.0f) ? amax / 7.0f : 1.0f;
+                const float inv = 1.0f / sc;
+                ws[int64_t(n) * kg + g] = sc;
+                for (int j = 0; j < G; j += 2) {
+                    int q0 = int(sycl::round(float(row[k0 + j]) * inv));
+                    int q1 = int(sycl::round(float(row[k0 + j + 1]) * inv));
+                    q0 = sycl::clamp(q0, -8, 7);
+                    q1 = sycl::clamp(q1, -8, 7);
+                    out[int64_t(n) * (K / 2) + (k0 + j) / 2] =
+                        uint8_t((uint32_t(q0) & 0x0Fu) |
+                                ((uint32_t(q1) & 0x0Fu) << 4));
+                }
+            });
+    });
+}
+
 // ---------------------------------------------------------------------
 // Rotary embedding, PARTIAL.
 //

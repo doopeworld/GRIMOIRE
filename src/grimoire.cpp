@@ -505,6 +505,9 @@ sycl::event launch_gemv_int4sym_batch(sycl::queue&, const uint8_t*, const float*
 sycl::event launch_mxfp4_to_int4sym(sycl::queue&, const uint8_t*, const uint8_t*,
                                     int64_t, int64_t, uint8_t*, float*, int, int,
                                     const std::vector<sycl::event>&);
+sycl::event launch_f16_to_int4sym(sycl::queue&, const sycl::half*, uint8_t*,
+                                  float*, int, int,
+                                  const std::vector<sycl::event>&);
 sycl::event launch_quantize_rows_int8(sycl::queue&, const float*, int8_t*,
                                     float*, int, int,
                                     const std::vector<sycl::event>&);
@@ -1458,7 +1461,7 @@ struct Grimoire {
         bool ok=false, v2=false;
         DevQuant fc, selector_hidden;
         DevQuant fused_context_kv;
-        DevQuant shared_embed_f16, shared_lm_head_f16;
+        DevQuant shared_embed_f16, shared_lm_head_f16, draft_lm_head_i4;
         bf16_t *hidden_norm=nullptr, *norm=nullptr;
         sycl::half *hidden_norm_f16=nullptr, *norm_f16=nullptr;
         bf16_t *predecessor=nullptr, *successor=nullptr;
@@ -1481,6 +1484,7 @@ struct Grimoire {
         int8_t *a8=nullptr;
         float *a8s=nullptr;
         int32_t *tokens=nullptr, *draft_ids=nullptr;
+        int draft_logits_stride=0;
         // NInfer Build-2 proposal vocabulary.  The Q4G64 byte plane is
         // already native signed-s4 DPAS layout; scales are widened from FP16
         // once at load, and argmax rows are remapped through token_ids.
@@ -1665,7 +1669,8 @@ struct Grimoire {
     // state instead of the main model's h_t, which is how depth > 1 works.
     int  mtp_draft(int next_token, int position, bool from_mtp_hidden = false);
     bool dflash_draft(int bonus_token, int position,
-                      std::vector<int32_t>& draft_tokens);
+                      std::vector<int32_t>& draft_tokens,
+                      bool context_only = false);
     int          argmax_token();
     void release();
 };
@@ -2567,6 +2572,31 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
             db+=d.w.bytes();return d;
         };
+        // The draft consumes the shared vocabulary projection too. Keeping
+        // that 2.50 GiB matrix in FP16 left it as the largest steady draft
+        // region after quantizing the five layers. A symmetric INT4 copy is
+        // used only for proposals; target verification remains exact FP16.
+        if(cfg.is_muse&&muse_draft_q&&
+           !std::getenv("GRIMOIRE_MUSE_DRAFT_FP16_HEAD")){
+            auto& head=dflash2.draft_lm_head_i4;
+            const int N=dflash2.shared_lm_head_f16.w.N;
+            const int K=dflash2.shared_lm_head_f16.w.K;
+            const int NP=(N+255)&~255;
+            uint8_t* pack=sycl::malloc_device<uint8_t>(size_t(NP)*(K/2),q);
+            float* scales=sycl::malloc_device<float>(size_t(NP)*(K/128),q);
+            if(!pack||!scales||K%128){
+                if(pack)sycl::free(pack,q);
+                if(scales)sycl::free(scales,q);
+                dok=false;
+            }else{
+                q.memset(pack,0,size_t(NP)*(K/2));
+                q.memset(scales,0,size_t(NP)*(K/128)*sizeof(float));
+                launch_f16_to_int4sym(q,dflash2.shared_lm_head_f16.fp16,
+                    pack,scales,N,K,{}).wait();
+                head.w.N=NP;head.w.K=K;head.i4=pack;head.i4s=scales;
+                db+=size_t(NP)*(K/2)+size_t(NP)*(K/128)*sizeof(float);
+            }
+        }
         auto bload=[&](const std::string& n,const char* what){
             TensorRef r=dr(n);bf16_t* p=dev_copy_t<bf16_t>(q,dc,r,what,&dok);
             if(r.ok())db+=size_t(r.t.numel())*sizeof(bf16_t);return p;
@@ -2823,8 +2853,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 dflash2.conv_scratch=dfd(size_t(DM)*DH);
             }
             const int draft_vocab=dflash2.draft_head_rows?
-                dflash2.draft_head_rows:cfg.vocab;
-            dflash2.logits=dfd(size_t(DM-1)*draft_vocab);
+                dflash2.draft_head_rows:
+                (dflash2.draft_lm_head_i4.has_i4()?
+                    dflash2.draft_lm_head_i4.w.N:cfg.vocab);
+            dflash2.draft_logits_stride=draft_vocab;
+            dflash2.logits=dfd(size_t(DM-1)*dflash2.draft_logits_stride);
             if(cfg.is_muse){
                 auto df16=[&](size_t n){
                     db+=n*sizeof(sycl::half);
@@ -3296,6 +3329,7 @@ void Grimoire::release() {
     dflash2.fused_context_kv.release(q);
     dflash2.shared_embed_f16.release(q);
     dflash2.shared_lm_head_f16.release(q);
+    dflash2.draft_lm_head_i4.release(q);
     for (auto& d : dflash2.layers) {
         d.q.release(q); d.k.release(q); d.v.release(q); d.qkv.release(q);
         d.o.release(q);
@@ -4810,7 +4844,8 @@ int Grimoire::argmax_token() {
 // has additional grouped-conv/selector stages and deliberately does not enter
 // this path.
 bool Grimoire::dflash_draft(int bonus_token, int position,
-                            std::vector<int32_t>& draft_tokens) {
+                            std::vector<int32_t>& draft_tokens,
+                            bool context_only) {
     constexpr int MMAX=16;
     // Ornith's verify slope is ~2.95 ms per extra verified token, so the
     // profitable block is far shorter than the drafter's native 16. Let the
@@ -4844,6 +4879,23 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     const float theta=dflash2.rope_theta;
     const auto fa2_paged=cfg.is_muse?load_xe2_dflash_paged_f16():nullptr;
     if(cfg.is_muse&&!fa2_paged)return false;
+    const bool time_draft=std::getenv("GRIMOIRE_DFLASH_TIME")!=nullptr;
+    static int time_draft_call=0;
+    const int timed_call=time_draft_call++;
+    std::map<std::string,double> draft_times;
+    std::chrono::high_resolution_clock::time_point draft_prev;
+    if(time_draft){
+        q.wait_and_throw();
+        draft_prev=std::chrono::high_resolution_clock::now();
+    }
+    auto draft_mark=[&](const char* stage){
+        if(!time_draft)return;
+        q.wait_and_throw();
+        const auto now=std::chrono::high_resolution_clock::now();
+        draft_times[stage]+=std::chrono::duration<double,std::milli>(
+            now-draft_prev).count();
+        draft_prev=now;
+    };
     const bool trace=std::getenv("GRIMOIRE_DFLASH_TRACE")!=nullptr;
     auto checkpoint=[&](const char* stage){
         if(!trace)return;
@@ -4988,6 +5040,15 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         checkpoint("context KV");
         dflash2.context_pos+=rows;
     }
+    draft_mark("context ingest");
+    if(context_only){
+        if(time_draft){
+            std::fprintf(stderr,
+                "  DFlash context preparation call %d: %.3f ms\n",
+                timed_call,draft_times["context ingest"]);
+        }
+        return true;
+    }
 
     std::array<int32_t,MMAX> host_tokens{};
     host_tokens[0]=bonus_token;
@@ -5003,6 +5064,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     else
         launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
     checkpoint("block embedding");
+    draft_mark("embed + setup");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
 
     if(cfg.is_muse){
@@ -5056,6 +5118,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         else
             norm(dflash2.resid,dflash2.mlp,d.in_norm,d.in_norm_f16,
                  dflash2.normed,M);
+        draft_mark("input norm");
         dump_f32("08_L"+std::to_string(li)+"_innorm",dflash2.normed,size_t(M)*H);
         if(dflash2.v2){
             mm(d.attn_conv_proj,dflash2.normed,dflash2.conv_delta,M);
@@ -5064,6 +5127,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         }
         if(cfg.is_muse){
             const sycl::half* qkv=mm_f16_raw(d.qkv,dflash2.normed,M);
+            draft_mark("qkv f16 gemm");
             launch_qkv_norm_rope_f16w_fused(q,qkv,dflash2.q_f16,
                 dflash2.k_f16,dflash2.v_f16,d.q_norm_f16,d.k_norm_f16,M,QH,KVH,HD,
                 position,theta,eps,{});
@@ -5078,6 +5142,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             mm(d.v,dflash2.normed,dflash2.v,M);
         }
         checkpoint("QKV projections");
+        draft_mark("qkv norm + rope");
         if(cfg.is_muse){
             launch_kv_append_f16_paged(q,dflash2.k_f16,dflash2.v_f16,
                 d.k_cache_f16,d.v_cache_f16,M,position,KVH,HD,
@@ -5116,6 +5181,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 dflash2.cu_q,dflash2.cu_k,dflash2.seqused_k,
                 1.0f/std::sqrt(float(HD)),window,window,false);
             if(rc)return false;
+            draft_mark("kv append + attention");
             launch_f16_to_f32(q,dflash2.attn_f16,dflash2.attn,
                 size_t(M)*QW,{});
         }else{
@@ -5129,8 +5195,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 1.0f/std::sqrt(float(HD)));
         }
         checkpoint("block attention");
+        draft_mark("attention convert");
         dump_f32("13_L"+std::to_string(li)+"_attn",dflash2.attn,size_t(M)*QW);
         mm(d.o,dflash2.attn,dflash2.proj,M);
+        draft_mark("o proj");
         if(dflash2.v2){
             dyn_conv(dflash2.proj,d.attn_conv_base,dflash2.conv_scratch,1);
             conv_back(dflash2.proj);
@@ -5138,16 +5206,20 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         dump_f32("14_L"+std::to_string(li)+"_o",dflash2.proj,size_t(M)*H);
         norm(dflash2.resid,dflash2.proj,d.post_norm,d.post_norm_f16,
              dflash2.normed,M);
+        draft_mark("post-attn norm");
         if(dflash2.v2){
             mm(d.mlp_conv_proj,dflash2.normed,dflash2.conv_delta,M);
             dyn_conv(dflash2.normed,d.mlp_conv_base,dflash2.conv_scratch,0);
             conv_back(dflash2.normed);
         }
         mm(d.gate_up,dflash2.normed,dflash2.gate_up,M);
+        draft_mark("gate_up proj");
         if(cfg.is_muse)
             launch_swiglu_f16_batched(q,dflash2.gate_up,dflash2.h,M,I,{});
         else launch_swiglu_batched(q,dflash2.gate_up,dflash2.h,M,I);
+        draft_mark("swiglu");
         mm(d.down,dflash2.h,dflash2.mlp,M);
+        draft_mark("down proj");
         if(dflash2.v2){
             dyn_conv(dflash2.mlp,d.mlp_conv_base,dflash2.conv_scratch,1);
             conv_back(dflash2.mlp);
@@ -5157,6 +5229,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }
     norm(dflash2.resid,dflash2.mlp,dflash2.norm,dflash2.norm_f16,
          dflash2.normed,M);
+    draft_mark("final norm");
 
     auto w4=load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32_m16");
     dump_f32("16_finalnorm",dflash2.normed,size_t(M)*H);
@@ -5169,6 +5242,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         head_w4(&q,dflash2.a8,dflash2.draft_head_i4,
                 dflash2.draft_head_i4s,dflash2.a8s,dflash2.logits,
                 M-1,dflash2.draft_head_rows,H);
+    }else if(cfg.is_muse&&dflash2.draft_lm_head_i4.has_i4()&&w4){
+        const auto& head=dflash2.draft_lm_head_i4;
+        launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
+                                  M-1,H,{});
+        w4(&q,dflash2.a8,head.i4,head.i4s,dflash2.a8s,dflash2.logits,
+           M-1,head.w.N,H);
     }else if(cfg.is_muse){
         mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
            dflash2.logits,M-1);
@@ -5184,10 +5263,13 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else for(int r=1;r<M;++r)
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                  dflash2.logits+int64_t(r-1)*cfg.vocab,{});
+    draft_mark("lm head");
     const int draft_vocab=dflash2.draft_head_rows?
         dflash2.draft_head_rows:cfg.vocab;
+    const int draft_stride=dflash2.draft_logits_stride?
+        dflash2.draft_logits_stride:draft_vocab;
     for(int r=0;r<M-1;++r){
-        launch_argmax(q,dflash2.logits+int64_t(r)*draft_vocab,draft_vocab,
+        launch_argmax(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
                       s.d_tok,s.d_val,{});
         if(dflash2.draft_head_rows){
             const int32_t* map=dflash2.draft_head_token_ids;
@@ -5196,10 +5278,11 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             q.single_task([=](){*dst=map[*src];});
         }else q.memcpy(dflash2.draft_ids+r,s.d_tok,sizeof(int32_t));
     }
-    dump_f32("17_logits",dflash2.logits,size_t(M-1)*draft_vocab);
+    dump_f32("17_logits",dflash2.logits,size_t(M-1)*draft_stride);
     draft_tokens.resize(M-1);
     q.memcpy(draft_tokens.data(),dflash2.draft_ids,
              size_t(M-1)*sizeof(int32_t)).wait();
+    draft_mark("argmax + readback");
     if(dumping){
         std::fprintf(stderr,"  dflash dump: draft_ids");
         for(int r=0;r<M-1;++r)
@@ -5207,6 +5290,17 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         std::fprintf(stderr,"\n");
     }
     checkpoint("draft logits");
+    if(time_draft){
+        double total=0.0;
+        for(const auto& kv:draft_times)total+=kv.second;
+        std::fprintf(stderr,
+            "  DFlash native timing call %d, %d layers, M=%d:\n",
+            timed_call,int(dflash2.layers.size()),M);
+        for(const auto& kv:draft_times)
+            std::fprintf(stderr,"    %-24s %7.3f ms  (%5.1f%%)\n",
+                kv.first.c_str(),kv.second,total?100.0*kv.second/total:0.0);
+        std::fprintf(stderr,"    %-24s %7.3f ms\n","TOTAL",total);
+    }
     return true;
 }
 
@@ -5468,13 +5562,18 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         launch_gate_sigmoid_mul_h(q,attn,gate,M,QW,{});
         mm(d.o_proj,attn,proj);
         mt_mark("o_proj");
-        launch_rmsnorm_residual_f16w_h(q,proj,nullptr,d.post_norm_f16,tmp,
-                                       M,H,cfg.post_norm_eps,{},1.0f);
-        launch_add_f16_round_h(q,hidden,tmp,M*H,{});
-        mt_mark("post-attn norm+add");
+        if(std::getenv("GRIMOIRE_MUSE_UNFUSED_NORMS")){
+            launch_rmsnorm_residual_f16w_h(q,proj,nullptr,d.post_norm_f16,tmp,
+                                           M,H,cfg.post_norm_eps,{},1.0f);
+            launch_add_f16_round_h(q,hidden,tmp,M*H,{});
+            launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,d.pre_ff_norm_f16,
+                                           normed,M,H,cfg.rms_eps,{},1.0f);
+        }else{
+            launch_muse_post_attn_pre_ff_h(q,hidden,proj,d.post_norm_f16,
+                d.pre_ff_norm_f16,normed,M,H,cfg.post_norm_eps,cfg.rms_eps,{});
+        }
+        mt_mark("post-attn+pre-ff norms");
 
-        launch_rmsnorm_residual_f16w_h(q,hidden,nullptr,d.pre_ff_norm_f16,
-                                       normed,M,H,cfg.rms_eps,{},1.0f);
         mm(d.sh_gu,normed,ff);
         mt_mark("FFN gate_up");
         launch_swiglu_h(q,ff,ff,M,I,{});
@@ -6713,6 +6812,16 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         }
     }
     e.sync();                      // pp must time execution, not submission
+    if (e.dflash2.ok &&
+        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr)) {
+        std::vector<int32_t> unused;
+        if (!e.dflash_draft(0, e.pos, unused, true)) {
+            std::fprintf(stderr,
+                "\n  DFlash context preparation failed at position %d\n", e.pos);
+            e.release();
+            return 1;
+        }
+    }
     const auto p1 = std::chrono::high_resolution_clock::now();
     const double pp_ms = std::chrono::duration<double, std::milli>(p1 - p0).count();
 
@@ -7076,6 +7185,16 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         }
     }
     e.sync();
+    if (e.dflash2.ok &&
+        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr)) {
+        std::vector<int32_t> unused;
+        if (!e.dflash_draft(0, e.pos, unused, true)) {
+            std::fprintf(stderr,
+                "    [prefill] DFlash context preparation failed at position %d\n",
+                e.pos);
+            return 0;
+        }
+    }
     {
         const double pf_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - pf_t0).count();
