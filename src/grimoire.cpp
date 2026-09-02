@@ -1494,6 +1494,7 @@ struct Grimoire {
         // artifact, not the config: base_kernel is [2,taps,hidden] and
         // kernel_projection is [2*taps*groups, hidden].
         float *conv_delta=nullptr, *conv_scratch=nullptr;
+        bool fp16_draft=true;   // drafter weights uploaded as FP16
         int conv_taps=0, conv_groups=0, conv_block=16;
         // Muse speculative verifier scratch, reused after the draft pass.
         float *verify_logits=nullptr;
@@ -2548,9 +2549,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // load.  Quantizing these weights to MXFP4 is not an equivalent
         // implementation and changes draft agreement, so Muse never inherits
         // the target projection format here.
-        const Fmt dflash_fmt=cfg.is_muse?Fmt::BF16:(dflash2.v2?PF:Fmt::BF16);
+        // The drafter ships BF16 and is uploaded as FP16 to mirror vLLM's
+        // numerics. That makes every draft stream 4x the bytes the INT4 target
+        // does: measured 7.35 GB per draft at 223 GB/s = 33 ms, against the
+        // verify's 15 GB at 536 GB/s. GRIMOIRE_MUSE_DRAFT_MXFP4=1 quantizes the
+        // drafter instead, cutting draft traffic ~4x and 3.5 GiB of device
+        // memory. It changes draft agreement, so judge it on measured
+        // acceptance, not on whether it loads.
+        const bool muse_draft_q =
+            cfg.is_muse && std::getenv("GRIMOIRE_MUSE_DRAFT_MXFP4") != nullptr;
+        const bool muse_fp16_draft = cfg.is_muse && !muse_draft_q;
+        dflash2.fp16_draft = muse_fp16_draft;
+        const Fmt dflash_fmt=muse_draft_q?Fmt::MXFP4
+            :(cfg.is_muse?Fmt::BF16:(dflash2.v2?PF:Fmt::BF16));
         auto qload=[&](const std::string& n,const char* what){
-            DevQuant d=cfg.is_muse?upload_f16_t(q,dc,dr(n),what,&dok):
+            DevQuant d=muse_fp16_draft?upload_f16_t(q,dc,dr(n),what,&dok):
                 quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
             db+=d.w.bytes();return d;
         };
@@ -2612,7 +2625,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 d.v=qload(p+"self_attn.v_proj.weight","dflash2.v_proj");
             }
             d.o=qload(p+"self_attn.o_proj.weight","dflash2.o_proj");
-            if(cfg.is_muse){
+            if(cfg.is_muse&&muse_draft_q){
+                d.gate_up=concat_upload_t(q,dc,
+                    dr(p+"mlp.gate_proj.weight"),dr(p+"mlp.up_proj.weight"),
+                    dflash_fmt,"dflash2.gate_up",&dok);
+            }else if(cfg.is_muse){
                 std::vector<TensorRef> gu={dr(p+"mlp.gate_proj.weight"),
                                            dr(p+"mlp.up_proj.weight")};
                 d.gate_up=concat_upload_many_f16_t(
