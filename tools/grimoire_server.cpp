@@ -373,7 +373,10 @@ int main(int argc, char** argv) {
                                 httplib::Response& res, bool chat_shape) {
         std::lock_guard<std::mutex> lock(engine_mu);
         const auto t0 = std::chrono::steady_clock::now();
+        const auto tk0 = std::chrono::steady_clock::now();
         std::vector<int32_t> ids = tk.encode(prompt_text);
+        const double enc_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tk0).count();
         std::vector<int32_t> out_ids;
         const int n_predict = max_tokens > 0 ? max_tokens : 128;
         const int completion_tokens = b70::grimoire_serve_generate(
@@ -382,8 +385,8 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() - t0).count();
         std::string text = tk.decode(out_ids);
         if (chat_shape) text = harmony_final(text);
-        std::fprintf(stderr, "[req] prompt=%zu completion=%d %.2fs\n",
-                     ids.size(), completion_tokens, dt);
+        std::fprintf(stderr, "[req] prompt=%zu completion=%d %.2fs (encode %.0f ms)\n",
+                     ids.size(), completion_tokens, dt, enc_ms);
 
         std::ostringstream j;
         const long long now = static_cast<long long>(std::time(nullptr));

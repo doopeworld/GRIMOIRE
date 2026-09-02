@@ -7048,13 +7048,24 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         if (on_token && !on_token(t)) cancelled = true;
     };
     e.reset();
-    if (!e.prefill(prompt_ids)) {
+    const auto pf_t0 = std::chrono::steady_clock::now();
+    const bool pf_ok = e.prefill(prompt_ids);
+    if (!pf_ok) {
+        std::fprintf(stderr, "    [prefill] BATCHED PREFILL FAILED -- falling "
+            "back to per-token forward (this is ~100x slower)\n");
         for (size_t i = 0; i < prompt_ids.size(); ++i) {
             e.forward(prompt_ids[i]);
             if ((i & 63) == 63) e.sync();
         }
     }
     e.sync();
+    {
+        const double pf_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - pf_t0).count();
+        std::fprintf(stderr, "    [prefill] %zu tokens in %.0f ms -> %.1f tok/s\n",
+            prompt_ids.size(), pf_ms,
+            pf_ms > 0.0 ? 1000.0 * double(prompt_ids.size()) / pf_ms : 0.0);
+    }
     int tok = e.argmax_token();
     out_ids.clear();
     out_ids.reserve(size_t(n_predict));
