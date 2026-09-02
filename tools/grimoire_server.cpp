@@ -316,7 +316,12 @@ int main(int argc, char** argv) {
                      << (chat_shape ? "\"delta\":{\"role\":\"assistant\"}"
                                     : "\"text\":\"\"")
                      << ",\"finish_reason\":null}]}";
-                if (chat_shape) send(head.str());
+                // Deliberately NOT sent yet. A streaming client measures
+                // time-to-first-token from the first event it receives; if the
+                // role frame goes out before prefill runs, TTFT reads ~0 and
+                // the prefill columns come back empty (llama-benchy shows no
+                // pp row). Emit it together with the first real token instead.
+                bool head_sent = false;
 
                 std::vector<int32_t> ids = tk.encode(prompt_text);
                 std::vector<int32_t> out_ids;
@@ -325,6 +330,10 @@ int main(int argc, char** argv) {
                     *e, ids, n_predict, tk.eos(), out_ids,
                     tk.special_id("<|eot|>"),
                     [&](int32_t tokid) -> bool {
+                        if (chat_shape && !head_sent) {
+                            head_sent = true;
+                            if (!send(head.str())) return false;
+                        }
                         const std::string piece = tk.decode_one(tokid);
                         std::ostringstream c;
                         c << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
@@ -337,6 +346,7 @@ int main(int argc, char** argv) {
                         return send(c.str());
                     });
 
+                if (chat_shape && !head_sent) send(head.str());
                 std::ostringstream tail;
                 tail << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
                      << "\",\"created\":" << now << ",\"model\":\""
