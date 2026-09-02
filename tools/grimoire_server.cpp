@@ -301,6 +301,7 @@ int main(int argc, char** argv) {
         res.set_chunked_content_provider(
             "text/event-stream",
             [&, prompt_text, n_predict, mdl, chat_shape](size_t, httplib::DataSink& sink) {
+                const auto ttft_t0 = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> lock(engine_mu);
                 const long long now = static_cast<long long>(std::time(nullptr));
                 const char* obj = chat_shape ? "chat.completion.chunk"
@@ -332,6 +333,11 @@ int main(int argc, char** argv) {
                     [&](int32_t tokid) -> bool {
                         if (chat_shape && !head_sent) {
                             head_sent = true;
+                            std::fprintf(stderr,
+                                "    [ttft] first token at %.0f ms\n",
+                                std::chrono::duration<double,std::milli>(
+                                    std::chrono::steady_clock::now()-ttft_t0).count());
+                            std::fflush(stderr);
                             if (!send(head.str())) return false;
                         }
                         const std::string piece = tk.decode_one(tokid);

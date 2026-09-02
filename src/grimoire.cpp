@@ -7202,7 +7202,12 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             prompt_ids.size(), pf_ms,
             pf_ms > 0.0 ? 1000.0 * double(prompt_ids.size()) / pf_ms : 0.0);
     }
+    const auto am_t0 = std::chrono::steady_clock::now();
     int tok = e.argmax_token();
+    std::fprintf(stderr, "    [argmax] %.0f ms\n",
+        std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-am_t0).count());
+    std::fflush(stderr);
     out_ids.clear();
     out_ids.reserve(size_t(n_predict));
     int n = 0;
