@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -36,7 +37,8 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
 // this file; this call only prefills+decodes already-tokenized ids.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              int n_predict, int eos_id,
-                             std::vector<int32_t>& out_ids, int eot_id);
+                             std::vector<int32_t>& out_ids, int eot_id,
+                             const std::function<bool(int32_t)>& on_token = {});
 }  // namespace b70
 
 // Harmony channel extraction. Muse-Glimmer emits its chain of thought in a
@@ -65,6 +67,17 @@ static std::string harmony_final(const std::string& text) {
 }
 
 // ---- tiny JSON helpers (only what an OpenAI request/response needs) ------
+static bool json_find_true(const std::string& j, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    size_t p = j.find(needle);
+    if (p == std::string::npos) return false;
+    p = j.find(':', p + needle.size());
+    if (p == std::string::npos) return false;
+    ++p;
+    while (p < j.size() && std::isspace(static_cast<unsigned char>(j[p]))) ++p;
+    return j.compare(p, 4, "true") == 0;
+}
+
 static std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -275,6 +288,77 @@ int main(int argc, char** argv) {
         res.set_content(j.str(), "application/json");
     });
 
+    // OpenAI SSE stream. Each token becomes one chat.completion.chunk, so a
+    // client can time the first token separately from the rest. The reasoning
+    // channel is NOT stripped here: a stream must forward tokens as they are
+    // produced, and a short generation (a benchmark's tg=32) never reaches the
+    // to=user channel -- filtering would emit nothing at all. Non-streaming
+    // responses still return only the final channel.
+    auto handle_stream = [&](const std::string& prompt_text, int max_tokens,
+                             httplib::Response& res, bool chat_shape) {
+        const std::string mdl = model_dir;
+        const int n_predict = max_tokens > 0 ? max_tokens : 128;
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [&, prompt_text, n_predict, mdl, chat_shape](size_t, httplib::DataSink& sink) {
+                std::lock_guard<std::mutex> lock(engine_mu);
+                const long long now = static_cast<long long>(std::time(nullptr));
+                const char* obj = chat_shape ? "chat.completion.chunk"
+                                             : "text_completion";
+                auto send = [&](const std::string& payload) {
+                    const std::string line = "data: " + payload + "\n\n";
+                    return sink.write(line.data(), line.size());
+                };
+                std::ostringstream head;
+                head << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
+                     << "\",\"created\":" << now << ",\"model\":\""
+                     << json_escape(mdl) << "\",\"choices\":[{\"index\":0,"
+                     << (chat_shape ? "\"delta\":{\"role\":\"assistant\"}"
+                                    : "\"text\":\"\"")
+                     << ",\"finish_reason\":null}]}";
+                if (chat_shape) send(head.str());
+
+                std::vector<int32_t> ids = tk.encode(prompt_text);
+                std::vector<int32_t> out_ids;
+                const auto t0 = std::chrono::steady_clock::now();
+                const int produced = b70::grimoire_serve_generate(
+                    *e, ids, n_predict, tk.eos(), out_ids,
+                    tk.special_id("<|eot|>"),
+                    [&](int32_t tokid) -> bool {
+                        const std::string piece = tk.decode_one(tokid);
+                        std::ostringstream c;
+                        c << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
+                          << "\",\"created\":" << now << ",\"model\":\""
+                          << json_escape(mdl) << "\",\"choices\":[{\"index\":0,"
+                          << (chat_shape
+                                ? "\"delta\":{\"content\":\"" + json_escape(piece) + "\"}"
+                                : "\"text\":\"" + json_escape(piece) + "\"")
+                          << ",\"finish_reason\":null}]}";
+                        return send(c.str());
+                    });
+
+                std::ostringstream tail;
+                tail << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
+                     << "\",\"created\":" << now << ",\"model\":\""
+                     << json_escape(mdl) << "\",\"choices\":[{\"index\":0,"
+                     << (chat_shape ? "\"delta\":{}" : "\"text\":\"\"")
+                     << ",\"finish_reason\":\"stop\"}],"
+                     << "\"usage\":{\"prompt_tokens\":" << ids.size()
+                     << ",\"completion_tokens\":" << produced
+                     << ",\"total_tokens\":" << (ids.size() + size_t(produced))
+                     << "}}";
+                send(tail.str());
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                const double dt = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "[req/stream] prompt=%zu completion=%d %.2fs\n",
+                             ids.size(), produced, dt);
+                sink.done();
+                return false;
+            });
+    };
+
     auto handle_generate = [&](const std::string& prompt_text, int max_tokens,
                                 httplib::Response& res, bool chat_shape) {
         std::lock_guard<std::mutex> lock(engine_mu);
@@ -330,7 +414,10 @@ int main(int argc, char** argv) {
         double max_tok = 0;
         json_find_number(req.body, "max_tokens", max_tok);
         const std::string prompt = tk.apply_chat_template(user, system);
-        handle_generate(prompt, int(max_tok), res, /*chat_shape=*/true);
+        if (json_find_true(req.body, "stream"))
+            handle_stream(prompt, int(max_tok), res, /*chat_shape=*/true);
+        else
+            handle_generate(prompt, int(max_tok), res, /*chat_shape=*/true);
     });
 
     // llama-benchy target: raw prompt, no chat template.

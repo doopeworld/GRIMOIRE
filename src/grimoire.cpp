@@ -27,6 +27,7 @@
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <memory>
+#include <functional>
 #include <type_traits>
 #include <dlfcn.h>
 
@@ -7034,8 +7035,18 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
 // server's known follow-up, not a silent gap.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              int n_predict, int eos_id, std::vector<int32_t>& out_ids,
-                             int eot_id) {
+                             int eot_id,
+                             const std::function<bool(int32_t)>& on_token) {
     auto is_stop = [&](int t) { return t == eos_id || (eot_id >= 0 && t == eot_id); };
+    // Streaming clients (llama-benchy, open-webui) need each token as it is
+    // produced, not one JSON blob at the end -- without it they cannot measure
+    // time-to-first-token and llama-benchy reports "No results collected".
+    // Returning false from the callback stops generation (client disconnected).
+    bool cancelled = false;
+    auto emit = [&](int32_t t) {
+        out_ids.push_back(t);
+        if (on_token && !on_token(t)) cancelled = true;
+    };
     e.reset();
     if (!e.prefill(prompt_ids)) {
         for (size_t i = 0; i < prompt_ids.size(); ++i) {
@@ -7106,8 +7117,9 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             for (int i = 0; i < accepted; ++i) {
                 const int t = candidates[i];
                 if (is_stop(t) || n >= n_predict) { stop = true; break; }
-                out_ids.push_back(t);
+                emit(t);
                 ++n;
+                if (cancelled) { stop = true; break; }
             }
             tok = next;
         }
@@ -7116,7 +7128,8 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
 
     for (; n < n_predict; ++n) {
         if (is_stop(tok)) break;
-        out_ids.push_back(tok);
+        emit(tok);
+        if (cancelled) { ++n; break; }
         e.forward(tok);
         tok = e.argmax_token();
     }
