@@ -7079,6 +7079,16 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok;
     const bool dflash_spec = e.dflash2.ok &&
         (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
+    // The first token is already known from the prefill argmax. Emitting it
+    // before the first speculation round removes a whole draft+verify cycle
+    // from time-to-first-token. A benchmark charges that to prefill, which is
+    // why reported PP read ~1790 against ~2070 of real prefill compute.
+    int skip_first = 0;
+    if ((mtp_spec || dflash_spec) && on_token && n < n_predict && !is_stop(tok)) {
+        emit(tok);
+        ++n;
+        skip_first = 1;
+    }
     if (mtp_spec || dflash_spec) {
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
@@ -7125,13 +7135,14 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             if (accepted < int(candidates.size()))
                 e.commit_spec_prefix(saved_pos, accepted);
 
-            for (int i = 0; i < accepted; ++i) {
+            for (int i = skip_first; i < accepted; ++i) {
                 const int t = candidates[i];
                 if (is_stop(t) || n >= n_predict) { stop = true; break; }
                 emit(t);
                 ++n;
                 if (cancelled) { stop = true; break; }
             }
+            skip_first = 0;
             tok = next;
         }
         return n;
