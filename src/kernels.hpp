@@ -272,8 +272,6 @@ sycl::event launch_rmsnorm_residual_f16_batched(
     const std::vector<sycl::event>& deps = {}, float weight_offset = 0.0f);
 // FP16-storage activation variants; see prefill.cpp for why these are
 // numerically identical to the f32 versions.
-sycl::event launch_embed_bf16_h(sycl::queue&, const bf16_t*, const int32_t*,
-    sycl::half*, int, int, const std::vector<sycl::event>& deps = {});
 sycl::event launch_embed_f16_h(sycl::queue&, const sycl::half*, const int32_t*,
     sycl::half*, int, int, const std::vector<sycl::event>& = {});
 sycl::event launch_add_f16_round_h(sycl::queue&, sycl::half*, const sycl::half*,

@@ -306,23 +306,6 @@ sycl::event launch_embed_f16_h(sycl::queue& q, const sycl::half* table,
     });
 }
 
-// Same gather as launch_embed_f16_h but reads the TARGET's bf16 embedding
-// table directly. The drafter used to upload its own fp16 copy of exactly
-// these values (2.50 GiB on Muse); converting bf16->fp16 here is bit-identical
-// to that pre-converted copy, so the copy is pure duplication.
-sycl::event launch_embed_bf16_h(sycl::queue& q, const bf16_t* table,
-    const int32_t* tokens, sycl::half* out, int count, int hidden,
-    const std::vector<sycl::event>& deps) {
-    return q.submit([&](sycl::handler& h) {
-        h.depends_on(deps);
-        h.parallel_for(sycl::range<1>(size_t(count)*hidden), [=](sycl::id<1> id) {
-            const size_t i=id[0];
-            const int row=int(i/hidden), col=int(i%hidden);
-            out[i]=sycl::half(bf16_to_f32(table[int64_t(tokens[row])*hidden+col]));
-        });
-    });
-}
-
 sycl::event launch_add_f16_round_h(sycl::queue& q, sycl::half* dst,
     const sycl::half* src, int n, const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h){
