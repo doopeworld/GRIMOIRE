@@ -7173,7 +7173,12 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         out_ids.push_back(t);
         if (on_token && !on_token(t)) cancelled = true;
     };
+    const auto rs_t0 = std::chrono::steady_clock::now();
     e.reset();
+    std::fprintf(stderr, "    [reset] %.0f ms\n",
+        std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-rs_t0).count());
+    std::fflush(stderr);
     const auto pf_t0 = std::chrono::steady_clock::now();
     const bool pf_ok = e.prefill(prompt_ids);
     if (!pf_ok) {

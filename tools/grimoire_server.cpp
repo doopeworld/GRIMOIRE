@@ -324,7 +324,12 @@ int main(int argc, char** argv) {
                 // pp row). Emit it together with the first real token instead.
                 bool head_sent = false;
 
+                const auto enc_t0 = std::chrono::steady_clock::now();
                 std::vector<int32_t> ids = tk.encode(prompt_text);
+                std::fprintf(stderr, "    [encode] %.0f ms (%zu tok)\n",
+                    std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-enc_t0).count(), ids.size());
+                std::fflush(stderr);
                 std::vector<int32_t> out_ids;
                 const auto t0 = std::chrono::steady_clock::now();
                 const int produced = b70::grimoire_serve_generate(
