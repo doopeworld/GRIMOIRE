@@ -101,3 +101,82 @@ raw 64-token or 256-token figures above, which are still overhead-dominated.
    `GRIMOIRE_MUSE_PREFILL_EXACT_BF16=1` (env flags already in
    `prefill_muse`) to isolate whether the MXFP4 dense-GEMM dispatch itself
    is the bottleneck vs. the surrounding per-layer glue kernels.
+
+## UPDATE 2026-09-03: server chat/streaming rebuild + verification, BUG FOUND
+
+Rebuilt `grimoire:b70-native` from c7c6ff8 (server/faa7bb8 + server/c7c6ff8,
+chat-history preservation + Harmony stream buffer clear) and recreated the
+`GRIMOIRE-MUSE` container identically (same env, mounts, cmd: Muse-Glimmer-30B-INT4-W4A16
++mxfp4 proj, ctx 8192, dflash-model Muse-Glimmer-assistant, port 6886).
+
+**Verified working:**
+- Streaming (`/v1/chat/completions`, `stream:true`) delivers clean per-token
+  `delta.content` chunks with no duplication or stale-buffer leakage, for
+  responses long enough to pass through the models /analysis
+
+## UPDATE 2026-09-03 (cont.): reasoning_content streaming fix, llama-benchy verified
+
+Rebuilt `grimoire:b70-native` again (image id `4cec00a5...`) with a second
+streaming-path change in `tools/grimoire_server.cpp`, on top of the bare-marker
+fix above.
+
+**Problem found:** `llama-benchy`'s pp/tg benchmark (long prompt, e.g. 4096
+tokens, short completion, e.g. `tg=32`) reported "No results collected. Check
+if the model is generating tokens." Server-side logs showed the requests
+completing normally (`completion=32`, ~2.5-2.9s, no errors) but with no
+`[ttft]` line, meaning the model never reached the `to=user` transition
+within its 32-token budget -- it was still inside the private/analysis
+channel when generation stopped.
+
+**Root cause (predates this session, from `faa7bb8`):** the streaming path
+buffers every token into `harmony_pending` and only forwards anything to the
+client once a `to=user` marker is found. If the marker is never found before
+generation ends (any short completion whose full budget is spent still
+"thinking"), literally nothing is ever sent to the client -- not the
+reasoning, not an answer, nothing. `llama-benchy` reads `content`,
+`reasoning_content`, or `reasoning` from each delta and counts a "result" if
+any of the three is non-empty; an all-buffered, nothing-sent stream trips its
+"no results" path.
+
+**Fix:** while `harmony_user` is false (i.e. still inside the private
+channel), forward each token immediately as `delta.reasoning_content`
+instead of silently buffering it. This matches the vLLM
+`--reasoning-parser muse_glimmer` convention referenced in
+[[grimoire-server]] memory. Once the `to=user` transition is found (either
+form), behavior is unchanged: the remainder streams as `delta.content`, same
+as before. Non-streaming (`harmony_final()`) was NOT touched in this update --
+still only the bare-marker fix from the earlier update above.
+
+**Verified:** container restarted on the new image (id `4cec00a5...` matches
+`docker inspect` exactly), loads cleanly, reports ready. Not independently
+re-run through curl by the assistant this round -- verified via Ian
+restarting `GRIMOIRE-MUSE` himself and confirming it loaded and the image id
+matched.
+
+**Incident during this work (unrelated to the code fix, worth recording):**
+while verifying the FIRST fix (bare-marker), a throwaway test container
+bound to `ZE_AFFINITY_MASK=1` (GPU1, `0000:35:00.0`, the USB4-attached card)
+aborted mid-load and wedged that GPU (`xe 0000:35:00.0: trying reset from
+guc_exec_queue_timedout_job` spamming dmesg, PCI runtime_status stuck instead
+of idling). A second throwaway container aimed at GPU0 then also hung in
+kernel D-state, unkillable by `docker kill`/`SIGKILL` (contended with the
+real `GRIMOIRE-MUSE` trying to load on the same device). Ian rebooted the
+Tower to clear both. Lesson: do NOT create ad hoc verification containers
+against either B70 -- test only through the real, already-configured
+`GRIMOIRE-MUSE` container, or not at all without asking first.
+
+### Next steps
+1. Have Ian (or a future session) re-run `llama-benchy`'s pp=4096/tg=32 test
+   against the current `GRIMOIRE-MUSE` to confirm it now reports real
+   numbers instead of "No results collected."
+2. Decide whether Open WebUI should render Muse's `reasoning_content` as a
+   collapsed "thinking" block (it may already, being a standard field) --
+   worth a manual check in the actual UI, not just curl.
+3. Apply the same reasoning/final split to the non-streaming path
+   (`harmony_final()` / `handle_generate`) if a `reasoning_content` field is
+   wanted there too -- currently only streaming was changed.
+4. The short-response regression noted in the update above (bare `to=user`
+   at generation start) and this longer-response one (marker never reached)
+   should both get a standing regression test once there's a harness for it
+   -- max_tokens ~10-20 AND ~32-with-long-prompt cases, checked in streaming
+   mode specifically.

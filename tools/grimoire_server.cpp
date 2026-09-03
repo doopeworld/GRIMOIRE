@@ -48,10 +48,23 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
 // Returns the LAST complete to=user segment, or the input unchanged when the
 // markers are absent (Qwen/Ornith, which do not use channels).
 static std::string harmony_final(const std::string& text) {
-    static const std::string kUser = "assistant to=user";
-    const size_t last = text.rfind(kUser);
-    if (last == std::string::npos) return text;
-    size_t b = last + kUser.size();
+    static const std::string kAssistant = "assistant to=user";
+    static const std::string kBare = "to=user";
+    size_t b;
+    const size_t last = text.rfind(kAssistant);
+    if (last != std::string::npos) {
+        b = last + kAssistant.size();
+    } else {
+        // A short answer can skip the private/analysis channel entirely, so
+        // generation starts directly with the bare "to=user" recipient
+        // marker (the word "assistant" is already in the prompt template,
+        // not generated). Only trust a bare marker at the very start of the
+        // text -- anywhere else "to=user" could be genuine answer content.
+        size_t p = 0;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\n')) ++p;
+        if (text.compare(p, kBare.size(), kBare) != 0) return text;
+        b = p + kBare.size();
+    }
     // A channel body may begin right after the marker or after a separator.
     while (b < text.size() && (text[b] == ' ' || text[b] == '\n')) ++b;
     // The segment ends at the next channel marker ("assistant to=" / "to=self").
@@ -342,12 +355,56 @@ int main(int argc, char** argv) {
                         if (chat_shape && harmony_model) {
                             harmony_pending += piece;
                             if (!harmony_user) {
-                                static const std::string marker_text =
+                                static const std::string kAssistant =
                                     "assistant to=user";
-                                const size_t marker = harmony_pending.find(marker_text);
-                                if (marker == std::string::npos) return true;
+                                static const std::string kBare = "to=user";
+                                size_t marker = harmony_pending.find(kAssistant);
+                                size_t marker_len = kAssistant.size();
+                                if (marker == std::string::npos) {
+                                    // Same skip-the-analysis-channel case as
+                                    // harmony_final(): only trust a bare
+                                    // "to=user" when it leads the buffer.
+                                    size_t p = 0;
+                                    while (p < harmony_pending.size() &&
+                                           (harmony_pending[p] == ' ' ||
+                                            harmony_pending[p] == '\n')) ++p;
+                                    const size_t avail = harmony_pending.size() - p;
+                                    const size_t want = std::min(avail, kBare.size());
+                                    if (harmony_pending.compare(p, want, kBare, 0, want) == 0) {
+                                        if (avail < kBare.size()) return true;
+                                        marker = p;
+                                        marker_len = kBare.size();
+                                    }
+                                }
+                                if (marker == std::string::npos) {
+                                    // Still inside the private/analysis
+                                    // channel. Forward it as reasoning_content
+                                    // (matching vLLM's muse_glimmer reasoning
+                                    // parser) instead of silently dropping it --
+                                    // a tight token budget (e.g. a benchmark's
+                                    // tg=32) can otherwise finish generation
+                                    // without ever reaching to=user, producing
+                                    // zero visible output despite real tokens
+                                    // having been generated.
+                                    if (chat_shape && !head_sent) {
+                                        head_sent = true;
+                                        std::fprintf(stderr,
+                                            "    [ttft] first token at %.0f ms\n",
+                                            std::chrono::duration<double,std::milli>(
+                                                std::chrono::steady_clock::now()-ttft_t0).count());
+                                        std::fflush(stderr);
+                                        if (!send(head.str())) return false;
+                                    }
+                                    std::ostringstream rc;
+                                    rc << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
+                                       << "\",\"created\":" << now << ",\"model\":\""
+                                       << json_escape(mdl) << "\",\"choices\":[{\"index\":0,"
+                                       << "\"delta\":{\"reasoning_content\":\"" << json_escape(piece) << "\"}"
+                                       << ",\"finish_reason\":null}]}";
+                                    return send(rc.str());
+                                }
                                 harmony_user = true;
-                                harmony_pending.erase(0, marker + marker_text.size());
+                                harmony_pending.erase(0, marker + marker_len);
                                 while (!harmony_pending.empty() &&
                                        (harmony_pending.front() == ' ' ||
                                         harmony_pending.front() == '\n'))
