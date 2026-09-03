@@ -28,6 +28,11 @@
 
 namespace b70 {
 
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
 class Tokenizer {
 public:
     bool load(const std::string& dir, std::string& err);
@@ -59,6 +64,9 @@ public:
     // strings come from tokenizer_config.json when present.
     std::string apply_chat_template(const std::string& user,
                                     const std::string& system = "") const;
+    // Render an ordered conversation without dropping prior turns. Harmony
+    // models use recipient channels; Qwen/Ornith retain ChatML formatting.
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages) const;
 
 private:
     std::vector<std::string>                     id_to_tok_;

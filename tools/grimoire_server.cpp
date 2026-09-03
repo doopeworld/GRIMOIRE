@@ -16,6 +16,7 @@
 #include "b70/tokenizer.hpp"
 #include "httplib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -47,7 +48,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
 // Returns the LAST complete to=user segment, or the input unchanged when the
 // markers are absent (Qwen/Ornith, which do not use channels).
 static std::string harmony_final(const std::string& text) {
-    static const std::string kUser = "to=user";
+    static const std::string kUser = "assistant to=user";
     const size_t last = text.rfind(kUser);
     if (last == std::string::npos) return text;
     size_t b = last + kUser.size();
@@ -149,10 +150,8 @@ static bool json_find_number(const std::string& j, const std::string& key,
     return true;
 }
 
-// Extract every "content":"..." string in a "messages":[...] array, in
-// order, concatenated as system+user turns already flattened by the caller
-// (this server only supports a single system + single user turn per
-// request, matching the one apply_chat_template signature the engine has).
+// Extract message fields in request order. Open WebUI sends string content;
+// roles and content are paired below to preserve the entire conversation.
 static std::vector<std::string> json_find_all_content(const std::string& j) {
     std::vector<std::string> out;
     size_t p = 0;
@@ -249,6 +248,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
         return 1;
     }
+    const bool harmony_model = tk.special_id("<|begin_of_text|>") >= 0;
 
     std::fprintf(stderr, "loading %s ...\n", model_dir.c_str());
     b70::Grimoire* e = b70::grimoire_new();
@@ -288,19 +288,16 @@ int main(int argc, char** argv) {
         res.set_content(j.str(), "application/json");
     });
 
-    // OpenAI SSE stream. Each token becomes one chat.completion.chunk, so a
-    // client can time the first token separately from the rest. The reasoning
-    // channel is NOT stripped here: a stream must forward tokens as they are
-    // produced, and a short generation (a benchmark's tg=32) never reaches the
-    // to=user channel -- filtering would emit nothing at all. Non-streaming
-    // responses still return only the final channel.
+    // OpenAI SSE stream. Raw completions stay token-by-token for llama-benchy.
+    // Harmony chat buffers the private to=self channel and starts emitting only
+    // after to=user, so Open WebUI never receives chain-of-thought or protocol
+    // markers.
     auto handle_stream = [&](const std::string& prompt_text, int max_tokens,
                              httplib::Response& res, bool chat_shape) {
         const std::string mdl = model_dir;
-        const int n_predict = max_tokens > 0 ? max_tokens : 128;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&, prompt_text, n_predict, mdl, chat_shape](size_t, httplib::DataSink& sink) {
+            [&, prompt_text, max_tokens, mdl, chat_shape](size_t, httplib::DataSink& sink) {
                 const auto ttft_t0 = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> lock(engine_mu);
                 const long long now = static_cast<long long>(std::time(nullptr));
@@ -326,16 +323,39 @@ int main(int argc, char** argv) {
 
                 const auto enc_t0 = std::chrono::steady_clock::now();
                 std::vector<int32_t> ids = tk.encode(prompt_text);
+                const int room = std::max(1, max_seq - int(ids.size()));
+                const int n_predict = max_tokens > 0 ? max_tokens
+                    : std::min(4096, room);
                 std::fprintf(stderr, "    [encode] %.0f ms (%zu tok)\n",
                     std::chrono::duration<double,std::milli>(
                         std::chrono::steady_clock::now()-enc_t0).count(), ids.size());
                 std::fflush(stderr);
                 std::vector<int32_t> out_ids;
+                std::string harmony_pending;
+                bool harmony_user = false;
                 const auto t0 = std::chrono::steady_clock::now();
                 const int produced = b70::grimoire_serve_generate(
                     *e, ids, n_predict, tk.eos(), out_ids,
                     tk.special_id("<|eot|>"),
                     [&](int32_t tokid) -> bool {
+                        std::string piece = tk.decode_one(tokid);
+                        if (chat_shape && harmony_model) {
+                            harmony_pending += piece;
+                            if (!harmony_user) {
+                                static const std::string marker_text =
+                                    "assistant to=user";
+                                const size_t marker = harmony_pending.find(marker_text);
+                                if (marker == std::string::npos) return true;
+                                harmony_user = true;
+                                harmony_pending.erase(0, marker + marker_text.size());
+                                while (!harmony_pending.empty() &&
+                                       (harmony_pending.front() == ' ' ||
+                                        harmony_pending.front() == '\n'))
+                                    harmony_pending.erase(harmony_pending.begin());
+                            }
+                            piece.swap(harmony_pending);
+                            if (piece.empty()) return true;
+                        }
                         if (chat_shape && !head_sent) {
                             head_sent = true;
                             std::fprintf(stderr,
@@ -345,7 +365,6 @@ int main(int argc, char** argv) {
                             std::fflush(stderr);
                             if (!send(head.str())) return false;
                         }
-                        const std::string piece = tk.decode_one(tokid);
                         std::ostringstream c;
                         c << "{\"id\":\"chatcmpl-grimoire\",\"object\":\"" << obj
                           << "\",\"created\":" << now << ",\"model\":\""
@@ -389,7 +408,9 @@ int main(int argc, char** argv) {
         const double enc_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tk0).count();
         std::vector<int32_t> out_ids;
-        const int n_predict = max_tokens > 0 ? max_tokens : 128;
+        const int room = std::max(1, max_seq - int(ids.size()));
+        const int n_predict = max_tokens > 0 ? max_tokens
+            : std::min(4096, room);
         const int completion_tokens = b70::grimoire_serve_generate(
             *e, ids, n_predict, tk.eos(), out_ids, tk.special_id("<|eot|>"));
         const double dt = std::chrono::duration<double>(
@@ -427,17 +448,19 @@ int main(int argc, char** argv) {
     // open-webui target.
     svr.Post("/v1/chat/completions",
              [&](const httplib::Request& req, httplib::Response& res) {
-        std::vector<std::string> roles = json_find_all_role(req.body);
-        std::vector<std::string> contents = json_find_all_content(req.body);
-        std::string system, user;
-        for (size_t i = 0; i < roles.size() && i < contents.size(); ++i) {
-            if (roles[i] == "system") system = contents[i];
-            else if (roles[i] == "user") user = contents[i];
-        }
-        if (user.empty() && !contents.empty()) user = contents.back();
+        const std::vector<std::string> roles = json_find_all_role(req.body);
+        const std::vector<std::string> contents = json_find_all_content(req.body);
+        std::vector<b70::ChatMessage> messages;
+        for (size_t i = 0; i < roles.size() && i < contents.size(); ++i)
+            if (roles[i] == "system" || roles[i] == "user" ||
+                roles[i] == "assistant")
+                messages.push_back({roles[i], contents[i]});
+        if (messages.empty() && !contents.empty())
+            messages.push_back({"user", contents.back()});
         double max_tok = 0;
-        json_find_number(req.body, "max_tokens", max_tok);
-        const std::string prompt = tk.apply_chat_template(user, system);
+        if (!json_find_number(req.body, "max_completion_tokens", max_tok))
+            json_find_number(req.body, "max_tokens", max_tok);
+        const std::string prompt = tk.apply_chat_template(messages);
         if (json_find_true(req.body, "stream"))
             handle_stream(prompt, int(max_tok), res, /*chat_shape=*/true);
         else

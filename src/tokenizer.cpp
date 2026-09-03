@@ -510,6 +510,14 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
 
 std::string Tokenizer::apply_chat_template(const std::string& user,
                                            const std::string& system) const {
+    std::vector<ChatMessage> messages;
+    if (!system.empty()) messages.push_back({"system", system});
+    messages.push_back({"user", user});
+    return apply_chat_template(messages);
+}
+
+std::string Tokenizer::apply_chat_template(
+        const std::vector<ChatMessage>& messages) const {
     // Muse-Glimmer's current tokenizer is Harmony-style, not ChatML.  Keep
     // this branch keyed to a checkpoint token so Qwen/Ornith retain their
     // existing template.  This mirrors transformers/vLLM's default template,
@@ -530,17 +538,39 @@ std::string Tokenizer::apply_chat_template(const std::string& user,
             "Current date: " + std::string(date) + ".\n\n"
             "Reasoning strength: high.\n\n"
             "# Valid recipients: \"self\", \"user\".";
-        return "<|begin_of_text|><|start|>system<|message|>" +
-            (system.empty() ? default_system : system) +
-            "<|eot|><|start|>user<|message|>" + user +
-            "<|eot|><|start|>assistant";
+        const std::string meta =
+            "\n\nReasoning strength: high.\n\n"
+            "# Valid recipients: \"self\", \"user\".";
+        std::string out = "<|begin_of_text|>";
+        bool has_system = false;
+        for (const auto& message : messages)
+            if (message.role == "system") has_system = true;
+        if (!has_system)
+            out += "<|start|>system<|message|>" + default_system + "<|eot|>";
+        for (const auto& message : messages) {
+            if (message.role == "system") {
+                out += "<|start|>system<|message|>" + message.content + meta +
+                       "<|eot|>";
+            } else if (message.role == "user") {
+                out += "<|start|>user<|message|>" + message.content + "<|eot|>";
+            } else if (message.role == "assistant") {
+                // OpenAI history contains the user-visible answer; reasoning
+                // was intentionally filtered from the preceding response.
+                out += "<|start|>assistant to=user<|message|>" + message.content +
+                       "<|eot|>";
+            }
+        }
+        out += "<|start|>assistant";
+        return out;
     }
     std::string out;
-    if (!system.empty())
-        out += "<|im_start|>system\n" + system + "<|im_end|>\n";
-    // Verified against tokenizer.apply_chat_template on this checkpoint:
-    //   <|im_start|>user\nPROMPT<|im_end|>\n<|im_start|>assistant\n<think>\n
-    out += "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    for (const auto& message : messages) {
+        if (message.role == "system" || message.role == "user" ||
+            message.role == "assistant")
+            out += "<|im_start|>" + message.role + "\n" + message.content +
+                   "<|im_end|>\n";
+    }
+    out += "<|im_start|>assistant\n<think>\n";
     return out;
 }
 
