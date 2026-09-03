@@ -353,7 +353,8 @@ int main(int argc, char** argv) {
                                         harmony_pending.front() == '\n'))
                                     harmony_pending.erase(harmony_pending.begin());
                             }
-                            piece.swap(harmony_pending);
+                            piece = harmony_pending;
+                            harmony_pending.clear();
                             if (piece.empty()) return true;
                         }
                         if (chat_shape && !head_sent) {
