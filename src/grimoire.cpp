@@ -1499,6 +1499,7 @@ struct Grimoire {
         // kernel_projection is [2*taps*groups, hidden].
         float *conv_delta=nullptr, *conv_scratch=nullptr;
         bool fp16_draft=true;   // drafter weights uploaded as FP16
+        int ctx_chunk=16;       // rows per draft-context ingest iteration
         int conv_taps=0, conv_groups=0, conv_block=16;
         // Muse speculative verifier scratch, reused after the draft pass.
         float *verify_logits=nullptr;
@@ -2822,9 +2823,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             const int DKV=dflash2.kv_heads*dflash2.head_dim;
             const int DI2=2*dflash2.inter;
             auto dfd=[&](size_t n){db+=n*sizeof(float);return sycl::malloc_device<float>(n,q);};
-            dflash2.ctx=dfd(size_t(DM)*DH);
+            // Muse's context projection is independent of the 16-token draft
+            // query block. A wider batch avoids thousands of tiny launches.
+            // Non-Muse keeps DM because it also uses fixed-size q/k/v scratch.
+            dflash2.ctx_chunk=DM;
             if(cfg.is_muse){
-                const size_t all_kv=size_t(dflash2.layers.size())*DM*DKV;
+                const char* v=std::getenv("GRIMOIRE_DFLASH_CTX_CHUNK");
+                int c=v&&*v?std::atoi(v):256;
+                if(c<DM)c=DM;
+                if(c>4096)c=4096;
+                dflash2.ctx_chunk=c;
+            }
+            const int DMC=std::max(DM,dflash2.ctx_chunk);
+            dflash2.ctx=dfd(size_t(DMC)*DH);
+            if(cfg.is_muse){
+                const size_t all_kv=size_t(dflash2.layers.size())*DMC*DKV;
                 dflash2.context_kv_all=dfd(2*all_kv);
                 dflash2.context_k_all_f16=
                     sycl::malloc_device<sycl::half>(all_kv,q);
@@ -2839,7 +2852,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // races its own input and also changes the row stride I -> H.
             dflash2.h=dfd(size_t(DM)*dflash2.inter);
             dflash2.resid=dfd(size_t(DM)*DH);
-            dflash2.normed=dfd(size_t(DM)*DH);
+            dflash2.normed=dfd(size_t(DMC)*DH);
             dflash2.q=dfd(size_t(DM)*DQ);
             dflash2.k=dfd(size_t(DM)*DKV);
             dflash2.v=dfd(size_t(DM)*DKV);
@@ -2877,8 +2890,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 // which collapses draft acceptance to zero with no error.
                 const int linear_out_width=std::max({DH,DQ,DKV,DI2,
                     int(dflash2.layers.size())*2*DKV,cfg.vocab});
-                dflash2.linear_in_f16=df16(size_t(DM)*linear_in_width);
-                dflash2.linear_out_f16=df16(size_t(DM)*linear_out_width);
+                dflash2.linear_in_f16=df16(size_t(DMC)*linear_in_width);
+                dflash2.linear_out_f16=df16(size_t(DMC)*linear_out_width);
                 dflash2.block_table=sycl::malloc_device<int32_t>(dflash2.num_blocks,q);
                 dflash2.cu_q=sycl::malloc_device<int32_t>(2,q);
                 dflash2.cu_k=sycl::malloc_device<int32_t>(2,q);
@@ -2900,7 +2913,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 }
             }
             dflash2.bf=sycl::malloc_device<sycl_bf16>(
-                size_t(DM)*dflash2.target_layers.size()*DH,q);
+                size_t(DMC)*dflash2.target_layers.size()*DH,q);
             dflash2.a8=sycl::malloc_device<int8_t>(size_t(DM)*DH,q);
             dflash2.a8s=sycl::malloc_device<float>(DM,q);
             dflash2.tokens=sycl::malloc_device<int32_t>(DM,q);
@@ -2939,7 +2952,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     }
                 }
             }
-            db+=size_t(DM)*dflash2.target_layers.size()*DH*sizeof(bf16_t)
+            db+=size_t(DMC)*dflash2.target_layers.size()*DH*sizeof(bf16_t)
                 +size_t(DM)*DH+size_t(DM)*sizeof(float)
                 +size_t(2*DM-1)*sizeof(int32_t);
             if(!dflash2.ctx||!dflash2.h||!dflash2.resid||!dflash2.normed||
@@ -4996,7 +5009,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // not require a separate draft-cache rollback image.
     while(dflash2.context_pos<position){
         const int start=dflash2.context_pos;
-        const int rows=std::min(M,position-start);
+        const int rows=std::min(std::max(M,dflash2.ctx_chunk),position-start);
         dump_f32("01_aux_"+std::to_string(start),
                  dflash2.target_aux+int64_t(start)*NT*H,size_t(rows)*NT*H);
         fc_mm(dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
