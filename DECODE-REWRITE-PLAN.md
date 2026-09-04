@@ -87,3 +87,56 @@ the wrong road: even perfect, it tops out around 450 GB/s.
 Do NOT resume the open M=1 batched-attention bug
 (`GRIMOIRE_DECODE_BATCHED_ATTN`, see DECODE-ATTENTION-2026-09-04.md). It is
 worth ~1.2x on a code path scheduled for deletion.
+
+---
+
+# MEASURED: the bridge exists — 625.7 GB/s (2026-09-04, tools/bench_bridge.cpp)
+
+Bare SYCL, 8 GB VRAM arena, no model, no cutlass, no torch. Same card, same
+bytes, same allocation — only the access pattern differs:
+
+```
+scalar1      35.6 GB/s   <- what launch_flash_decode does today
+vec4        137.1 GB/s
+vec16       411.2 GB/s   <- wide loads alone
+vec16x4     625.7 GB/s   <- wide loads + 4 streams in flight
+```
+
+**17.6x between the worst and best pattern on identical hardware**, and the
+worst one is the one decode uses.
+
+Conclusions that supersede everything above:
+
+1. **The B70 is not the limit.** 625.7 GB/s beats the 608 spec sheet.
+2. **cutlass is NOT required.** Raw SYCL reaches full width. cutlass is fast
+   because it emits wide loads, not because it is cutlass. The earlier plan to
+   route decode through `cutlass_paged_decode_xe2` is optional, not necessary —
+   prefer owning the kernel.
+3. **Width alone is not enough.** vec16 = 411 GB/s; four independent streams
+   take it to 625. The load pipeline needs several requests in flight to hide
+   latency. Any rewrite must carry >= 4 concurrent streams per sub-group.
+4. **Sub-group-contiguous addressing is mandatory.** Lanes must read adjacent
+   16 B chunks so each step retires one 256 B run.
+
+## Budget against the measured bridge
+
+```
+14.5 GB/token @ 625.7 GB/s ->  23.2 ms -> 43 t/s base   <- achievable today
+                 measured  ->  43.9 ms -> 330 GB/s      <- 53% of the road
+```
+
+43 t/s base on ONE card, no speculation, no TP. With MTP at the conservative
+1.25x measured on 2026-09-04 that is ~54 TG, past the 44 bar, with the second
+B70 untouched.
+
+## Revised order of work
+
+1. Port the `vec16x4` pattern into the FFN GEMV (9.1 GB of the 14.5 GB budget,
+   currently 307 GB/s). Largest single win.
+2. Same pattern for the attention mixer (currently ~35 GB/s scalar).
+3. Lay the `.b70` arena out in execution order so a token is one linear sweep.
+   The format is ours -- safetensors cannot do this, and it is the one
+   structural advantage GRIMOIRE has over every other engine on this card.
+4. Only then consider TP.
+
+Re-run the bar at any time: `bin/bench_bridge <GB> <iters>`.
