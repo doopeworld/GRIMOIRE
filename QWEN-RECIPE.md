@@ -23,10 +23,12 @@ regression" trap; it cost a full debugging session.
 
 Omitting it lowers acceptance. 32K and 64K lower it further.
 
-## Do NOT set GRIMOIRE_MTP_EXACT_VERIFY on Qwen
+## Choose verification for the measured context length
 
-It forces the accurate-but-slow lm_head path at M<=4. It was only ever needed
-to mask the stale-a8-cache bug fixed in a1a92eb.
+For short prompts, omit `GRIMOIRE_MTP_EXACT_VERIFY`; the faster W4A8 verifier
+produced the 49.8 tok/s result above. For llama-benchy's ~4K-token prompt, set
+`GRIMOIRE_MTP_EXACT_VERIFY=1`; a1a92eb measured 92% acceptance and 37.6 tok/s.
+The container recipe targets llama-benchy and therefore enables exact verify.
 
 ## Bridges must actually load
 
@@ -63,8 +65,8 @@ GRIMOIRE_MTP_EXACT_VERIFY=1, k=3, 92% acceptance, **TG 37.6**. That is the
 number to beat at 4k context. Quoting 49.8 against a llama-benchy run is
 comparing a 7-token prompt to a 4500-token one, and it cost a full day.
 
-Note also that the "Do NOT set GRIMOIRE_MTP_EXACT_VERIFY" guidance above
-contradicts a1a92eb, which documents TWO effects and fixed only one:
+The two context-dependent settings exist because a1a92eb documents TWO effects
+and fixed only one:
 stale a8 cache 0%->69% (fixed), int8 precision 92%->69% (still open).
 EXACT_VERIFY covers the second. It is the right flag at 4k context and the
 wrong one at 7 tokens, which is why both claims look true in isolation.

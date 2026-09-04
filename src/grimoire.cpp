@@ -3123,6 +3123,18 @@ void Grimoire::reset() {
     const int32_t z = 0, one = 1;
     if (s.d_pos)     q.memcpy(s.d_pos, &z, sizeof(int32_t));
     if (s.d_seq_len) q.memcpy(s.d_seq_len, &one, sizeof(int32_t));
+    // The historical 37.6 tok/s Qwen result came from a fresh CLI process:
+    // the MTP head addressed its private KV cache by absolute prompt position,
+    // while prompt prefill never populated that cache. Reproduce that state
+    // safely for every server request instead of reading stale prior-request
+    // data. The Qwen container recipe enables this; an explicit 0 disables it.
+    const char* mtp_zero_env = std::getenv("GRIMOIRE_MTP_ZERO_CACHE");
+    if (mtp.L.k_cache && mtp.L.v_cache && mtp_zero_env && *mtp_zero_env &&
+        std::atoi(mtp_zero_env) != 0) {
+        const size_t mtp_kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
+        q.memset(mtp.L.k_cache, 0, mtp_kv_bytes);
+        q.memset(mtp.L.v_cache, 0, mtp_kv_bytes);
+    }
     q.wait();
     dag_tail.clear();
     dflash2.context_pos = 0;
@@ -4714,7 +4726,10 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     q.memcpy(s.d_pos, &position, sizeof(int32_t));
     if (!mtp.d_slot) mtp.d_slot = sycl::malloc_device<int32_t>(1, q);
     if (mtp.kv_len >= max_seq) mtp.kv_len = 0;  // never read past what we wrote
-    const int32_t slot = mtp.kv_len;
+    const char* mtp_zero_env = std::getenv("GRIMOIRE_MTP_ZERO_CACHE");
+    const bool absolute_zero_cache = mtp_zero_env && *mtp_zero_env &&
+        std::atoi(mtp_zero_env) != 0;
+    const int32_t slot = absolute_zero_cache ? position : mtp.kv_len;
     q.memcpy(mtp.d_slot, &slot, sizeof(int32_t));
     const int32_t seq = slot + 1;
     q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
@@ -4828,7 +4843,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
-    ++mtp.kv_len;   // this draft's K/V now occupies `slot`
+    if (!absolute_zero_cache) ++mtp.kv_len; // compact-cache mode owns kv_len
     return int(tok);
 }
 
@@ -6868,7 +6883,8 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
     // per-token launches as one command list; its embed node reads s.d_tok,
     // which argmax_token() has already written, so replay needs no rebind.
     // Speculative paths call forward() directly and are unaffected.
-    if (std::getenv("GRIMOIRE_DECODE_GRAPH")) {
+    const char* graph_env = std::getenv("GRIMOIRE_DECODE_GRAPH");
+    if (graph_env && *graph_env && std::atoi(graph_env) != 0) {
         std::printf("  recording decode graph ... ");
         std::fflush(stdout);
         const bool ok = e.build_graph();
@@ -7183,14 +7199,8 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
     return e.build(dir, opt, err);
 }
 
-// Plain greedy decode: no MTP/DFlash speculation. This mirrors the fallback
-// loop at the tail of grimoire_generate() above (e.forward + argmax_token),
-// which is the simplest and most exercised decode path in this codebase.
-// Speculative decode is NOT wired into the server yet -- it needs the
-// snapshot/rollback machinery from the CLI's spec branch, which is
-// intricate enough that it deserves its own verified change rather than a
-// hand-copy done without a GPU available to test it. Track this as the
-// server's known follow-up, not a silent gap.
+// Persistent OpenAI server generation. Speculative decode and the direct
+// greedy fallback share the same resident engine state.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              int n_predict, int eos_id, std::vector<int32_t>& out_ids,
                              int eot_id,
@@ -7257,6 +7267,18 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok;
     const bool dflash_spec = e.dflash2.ok &&
         (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
+    // The CLI has used this graph-replay path since c957f2f, but the server
+    // fallback still submitted every kernel in forward() separately. Build
+    // the same reusable graph once for non-speculative server decode. The
+    // graph reads the current token from s.d_tok, which argmax_token() wrote.
+    const char* graph_env = std::getenv("GRIMOIRE_DECODE_GRAPH");
+    if (!mtp_spec && !dflash_spec && graph_env && *graph_env &&
+        std::atoi(graph_env) != 0 && !e.graph_ok) {
+        const bool ok = e.build_graph();
+        std::fprintf(stderr, "    [decode] command graph %s\n",
+                     ok ? "ready" : "unavailable; using direct submission");
+        std::fflush(stderr);
+    }
     // The first token is already known from the prefill argmax. Emitting it
     // before the first speculation round removes a whole draft+verify cycle
     // from time-to-first-token. A benchmark charges that to prefill, which is
@@ -7360,7 +7382,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         if (is_stop(tok)) break;
         emit(tok);
         if (cancelled) { ++n; break; }
-        e.forward(tok);
+        if (e.graph_ok) e.step(); else e.forward(tok);
         tok = e.argmax_token();
     }
     // Deliberately no e.release() here: the engine stays resident across
