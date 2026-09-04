@@ -102,6 +102,14 @@ K/V base pointers, strides, the `head = kvh*q_per_kv + q_in_kv` mapping, the
 collapses to 1 at M=1, so `wg = 1*q_per_kv*SG_SIZE = 96` -- the one geometry
 the verify path never produces.
 
+ALSO RULED OUT (verified exhaustively): the SLM staging loop covers
+`head_dim*KT` completely. `for (x = lid; x < head_dim*KT; x += wg)` with
+`wg=96` and `head_dim*KT=4096` hits every index exactly once even though
+`4096 % 96 = 64`, because each x maps to `lid = x % 96`. Do not spend time
+here. The launch geometry (`4 kv_heads * splits * 1 tile * 96`) and the
+`kvh = block/splits`, `part = block%splits` decomposition were also checked
+by hand and are correct at M=1.
+
 NEXT ACTION: stop reading and diff numerically. Dump `s.attn_out` for a single
 `(layer, pos)` from both kernels on the same ~2000-token prompt and compare
 element-wise. `probe()` at `probe_layer` already exists at the decode site
