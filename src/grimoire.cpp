@@ -4562,10 +4562,16 @@ const float* Grimoire::forward(int token) {
             static const bool batched_decode_attn =
                 std::getenv("GRIMOIRE_DECODE_BATCHED_ATTN") != nullptr;
             if (batched_decode_attn) {
-                const int vs = std::min(MAX_SPLITS,
-                    std::max(GRAPH_SPLITS, (pos + 1 + 127) / 128));
+                static const int bdelta = [] {
+                    const char* e = std::getenv("GRIMOIRE_DECODE_BATCHED_DELTA");
+                    return e ? std::atoi(e) : 0;
+                }();
+                static const char* vs_env = std::getenv("GRIMOIRE_DECODE_BATCHED_SPLITS");
+                const int vs = vs_env ? std::atoi(vs_env)
+                    : std::min(MAX_SPLITS,
+                        std::max(GRAPH_SPLITS, (pos + 1 + 127) / 128));
                 launch_flash_decode_batched(q, qvec, d.k_cache, d.v_cache,
-                    s.attn_out, 1, pos + 1, qheads, cfg.n_kv_heads,
+                    s.attn_out, 1, pos + 1 + bdelta, qheads, cfg.n_kv_heads,
                     cfg.head_dim, max_seq, ap.softmax_scale,
                     s.part, s.pm, s.pl, vs, {});
                 MK("  flash_decode_batched");

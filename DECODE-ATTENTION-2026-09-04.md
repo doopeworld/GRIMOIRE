@@ -82,11 +82,34 @@ MEASURED with the flag on: full attention 19,152 -> **12,836 us**, token
 43,930 -> **37,154 us (26.9 t/s base)**.
 **But output is garbage**: `'roppelnd\n== oppelnd (Deutsch) =='`.
 
-The call passes `tokens=1, base_seq_len=pos+1`. The kernel's convention is
-that row r sees `base_seq_len + r` entries *excluding its own KV entry*
-(see the comment in the `exact_verify` branch, `src/grimoire.cpp` ~6440).
-Resolve by comparing against `launch_flash_decode` output for the same
-`(pos, layer)` on a 2-token prompt before trusting any speed number.
+NARROWED (evening of 2026-09-04) -- these are ruled OUT, do not re-test:
+
+- **Not the split count.** Fails identically with
+  `GRIMOIRE_DECODE_BATCHED_SPLITS=8` (the value the working verify path uses)
+  and with the adaptive value.
+- **Not the `base_seq_len` convention.** Fails with
+  `GRIMOIRE_DECODE_BATCHED_DELTA=0` (`base_seq_len = pos+1`, live-decode
+  semantics) and `-1` (`= pos`, the verify path's semantics).
+- **Not the kernel itself.** It is CORRECT at short context: a 6-token prompt
+  returns `" Paris."`. It is also correct at depth for M>1, which is what the
+  MTP verify path exercises every round.
+
+So the failure is specific to **M=1 at depth**. Static review found nothing:
+K/V base pointers, strides, the `head = kvh*q_per_kv + q_in_kv` mapping, the
+`s < s_end && s < row_seq` mask, the partials index
+`(row*num_heads + head)*splits + part`, and the SLM staging loop all match
+`launch_flash_decode` or are internally consistent. Note `rows_per_wg`
+collapses to 1 at M=1, so `wg = 1*q_per_kv*SG_SIZE = 96` -- the one geometry
+the verify path never produces.
+
+NEXT ACTION: stop reading and diff numerically. Dump `s.attn_out` for a single
+`(layer, pos)` from both kernels on the same ~2000-token prompt and compare
+element-wise. `probe()` at `probe_layer` already exists at the decode site
+(`probe("FA attn core", s.attn_out, qheads*cfg.head_dim)`). Suspect the M=1
+workgroup geometry (wg=96) first, since that is the only untested shape.
+
+Both override env vars (`GRIMOIRE_DECODE_BATCHED_SPLITS`,
+`GRIMOIRE_DECODE_BATCHED_DELTA`) are committed and still in place for this.
 
 ### 2. Attention is still ~1197 us/layer against a ~16 us roofline
 KV per layer at 4778 tokens is 4 kv_heads x 256 dim x 4778 x 1 byte x 2
