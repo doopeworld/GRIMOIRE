@@ -44,13 +44,44 @@ COPY --from=builder /usr/local/lib/libigdfcl.so.2* /usr/local/lib/
 COPY --from=builder /usr/local/lib/libopencl-clang2.so.17 /usr/local/lib/
 COPY --from=builder /etc/OpenCL/vendors/intel.icd /etc/OpenCL/vendors/intel.icd
 
-COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire
-COPY --from=builder /grimoire/bin/grimoire-server /usr/local/bin/grimoire-server
+COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire.real
+COPY --from=builder /grimoire/bin/grimoire-server /usr/local/bin/grimoire-server.real
+# Per-model recipes + the wrapper that applies them.  The wrapper is
+# installed AT each binary's own path so it still runs when a container
+# overrides --entrypoint, which the Unraid templates all do.  With no
+# recipe for a model it is inert and simply execs the real binary.
+COPY docker/recipes/ /opt/grimoire/recipes/
+COPY tools/grimoire_recipe_entry.sh /usr/local/bin/grimoire
+RUN cp /usr/local/bin/grimoire /usr/local/bin/grimoire-server \
+ && chmod 0755 /usr/local/bin/grimoire /usr/local/bin/grimoire-server
 COPY --from=builder /grimoire/src/libgrimoire_xe2_grouped.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_raw.so /opt/grimoire/lib/
+COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_bridge.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_gdn_raw.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_onednn.so /opt/grimoire/lib/
 COPY --from=builder /opt/intel/oneapi/dnnl/2026.0/lib/libdnnl.so.3* /opt/grimoire/lib/
+
+# Chunk-GDN prefill shim dependencies.  libgrimoire_xe2_attention_bridge.so is
+# the only bridge exporting grimoire_xe2_chunk_gdn_bf16; without these the
+# loader in src/grimoire.cpp falls through to the slow path and Qwen PP 4096
+# drops from ~2540 to ~1650 tok/s.  Paths are kept identical to the builder so
+# the bridge RUNPATH resolves with no LD_LIBRARY_PATH, matching tools/tune.sh.
+COPY --from=builder \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libc10.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libc10_xpu.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libgomp.so.1 \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch_xpu.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/libtorch-xpu-ops-sycltla.so \
+     /opt/venv/lib/python3.12/site-packages/torch/lib/
+COPY --from=builder \
+     /opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels/libattn_kernels_xe_2.so \
+     /opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels/libgdn_attn_kernels_xe_2.so \
+     /opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels/
+COPY --from=builder /opt/venv/lib/libmkl_*.so.* /opt/venv/lib/
+COPY --from=builder /opt/venv/lib/libpti_view.so.1 /opt/venv/lib/
+COPY --from=builder /opt/intel/oneapi/ccl/latest/lib/libccl.so.2 /opt/grimoire/lib/
 
 RUN find /opt/intel/oneapi/compiler -name 'libsycl.so*' -printf '%h\n' | sort -u \
       > /etc/ld.so.conf.d/oneapi-b70.conf \
@@ -65,19 +96,33 @@ RUN find /opt/intel/oneapi/compiler -name 'libsycl.so*' -printf '%h\n' | sort -u
  && find /opt/intel/oneapi/tbb -name 'libtbb.so*' -printf '%h\n' | sort -u \
       >> /etc/ld.so.conf.d/oneapi-b70.conf \
  && echo /opt/grimoire/lib >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && echo /opt/venv/lib/python3.12/site-packages/torch/lib >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && echo /opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels >> /etc/ld.so.conf.d/oneapi-b70.conf \
+ && echo /opt/venv/lib >> /etc/ld.so.conf.d/oneapi-b70.conf \
  && ldconfig \
- && ! ldd /usr/local/bin/grimoire | grep -q 'not found' \
- && ! ldd /usr/local/bin/grimoire-server | grep -q 'not found' \
+ && echo '=== MISSING DEPS DIAGNOSTIC ===' \
+ && for f in /usr/local/bin/grimoire.real /usr/local/bin/grimoire-server.real \
+      /opt/grimoire/lib/libgrimoire_xe2_grouped.so \
+      /opt/grimoire/lib/libgrimoire_xe2_attention_raw.so \
+      /opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so \
+      /opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so \
+      /opt/grimoire/lib/libgrimoire_onednn.so; do \
+      echo "--- $f"; ldd $f 2>&1 | grep 'not found' || echo '    ok'; \
+    done \
+ && echo '=== END DIAGNOSTIC ===' \
+ && ! ldd /usr/local/bin/grimoire.real | grep -q 'not found' \
+ && ! ldd /usr/local/bin/grimoire-server.real | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_grouped.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_raw.so | grep -q 'not found' \
+ && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_onednn.so | grep -q 'not found' \
  && test -n "$(find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so*' -print -quit)" \
  && ! ldd "$(find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so.0.*' -print -quit)" | grep -q 'not found' \
  && ! command -v python >/dev/null 2>&1 \
  && ! command -v python3 >/dev/null 2>&1 \
- && ! find /opt /usr/local -type f \( -name 'libtorch*' -o -name 'libc10*' \
-      -o -name 'libur_adapter_cuda*' -o -name 'libur_adapter_hip*' \) \
+ && ! find /opt /usr/local -type f \( -name 'libur_adapter_cuda*' \
+      -o -name 'libur_adapter_hip*' \) \
       -print -quit | grep -q .
 
 ENV ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
@@ -86,7 +131,7 @@ ENV ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     SYCL_CACHE_PERSISTENT=1 \
     SYCL_CACHE_DIR=/cache/sycl \
     GRIMOIRE_XE2_GROUPED_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_grouped.so \
-    GRIMOIRE_XE2_ATTN_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_attention_raw.so \
+    GRIMOIRE_XE2_ATTN_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so \
     GRIMOIRE_XE2_GDN_RAW_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so \
     GRIMOIRE_ONEDNN_BRIDGE=/opt/grimoire/lib/libgrimoire_onednn.so
 

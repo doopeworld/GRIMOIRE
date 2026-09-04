@@ -1432,6 +1432,16 @@ struct Grimoire {
         float   *x   = nullptr;    // [H]
         float   *h2  = nullptr;    // [H] normed
         float   *resid = nullptr;  // [H]
+        // Nothing outside mtp_draft ever writes mtp.L's KV cache -- prefill
+        // does not touch it and reset() did not clear it.  Indexing it by
+        // absolute position therefore made the head attend over `position`
+        // slots of stale K/V left by earlier requests.  Measured: acceptance
+        // 53% at ctx 23 collapsing to 0-26% at ctx 4.4k, with verify cost
+        // flat (48 -> 59 ms/round), i.e. a poisoned drafter, not a slow one.
+        // Write at a compact slot and attend only over slots this request
+        // actually wrote.
+        int32_t *d_slot = nullptr;  // device copy of kv_len for kv_append
+        int      kv_len = 0;        // slots written since the last reset()
     } mtp;
 
     // ---- DFlash masked block drafter ------------------------------
@@ -3116,6 +3126,7 @@ void Grimoire::reset() {
     q.wait();
     dag_tail.clear();
     dflash2.context_pos = 0;
+    mtp.kv_len = 0;   // the MTP head's KV cache is per-request; see MtpHead
     pos = 0;
 }
 
@@ -3314,7 +3325,7 @@ void Grimoire::release() {
                         (void*)d.gu_pack, (void*)d.gu_scale,
                         (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
-                        (void*)d.k_cache, (void*)d.v_cache})
+                        (void*)d.k_cache, (void*)d.v_cache, (void*)mtp.d_slot})
             if (p) sycl::free(p, q);
         mtp = {};
     }
@@ -4696,9 +4707,16 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     const std::vector<sycl::event> none{};
     LayerDev& d = mtp.L;
 
-    // position for this draft: token t+1 sits at `position`
+    // position for this draft: token t+1 sits at `position`.  RoPE below uses
+    // that ABSOLUTE position and must keep doing so.  The MTP layer's private
+    // KV cache is a different matter: see MtpHead for why it is indexed by a
+    // compact per-request slot rather than by `position`.
     q.memcpy(s.d_pos, &position, sizeof(int32_t));
-    const int32_t seq = position + 1;
+    if (!mtp.d_slot) mtp.d_slot = sycl::malloc_device<int32_t>(1, q);
+    if (mtp.kv_len >= max_seq) mtp.kv_len = 0;  // never read past what we wrote
+    const int32_t slot = mtp.kv_len;
+    q.memcpy(mtp.d_slot, &slot, sizeof(int32_t));
+    const int32_t seq = slot + 1;
     q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
 
     // cat order.  DeepSeek/Qwen MTP is fc([norm(embedding) ; norm(hidden)]),
@@ -4749,12 +4767,12 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
                         cfg.rope_theta, cfg.partial_rope, none);
     }
     launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
-                         s.d_pos, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
+                         mtp.d_slot, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
 
     AttnParams ap{};
     ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
     ap.out = s.attn_out;
-    ap.seq_len = position + 1; ap.seq_cap = max_seq;
+    ap.seq_len = slot + 1; ap.seq_cap = max_seq;
     ap.head_dim = cfg.head_dim; ap.num_heads = cfg.n_heads;
     ap.num_kv_heads = cfg.n_kv_heads;
     ap.softmax_scale = 1.0f / std::sqrt(float(cfg.head_dim));
@@ -4810,6 +4828,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
+    ++mtp.kv_len;   // this draft's K/V now occupies `slot`
     return int(tok);
 }
 
@@ -7248,6 +7267,13 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         ++n;
         skip_first = 1;
     }
+    // Acceptance/verify accounting for the server path. GRIMOIRE_MTP_PROFILE
+    // only ever instrumented the CLI loop, which is why a slow server decode
+    // could never be attributed to acceptance vs verify cost.
+    const bool spec_profile = std::getenv("GRIMOIRE_MTP_PROFILE") != nullptr;
+    int spec_rounds = 0, spec_drafted = 0, spec_accepted = 0;
+    double spec_draft_ms = 0.0, spec_verify_ms = 0.0;
+    const auto spec_t0 = std::chrono::steady_clock::now();
     if (mtp_spec || dflash_spec) {
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
@@ -7263,6 +7289,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             const int saved_pos = e.pos;
             e.snapshot_recurrent();
 
+            const auto dr_t0 = std::chrono::steady_clock::now();
             std::vector<int32_t> candidates;
             candidates.reserve(size_t(k) + 1);
             candidates.push_back(tok);
@@ -7282,13 +7309,22 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             }
             if (candidates.size() < 2) break;   // drafter produced nothing
 
+            spec_draft_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - dr_t0).count();
+
+            const auto vf_t0 = std::chrono::steady_clock::now();
             std::vector<int32_t> verified;
             if (!e.prefill(candidates, &verified) ||
                 verified.size() != candidates.size()) break;
+            spec_verify_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - vf_t0).count();
 
             int accepted = 1;
             for (; accepted < int(candidates.size()); ++accepted)
                 if (candidates[accepted] != verified[accepted - 1]) break;
+            ++spec_rounds;
+            spec_drafted  += int(candidates.size()) - 1;
+            spec_accepted += accepted - 1;
             const int next = verified[accepted - 1];
 
             if (accepted < int(candidates.size()))
@@ -7303,6 +7339,19 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             }
             skip_first = 0;
             tok = next;
+        }
+        if (spec_profile && spec_rounds > 0) {
+            const double tot_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - spec_t0).count();
+            std::fprintf(stderr,
+                "    [spec] %d rounds  accept %d/%d = %.1f%%  %.2f tok/round"
+                "  draft %.0f ms  verify %.0f ms  other %.0f ms -> %.1f tok/s\n",
+                spec_rounds, spec_accepted, spec_drafted,
+                spec_drafted ? 100.0 * spec_accepted / spec_drafted : 0.0,
+                double(n) / spec_rounds, spec_draft_ms, spec_verify_ms,
+                tot_ms - spec_draft_ms - spec_verify_ms,
+                tot_ms > 0.0 ? 1000.0 * n / tot_ms : 0.0);
+            std::fflush(stderr);
         }
         return n;
     }

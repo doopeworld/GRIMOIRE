@@ -16,3 +16,7 @@ work-*/
 *.gguf
 *.pt
 *.pth
+
+# Recipes must reach the build context even though docker/ is ignored.
+!docker/recipes
+!docker/recipes/**

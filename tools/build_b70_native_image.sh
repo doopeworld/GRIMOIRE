@@ -20,10 +20,10 @@ docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
   set -eu
   command -v python >/dev/null 2>&1 && exit 10 || true
   command -v python3 >/dev/null 2>&1 && exit 10 || true
-  find / -xdev -type f \( -name "libtorch*" -o -name "libc10*" \) -print -quit | grep -q . && exit 11 || true
   find /opt /usr/local -type f \( -name "libur_adapter_cuda*" -o -name "libur_adapter_hip*" \) -print -quit | grep -q . && exit 11 || true
-  ldd /usr/local/bin/grimoire | grep "not found" && exit 12 || true
+  ldd /usr/local/bin/grimoire.real | grep "not found" && exit 12 || true
   ldd /opt/grimoire/lib/libgrimoire_xe2_grouped.so | grep "not found" && exit 13 || true
+  ldd /opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so | grep "not found" && exit 14 || true
   test -n "$(find /opt/intel/oneapi/compiler -name "libur_adapter_level_zero.so*" -print -quit)"
 '
 
