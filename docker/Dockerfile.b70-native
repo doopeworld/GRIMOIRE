@@ -48,6 +48,7 @@ COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire
 COPY --from=builder /grimoire/bin/grimoire-server /usr/local/bin/grimoire-server
 COPY --from=builder /grimoire/src/libgrimoire_xe2_grouped.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_raw.so /opt/grimoire/lib/
+COPY --from=builder /grimoire/src/libgrimoire_xe2_attention_bridge.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_xe2_gdn_raw.so /opt/grimoire/lib/
 COPY --from=builder /grimoire/src/libgrimoire_onednn.so /opt/grimoire/lib/
 COPY --from=builder /opt/intel/oneapi/dnnl/2026.0/lib/libdnnl.so.3* /opt/grimoire/lib/
@@ -70,6 +71,7 @@ RUN find /opt/intel/oneapi/compiler -name 'libsycl.so*' -printf '%h\n' | sort -u
  && ! ldd /usr/local/bin/grimoire-server | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_grouped.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_raw.so | grep -q 'not found' \
+ && ! ldd /opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so | grep -q 'not found' \
  && ! ldd /opt/grimoire/lib/libgrimoire_onednn.so | grep -q 'not found' \
  && test -n "$(find /opt/intel/oneapi/compiler -name 'libur_adapter_level_zero.so*' -print -quit)" \
@@ -86,7 +88,7 @@ ENV ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
     SYCL_CACHE_PERSISTENT=1 \
     SYCL_CACHE_DIR=/cache/sycl \
     GRIMOIRE_XE2_GROUPED_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_grouped.so \
-    GRIMOIRE_XE2_ATTN_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_attention_raw.so \
+    GRIMOIRE_XE2_ATTN_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_attention_bridge.so \
     GRIMOIRE_XE2_GDN_RAW_BRIDGE=/opt/grimoire/lib/libgrimoire_xe2_gdn_raw.so \
     GRIMOIRE_ONEDNN_BRIDGE=/opt/grimoire/lib/libgrimoire_onednn.so
 
