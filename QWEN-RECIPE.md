@@ -38,3 +38,33 @@ libgrimoire_xe2_bridge.so, superseded by libgrimoire_xe2_grouped.so).
 
 The bridge needs libtorch + vllm_xpu_kernels linked in (see
 tools/build_bridges_b70.sh) and the runtime LD_LIBRARY_PATH that tune.sh sets.
+
+## TG numbers are meaningless without the prompt length
+
+Every high-TG record in this repo was measured on a SHORT prompt. The 49.8
+above came from `-p 'Explain why the sky is blue.'` (~7 tokens).
+MTP-FINAL-51.7TG-20260826.log records 51.7 TG on an 18-token prompt
+(94 MTP steps, 2.76 committed/step, 165/222 = 74% acceptance).
+
+llama-benchy measures tg32 after a ~4500-token prompt. That is a different
+measurement and the two are NOT comparable. Measured 2026-09-04 on one
+grimoire-server process, same build, same flags, in one run:
+
+| prompt   | acceptance | tok/round | TG        |
+|---------:|-----------:|----------:|----------:|
+|   23 tok |      53.3% |      2.60 | 46.8 t/s  |
+| 4500 tok |    11-26%  | 1.00-1.68 | 13-22 t/s |
+
+Verify cost is FLAT across that range (48 -> 59 ms/round). The entire
+difference is MTP draft acceptance.
+
+The only long-context record that exists is a1a92eb: 4070-token prompt,
+GRIMOIRE_MTP_EXACT_VERIFY=1, k=3, 92% acceptance, **TG 37.6**. That is the
+number to beat at 4k context. Quoting 49.8 against a llama-benchy run is
+comparing a 7-token prompt to a 4500-token one, and it cost a full day.
+
+Note also that the "Do NOT set GRIMOIRE_MTP_EXACT_VERIFY" guidance above
+contradicts a1a92eb, which documents TWO effects and fixed only one:
+stale a8 cache 0%->69% (fixed), int8 precision 92%->69% (still open).
+EXACT_VERIFY covers the second. It is the right flag at 4k context and the
+wrong one at 7 tokens, which is why both claims look true in isolation.
