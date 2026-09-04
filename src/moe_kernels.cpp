@@ -255,6 +255,7 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                     const int64_t route = int64_t(token) * K + slot;
                     const int   e  = d_expert[route];
                     const float rw = d_weight[route];
+                    if (e < 0 || rw == 0.0f) continue;
 
                     float acc[R];
                     #pragma unroll
