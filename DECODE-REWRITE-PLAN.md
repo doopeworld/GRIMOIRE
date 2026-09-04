@@ -140,3 +140,52 @@ B70 untouched.
 4. Only then consider TP.
 
 Re-run the bar at any time: `bin/bench_bridge <GB> <iters>`.
+
+---
+
+# Format: `.b70` reads every quantized tensor TWICE
+
+Every serious engine owns its format because the format is where the bandwidth
+lives: OpenVINO has IR, llama.cpp has GGUF, TensorRT has engine files. We have
+`.b70`. It is currently laid out for convenience, not for streaming.
+
+```c
+struct NativeTensorRecord {
+    uint64_t payload_offset, payload_bytes;   // weights here
+    uint64_t scales_offset,  scales_bytes;    // scales far away
+};
+```
+
+Two regions per tensor means **two streams from two distant addresses** for
+every MXFP4 weight. GGUF's block quants interleave the scale INTO the block so
+one contiguous read returns both. That is very likely part of why the FFN GEMV
+measures 307 GB/s while `bench_bridge`'s single contiguous stream reaches 625.7.
+
+Converter changes (`tools/b70_compile_model.cpp` -- ours, no retraining):
+
+1. **Interleave scales into the payload.** One block = its weights and its
+   scale, adjacent. One stream, not two.
+2. **Order tensors by execution** so a token is one linear sweep from byte 0.
+3. **Align blocks to the 256 B sub-group run** `bench_bridge` showed is optimal.
+
+Note this changes the artifact, so the loader must accept both layouts (as it
+already does for the RAW-vs-packed MTP head) or the artifact version bumps.
+
+# START HERE TOMORROW
+
+```
+bin/bench_bridge 8 5          # re-establish the bar: expect ~625 GB/s
+```
+
+Then, in order, measuring GB/s after each step and stopping if it does not move:
+
+1. **FFN GEMV** -- 9.1 GB of the 14.5 GB budget, currently 307 GB/s. Port the
+   `vec16x4` pattern: 16 B per lane, lanes sub-group-contiguous, >= 4
+   independent streams in flight. Largest single win.
+2. **Attention mixer** -- currently ~35 GB/s (scalar byte loads). Same pattern.
+   Do NOT resume the M=1 batched-attention bug; that code is for deletion.
+3. **Converter** -- interleave scales, order by execution, align to 256 B.
+4. TP across both B70s only after one card runs at width.
+
+Standing rule: judge every change on achieved GB/s from the device timeline,
+not on llama-benchy, which drifts 1969-2500 on identical binaries.
