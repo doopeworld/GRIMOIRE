@@ -1432,16 +1432,6 @@ struct Grimoire {
         float   *x   = nullptr;    // [H]
         float   *h2  = nullptr;    // [H] normed
         float   *resid = nullptr;  // [H]
-        // Nothing outside mtp_draft ever writes mtp.L's KV cache -- prefill
-        // does not touch it and reset() did not clear it.  Indexing it by
-        // absolute position therefore made the head attend over `position`
-        // slots of stale K/V left by earlier requests.  Measured: acceptance
-        // 53% at ctx 23 collapsing to 0-26% at ctx 4.4k, with verify cost
-        // flat (48 -> 59 ms/round), i.e. a poisoned drafter, not a slow one.
-        // Write at a compact slot and attend only over slots this request
-        // actually wrote.
-        int32_t *d_slot = nullptr;  // device copy of kv_len for kv_append
-        int      kv_len = 0;        // slots written since the last reset()
     } mtp;
 
     // ---- DFlash masked block drafter ------------------------------
@@ -3123,22 +3113,9 @@ void Grimoire::reset() {
     const int32_t z = 0, one = 1;
     if (s.d_pos)     q.memcpy(s.d_pos, &z, sizeof(int32_t));
     if (s.d_seq_len) q.memcpy(s.d_seq_len, &one, sizeof(int32_t));
-    // The historical 37.6 tok/s Qwen result came from a fresh CLI process:
-    // the MTP head addressed its private KV cache by absolute prompt position,
-    // while prompt prefill never populated that cache. Reproduce that state
-    // safely for every server request instead of reading stale prior-request
-    // data. The Qwen container recipe enables this; an explicit 0 disables it.
-    const char* mtp_zero_env = std::getenv("GRIMOIRE_MTP_ZERO_CACHE");
-    if (mtp.L.k_cache && mtp.L.v_cache && mtp_zero_env && *mtp_zero_env &&
-        std::atoi(mtp_zero_env) != 0) {
-        const size_t mtp_kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
-        q.memset(mtp.L.k_cache, 0, mtp_kv_bytes);
-        q.memset(mtp.L.v_cache, 0, mtp_kv_bytes);
-    }
     q.wait();
     dag_tail.clear();
     dflash2.context_pos = 0;
-    mtp.kv_len = 0;   // the MTP head's KV cache is per-request; see MtpHead
     pos = 0;
 }
 
@@ -3337,7 +3314,7 @@ void Grimoire::release() {
                         (void*)d.gu_pack, (void*)d.gu_scale,
                         (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
-                        (void*)d.k_cache, (void*)d.v_cache, (void*)mtp.d_slot})
+                        (void*)d.k_cache, (void*)d.v_cache})
             if (p) sycl::free(p, q);
         mtp = {};
     }
@@ -4719,19 +4696,9 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     const std::vector<sycl::event> none{};
     LayerDev& d = mtp.L;
 
-    // position for this draft: token t+1 sits at `position`.  RoPE below uses
-    // that ABSOLUTE position and must keep doing so.  The MTP layer's private
-    // KV cache is a different matter: see MtpHead for why it is indexed by a
-    // compact per-request slot rather than by `position`.
+    // position for this draft: token t+1 sits at `position`
     q.memcpy(s.d_pos, &position, sizeof(int32_t));
-    if (!mtp.d_slot) mtp.d_slot = sycl::malloc_device<int32_t>(1, q);
-    if (mtp.kv_len >= max_seq) mtp.kv_len = 0;  // never read past what we wrote
-    const char* mtp_zero_env = std::getenv("GRIMOIRE_MTP_ZERO_CACHE");
-    const bool absolute_zero_cache = mtp_zero_env && *mtp_zero_env &&
-        std::atoi(mtp_zero_env) != 0;
-    const int32_t slot = absolute_zero_cache ? position : mtp.kv_len;
-    q.memcpy(mtp.d_slot, &slot, sizeof(int32_t));
-    const int32_t seq = slot + 1;
+    const int32_t seq = position + 1;
     q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
 
     // cat order.  DeepSeek/Qwen MTP is fc([norm(embedding) ; norm(hidden)]),
@@ -4782,12 +4749,12 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
                         cfg.rope_theta, cfg.partial_rope, none);
     }
     launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
-                         mtp.d_slot, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
+                         s.d_pos, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
 
     AttnParams ap{};
     ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
     ap.out = s.attn_out;
-    ap.seq_len = slot + 1; ap.seq_cap = max_seq;
+    ap.seq_len = position + 1; ap.seq_cap = max_seq;
     ap.head_dim = cfg.head_dim; ap.num_heads = cfg.n_heads;
     ap.num_kv_heads = cfg.n_kv_heads;
     ap.softmax_scale = 1.0f / std::sqrt(float(cfg.head_dim));
@@ -4843,7 +4810,6 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
-    if (!absolute_zero_cache) ++mtp.kv_len; // compact-cache mode owns kv_len
     return int(tok);
 }
 
@@ -7310,6 +7276,9 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             if (k <= 0) break;
             const int saved_pos = e.pos;
             e.snapshot_recurrent();
+            // Match the proven CLI MTP path: profiling drains the checkpoint
+            // before starting the timed draft phase.
+            if (spec_profile) e.q.wait();
 
             const auto dr_t0 = std::chrono::steady_clock::now();
             std::vector<int32_t> candidates;
