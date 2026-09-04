@@ -171,6 +171,13 @@ Converter changes (`tools/b70_compile_model.cpp` -- ours, no retraining):
 Note this changes the artifact, so the loader must accept both layouts (as it
 already does for the RAW-vs-packed MTP head) or the artifact version bumps.
 
+**Keep it format-agnostic: int4 and MXFP4 both.** Under streaming int4 g128 is
+only ~6.7% off MXFP4 (the old 1.28-1.62x figure was cache-hot, see
+grimoire-int4-path). Set the priority accordingly: choosing the quant format is
+a ~7% decision, the access pattern is a 17.6x decision (35.6 -> 625.7 GB/s).
+Do not spend time picking a format until every load is wide. The block layout
+-- interleaved scale, 256 B alignment, execution order -- must work for both.
+
 # START HERE TOMORROW
 
 ```
