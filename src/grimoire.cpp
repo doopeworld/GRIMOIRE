@@ -2316,7 +2316,16 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             std::printf("not present in this checkpoint -- MTP disabled\n");
         } else {
             bool mok = true;
-            mtp.fc      = quantize_upload_t(q, ck, t_fc, PF, "mtp.fc", &mok);
+            // The MTP head's format follows what the checkpoint actually
+            // stores. b70_compile_model keeps mtp.* RAW BF16 (a 4-bit draft
+            // head accepts 0-23% of its drafts vs 43-73% at BF16), but older
+            // artifacts packed it to MXFP4 and a packed native tensor cannot
+            // be read back as a float matrix. So: RAW -> BF16, packed -> PF.
+            auto mtp_fmt = [&](const TensorRef& r) {
+                return (r.native && r.native->encoding ==
+                        uint32_t(NativeEncoding::RAW)) ? Fmt::BF16 : PF;
+            };
+            mtp.fc      = quantize_upload_t(q, ck, t_fc, mtp_fmt(t_fc), "mtp.fc", &mok);
             mtp.pre_h   = dev_copy_t<bf16_t>(q, ck, t_preh, "mtp.pre_h", &mok);
             mtp.pre_e   = dev_copy_t<bf16_t>(q, ck, t_pree, "mtp.pre_e", &mok);
             mtp.norm    = dev_copy_t<bf16_t>(q, ck, t_nrm,  "mtp.norm",  &mok);
@@ -2324,10 +2333,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             m.kind      = LayerKind::FULL_ATTN;
             m.in_norm   = dev_copy_t<bf16_t>(q, ck, t_in,  "mtp.in_norm",   &mok);
             m.post_norm = dev_copy_t<bf16_t>(q, ck, t_pon, "mtp.post_norm", &mok);
-            m.q_proj    = quantize_upload_t(q, ck, t_q, PF, "mtp.q_proj", &mok);
-            m.k_proj    = quantize_upload_t(q, ck, t_k, PF, "mtp.k_proj", &mok);
-            m.v_proj    = quantize_upload_t(q, ck, t_v, PF, "mtp.v_proj", &mok);
-            m.o_proj    = quantize_upload_t(q, ck, t_o, PF, "mtp.o_proj", &mok);
+            m.q_proj    = quantize_upload_t(q, ck, t_q, mtp_fmt(t_q), "mtp.q_proj", &mok);
+            m.k_proj    = quantize_upload_t(q, ck, t_k, mtp_fmt(t_k), "mtp.k_proj", &mok);
+            m.v_proj    = quantize_upload_t(q, ck, t_v, mtp_fmt(t_v), "mtp.v_proj", &mok);
+            m.o_proj    = quantize_upload_t(q, ck, t_o, mtp_fmt(t_o), "mtp.o_proj", &mok);
             if (t_qn.ok()) m.q_norm = dev_copy_t<bf16_t>(q, ck, t_qn, "mtp.q_norm", &mok);
             if (t_kn.ok()) m.k_norm = dev_copy_t<bf16_t>(q, ck, t_kn, "mtp.k_norm", &mok);
 
@@ -2427,9 +2436,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                               + m.router.w.bytes() + m.sh_gu.w.bytes()
                               + m.sh_down.w.bytes() + m.sh_gate_q.w.bytes();
             } else {
-                m.sh_gu = concat_upload_t(q, ck, t_g, t_u, PF,
+                m.sh_gu = concat_upload_t(q, ck, t_g, t_u, mtp_fmt(t_g),
                                           "mtp.gate_up", &mok);
-                m.sh_down = quantize_upload_t(q, ck, t_d, PF,
+                m.sh_down = quantize_upload_t(q, ck, t_d, mtp_fmt(t_d),
                                               "mtp.down", &mok);
                 mtp_ffn_bytes = m.sh_gu.w.bytes() + m.sh_down.w.bytes();
             }
@@ -3073,9 +3082,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     s.sh_gate_val = sycl::malloc_device<float>(1, q);
     // Decode uses row 0.  Speculative verification needs one split-K result
     // per row so its queries can share a single streamed K/V tile.
-    s.part    = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * GRAPH_SPLITS * cfg.head_dim, q);
-    s.pm      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * GRAPH_SPLITS, q);
-    s.pl      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * GRAPH_SPLITS, q);
+    // MAX_SPLITS, not GRAPH_SPLITS: single-token decode now sizes its split-K
+    // width from the live sequence length (see decode_splits in attention.cpp),
+    // so the workspace must cover the widest split it can choose. The batched
+    // verify path still uses GRAPH_SPLITS and simply occupies a prefix.
+    s.part    = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS * cfg.head_dim, q);
+    s.pm      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
+    s.pl      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
     q.wait();
 
     if (pp_enabled() || tp_enabled()) {
@@ -4541,10 +4554,27 @@ const float* Grimoire::forward(int token) {
             ap.splits    = GRAPH_SPLITS;
             ap.d_seq_len = s.d_seq_len;
             if (i == probe_layer) probe("FA v", s.bbuf, cfg.n_kv_heads * cfg.head_dim);
+            // GQA redundancy: this model is 24 query heads over 4 KV heads, so
+            // launch_flash_decode's one-subgroup-per-query-head mapping fetches
+            // every KV byte 6 times. The batched kernel gives a workgroup one
+            // KV head and stages K/V in SLM for all q_per_kv query heads, so
+            // the cache streams once. Opt-in until measured.
+            static const bool batched_decode_attn =
+                std::getenv("GRIMOIRE_DECODE_BATCHED_ATTN") != nullptr;
+            if (batched_decode_attn) {
+                const int vs = std::min(MAX_SPLITS,
+                    std::max(GRAPH_SPLITS, (pos + 1 + 127) / 128));
+                launch_flash_decode_batched(q, qvec, d.k_cache, d.v_cache,
+                    s.attn_out, 1, pos + 1, qheads, cfg.n_kv_heads,
+                    cfg.head_dim, max_seq, ap.softmax_scale,
+                    s.part, s.pm, s.pl, vs, {});
+                MK("  flash_decode_batched");
+            } else {
             launch_flash_decode(q, ap, none);
             MK("  flash_decode");
             launch_flash_merge(q, ap, none);
             MK("  flash_merge");
+            }
             if (i == probe_layer) probe("FA attn core", s.attn_out, qheads * cfg.head_dim);
 
             // apply the output gate before projecting back
@@ -6391,10 +6421,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }else{
                 if(next_tokens && M<=kSpecBatch &&
                    !std::getenv("GRIMOIRE_LEGACY_VERIFY_ATTN")){
+                    // Split-K must track context depth here for the same
+                    // reason it does in single-token decode: at 4778 tokens
+                    // GRAPH_SPLITS(8) left verify at 60 ms/round -- 82% of
+                    // speculative decode time -- because each split walked
+                    // ~600 keys serially. The workspace is sized for
+                    // MAX_SPLITS, and the merge skips empty splits.
+                    // Measured: widening verify split-K gave no gain (verify is
+                    // a 4-token weight-bound forward pass, 57 vs 60 ms/round)
+                    // and wider splits cost draft acceptance through extra
+                    // partial-softmax merge error. Keep the proven floor.
+                    const int vsplits = GRAPH_SPLITS;
                     launch_flash_decode_batched(q,qv,d.k_cache,d.v_cache,t3,
                         M,pos,cfg.n_heads,cfg.n_kv_heads,cfg.head_dim,max_seq,
                         1.0f/std::sqrt(float(cfg.head_dim)),s.part,s.pm,s.pl,
-                        GRAPH_SPLITS,{});
+                        vsplits,{});
                 }else if(exact_verify){
                         const int start=pos;
                         q.submit([&](sycl::handler& h){

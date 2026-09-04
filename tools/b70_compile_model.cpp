@@ -52,6 +52,15 @@ bool keeps_bf16(const std::string& name) {
         const size_t n = std::strlen(suffix);
         return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
     };
+    // The MTP draft head. Measured 2026-09-04 on Qwen3.8-27B at a 4096-token
+    // prompt with llama-benchy: the head quantized to MXFP4 accepts 0-23% of
+    // its drafts (TG 14.8), while the same architecture with a BF16 head
+    // accepts 43-73% (TG 28-33, peaking at 47.2). Speculation multiplies the
+    // head's error -- a draft is either bit-exact against the target argmax or
+    // it is thrown away -- so 4-bit rounding here does not degrade quality
+    // gracefully, it destroys acceptance. The head is one small layer: keeping
+    // it costs ~0.65 GiB against a 15 GiB artifact and buys back ~2x decode.
+    if (name.rfind("mtp.", 0) == 0) return true;
     // ".mlp.gate.weight" must not catch ".mlp.gate_proj.weight".
     return ends_with(".linear_attn.in_proj_a.weight") ||
            ends_with(".linear_attn.in_proj_b.weight") ||

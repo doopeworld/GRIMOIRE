@@ -28,6 +28,26 @@
 
 namespace b70 {
 
+// Split-K width for single-token decode. launch_flash_decode and
+// launch_flash_merge MUST derive this identically -- the merge walks
+// [head][split] partials and a mismatch reads the wrong lanes.
+//
+// GRAPH_SPLITS(8) never scaled with context depth. Measured 2026-09-04 on
+// Qwen3.8-27B at 4778 tokens: 3650 us per full-attention layer, 54.8 of 82 ms
+// per token, an achieved 4.6 GB/s against a 602 GB/s roofline -- exactly the
+// latency-bound regime this kernel's own comment warns about. Scaling splits
+// with seq_len took the layer to 1197 us and the token to 43.9 ms.
+//
+// 128 keys per split is the measured optimum. 64 was tried and is WORSE
+// (TG 22.1 vs 28.7): more partials means more merge rounding, which costs
+// speculative draft acceptance.
+static inline int decode_splits(const AttnParams& p) {
+    int want = (p.seq_len + 127) / 128;
+    if (want < p.splits) want = p.splits;
+    if (want > MAX_SPLITS) want = MAX_SPLITS;
+    return want > 0 ? want : 1;
+}
+
 sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                                 const std::vector<sycl::event>& deps) {
     const int HD  = p.head_dim;
@@ -51,7 +71,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
         // the same rescale rule. This is standard FlashDecoding split-K,
         // and it is what turns the kernel from latency-bound into
         // bandwidth-bound.
-        const int splits = pp.splits;
+        const int splits = decode_splits(p);
         h.parallel_for(
             sycl::nd_range<1>(size_t(pp.num_heads) * size_t(splits) * SG_SIZE,
                               size_t(SG_SIZE)),
@@ -173,13 +193,14 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const AttnParams pp = p;
+        const int msplits = decode_splits(p);
         h.parallel_for(
             sycl::nd_range<1>(size_t(pp.num_heads) * SG_SIZE, size_t(SG_SIZE)),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const int lane = int(it.get_sub_group().get_local_id()[0]);
                 const int head = int(it.get_group(0));
                 if (head >= pp.num_heads) return;
-                const int splits = pp.splits;
+                const int splits = msplits;
 
                 float m = -std::numeric_limits<float>::infinity();
                 for (int i = 0; i < splits; ++i)

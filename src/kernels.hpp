@@ -27,6 +27,17 @@ inline sycl_bf16 to_sycl_bf16(float f) { return sycl_bf16(f); }
 // ---------------------------------------------------------------------
 constexpr int SG_SIZE = 16;
 
+// Upper bound on FlashDecoding split-K chunks for single-token decode.
+// GRAPH_SPLITS (8) sizes the graph-recorded path and never scaled with
+// context depth: measured 2026-09-04 on Qwen3.8-27B at 4778 tokens, the 16
+// full-attention layers cost 3650 us EACH (54.8 of 82 ms per token) at an
+// achieved 4.6 GB/s against a 602 GB/s roofline -- exactly the latency-bound
+// regime the flash-decode comment warns about. 8 splits x 40 heads is 320
+// sub-groups on a 256-EU part, and each split then walks ~600 keys serially.
+// The partial (acc,m,l) workspace is sized for this bound; the merge already
+// skips empty splits, so over-splitting a short sequence is harmless.
+constexpr int MAX_SPLITS = 64;
+
 constexpr int TM      = 8;    // joint_matrix M
 constexpr int TN      = 16;   // joint_matrix N
 constexpr int TK_BF16 = 16;   // joint_matrix K, bf16 DPAS
