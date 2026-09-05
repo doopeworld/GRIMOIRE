@@ -130,11 +130,73 @@ static bool json_find_string(const std::string& j, const std::string& key,
     while (p < j.size() && j[p] != '"') {
         if (j[p] == '\\' && p + 1 < j.size()) {
             char c = j[p + 1];
-            if (c == 'n') val += '\n';
-            else if (c == 't') val += '\t';
-            else if (c == 'r') val += '\r';
-            else val += c;
-            p += 2;
+            if (c == 'n') { val += '\n'; p += 2; }
+            else if (c == 't') { val += '\t'; p += 2; }
+            else if (c == 'r') { val += '\r'; p += 2; }
+            else if (c == 'b') { val += '\b'; p += 2; }
+            else if (c == 'f') { val += '\f'; p += 2; }
+            else if (c == 'u') {
+                // \uXXXX. This was previously NOT decoded: the 'u' fell into
+                // the catch-all below and "201c" then passed through as literal
+                // ASCII, so every non-ASCII character in a request arrived as
+                // FIVE junk characters. json.dumps() and most JSON clients
+                // default to ensure_ascii=True, so this corrupted essentially
+                // every real-world prompt containing a curly quote, apostrophe
+                // or dash -- the model saw `u201cHe said` instead of `"He said`.
+                //
+                // MEASURED 2026-09-05, identical Conan Doyle text: the HTTP
+                // server reported 7475 prompt tokens where the same tokenizer
+                // called directly reported 5983, and MTP draft acceptance was
+                // 33% through the server against 82% through the CLI. The
+                // drafter, the kernels and the quantisation were all innocent.
+                unsigned cp = 0; int got = 0;
+                for (int k = 0; k < 4 && p + 2 + size_t(k) < j.size(); ++k) {
+                    const char h = j[p + 2 + size_t(k)];
+                    int d;
+                    if (h >= '0' && h <= '9') d = h - '0';
+                    else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+                    else break;
+                    cp = (cp << 4) | unsigned(d); ++got;
+                }
+                if (got != 4) { val += c; p += 2; continue; }
+                p += 6;
+                // Surrogate pair: a high surrogate must be combined with the
+                // low one that follows, or the codepoint is wrong.
+                if (cp >= 0xD800 && cp <= 0xDBFF && p + 1 < j.size() &&
+                    j[p] == '\\' && j[p + 1] == 'u') {
+                    unsigned lo = 0; int g2 = 0;
+                    for (int k = 0; k < 4 && p + 2 + size_t(k) < j.size(); ++k) {
+                        const char h = j[p + 2 + size_t(k)];
+                        int d;
+                        if (h >= '0' && h <= '9') d = h - '0';
+                        else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+                        else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+                        else break;
+                        lo = (lo << 4) | unsigned(d); ++g2;
+                    }
+                    if (g2 == 4 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    }
+                }
+                // Encode as UTF-8.
+                if (cp < 0x80) val += char(cp);
+                else if (cp < 0x800) {
+                    val += char(0xC0 | (cp >> 6));
+                    val += char(0x80 | (cp & 0x3F));
+                } else if (cp < 0x10000) {
+                    val += char(0xE0 | (cp >> 12));
+                    val += char(0x80 | ((cp >> 6) & 0x3F));
+                    val += char(0x80 | (cp & 0x3F));
+                } else {
+                    val += char(0xF0 | (cp >> 18));
+                    val += char(0x80 | ((cp >> 12) & 0x3F));
+                    val += char(0x80 | ((cp >> 6) & 0x3F));
+                    val += char(0x80 | (cp & 0x3F));
+                }
+            }
+            else { val += c; p += 2; }
         } else {
             val += j[p];
             ++p;

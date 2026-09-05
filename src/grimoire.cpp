@@ -3300,6 +3300,30 @@ void Grimoire::reset() {
         if (d.conv_ring)
             q.memset(d.conv_ring, 0, size_t(qkv_ch) * (cfg.conv_kernel - 1) * sizeof(float));
     }
+    // MTP head KV cache. Nothing outside mtp_draft ever writes it: prefill
+    // does not touch it and reset() did not clear it, so a long-lived server
+    // carried draft K/V from EARLIER REQUESTS into the next one and the head
+    // attended over stale context. See 3b5b510, which localised the whole TG
+    // gap to acceptance and left this as its untested leading hypothesis:
+    // a1a92eb's 92% acceptance / 37.6 TG was measured in a FRESH CLI PROCESS
+    // whose MTP cache was newly allocated and effectively zero, i.e. with the
+    // head's attention contributing nothing -- while the server accumulates
+    // real K/V and so attends to WRONG context rather than NO context.
+    // The arrival-order signature it predicted is exactly what the container
+    // logs show on 2026-09-05: the first requests after a restart give
+    // 33% / 0% / 53% acceptance and every request after settles at 11-26%.
+    // Zeroing here reproduces the fresh-process condition per request.
+    //
+    // This is a DIAGNOSTIC, not the real fix. If it lifts acceptance, the
+    // actual fix is to POPULATE this cache during prefill (batched forward of
+    // the MTP layer over the prompt using the hidden states prefill already
+    // has in `bh`), which is what vLLM does and why it holds ~52 TG at 4.4k
+    // context. No batched path exists for that layer today.
+    if (mtp.ok && mtp.L.k_cache && mtp.L.v_cache) {
+        const size_t kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
+        q.memset(mtp.L.k_cache, 0, kv_bytes);
+        q.memset(mtp.L.v_cache, 0, kv_bytes);
+    }
     const int32_t z = 0, one = 1;
     if (s.d_pos)     q.memcpy(s.d_pos, &z, sizeof(int32_t));
     if (s.d_seq_len) q.memcpy(s.d_seq_len, &one, sizeof(int32_t));
@@ -4921,9 +4945,22 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     static const bool hid_first = std::getenv("GRIMOIRE_MTP_HID_FIRST") != nullptr;
     float* p_emb = hid_first ? mtp.cat + H : mtp.cat;
     float* p_hid = hid_first ? mtp.cat     : mtp.cat + H;
-    // mtp.x is read here and only overwritten by the fc gemv below, so a
-    // chained draft can use it in place as its hidden input.
-    const float* hsrc = from_mtp_hidden ? mtp.x : s.h;
+    // CHAINED-DRAFT HIDDEN SOURCE.
+    //
+    // vLLM feeds the MTP layer's OUTPUT into the next draft step, not its
+    // input. Confirmed in the live container 2026-09-05:
+    //   qwen3_5_mtp.py:179  hidden_states, _ = self.norm(hidden_states, residual)
+    //                :183  return hidden_states          <- post-layer, post-norm
+    //   llm_base_proposer.py:600-601  hidden_states = ret_hidden_states
+    //                                 ... carried into the next draft step
+    // GRIMOIRE used mtp.x, which is the fc OUTPUT = the decoder layer's INPUT,
+    // so every chained draft (position 2 onward) started from the wrong
+    // tensor. The correct value was already computed for the lm_head but
+    // written to the shared scratch s.h2 and clobbered; mtp.h2 was allocated
+    // (grimoire.cpp ~3161) and never used. It now holds it across calls.
+    // GRIMOIRE_MTP_CHAIN_OLD=1 restores the previous behaviour for A/B.
+    static const bool chain_old = std::getenv("GRIMOIRE_MTP_CHAIN_OLD") != nullptr;
+    const float* hsrc = from_mtp_hidden ? (chain_old ? mtp.x : mtp.h2) : s.h;
     launch_rmsnorm_residual(q, const_cast<float*>(hsrc), nullptr, mtp.pre_h,
                             p_hid, H, cfg.rms_eps, none);
     launch_embed(q, embed, next_token, mtp.resid, H, none);
@@ -5009,17 +5046,20 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     }
 
     // ---- final norm + the model's own lm_head ---------------------------
-    launch_rmsnorm_residual(q, mtp.x, s.moe_y, mtp.norm, s.h2, H, cfg.rms_eps, none);
+    // Into mtp.h2, not s.h2: this value is both the lm_head input AND the
+    // hidden state the next chained draft consumes, and s.h2 is shared
+    // scratch that the next call overwrites before it is read.
+    launch_rmsnorm_residual(q, mtp.x, s.moe_y, mtp.norm, mtp.h2, H, cfg.rms_eps, none);
     static const int draft_vocab = [] {
         const char* v = std::getenv("GRIMOIRE_MTP_DRAFT_VOCAB");
         return v && *v ? std::atoi(v) : 0;
     }();
     const int dv = draft_vocab > 0 ? std::min(draft_vocab, cfg.vocab) : cfg.vocab;
     if (dv < cfg.vocab && lm_head.has_i4())
-        launch_gemv_int4sym(q, lm_head.i4, lm_head.i4s, s.h2, s.logits,
+        launch_gemv_int4sym(q, lm_head.i4, lm_head.i4s, mtp.h2, s.logits,
                             dv, H, none);
     else
-        gemv_any(lm_head, s.h2, s.logits, none);
+        gemv_any(lm_head, mtp.h2, s.logits, none);
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
