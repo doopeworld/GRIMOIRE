@@ -813,6 +813,120 @@ sycl::event launch_gemv_int4sym_batch(sycl::queue& q, const uint8_t* pack,
     }
 }
 
+// ---------------------------------------------------------------------
+// MEASURED WORSE, 2026-09-05. Kept opt-in (GRIMOIRE_GEMV_BATCH_NORED=1)
+// and out of any default path as a documented dead end -- do not retry
+// this exact axis change without fixing the coalescing problem below.
+//
+// gemv_int4sym_batch_impl above splits K across the 16 lanes of a
+// sub-group and calls sycl::reduce_over_group once per (block, row,
+// batch-column). Reading OpenVINO's GPU plugin kernel for this exact
+// batch range (fully_connected_gpu_bf_tiled_dyn_b_core.cl, batch 2-32,
+// INT4 weights) showed a different axis: each LANE owns one output row
+// for the ENTIRE K-walk, no cross-lane reduction at all. The hypothesis
+// was that reduce_over_group was the tax costing us the FFN (N=17408)
+// -- widening GRIMOIRE_GEMV_BATCH_MAX_N to cover it on 2026-09-05 made
+// verify WORSE (54.7 -> 60.4 ms/round) through the reduce-based kernel.
+//
+// MEASURED (llama-benchy-style MTP profile, W4A8, k=3, same binary,
+// coherence PASSED both ways, 20/27 drafts accepted identically):
+//     reduce-based (gemv_int4sym_batch_impl)   verify 54.5 ms/round
+//     this kernel  (batch_nored)               verify 61.9 ms/round
+// WORSE, not better. The hypothesis was wrong: removing the reduction
+// also removes the ONE thing the reduce-based kernel gets right for
+// free -- in that kernel, all 16 lanes read ADJACENT bytes of the SAME
+// row (k0 = base + lane*EPL), one coalesced transaction. This kernel
+// gives each lane a DIFFERENT row (row_bytes apart), so the sub-group
+// now issues 16 independent, non-adjacent cache-line reads every step
+// instead of one wide coalesced one. That coalescing loss costs more
+// than the reduction saved. OpenVINO's kernel gets no-reduction AND
+// coalesced reads together because its weight layout is physically
+// interleaved (the OSV32/OSV64 layouts in its core kernel) for exactly
+// this access pattern -- GRIMOIRE's row-major payload is not, so the
+// axis alone does not carry the win across. A real retry needs either
+// an interleaved repack of the INT4 payload (bigger, riskier change,
+// touches the loader) or a block-read across lanes for DIFFERENT rows
+// within the SAME weight-format constraints (unexplored). Neither is
+// done. Left in as a documented negative result, not a live option.
+// ---------------------------------------------------------------------
+template <int MB>
+sycl::event gemv_int4sym_batch_nored_impl(sycl::queue& q, const uint8_t* pack,
+                                          const float* ws, const float* x, float* y,
+                                          int N, int K,
+                                          const std::vector<sycl::event>& deps) {
+    constexpr int G = 128;
+    const int rows_per_wg = WG_SUBGROUPS * SG_SIZE;  // one output row per lane
+    const int n_blocks    = (N + rows_per_wg - 1) / rows_per_wg;
+    const int cap         = gemv_cap();
+    const int n_groups    = (cap > 0 && n_blocks > cap) ? cap : n_blocks;
+    const int wg_threads  = WG_SUBGROUPS * SG_SIZE;
+    const int64_t row_bytes = int64_t(K) / 2;
+    const int kg = K / G;
+
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> i4lut(16, h);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(n_groups) * size_t(wg_threads),
+                              size_t(wg_threads)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  sgid = int(sg.get_group_id()[0]);
+                const int  lid  = int(it.get_local_id(0));
+                float* lut = i4lut.template
+                    get_multi_ptr<sycl::access::decorated::no>().get();
+                for (int b = lid; b < 16; b += wg_threads)
+                    lut[b] = float(int(int8_t(uint8_t(b) << 4)) >> 4);
+                sycl::group_barrier(it.get_group());
+
+                for (int blk = int(it.get_group(0)); blk < n_blocks;
+                     blk += int(it.get_group_range(0))) {
+                    // OpenVINO's axis: this lane owns row n for the whole
+                    // K-walk. No reduce_over_group anywhere below.
+                    const int n = blk * rows_per_wg + sgid * SG_SIZE + lane;
+                    if (n >= N) continue;
+                    const uint8_t* row = pack + int64_t(n) * row_bytes;
+
+                    float acc[MB];
+                    #pragma unroll
+                    for (int m = 0; m < MB; ++m) acc[m] = 0.0f;
+
+                    for (int k0 = 0; k0 < K; k0 += 16) {
+                        const uint64_t packed =
+                            *reinterpret_cast<const uint64_t*>(row + (k0 >> 1));
+                        const float sc = ws[int64_t(n) * kg + k0 / G];
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const uint8_t byte = uint8_t(packed >> (8 * i));
+                            const float w0 = lut[byte & 0x0F] * sc;
+                            const float w1 = lut[byte >> 4]   * sc;
+                            #pragma unroll
+                            for (int m = 0; m < MB; ++m) {
+                                acc[m] = sycl::fma(w0, x[int64_t(m) * K + k0 + 2 * i],     acc[m]);
+                                acc[m] = sycl::fma(w1, x[int64_t(m) * K + k0 + 2 * i + 1], acc[m]);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < MB; ++m) y[int64_t(m) * N + n] = acc[m];
+                }
+            });
+    });
+}
+
+sycl::event launch_gemv_int4sym_batch_nored(sycl::queue& q, const uint8_t* pack,
+                                            const float* ws, const float* x, float* y,
+                                            int N, int K, int MB,
+                                            const std::vector<sycl::event>& deps) {
+    switch (MB) {
+        case 1: return gemv_int4sym_batch_nored_impl<1>(q, pack, ws, x, y, N, K, deps);
+        case 2: return gemv_int4sym_batch_nored_impl<2>(q, pack, ws, x, y, N, K, deps);
+        case 3: return gemv_int4sym_batch_nored_impl<3>(q, pack, ws, x, y, N, K, deps);
+        default: return gemv_int4sym_batch_nored_impl<4>(q, pack, ws, x, y, N, K, deps);
+    }
+}
+
 sycl::event launch_gemv_int4sym(sycl::queue& q, const uint8_t* pack,
                                 const float* ws, const float* x, float* y,
                                 int N, int K,

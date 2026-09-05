@@ -47,8 +47,20 @@ static inline int decode_splits(const AttnParams& p) {
     // expensive flash_merge (it walks [head][split] partials serially).
     static const int KPS = [] {
         const char* e = std::getenv("GRIMOIRE_ATTN_KEYS_PER_SPLIT");
-        const int v = e ? std::atoi(e) : 128;
-        return v > 0 ? v : 128;
+        // DEFAULT 32, not 128. Measured 2026-09-05 on Qwen3.8-27B at 2623
+        // tokens, W4A8, coherence PASSED -- keys/split against per-layer cost:
+        //     128 -> flash_decode 697 us, merge  6, token 38.4 ms, tg 19.4
+        //      64 -> flash_decode 357 us, merge 10, token 33.0 ms, tg 21.8
+        //      32 -> flash_decode 186 us, merge 19, token 30.5 ms, tg 23.3  <-
+        //      16 -> flash_decode 314 us, merge 29, token 32.7 ms, tg 21.4
+        // 128 keys/split under-parallelises badly (21 splits x 24 heads = 504
+        // sub-groups on a 256-EU card). 16 over-splits: 128 splits leaves only
+        // ~20 keys each and the merge grows. The optimum is a split COUNT near
+        // 80-96, so this is keys-per-split only as a proxy -- at much deeper
+        // context MAX_SPLITS(128) caps it, which degrades gracefully toward
+        // wider splits. Sweep with the env var if the context is far from 2.6k.
+        const int v = e ? std::atoi(e) : 32;
+        return v > 0 ? v : 32;
     }();
     int want = (p.seq_len + KPS - 1) / KPS;
     if (want < p.splits) want = p.splits;

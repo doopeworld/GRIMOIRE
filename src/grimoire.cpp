@@ -565,6 +565,9 @@ sycl::event launch_gemv_int4sym(sycl::queue&, const uint8_t*, const float*,
 sycl::event launch_gemv_int4sym_batch(sycl::queue&, const uint8_t*, const float*,
                                 const float*, float*, int, int, int,
                                 const std::vector<sycl::event>&);
+sycl::event launch_gemv_int4sym_batch_nored(sycl::queue&, const uint8_t*, const float*,
+                                const float*, float*, int, int, int,
+                                const std::vector<sycl::event>&);
 sycl::event launch_mxfp4_to_int4sym(sycl::queue&, const uint8_t*, const uint8_t*,
                                     int64_t, int64_t, uint8_t*, float*, int, int,
                                     const std::vector<sycl::event>&);
@@ -6159,6 +6162,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // 4-row verify pass at 270 GB/s (54.2 ms/round, flat in M from 2 to 6)
         // because its tiling buys compute reuse a 4-row pass cannot use.
         // Tunable so the crossover can be swept without a rebuild.
+        // EXPERIMENTAL, opt-in, UNTESTED as of 2026-09-05 -- see the kernel
+        // comment in gemv_decode.cpp. Tried first and returns early so the
+        // flag being unset leaves every path below bit-for-bit unchanged.
+        static const bool nored = std::getenv("GRIMOIRE_GEMV_BATCH_NORED") != nullptr;
+        if (nored && M<=16 && w.has_i4() && (w.w.K % 16)==0) {
+            for(int r=0;r<M;r+=4){
+                const int mb=std::min(4,M-r);
+                launch_gemv_int4sym_batch_nored(q,w.i4,w.i4s,
+                    x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,
+                    w.w.N,w.w.K,mb,{});
+            }
+            return;
+        }
         static const int batch_max_n = [] {
             const char* e = std::getenv("GRIMOIRE_GEMV_BATCH_MAX_N");
             const int v = e ? std::atoi(e) : 2048;
