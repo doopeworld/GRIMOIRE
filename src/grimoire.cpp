@@ -363,6 +363,21 @@ struct OneDnnW4Api {
     explicit operator bool() const { return create && scratch_size && execute && destroy; }
 };
 
+// oneDNN MXFP4 W4A16 matmul. This is the same class of kernel vLLM XPU calls
+// for every linear layer (csrc/xpu/onednn/onednn_matmul.cpp -> int4_gemm_w4a16).
+// The bridge's MXPlan already maps GRIMOIRE's native [N,K] row-major E2M1
+// payload and its contiguous E8M0 scales straight in -- no repacking.
+// Measured 2026-09-05 at M=1, N=10240, K=5120 with incompressible weights:
+// 48.45 us = 535 GiB/s (~575 GB/s, 94% of the 608 GB/s part), where the
+// hand-written GEMV on the same shape does 126-370 GB/s.
+struct OneDnnMXApi {
+    void* (*create)(sycl::queue*,int,int,int) = nullptr;
+    size_t (*scratch_size)(void*) = nullptr;
+    void (*execute)(void*,const void*,const void*,const void*,void*,void*) = nullptr;
+    void (*destroy)(void*) = nullptr;
+    explicit operator bool() const { return create && scratch_size && execute && destroy; }
+};
+
 struct OneDnnBF16Api {
     void* (*create)(sycl::queue*,int,int,int) = nullptr;
     size_t (*scratch_size)(void*) = nullptr;
@@ -412,6 +427,24 @@ static OneDnnBF16Api load_onednn_bf16() {
         api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_bf16_f32_destroy"));
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
+    return api;
+}
+
+static OneDnnMXApi load_onednn_mx() {
+    static OneDnnMXApi api{}; static bool attempted=false; static void* handle=nullptr;
+    if(attempted)return api; attempted=true;
+    const char* env=std::getenv("GRIMOIRE_ONEDNN_BRIDGE");
+    const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
+        "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
+    for(const char* path:paths){
+        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_create"));
+        api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_scratch_size"));
+        api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_execute"));
+        api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_destroy"));
+        if(api)break; api={}; dlclose(handle); handle=nullptr;
+    }
+    if(!api)std::fprintf(stderr,"  oneDNN MXFP4 W4A16 unavailable\n");
     return api;
 }
 
@@ -1635,7 +1668,59 @@ struct Grimoire {
         }
         if (dq.has_i4())
             return launch_gemv_int4sym(q, dq.i4, dq.i4s, x, y, dq.w.N, dq.w.K, deps);
+        if (onednn_mx_gemv(dq, x, y, deps)) return mx_last;
         return launch_gemv(q, dq.w, x, y, deps);
+    }
+
+    // Route a single-token MXFP4 projection through oneDNN. Opt-in while it is
+    // being measured; the plan is cached per (N,K) because building a oneDNN
+    // primitive_desc per call would dwarf the 48 us it takes to run.
+    struct MxPlanEntry { void* plan; void* scratch; };
+    std::map<std::pair<int,int>, MxPlanEntry> mx_plans;
+    sycl::event mx_last{};
+    sycl_bf16* mx_a = nullptr; sycl_bf16* mx_o = nullptr;
+    size_t mx_a_cap = 0, mx_o_cap = 0;
+
+    bool onednn_mx_gemv(const DevQuant& dq, const float* x, float* y,
+                        const std::vector<sycl::event>& deps) {
+        static const bool on = std::getenv("GRIMOIRE_ONEDNN_GEMV") != nullptr;
+        if (!on) return false;
+        if (dq.w.fmt != Fmt::MXFP4 || !dq.w.payload || !dq.w.scales) return false;
+        const int N = dq.w.N, K = dq.w.K;
+        if ((K % 32) != 0) return false;
+        static OneDnnMXApi api = load_onednn_mx();
+        if (!api) return false;
+
+        auto key = std::make_pair(N, K);
+        auto it = mx_plans.find(key);
+        if (it == mx_plans.end()) {
+            void* pl = api.create(&q, 1, N, K);
+            if (!pl) { mx_plans[key] = {nullptr, nullptr}; return false; }
+            const size_t sb = api.scratch_size(pl);
+            void* sc = sb ? sycl::malloc_device<uint8_t>(sb, q) : nullptr;
+            it = mx_plans.emplace(key, MxPlanEntry{pl, sc}).first;
+        }
+        if (!it->second.plan) return false;
+
+        if (mx_a_cap < size_t(K)) {
+            if (mx_a) sycl::free(mx_a, q);
+            mx_a = sycl::malloc_device<sycl_bf16>(size_t(K), q); mx_a_cap = size_t(K);
+        }
+        if (mx_o_cap < size_t(N)) {
+            if (mx_o) sycl::free(mx_o, q);
+            mx_o = sycl::malloc_device<sycl_bf16>(size_t(N), q); mx_o_cap = size_t(N);
+        }
+        if (!mx_a || !mx_o) return false;
+
+        // NO waits: q is in-order, so the convert -> matmul -> convert chain
+        // is already ordered. An earlier version waited on both conversions,
+        // which turned every one of the ~200 projections per token into a full
+        // pipeline sync and cost more than the kernel saved (TG 17.2 -> 10.0).
+        launch_f32_to_bf16(q, x, mx_a, K, deps);
+        api.execute(it->second.plan, mx_a, dq.w.payload, dq.w.scales,
+                    mx_o, it->second.scratch);
+        mx_last = launch_bf16_to_f32(q, mx_o, y, N, {});
+        return true;
     }
 
     // Decode FFN GEMV.  When the W4A8 path converted this layer's weights the

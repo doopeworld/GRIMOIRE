@@ -21,9 +21,12 @@ int main(){
   constexpr int M=1,N=10240,K=5120;
   sycl::queue q{sycl::gpu_selector_v,sycl::property::queue::in_order{}};
   std::vector<bf16> ah(K);std::vector<unsigned char> bh(size_t(N)*K/2);
-  std::vector<unsigned char> sh(size_t(N)*K/32,121);
+  std::vector<unsigned char> sh(size_t(N)*K/32); for(size_t i=0;i<sh.size();++i) sh[i]=(unsigned char)(119+(i%7));
   for(int k=0;k<K;++k)ah[k]=bf16(float(int(k*17%31)-15)/32.0f);
-  for(size_t i=0;i<bh.size();++i)bh[i]=unsigned((i*5)%16)|unsigned((i*11)%16)<<4;
+  // INCOMPRESSIBLE fill: the old pattern ((i*5)%16 | ((i*11)%16)<<4) repeats
+  // and is hardware-compressed, which inflates GB/s. 2026-09-05.
+  { uint32_t r=2463534242u;
+    for(size_t i=0;i<bh.size();++i){ r^=r<<13; r^=r>>17; r^=r<<5; bh[i]=(unsigned char)(r>>24); } }
   auto*a=sycl::malloc_device<bf16>(ah.size(),q);
   auto*b=sycl::malloc_device<unsigned char>(bh.size(),q);
   auto*s=sycl::malloc_device<unsigned char>(sh.size(),q);
