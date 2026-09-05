@@ -308,15 +308,64 @@ inline int u8len(unsigned char c) {
     return 1;
 }
 
-// \p{L}: ASCII letters plus any non-ASCII codepoint. Treating all
-// multi-byte characters as letters is the right approximation here --
-// CJK, accented Latin and Cyrillic are all \p{L}, and the punctuation
-// that is not gets handled by the byte-level fallback without changing
-// the token count for normal text.
+// Decode a UTF-8 sequence to its codepoint. Returns 0 on a malformed
+// lead byte, which callers treat as "not a letter".
+inline uint32_t u8cp(const std::string& t, size_t i, int len) {
+    const unsigned char c0 = t[i];
+    if (len == 1) return c0;
+    if (i + size_t(len) > t.size()) return 0;
+    uint32_t cp = c0 & (0xFF >> (len + 1));
+    for (int k = 1; k < len; ++k) {
+        const unsigned char ck = t[i + size_t(k)];
+        if ((ck & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (ck & 0x3F);
+    }
+    return cp;
+}
+
+// Unicode punctuation/symbol blocks that are NOT \p{L}. Qwen's
+// pre-tokenizer groups these with the punctuation run
+// (' ?[^\s\p{L}\p{N}]+'), not with adjacent words.
+inline bool is_punct_cp(uint32_t cp) {
+    if (cp >= 0x00A0 && cp <= 0x00BF) return true;  // Latin-1 punct/symbols
+    if (cp == 0x00D7 || cp == 0x00F7) return true;  // multiplication/division
+    if (cp >= 0x2000 && cp <= 0x206F) return true;  // General Punctuation
+    if (cp >= 0x2E00 && cp <= 0x2E7F) return true;  // Supplemental Punctuation
+    if (cp >= 0x3000 && cp <= 0x303F) return true;  // CJK Symbols & Punctuation
+    return false;
+}
+
+// \p{L}: ASCII letters plus non-ASCII codepoints that are not punctuation.
+//
+// This USED to return true for EVERY multi-byte codepoint, with a comment
+// claiming that was a safe approximation because "the punctuation that is
+// not gets handled by the byte-level fallback without changing the token
+// count for normal text". That is false, and it was expensive: a curly
+// apostrophe, smart quote or em dash was glued onto the adjacent word, so
+// the chunk handed to BPE ("\u201cHe) never appears in the merge table,
+// nothing merged, and the whole run fell back to raw bytes.
+//
+// MEASURED 2026-09-05 against vLLM serving the same Qwen3.8-27B tokenizer,
+// identical strings through both /v1/completions (prompt_tokens):
+//     ascii only     vLLM 16   GRIMOIRE 16    <- why this was never caught;
+//     smart quotes   vLLM 17   GRIMOIRE 34       the in-tree verifier's
+//     em dash        vLLM 15   GRIMOIRE 27       reference string is pure
+//     apostrophes    vLLM 18   GRIMOIRE 38       ASCII and passes regardless
+// Real prose is ~2x over-tokenised: 24051 chars of Conan Doyle gave vLLM
+// 5983 tokens and GRIMOIRE 7475. That inflates every PP tok/s figure (more
+// tokens counted for the same text), makes TG genuinely worse (each token
+// carries less text), and feeds the model byte-fallback sequences it never
+// saw in training -- which is a plausible contributor to the MTP draft
+// acceptance collapse on real text (12-26%) versus ASCII-ish synthetic
+// prompts (74%).
 inline bool is_letter_at(const std::string& t, size_t i, int& len) {
     const unsigned char c = t[i];
     len = u8len(c);
-    if (len > 1) return true;
+    if (len > 1) {
+        const uint32_t cp = u8cp(t, i, len);
+        if (cp == 0) return false;
+        return !is_punct_cp(cp);
+    }
     return is_ascii_letter(c);
 }
 
