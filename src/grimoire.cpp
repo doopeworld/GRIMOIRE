@@ -382,6 +382,15 @@ struct OneDnnMXApi {
 // therefore decodes GRIMOIRE's sign-extended nibbles rotated by 8; this one
 // declares the payload as s4 and maps it in unchanged. See the SPlan comment
 // in xe2_onednn_bridge.cpp.
+// vLLM's w4a8 oneDNN matmul, ported in xe2_onednn_bridge.cpp.
+struct OneDnnW4A8Api {
+    void* (*create)(sycl::queue*,int,int,int,int) = nullptr;
+    size_t (*scratch_size)(void*) = nullptr;
+    void (*execute)(void*,const void*,const void*,const void*,const void*,void*,void*) = nullptr;
+    void (*destroy)(void*) = nullptr;
+    explicit operator bool() const { return create && scratch_size && execute && destroy; }
+};
+
 struct OneDnnS4Api {
     void* (*create)(sycl::queue*,int,int,int,int,int) = nullptr;
     size_t (*scratch_size)(void*) = nullptr;
@@ -457,6 +466,24 @@ static OneDnnMXApi load_onednn_mx() {
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
     if(!api)std::fprintf(stderr,"  oneDNN MXFP4 W4A16 unavailable\n");
+    return api;
+}
+
+static OneDnnW4A8Api load_onednn_w4a8() {
+    static OneDnnW4A8Api api{}; static bool attempted=false; static void* handle=nullptr;
+    if(attempted)return api; attempted=true;
+    const char* env=std::getenv("GRIMOIRE_ONEDNN_BRIDGE");
+    const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
+        "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
+    for(const char* path:paths){
+        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_w4a8_create"));
+        api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_w4a8_scratch_size"));
+        api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_w4a8_execute"));
+        api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_w4a8_destroy"));
+        if(api)break; api={}; dlclose(handle); handle=nullptr;
+    }
+    if(!api)std::fprintf(stderr,"  oneDNN W4A8 unavailable\n");
     return api;
 }
 
@@ -1846,6 +1873,10 @@ struct Grimoire {
     // from_mtp_hidden: chained drafts feed the head its OWN previous hidden
     // state instead of the main model's h_t, which is how depth > 1 works.
     int  mtp_draft(int next_token, int position, bool from_mtp_hidden = false);
+    // Populate the MTP head's KV cache over prompt positions so the drafter
+    // does not start each request blind. Writes K/V only -- no attention,
+    // no FFN, no lm_head. See mtp_warm() for why this matters.
+    void mtp_warm(const float* hidden, int next_token, int position);
     bool dflash_draft(int bonus_token, int position,
                       std::vector<int32_t>& draft_tokens,
                       bool context_only = false);
@@ -4927,6 +4958,57 @@ const float* Grimoire::forward(int token) {
 //  next one.  Everything else it borrows (s.h2, s.qkv, s.attn_out, s.moe_y,
 //  ...) is transient within a step and re-initialised at the top of forward.
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+//  MTP KV warm-up.
+//
+//  The MTP head attends over its OWN KV cache, and nothing ever wrote that
+//  cache for prompt positions: prefill did not touch it and reset() cleared
+//  it, so the drafter began every request with no context and its first
+//  drafts were near-worthless. Commit 3b5b510 named this and never built it:
+//  "the real fix is to populate mtp.L's KV cache during prefill ... That is
+//  what vLLM does and why it holds ~52 TG at 4.4k context."
+//
+//  MEASURED 2026-09-05, 4080-token prompt, k=3, EXACT_VERIFY, same config,
+//  only the generation length changed:
+//      n=32   31.4 tok/s     n=64  37.8 tok/s     n=128  42.0 tok/s
+//  A per-request fixed cost that dilutes as generation grows -- the warm-up
+//  penalty. vLLM shows no such slope and holds ~44 at n=32.
+//
+//  Only K and V are needed to fill the cache, so this runs the front of
+//  mtp_draft and stops: fc([norm(embed) ; norm(hidden)]) -> in_norm ->
+//  k_proj/v_proj -> k_norm -> RoPE -> kv_append. No attention, no FFN and no
+//  lm_head, which is what makes warming a few hundred positions affordable.
+// ---------------------------------------------------------------------
+void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
+    if (!mtp.ok) return;
+    const int H = cfg.hidden;
+    const std::vector<sycl::event> none{};
+    LayerDev& d = mtp.L;
+
+    q.memcpy(s.d_pos, &position, sizeof(int32_t));
+    const int32_t seq = position + 1;
+    q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
+
+    // Same concat order as mtp_draft: EMBEDDING FIRST.
+    launch_rmsnorm_residual(q, const_cast<float*>(hidden), nullptr, mtp.pre_h,
+                            mtp.cat + H, H, cfg.rms_eps, none);
+    launch_embed(q, embed, next_token, mtp.resid, H, none);
+    launch_rmsnorm_residual(q, mtp.resid, nullptr, mtp.pre_e, mtp.cat,
+                            H, cfg.rms_eps, none);
+    launch_gemv(q, mtp.fc.w, mtp.cat, mtp.x, none);
+    launch_rmsnorm_residual(q, mtp.x, nullptr, d.in_norm, s.h2, H, cfg.rms_eps, none);
+
+    gemv_any(d.k_proj, s.h2, s.zbuf, none);
+    gemv_any(d.v_proj, s.h2, s.bbuf, none);
+    if (d.k_norm)
+        launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
+                             cfg.head_dim, cfg.rms_eps, true, none);
+    launch_rope_dev(q, s.zbuf, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
+                    cfg.rope_theta, cfg.partial_rope, none);
+    launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
+                         s.d_pos, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
+}
+
 int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     if (!mtp.ok) return -1;
     const int H = cfg.hidden;
@@ -6241,6 +6323,70 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 return;
             }
         }
+        // ONEDNN W4A8 -- vLLM's own path, ported byte-for-byte in
+        // xe2_onednn_bridge.cpp. vLLM routes every linear layer through
+        // oneDNN at every batch size; GRIMOIRE sends verify batches to the
+        // prefill-tuned xe2_w4a8 tile instead, measured at ~227 GB/s against
+        // vLLM's ~500 on the identical workload with identical acceptance.
+        // Opt-in via GRIMOIRE_ONEDNN_W4A8=1 so the proven path stays default.
+        // ONEDNN W4A16 -- what vLLM actually runs for this model.
+        // Its only int4 GEMMs are csrc/xpu/onednn/int4_gemm_w4a16.h and
+        // int4_gemm_w4a8.h; there is no custom SYCL int4 GEMM in the tree.
+        // The checkpoint is GPTQ-Int4 with 16-bit activations, so the live
+        // path is w4a16. Its attribute setup is reproduced exactly in
+        // SPlan (xe2_onednn_bridge.cpp): weight scales mask (1<<0)+(1<<1)
+        // with {group_size,1} groups and set_fpmath_mode(bf16, true).
+        // The one required difference is s4 instead of u4+zp=8, because
+        // GRIMOIRE stores int4 sign-extended.
+        //
+        // GRIMOIRE instead sends verify batches to grimoire_xe2_dense_w4a8_f32
+        // (its own kernel, int8 activations). MEASURED 2026-09-05 against the
+        // live vLLM, identical model and prompt, equal ~2.5 tok/round:
+        //     GRIMOIRE verify 61 ms device  (graph replay, so not dispatch)
+        //     vLLM     round  29 ms
+        // Opt-in via GRIMOIRE_ONEDNN_W4A16=1.
+        static const bool od_a16_on = std::getenv("GRIMOIRE_ONEDNN_W4A16") != nullptr;
+        if(od_a16_on && w.has_i4() && xb && grouped_out && (w.w.K % 128)==0){
+            static OneDnnS4Api oda = load_onednn_s4();
+            if(oda){
+                constexpr int GS = 128;
+                const int N = w.w.N, K = w.w.K, G = K / GS;
+                struct A16Ent { void* plan; void* scratch; sycl_bf16* wsc; int m; };
+                static std::map<const float*, A16Ent> a16_plans;
+                auto it = a16_plans.find(w.i4s);
+                if(it == a16_plans.end() || it->second.m != M){
+                    if(it != a16_plans.end()){
+                        if(it->second.plan) oda.destroy(it->second.plan);
+                        if(it->second.scratch) sycl::free(it->second.scratch,q);
+                        if(it->second.wsc) sycl::free(it->second.wsc,q);
+                        a16_plans.erase(it);
+                    }
+                    void* pl = oda.create(&q, M, N, K, GS, 1);
+                    sycl_bf16* ts = nullptr; void* sc = nullptr;
+                    if(pl){
+                        const size_t sb = oda.scratch_size(pl);
+                        sc = sb ? sycl::malloc_device<uint8_t>(sb,q) : nullptr;
+                        ts = sycl::malloc_device<sycl_bf16>(size_t(G)*N,q);
+                        if(ts){
+                            const float* src = w.i4s;
+                            q.parallel_for(sycl::range<2>(size_t(G),size_t(N)),
+                                [=](sycl::id<2> id){
+                                    ts[id[0]*size_t(N)+id[1]] =
+                                        sycl_bf16(src[id[1]*size_t(G)+id[0]]);
+                                }).wait();
+                        }
+                    }
+                    it = a16_plans.emplace(w.i4s, A16Ent{pl,sc,ts,M}).first;
+                }
+                if(it->second.plan && it->second.wsc){
+                    launch_f32_to_bf16(q,x,xb,size_t(M)*size_t(K));
+                    oda.execute(it->second.plan, xb, w.i4, it->second.wsc,
+                                grouped_out, it->second.scratch);
+                    launch_bf16_to_f32(q,grouped_out,y,size_t(M)*size_t(N));
+                    return;
+                }
+            }
+        }
         if(w.has_i4() && xe2_w4a8_f32 && a8 && a8s){
             static const bool dbg=std::getenv("GRIMOIRE_W4A8_DEBUG")!=nullptr;
             if(dbg){std::printf("    [mm] N=%d K=%d M=%d quantize...",
@@ -6955,6 +7101,36 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
     }
     q.wait();
+
+    // MTP KV WARM-UP. Opt-in: GRIMOIRE_MTP_WARM=<positions>, 0/unset = off,
+    // so the default path is byte-for-byte unchanged.
+    //
+    // Only runs on a real prompt prefill (next_tokens == nullptr means this is
+    // not a speculative verify batch, which must not touch the drafter cache).
+    // Warms the LAST n positions rather than all M: the drafter's attention is
+    // dominated by recent context and warming 4000 positions serially would
+    // cost more than it saves. Position i is warmed with the hidden state of
+    // token i and the token at i+1, matching what mtp_draft consumes.
+    if (mtp.ok && !next_tokens && M > 1) {
+        static const int warm_n = [] {
+            const char* e = std::getenv("GRIMOIRE_MTP_WARM");
+            const int v = e && *e ? std::atoi(e) : 0;
+            return v > 0 ? v : 0;
+        }();
+        if (warm_n > 0) {
+            const int span = std::min(warm_n, M - 1);
+            const int first = M - 1 - span;
+            for (int i = first; i < M - 1; ++i)
+                mtp_warm(bh + int64_t(i) * H, tokens[size_t(i) + 1],
+                         start_pos + i);
+            q.wait();
+            // Restore the decode cursor that mtp_warm moved.
+            q.memcpy(s.d_pos, &pos, sizeof(int));
+            q.memcpy(s.d_seq_len, &pos, sizeof(int));
+            q.wait();
+        }
+    }
+
     if (!next_tokens && start_pos == 0) save_prefix(tokens);
     if(host_time&&!tl_sums.empty()){
         double tot=0; for(const auto& kv:tl_sums) tot+=kv.second;
