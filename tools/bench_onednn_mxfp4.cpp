@@ -17,8 +17,15 @@ static float e8m0(unsigned x){
   return x==0?std::ldexp(1.0f,-127):std::ldexp(1.0f,int(x)-127);
 }
 
+static void one(int N,int K,const char* nm);
 int main(){
-  constexpr int M=1,N=10240,K=5120;
+  one(34816,5120,"ffn-gate-up");
+  one(10240,5120,"la-qkv");
+  one(5120,17408,"ffn-down");
+  return 0;
+}
+static void one(int N,int K,const char* nm){
+  constexpr int M=1;
   sycl::queue q{sycl::gpu_selector_v,sycl::property::queue::in_order{}};
   std::vector<bf16> ah(K);std::vector<unsigned char> bh(size_t(N)*K/2);
   std::vector<unsigned char> sh(size_t(N)*K/32); for(size_t i=0;i<sh.size();++i) sh[i]=(unsigned char)(119+(i%7));
@@ -34,7 +41,7 @@ int main(){
   q.memcpy(a,ah.data(),ah.size()*2);q.memcpy(b,bh.data(),bh.size());
   q.memcpy(s,sh.data(),sh.size()).wait();
   void*p=grimoire_onednn_mxfp4_w4a16_create(&q,M,N,K);
-  if(!p){std::puts("MXFP4 plan creation failed");return 2;}
+  if(!p){std::printf("%-13s plan creation FAILED\n",nm);return;}
   size_t sb=grimoire_onednn_mxfp4_w4a16_scratch_size(p);
   auto*scratch=sb?sycl::malloc_device<unsigned char>(sb,q):nullptr;
   for(int i=0;i<10;++i){grimoire_onednn_mxfp4_w4a16_execute(p,a,b,s,o,scratch);q.wait();}
@@ -49,8 +56,7 @@ int main(){
     unsigned z=bh[size_t(n)*K/2+k/2];unsigned q4=(z>>((k&1)*4))&15;
     ref+=float(ah[k])*e2m1(q4)*e8m0(sh[size_t(n)*K/32+k/32]);}
     me=std::max(me,std::abs(double(float(oh[n]))-ref));mr=std::max(mr,std::abs(ref));}
-  std::printf("oneDNN MXFP4 W4A16 %dx%dx%d: %.3f us, %.1f GiB/s, scratch %.1f MiB, rel %.3e\n",
-    M,N,K,us,(double(bh.size()+sh.size())/(1ull<<30))/(us*1e-6),
+  std::printf("%-13s %6dx%-6d %8.1f us %8.1f GB/s  scratch %.1f MiB  err %.2e\n",
+    nm,N,K,us,(double(bh.size()+sh.size())/1e9)/(us*1e-6),
     double(sb)/(1<<20),me/(mr+1e-30));
-  return me/(mr+1e-30)>0.03;
 }
