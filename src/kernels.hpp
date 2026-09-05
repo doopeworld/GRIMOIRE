@@ -36,7 +36,7 @@ constexpr int SG_SIZE = 16;
 // sub-groups on a 256-EU part, and each split then walks ~600 keys serially.
 // The partial (acc,m,l) workspace is sized for this bound; the merge already
 // skips empty splits, so over-splitting a short sequence is harmless.
-constexpr int MAX_SPLITS = 64;
+constexpr int MAX_SPLITS = 128;
 
 constexpr int TM      = 8;    // joint_matrix M
 constexpr int TN      = 16;   // joint_matrix N

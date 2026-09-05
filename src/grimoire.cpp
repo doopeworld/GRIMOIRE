@@ -378,6 +378,18 @@ struct OneDnnMXApi {
     explicit operator bool() const { return create && scratch_size && execute && destroy; }
 };
 
+// Signed-int4 oneDNN matmul. The u4 API above needs a zero point of 8 and
+// therefore decodes GRIMOIRE's sign-extended nibbles rotated by 8; this one
+// declares the payload as s4 and maps it in unchanged. See the SPlan comment
+// in xe2_onednn_bridge.cpp.
+struct OneDnnS4Api {
+    void* (*create)(sycl::queue*,int,int,int,int,int) = nullptr;
+    size_t (*scratch_size)(void*) = nullptr;
+    void (*execute)(void*,const void*,const void*,const void*,void*,void*) = nullptr;
+    void (*destroy)(void*) = nullptr;
+    explicit operator bool() const { return create && scratch_size && execute && destroy; }
+};
+
 struct OneDnnBF16Api {
     void* (*create)(sycl::queue*,int,int,int) = nullptr;
     size_t (*scratch_size)(void*) = nullptr;
@@ -445,6 +457,24 @@ static OneDnnMXApi load_onednn_mx() {
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
     if(!api)std::fprintf(stderr,"  oneDNN MXFP4 W4A16 unavailable\n");
+    return api;
+}
+
+static OneDnnS4Api load_onednn_s4() {
+    static OneDnnS4Api api{}; static bool attempted=false; static void* handle=nullptr;
+    if(attempted)return api; attempted=true;
+    const char* env=std::getenv("GRIMOIRE_ONEDNN_BRIDGE");
+    const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
+        "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
+    for(const char* path:paths){
+        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_s4a16_create"));
+        api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_s4a16_scratch_size"));
+        api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_s4a16_execute"));
+        api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_s4a16_destroy"));
+        if(api)break; api={}; dlclose(handle); handle=nullptr;
+    }
+    if(!api)std::fprintf(stderr,"  oneDNN s4 W4A16 unavailable\n");
     return api;
 }
 
@@ -1700,12 +1730,12 @@ struct Grimoire {
         const int N = dq.w.N, K = dq.w.K;
         constexpr int GS = 128;
         if ((K % GS) != 0) return false;
-        static OneDnnW4Api api = load_onednn_w4();
+        static OneDnnS4Api api = load_onednn_s4();
         if (!api) return false;
 
         auto it = i4_plans.find(dq.i4s);
         if (it == i4_plans.end()) {
-            void* pl = api.create(&q, 1, N, K, GS, 1);
+            void* pl = api.create(&q, 1, N, K, GS, 1);  // bf16 activations, s4 weights
             if (!pl) { i4_plans[dq.i4s] = {nullptr,nullptr,nullptr}; return false; }
             const size_t sb = api.scratch_size(pl);
             void* sc = sb ? sycl::malloc_device<uint8_t>(sb, q) : nullptr;
@@ -1719,10 +1749,6 @@ struct Grimoire {
                     ts[g * size_t(N) + n] =
                         sycl_bf16(src[n * size_t(G) + g]);
                 }).wait();
-            if (!i4_zp) {
-                i4_zp = sycl::malloc_device<int8_t>(1, q);
-                const int8_t z = 8; q.memcpy(i4_zp, &z, 1).wait();
-            }
             it = i4_plans.emplace(dq.i4s, I4Entry{pl, sc, ts}).first;
         }
         if (!it->second.plan) return false;
@@ -1739,7 +1765,7 @@ struct Grimoire {
 
         launch_f32_to_bf16(q, x, mx_a, K, deps);
         api.execute(it->second.plan, mx_a, dq.i4, it->second.scales,
-                    i4_zp, mx_o, it->second.scratch);
+                    mx_o, it->second.scratch);
         mx_last = launch_bf16_to_f32(q, mx_o, y, N, {});
         return true;
     }
@@ -6125,7 +6151,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // silently pushed it onto the 4-work-group GEMM and cost more than
         // the conversion saved.  That is why speculation was slower than no
         // speculation on Ornith.
-        if(M<=16 && w.w.N<=2048){
+        // N GATE. Verify-sized batches stream the weight ONCE per chunk in the
+        // batched decode GEMV -- the same kernel family that gives M=1 decode
+        // its ~465 GB/s. The hardcoded N<=2048 sent every LARGE weight to the
+        // prefill-tuned xe2_w4a8 GEMM instead, and the FFN at N=17408 is 9.1 of
+        // the 14.5 GB a token reads. Measured 2026-09-05: that GEMM runs the
+        // 4-row verify pass at 270 GB/s (54.2 ms/round, flat in M from 2 to 6)
+        // because its tiling buys compute reuse a 4-row pass cannot use.
+        // Tunable so the crossover can be swept without a rebuild.
+        static const int batch_max_n = [] {
+            const char* e = std::getenv("GRIMOIRE_GEMV_BATCH_MAX_N");
+            const int v = e ? std::atoi(e) : 2048;
+            return v > 0 ? v : 2048;
+        }();
+        if(M<=16 && w.w.N<=batch_max_n){
             if(w.has_i4()){
                 // BATCHED GEMV: weights loaded once per chunk, M dot products
                 // against them.  Looping the single-row GEMV instead reloads

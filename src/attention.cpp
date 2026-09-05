@@ -42,7 +42,15 @@ namespace b70 {
 // (TG 22.1 vs 28.7): more partials means more merge rounding, which costs
 // speculative draft acceptance.
 static inline int decode_splits(const AttnParams& p) {
-    int want = (p.seq_len + 127) / 128;
+    // keys per split; tunable so the decode/merge balance can be swept without
+    // a rebuild. More splits = more parallelism in flash_decode but a more
+    // expensive flash_merge (it walks [head][split] partials serially).
+    static const int KPS = [] {
+        const char* e = std::getenv("GRIMOIRE_ATTN_KEYS_PER_SPLIT");
+        const int v = e ? std::atoi(e) : 128;
+        return v > 0 ? v : 128;
+    }();
+    int want = (p.seq_len + KPS - 1) / KPS;
     if (want < p.splits) want = p.splits;
     if (want > MAX_SPLITS) want = MAX_SPLITS;
     return want > 0 ? want : 1;
@@ -186,7 +194,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
 //     m   = max_i m_i
 //     l   = sum_i l_i * exp(m_i - m)
 //     acc = sum_i acc_i * exp(m_i - m)
-// One sub-group per head; trivially cheap next to the scan.
+// One sub-group per (head, dim-tile) -- see the geometry note below.
 // ---------------------------------------------------------------------
 sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
                                const std::vector<sycl::event>& deps) {
@@ -194,37 +202,53 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
         h.depends_on(deps);
         const AttnParams pp = p;
         const int msplits = decode_splits(p);
+        // One sub-group per (head, dim-tile) instead of one per head. The old
+        // geometry launched num_heads = 24 sub-groups for the whole merge --
+        // 1.2% of a 256-EU card -- so the merge cost grew linearly with the
+        // split count and ate the whole flash_decode win: at 64 splits it was
+        // 187 us to reduce 1.6 MB, an achieved 8 GB/s. Tiling the output dim
+        // gives num_heads * (head_dim / SG_SIZE) = 384 sub-groups on this model
+        // and makes each lane own exactly ONE output dim, so the partial reads
+        // are lane-contiguous 64-byte transactions.
+        //
+        // exp(m_i - m) is also hoisted: the old loop recomputed it once per
+        // (split, dim) pair, i.e. head_dim/SG_SIZE = 16 times more often than
+        // needed. The arithmetic and the summation order are unchanged, so the
+        // result stays bit-identical -- this must not perturb the draft
+        // acceptance that split width is known to affect.
+        const int dtiles = (pp.head_dim + SG_SIZE - 1) / SG_SIZE;
         h.parallel_for(
-            sycl::nd_range<1>(size_t(pp.num_heads) * SG_SIZE, size_t(SG_SIZE)),
+            sycl::nd_range<1>(size_t(pp.num_heads) * size_t(dtiles) * SG_SIZE,
+                              size_t(SG_SIZE)),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const int lane = int(it.get_sub_group().get_local_id()[0]);
-                const int head = int(it.get_group(0));
+                const int gid  = int(it.get_group(0));
+                const int head = gid / dtiles;
+                const int tile = gid % dtiles;
                 if (head >= pp.num_heads) return;
                 const int splits = msplits;
+                const int d = tile * SG_SIZE + lane;
+                if (d >= pp.head_dim) return;
+
+                const float* pm = pp.part_m + int64_t(head) * splits;
+                const float* pl = pp.part_l + int64_t(head) * splits;
 
                 float m = -std::numeric_limits<float>::infinity();
                 for (int i = 0; i < splits; ++i)
-                    m = sycl::fmax(m, pp.part_m[int64_t(head) * splits + i]);
+                    m = sycl::fmax(m, pm[i]);
 
-                float l = 0.0f;
+                // l and the output accumulator share one exp() per split.
+                float l = 0.0f, a = 0.0f;
                 for (int i = 0; i < splits; ++i) {
-                    const float mi = pp.part_m[int64_t(head) * splits + i];
+                    const float mi = pm[i];
                     if (sycl::isinf(mi)) continue;
-                    l += pp.part_l[int64_t(head) * splits + i] * sycl::exp(mi - m);
+                    const float e = sycl::exp(mi - m);
+                    l += pl[i] * e;
+                    a += pp.partials[(int64_t(head) * splits + i) * pp.head_dim + d] * e;
                 }
 
-                float* o = pp.out + int64_t(head) * pp.head_dim;
                 const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-                for (int d = lane; d < pp.head_dim; d += SG_SIZE) {
-                    float a = 0.0f;
-                    for (int i = 0; i < splits; ++i) {
-                        const int64_t pidx = int64_t(head) * splits + i;
-                        const float mi = pp.part_m[pidx];
-                        if (sycl::isinf(mi)) continue;
-                        a += pp.partials[pidx * pp.head_dim + d] * sycl::exp(mi - m);
-                    }
-                    o[d] = a * inv;
-                }
+                pp.out[int64_t(head) * pp.head_dim + d] = a * inv;
             });
     });
 }

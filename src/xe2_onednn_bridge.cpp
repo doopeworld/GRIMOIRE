@@ -189,6 +189,84 @@ struct F16Plan {
 };
 }
 
+// ---------------------------------------------------------------------
+// SIGNED int4 twin of Plan.
+//
+// GRIMOIRE's W4A8 payload stores every weight as a SIGN-EXTENDED nibble:
+// launch_gemv_int4sym decodes it as int8_t(b << 4) >> 4, so 0..7 map to 0..7
+// and 8..15 map to -8..-1.  Plan above declares the same bytes as u4 with a
+// zero point of 8, which decodes nibble b as b - 8.  Those are the same value
+// set ROTATED BY EIGHT -- nibble 0 is 0 to GRIMOIRE and -8 to oneDNN -- so
+// every weight in the model comes out wrong.  That is why GRIMOIRE_ONEDNN_I4
+// produced fluent nonsense ("lykebeebeebe") instead of noise, and why the
+// speedup it reported on 2026-09-05 was measured on a broken kernel.
+//
+// s4 sign-extends exactly like the GEMV's LUT, so the payload maps straight in
+// and the zero point disappears entirely.
+struct SPlan {
+  engine eng;
+  stream strm;
+  matmul::primitive_desc pd;
+  matmul prim;
+  memory::desc scale_md;
+  size_t scratch_bytes;
+  memory ma,mw,ms,mo,mx;
+  bool bound=false;
+
+  SPlan(sycl::queue& q,int m,int n,int k,int gs,bool bf16)
+    : eng(sycl_interop::make_engine(q.get_device(),q.get_context())),
+      strm(sycl_interop::make_stream(eng,q)),
+      pd(make_pd(eng,m,n,k,gs,bf16)),prim(pd),
+      scale_md({k/gs,n},bf16?memory::data_type::bf16:memory::data_type::f16,
+               memory::dims{n,1}),
+      scratch_bytes(pd.scratchpad_desc().get_size()) {}
+
+  static matmul::primitive_desc make_pd(const engine& e,int m,int n,int k,
+                                         int gs,bool bf16){
+    const auto ft=bf16?memory::data_type::bf16:memory::data_type::f16;
+    // wei {k,n} with stride {1,k} reads GRIMOIRE's [N][K] row-major payload
+    // in place -- the same transposed-view trick the MXFP4 plan uses.
+    memory::desc src({m,k},ft,memory::dims{k,1});
+    memory::desc wei({k,n},memory::data_type::s4,memory::dims{1,k});
+    memory::desc dst({m,n},ft,memory::dims{n,1});
+    primitive_attr attr;
+    attr.set_scratchpad_mode(scratchpad_mode::user);
+    attr.set_scales(DNNL_ARG_WEIGHTS,3,{gs,1},ft);
+    attr.set_fpmath_mode(bf16?fpmath_mode::bf16:fpmath_mode::f16,true);
+    return matmul::primitive_desc(e,src,wei,dst,attr);
+  }
+
+  memory wrap(const memory::desc& md,void* p){
+    return sycl_interop::make_memory(md,eng,sycl_interop::memory_kind::usm,p);
+  }
+  void run(void* a,void* b,void* s,void* out,void* scratch){
+    if(!bound){
+      ma=wrap(pd.src_desc(),a);mw=wrap(pd.weights_desc(),b);mo=wrap(pd.dst_desc(),out);
+      ms=wrap(scale_md,s);mx=wrap(pd.scratchpad_desc(),scratch);
+      bound=true;
+    }else{
+      ma.set_data_handle(a);mw.set_data_handle(b);ms.set_data_handle(s);
+      mo.set_data_handle(out);mx.set_data_handle(scratch);
+    }
+    prim.execute(strm,{{DNNL_ARG_SRC,ma},{DNNL_ARG_WEIGHTS,mw},{DNNL_ARG_DST,mo},
+      {DNNL_ARG_ATTR_SCALES|DNNL_ARG_WEIGHTS,ms},{DNNL_ARG_SCRATCHPAD,mx}});
+  }
+};
+
+extern "C" void* grimoire_onednn_s4a16_create(
+    sycl::queue* q,int m,int n,int k,int gs,int bf16){
+  try{return new SPlan(*q,m,n,k,gs,bf16!=0);}catch(...){return nullptr;}
+}
+extern "C" size_t grimoire_onednn_s4a16_scratch_size(void* p){
+  return p?static_cast<SPlan*>(p)->scratch_bytes:0;
+}
+extern "C" void grimoire_onednn_s4a16_execute(
+    void* p,const void* a,const void* b,const void* s,void* out,void* scratch){
+  static_cast<SPlan*>(p)->run(const_cast<void*>(a),const_cast<void*>(b),
+    const_cast<void*>(s),out,scratch);
+}
+extern "C" void grimoire_onednn_s4a16_destroy(void* p){delete static_cast<SPlan*>(p);}
+
 extern "C" void* grimoire_onednn_w4a16_create(
     sycl::queue* q,int m,int n,int k,int gs,int bf16){
   try{return new Plan(*q,m,n,k,gs,bf16!=0);}catch(...){return nullptr;}
