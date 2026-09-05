@@ -25,8 +25,17 @@ static double bench(sycl::queue&q,Fmt f,int N,int K,double& gbs){
   auto* x=sycl::malloc_device<float>(K,q);
   auto* y=sycl::malloc_device<float>(N,q);
   if(!pay||!x||!y||(sb&&!sc)){ std::printf("   alloc failed\n"); return -1; }
-  { std::vector<uint8_t> h(pb,0x44); q.memcpy(pay,h.data(),pb).wait();
-    if(sb){ std::vector<uint8_t> s(sb,127); q.memcpy(sc,s.data(),sb).wait(); }
+  // INCOMPRESSIBLE fill. A constant payload (this was 0x44) is compressed by
+  // the hardware, so the kernel never touches DRAM for most lines and the
+  // reported GB/s is an inflated upper bound. Same trap that made
+  // bench_bridge report 1818 GB/s on a 608 GB/s card (2026-09-05).
+  { std::vector<uint8_t> h(pb); { uint32_t r=12345u;
+      for(size_t i=0;i<pb;++i){ r=r*1664525u+1013904223u; h[i]=uint8_t(r>>24); } }
+    q.memcpy(pay,h.data(),pb).wait();
+    if(sb){ std::vector<uint8_t> s(sb);
+      // E8M0 exponents near 127 so dequant stays in range; still varied.
+      for(size_t i=0;i<sb;++i) s[i]=uint8_t(125+(i%5));
+      q.memcpy(sc,s.data(),sb).wait(); }
     std::vector<float> hx(K,0.01f); q.memcpy(x,hx.data(),K*4).wait(); }
   w.payload=pay; w.scales=sc; w.zeros=nullptr;
   double best=1e18;
@@ -46,7 +55,7 @@ int main(){
      q.get_device().get_info<sycl::info::device::name>().c_str());
   std::printf("%-13s %-8s %10s %10s %8s\n","shape","fmt","ms","GB/s","%roof");
   for(const auto&z:SH){
-    for(auto f:{Fmt::MXFP4}){
+    for(auto f:{Fmt::MXFP4,Fmt::INT4,Fmt::BF16}){
       double g=0, ms=bench(q,f,z.n,z.k,g);
       const char* fn = f==Fmt::MXFP4?"MXFP4":(f==Fmt::INT4?"INT4":"BF16");
       if(ms>0) std::printf("%-13s %-8s %10.4f %10.1f %7.0f%%\n",z.name,fn,ms,g,100*g/602.0);

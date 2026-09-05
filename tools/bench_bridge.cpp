@@ -159,6 +159,61 @@ int main(int argc, char** argv) {
         verify("w16x4", s, want);
     }
 
+    // ---- how many roads? sweep independent streams per lane -------------
+    // Little's Law: bandwidth = bytes-in-flight / latency. Width is one way to
+    // raise bytes-in-flight; INDEPENDENT STREAMS are another, and they also
+    // overlap ALU with memory -- which is the only lever that helps a dequant
+    // -heavy kernel like the MXFP4 GEMV, where the load cannot get wider.
+    {
+        using u32x4 = vec<uint32_t, 4>;
+        const size_t chunks = words / 4;
+        std::printf("\nstreams per lane (16 B each, sub-group contiguous):\n");
+        auto run_streams = [&](int S) {
+            const size_t per_g = chunks / groups;
+            const size_t step  = size_t(SG) * S;
+            if (per_g < step) return;
+            const size_t nit = per_g / step;
+            std::vector<uint32_t> want(threads);
+            for (size_t t = 0; t < threads; ++t) {
+                const size_t g = t / SG, lane = t % SG;
+                uint32_t acc = 0;
+                for (size_t i = 0; i < nit; ++i)
+                    for (int k = 0; k < S; ++k) {
+                        const uint64_t c = (g * per_g) + i * step + size_t(k) * SG + lane;
+                        acc += expect_run(c * 4, 4);
+                    }
+                want[t] = acc;
+            }
+            double secs = timeit(q, iters, [&] {
+                q.submit([&](handler& h) {
+                    h.parallel_for(nd_range<1>(threads, 256), [=](nd_item<1> it)
+                        [[sycl::reqd_sub_group_size(SG)]] {
+                        const size_t gid = it.get_global_id(0);
+                        const size_t g = gid / SG; const int lane = int(gid % SG);
+                        const u32x4* base =
+                            reinterpret_cast<const u32x4*>(arena) + g * per_g;
+                        uint32_t a[16];
+                        for (int k = 0; k < 16; ++k) a[k] = 0;
+                        for (size_t i = 0; i + step <= per_g; i += step)
+                            for (int k = 0; k < S; ++k) {
+                                u32x4 v = base[i + size_t(k) * SG + lane];
+                                a[k] += v[0] + v[1] + v[2] + v[3];
+                            }
+                        uint32_t acc = 0;
+                        for (int k = 0; k < S; ++k) acc += a[k];
+                        out[gid] = acc;
+                    });
+                });
+            });
+            q.memcpy(host.data(), out, threads * sizeof(uint32_t)).wait();
+            size_t bad = 0;
+            for (size_t t = 0; t < threads; ++t) if (host[t] != want[t]) ++bad;
+            std::printf("  x%-3d    %7.1f GB/s   %s\n", S, gbps(bytes, secs),
+                        bad == 0 ? "verified" : "FAIL");
+        };
+        for (int S : {1, 2, 4, 8, 16}) run_streams(S);
+    }
+
     std::printf("\nB70 spec 608 GB/s. Bar for building on: 550 GB/s.\n");
     free(arena, q); free(out, q);
     return 0;
