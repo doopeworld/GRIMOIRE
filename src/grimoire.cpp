@@ -1666,8 +1666,10 @@ struct Grimoire {
                 throw std::runtime_error("TP projection all-gather failed");
             return ev;
         }
-        if (dq.has_i4())
+        if (dq.has_i4()) {
+            if (onednn_i4_gemv(dq, x, y, deps)) return mx_last;
             return launch_gemv_int4sym(q, dq.i4, dq.i4s, x, y, dq.w.N, dq.w.K, deps);
+        }
         if (onednn_mx_gemv(dq, x, y, deps)) return mx_last;
         return launch_gemv(q, dq.w, x, y, deps);
     }
@@ -1680,6 +1682,67 @@ struct Grimoire {
     sycl::event mx_last{};
     sycl_bf16* mx_a = nullptr; sycl_bf16* mx_o = nullptr;
     size_t mx_a_cap = 0, mx_o_cap = 0;
+
+    // The W4A8-converted int4 weights are the bulk of decode: 21.8 ms of the
+    // 43.9 ms token. The oneDNN int4 matmul needs no weight repacking (its
+    // wei desc {k,n} with stride {1,k} reads GRIMOIRE's [N,K] row-major u4
+    // directly, same trick as the MXFP4 plan), but its scales are group-major
+    // bf16 [K/gs, N] while GRIMOIRE keeps f32 [N, K/gs]. Transpose+convert
+    // once per weight and cache it -- ~2 bytes per 128 weights, ~120 MB total.
+    struct I4Entry { void* plan; void* scratch; sycl_bf16* scales; };
+    std::map<const float*, I4Entry> i4_plans;
+    int8_t* i4_zp = nullptr;
+
+    bool onednn_i4_gemv(const DevQuant& dq, const float* x, float* y,
+                        const std::vector<sycl::event>& deps) {
+        static const bool on = std::getenv("GRIMOIRE_ONEDNN_I4") != nullptr;
+        if (!on) return false;
+        const int N = dq.w.N, K = dq.w.K;
+        constexpr int GS = 128;
+        if ((K % GS) != 0) return false;
+        static OneDnnW4Api api = load_onednn_w4();
+        if (!api) return false;
+
+        auto it = i4_plans.find(dq.i4s);
+        if (it == i4_plans.end()) {
+            void* pl = api.create(&q, 1, N, K, GS, 1);
+            if (!pl) { i4_plans[dq.i4s] = {nullptr,nullptr,nullptr}; return false; }
+            const size_t sb = api.scratch_size(pl);
+            void* sc = sb ? sycl::malloc_device<uint8_t>(sb, q) : nullptr;
+            const int G = K / GS;
+            sycl_bf16* ts = sycl::malloc_device<sycl_bf16>(size_t(G) * N, q);
+            if (!ts) { api.destroy(pl); i4_plans[dq.i4s] = {nullptr,nullptr,nullptr}; return false; }
+            const float* src = dq.i4s;
+            q.parallel_for(sycl::range<2>(size_t(G), size_t(N)),
+                [=](sycl::id<2> id) {
+                    const size_t g = id[0], n = id[1];
+                    ts[g * size_t(N) + n] =
+                        sycl_bf16(src[n * size_t(G) + g]);
+                }).wait();
+            if (!i4_zp) {
+                i4_zp = sycl::malloc_device<int8_t>(1, q);
+                const int8_t z = 8; q.memcpy(i4_zp, &z, 1).wait();
+            }
+            it = i4_plans.emplace(dq.i4s, I4Entry{pl, sc, ts}).first;
+        }
+        if (!it->second.plan) return false;
+
+        if (mx_a_cap < size_t(K)) {
+            if (mx_a) sycl::free(mx_a, q);
+            mx_a = sycl::malloc_device<sycl_bf16>(size_t(K), q); mx_a_cap = size_t(K);
+        }
+        if (mx_o_cap < size_t(N)) {
+            if (mx_o) sycl::free(mx_o, q);
+            mx_o = sycl::malloc_device<sycl_bf16>(size_t(N), q); mx_o_cap = size_t(N);
+        }
+        if (!mx_a || !mx_o) return false;
+
+        launch_f32_to_bf16(q, x, mx_a, K, deps);
+        api.execute(it->second.plan, mx_a, dq.i4, it->second.scales,
+                    i4_zp, mx_o, it->second.scratch);
+        mx_last = launch_bf16_to_f32(q, mx_o, y, N, {});
+        return true;
+    }
 
     bool onednn_mx_gemv(const DevQuant& dq, const float* x, float* y,
                         const std::vector<sycl::event>& deps) {
