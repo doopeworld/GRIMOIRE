@@ -34,6 +34,7 @@
 namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <cstdio>
 #include <map>
+#include <set>
 #include <array>
 #include <cctype>
 #include <cstring>
@@ -6099,14 +6100,28 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // xperm also backs the padded GDN q/k/v triple (each gdn_tokens rows), so
     // it must cover that as well as the MoE permute and the widest projection.
     const size_t gdn_qkv_elems=gdn_tokens*(2*size_t(Hk)*Dk+size_t(Hv)*Dv);
-    const size_t bridge_elems=std::max(std::max(size_t(R)*std::max(H,I),
+    // The grouped MoE GEMM rounds EVERY expert's row count up to the tile
+    // height: xe2_grouped_raw_launcher.hpp:31 computes
+    //     groups += ((rows[e] + tm - 1) / tm) * ...
+    // with tm = 64 for p64x128_prod.  The final tile of the LAST expert
+    // therefore reads up to tm-1 rows past that expert's data, which is past
+    // the end of these buffers when they are sized at exactly R rows.  Whether
+    // that faults depends only on what the allocator happened to map next,
+    // which is why a 4096-token prefill survived and a 3782-token one took the
+    // compute engine down with DEVICE_LOST (MEASURED 2026-09-06 on Ornith,
+    // reproduced from the CLI, so not a server-path problem).  Dense models
+    // never touch these buffers, which is why Qwen was never affected.
+    // One tile of slack costs ~1 MB and removes the whole class of overrun.
+    constexpr size_t kMoeTilePad = 128;   // >= tm of every grouped policy
+    const size_t Rpad = size_t(R) + kMoeTilePad;
+    const size_t bridge_elems=std::max(std::max(Rpad*std::max(H,I),
                                                 size_t(M)*W),gdn_qkv_elems);
     sycl_bf16* xperm=sycl::malloc_device<sycl_bf16>(bridge_elems,q);
     sycl_bf16* grouped_out=(xe2_grouped||xe2_grouped_mxfp4||xe2_dense_mxfp4||xe2_attention||xe2_gdn||od)
-        ? sycl::malloc_device<sycl_bf16>(std::max(std::max(size_t(R)*std::max(H,2*I),
+        ? sycl::malloc_device<sycl_bf16>(std::max(std::max(Rpad*std::max(H,2*I),
               size_t(M)*W),gdn_tokens*size_t(Hv)*Dv),q) : nullptr;
-    sycl_bf16* moe_res=defer_moe_gather?sycl::malloc_device<sycl_bf16>(size_t(R)*H,q):nullptr;
-    float* yperm=df(size_t(R)*H);
+    sycl_bf16* moe_res=defer_moe_gather?sycl::malloc_device<sycl_bf16>(Rpad*H,q):nullptr;
+    float* yperm=df(Rpad*H);
     int32_t* ptoken=sycl::malloc_device<int32_t>(R,q);
     int32_t* pinv=sycl::malloc_device<int32_t>(R,q);
     int32_t* grouped_rows=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_shared<int32_t>(E,q) : nullptr;
@@ -6248,8 +6263,53 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         return ev;
     };
+    // WHY A VERIFY BATCH COSTS MORE THAN A DECODE STEP, and the fix.
+    //
+    // The short circuit below sent EVERY weight of a speculative verify batch
+    // to the scalar FP32 GEMV.  That kernel streams the weight once, which is
+    // why it looks right, but its FMA count is linear in M -- an extra
+    // verified row is an extra full-model FP32 multiply-accumulate pass.
+    // MEASURED 2026-09-06 (Qwen3.8-27B, 5993-token prompt, dense FFN region,
+    // 64 layers, GRIMOIRE_TIME_LAYER=all):
+    //     M=2 24.10 ms   M=3 29.99 ms   M=4 36.14 ms
+    // exactly linear: 12.07 ms intercept (the weight sweep, ~470 GB/s) plus
+    // 6.02 ms per extra row.  ~9 TFLOP/s of FP32 FMA, about half of what the
+    // card can do in FP32 -- so this is not a bad GEMV, it is the wrong
+    // ENGINE.  vLLM never pays it because its int4 linears run on the
+    // systolic array, where 4 rows cost what 1 row costs.
+    //
+    // Ruled out first, so nobody repeats them: split-K width in the verify
+    // attention (no change, see the note at launch_flash_decode_batched); the
+    // int8 activation cache (GRIMOIRE_W4A8_NO_CACHE=1 reproduced the loss
+    // byte for byte); rows-per-sub-group (B70_BATCH_RPS=8 moved the slope the
+    // WRONG way, 6.02 -> 6.88, which is what killed the theory that the
+    // re-read activation tile was the cost).
+    //
+    // The engine that works is w4a16: int4 weights, BF16 activations.  The
+    // int8-activation W4A8 tile is also flat in M and also fast, but int8
+    // activations cost draft acceptance -- 2.58 -> 1.88 committed/step,
+    // 41/55 -> 30/61 accepts -- so it is never used for verify.  BF16
+    // activations lose nothing: the accepted-draft counts, the rollbacks and
+    // the emitted token stream are IDENTICAL to the FP32 GEMV path.
+    // MEASURED, same prompt, 128 new tokens, k=3:
+    //     FP32 GEMV verify   79.0 ms/round   35.7 tok/s
+    //     w4a16   verify     55.2 ms/round   49.5 tok/s   (+39%)
+    //     both: 42 steps, 3.12 committed/step, 89/103 accepts, 14 rollbacks
+    //
+    // Falls back to the exact GEMV, never to int8, if the oneDNN s4 bridge
+    // is missing -- bridges fail silently in this project and a silent fall
+    // back to int8 would look like a random acceptance regression.
+    const bool verify_a16 = exact_verify &&
+        !std::getenv("GRIMOIRE_VERIFY_EXACT_GEMV") && bool(load_onednn_s4());
     auto mm=[&](const DevQuant& w,const float* x,float* y){
-        if(exact_verify && M<=4){
+        if(exact_verify && M<=4 && !verify_a16){
+            if(std::getenv("GRIMOIRE_VERIFY_MAP")){
+                static std::set<std::pair<int,int>> seen;
+                if(seen.insert({w.w.N,w.w.K}).second)
+                    std::fprintf(stderr,
+                        "      verify mm  N=%-6d K=%-6d i4=%d payload=%d\n",
+                        w.w.N,w.w.K,int(w.has_i4()),int(w.w.payload!=nullptr));
+            }
             if(w.has_i4()) {
                 // One weight stream, M independent activation rows.  This is
                 // the speculative-verification analogue of decode GEMV: it
@@ -6345,8 +6405,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         //     GRIMOIRE verify 61 ms device  (graph replay, so not dispatch)
         //     vLLM     round  29 ms
         // Opt-in via GRIMOIRE_ONEDNN_W4A16=1.
+        // On by default for a verify batch (see the note on verify_a16 at the
+        // top of mm); still opt-in for every other batch shape.
         static const bool od_a16_on = std::getenv("GRIMOIRE_ONEDNN_W4A16") != nullptr;
-        if(od_a16_on && w.has_i4() && xb && grouped_out && (w.w.K % 128)==0){
+        if((od_a16_on || verify_a16) && w.has_i4() && xb && grouped_out
+           && (w.w.K % 128)==0){
             static OneDnnS4Api oda = load_onednn_s4();
             if(oda){
                 constexpr int GS = 128;
@@ -6386,6 +6449,17 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     return;
                 }
             }
+        }
+        // The w4a16 plan can fail to build (bridge absent, unsupported shape).
+        // A verify batch must land back on the EXACT GEMV when that happens,
+        // not on the int8 tile below, which is fast but costs acceptance.
+        if(verify_a16 && M<=kSpecBatch){
+            if(w.has_i4())
+                launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,y,w.w.N,w.w.K,M,{});
+            else
+                for(int r=0;r<M;++r)
+                    launch_gemv(q,w.w,x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,{});
+            return;
         }
         if(w.has_i4() && xe2_w4a8_f32 && a8 && a8s){
             static const bool dbg=std::getenv("GRIMOIRE_W4A8_DEBUG")!=nullptr;
@@ -6792,13 +6866,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 mmb(d.o_proj,o_in,r0);
             }else{
             mm(d.q_proj,bn,t0);
+            pp_mark("attn q proj");
             float* qv=t0;
             if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,cfg.head_dim);qv=t1;}
             mm(d.k_proj,bn,t3); mm(d.v_proj,bn,t4);
+            pp_mark("attn kv proj");
             launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
                 cfg.n_kv_heads,cfg.head_dim,pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps);
             launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,M,pos,cfg.n_kv_heads,
                 cfg.head_dim,max_seq);
+            pp_mark("attn rope + kv append");
             const sycl_bf16* attention_bf=nullptr;
             if(xe2_attention && pos==0 && M>=32){
                 const size_t qe=size_t(M)*cfg.n_heads*cfg.head_dim;
@@ -6826,6 +6903,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     // a 4-token weight-bound forward pass, 57 vs 60 ms/round)
                     // and wider splits cost draft acceptance through extra
                     // partial-softmax merge error. Keep the proven floor.
+                    // RE-TESTED 2026-09-06 and still no gain, now with the
+                    // depth-scaled split count the single-token path uses
+                    // (attention.cpp decode_splits, 32 keys/split).  At 6k
+                    // context that raises the verify split count from 8 to
+                    // MAX_SPLITS(128); the "attn flash" region measured
+                    // 20.58 ms at 8 splits and 20.45 ms at 128, and end-to-end
+                    // tg32 moved 28.6 -> 28.8.  This kernel is not
+                    // split-K-bound.  Keep the proven floor.
                     const int vsplits = GRAPH_SPLITS;
                     launch_flash_decode_batched(q,qv,d.k_cache,d.v_cache,t3,
                         M,pos,cfg.n_heads,cfg.n_kv_heads,cfg.head_dim,max_seq,
@@ -6860,6 +6945,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     next_tokens ? pos - 1 : pos,cfg.n_heads,
                     cfg.n_kv_heads,cfg.head_dim,max_seq,1.0f/std::sqrt(float(cfg.head_dim)));
             }
+            pp_mark("attn flash");
             if(attention_bf){
                 const sycl_bf16* o_in=attention_bf;
                 if(gated){launch_gate_sigmoid_mul_bf16_io(q,attention_bf,t2,xb,
@@ -7333,10 +7419,16 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
             int k = v && *v ? std::atoi(v) : 3;
-            // Exact verification currently preserves decode summation through
-            // the four-row GEMV.  The optimized W4A8 path has an eight-row
-            // tile and matching recurrent checkpoints, so it can use K=7.
-            const int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
+            // Exact verification used to be pinned to the four-row FP32
+            // GEMV, whose cost is LINEAR in M -- so every extra draft token
+            // bought acceptance and paid for it twice over, and k>3 measured
+            // worse (ca865d3: k=3 27.73, k=4 17.98).  With verify on the
+            // w4a16 systolic path that term is gone, so the cap is worth
+            // re-sweeping.  GRIMOIRE_MTP_MAX_K overrides it without a
+            // rebuild; the default is unchanged until the sweep says so.
+            int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
+            if (const char* mk = std::getenv("GRIMOIRE_MTP_MAX_K"))
+                if (int v = std::atoi(mk)) max_k = std::max(1, std::min(15, v));
             return std::max(0, std::min(max_k, k));
         }();
         int steps = 0, accepted_drafts = 0, attempted_drafts = 0;
@@ -7732,7 +7824,16 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         const int configured_k = dflash_spec ? 15 : [] {
             const char* v = std::getenv("GRIMOIRE_MTP_K");
             int k = v && *v ? std::atoi(v) : 3;
-            const int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
+            // Exact verification used to be pinned to the four-row FP32
+            // GEMV, whose cost is LINEAR in M -- so every extra draft token
+            // bought acceptance and paid for it twice over, and k>3 measured
+            // worse (ca865d3: k=3 27.73, k=4 17.98).  With verify on the
+            // w4a16 systolic path that term is gone, so the cap is worth
+            // re-sweeping.  GRIMOIRE_MTP_MAX_K overrides it without a
+            // rebuild; the default is unchanged until the sweep says so.
+            int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
+            if (const char* mk = std::getenv("GRIMOIRE_MTP_MAX_K"))
+                if (int v = std::atoi(mk)) max_k = std::max(1, std::min(15, v));
             return std::max(0, std::min(max_k, k));
         }();
         bool stop = false;
