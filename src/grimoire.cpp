@@ -6078,9 +6078,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         load_xe2_grouped_sym("grimoire_xe2_grouped_mxfp4_bf16_m8");
     Xe2GroupedMXFP4 xe2_grouped_mxfp4_m16 =
         load_xe2_grouped_sym("grimoire_xe2_grouped_mxfp4_bf16_m16");
+    Xe2GroupedMXFP4 xe2_grouped_mxfp4_full =
+        load_xe2_grouped_sym("grimoire_xe2_grouped_mxfp4_bf16_full");
     Xe2GroupedMXFP4 xe2_grouped_mxfp4 = xe2_grouped_mxfp4_big;
-    if(M<=8 && xe2_grouped_mxfp4_m8)  xe2_grouped_mxfp4 = xe2_grouped_mxfp4_m8;
-    else if(M<=16 && xe2_grouped_mxfp4_m16) xe2_grouped_mxfp4 = xe2_grouped_mxfp4_m16;
+    // Mirror vLLM's Xe2 dispatch exactly.  Its threshold is average routed
+    // rows per expert (Total_M / E), not the original token batch M.
+    const int moe_avg_m=cfg.is_moe() ? (R/cfg.n_experts) : 0;
+    if(moe_avg_m<=4 && xe2_grouped_mxfp4_m8)
+        xe2_grouped_mxfp4=xe2_grouped_mxfp4_m8;
+    else if(moe_avg_m<=8 && xe2_grouped_mxfp4_m16)
+        xe2_grouped_mxfp4=xe2_grouped_mxfp4_m16;
+    else if(moe_avg_m>128 && xe2_grouped_mxfp4_full)
+        xe2_grouped_mxfp4=xe2_grouped_mxfp4_full;
     Xe2FusedGateUpMXFP4 xe2_fused_gate_up=load_xe2_fused_gate_up_mxfp4();
     Xe2ChunkPrefill xe2_attention=load_xe2_chunk_prefill();
     load_bestla(cfg.n_layers);
@@ -7006,11 +7015,93 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 ++spec_route_layers;
             }
             pp_mark("post norm + route");
+            // A bad route turns the remap's SLM count into an arbitrary write,
+            // and the resulting fault is only reported at the following grouped
+            // GEMM.  Allow the real-prompt failure to be bisected before either
+            // kernel can consume the table.  The check is intentionally opt-in:
+            // it synchronizes and copies M*top_k integers to the host.
+            if(const char* check=std::getenv("GRIMOIRE_MOE_ROUTE_CHECK")){
+                const int check_layer=std::atoi(check);
+                if(check_layer==li){
+                    std::vector<int32_t> hroutes(static_cast<size_t>(R));
+                    q.memcpy(hroutes.data(),rex,size_t(R)*sizeof(int32_t)).wait();
+                    std::vector<int32_t> hcount(size_t(cfg.n_experts),0);
+                    int bad=0,duplicate=0,max_rows=0,active=0;
+                    for(int t=0;t<M;++t){
+                        for(int s=0;s<cfg.top_k;++s){
+                            const int e=hroutes[size_t(t)*cfg.top_k+s];
+                            if(e<0||e>=cfg.n_experts){++bad;continue;}
+                            ++hcount[size_t(e)];
+                            for(int p=0;p<s;++p)
+                                if(hroutes[size_t(t)*cfg.top_k+p]==e){
+                                    ++duplicate;break;
+                                }
+                        }
+                    }
+                    for(int n:hcount){if(n){++active;max_rows=std::max(max_rows,n);}}
+                    std::fprintf(stderr,
+                        "    MoE route check layer %d: rows=%d active=%d max=%d bad=%d duplicate=%d\n",
+                        li,R,active,max_rows,bad,duplicate);
+                    std::fflush(stderr);
+                    if(bad)
+                        return false;
+                }
+            }
             if(M>=32){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);
                     pp_mark("MoE device remap");
+                    if(const char* check=std::getenv("GRIMOIRE_MOE_ROUTE_CHECK")){
+                        const int check_layer=std::atoi(check);
+                        if(check_layer==li){
+                            std::vector<int32_t> hroutes(static_cast<size_t>(R));
+                            std::vector<int32_t> hrows(static_cast<size_t>(cfg.n_experts));
+                            std::vector<int32_t> htoken(static_cast<size_t>(R));
+                            std::vector<int32_t> hinv(static_cast<size_t>(R));
+                            q.memcpy(hroutes.data(),rex,size_t(R)*sizeof(int32_t));
+                            q.memcpy(hrows.data(),grouped_rows,
+                                     size_t(cfg.n_experts)*sizeof(int32_t));
+                            q.memcpy(htoken.data(),ptoken,size_t(R)*sizeof(int32_t));
+                            q.memcpy(hinv.data(),pinv,size_t(R)*sizeof(int32_t)).wait();
+                            std::vector<int32_t> expected(size_t(cfg.n_experts),0);
+                            for(int e:hroutes) if(e>=0&&e<cfg.n_experts)
+                                ++expected[size_t(e)];
+                            std::vector<unsigned char> seen(size_t(R),0);
+                            int row_mismatch=0,bad_perm=0,duplicate_perm=0;
+                            int inverse_mismatch=0,sum_rows=0,offset=0;
+                            for(int e=0;e<cfg.n_experts;++e){
+                                if(hrows[size_t(e)]!=expected[size_t(e)])
+                                    ++row_mismatch;
+                                sum_rows+=hrows[size_t(e)];
+                                for(int p=offset;p<offset+hrows[size_t(e)]&&p<R;++p){
+                                    const int t=htoken[size_t(p)];
+                                    if(t<0||t>=M) ++bad_perm;
+                                }
+                                offset+=hrows[size_t(e)];
+                            }
+                            for(int r=0;r<R;++r){
+                                const int p=hinv[size_t(r)];
+                                if(p<0||p>=R){++bad_perm;continue;}
+                                if(seen[size_t(p)]) ++duplicate_perm;
+                                seen[size_t(p)]=1;
+                                if(htoken[size_t(p)]!=r/cfg.top_k)
+                                    ++inverse_mismatch;
+                            }
+                            const int missing_perm=static_cast<int>(std::count(
+                                seen.begin(),seen.end(),static_cast<unsigned char>(0)));
+                            std::fprintf(stderr,
+                                "    MoE remap check layer %d: sum=%d row_mismatch=%d "
+                                "bad_perm=%d duplicate_perm=%d missing_perm=%d inverse_mismatch=%d\n",
+                                li,sum_rows,row_mismatch,bad_perm,duplicate_perm,
+                                missing_perm,inverse_mismatch);
+                            std::fflush(stderr);
+                            if(row_mismatch||sum_rows!=R||bad_perm||duplicate_perm||
+                               missing_perm||inverse_mismatch||
+                               std::getenv("GRIMOIRE_MOE_ROUTE_CHECK_STOP"))
+                                return false;
+                        }
+                    }
                     q.memset(grouped_atomic,0,sizeof(int32_t));
                     sycl_bf16* moe_act=xperm;
                     sycl_bf16* moe_down_out=grouped_out;

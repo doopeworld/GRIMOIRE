@@ -62,12 +62,6 @@ class p128x512 : public MoE::xe_gemm_policy_base { public:
    cute::Stride<cute::_8,cute::_1,cute::_0>>;
  using GmemTiledCopyD=cute::XE_STORE_2D<16,8,32>;
 };
-class p64x128_prod : public MoE::xe_gemm_policy_base { public:
- using WGTile=cute::Shape<cute::_64,cute::_128,cute::_32>;
- using SGLayout=cute::Layout<cute::Shape<cute::_2,cute::_4,cute::_1>,
-   cute::Stride<cute::_4,cute::_1,cute::_0>>;
- using GmemTiledCopyD=cute::XE_STORE_2D<16,8,32>;
-};
 #ifdef GRIMOIRE_ENABLE_AUTOTUNE
 #define GRIMOIRE_POLICY(NAME,M,N,SM,SN) \
 class NAME : public MoE::xe_gemm_policy_base { public: \
@@ -120,24 +114,25 @@ void tune_mxfp4(sycl::queue& q,const void*a,const unsigned char*b,
 }
 }
 
-class m8x128_g : public MoE::xe_gemm_policy_base { public:
- using WGTile=cute::Shape<cute::_8,cute::_128,cute::_32>;
- using SGLayout=cute::Layout<cute::Shape<cute::_1,cute::_4,cute::_1>,
-   cute::Stride<cute::_4,cute::_1,cute::_0>>;
- using GmemTiledCopyD=cute::XE_STORE_2D<16,8,32>;
-};
-class m16x128_g : public MoE::xe_gemm_policy_base { public:
- using WGTile=cute::Shape<cute::_16,cute::_128,cute::_32>;
- using SGLayout=cute::Layout<cute::Shape<cute::_2,cute::_4,cute::_1>,
-   cute::Stride<cute::_4,cute::_1,cute::_0>>;
- using GmemTiledCopyD=cute::XE_STORE_2D<16,8,32>;
-};
-
 extern "C" void grimoire_xe2_grouped_mxfp4_bf16(
     sycl::queue* q, const void* a, const unsigned char* b,
     const unsigned char* scales, void* d, int n, int k, const int* rows,
     const int* experts, int ne, int* atomic) {
-    launch_mxfp4<p64x128_prod>(
+    // Match vLLM's production dispatch for average expert occupancy <=128
+    // (Ornith top-8 / 256 experts means this covers prompts through M=4096).
+    // p64x128_prod uses XE_STORE_2D and is only safe when every expert row
+    // count fills its M tile; the old synthetic benchmark happened to route
+    // exactly 128 rows/expert, while real prompts leave partial tiles and can
+    // fault the device.  vLLM's m32 policy keeps the generic predicated store.
+    launch_mxfp4<MoE::w4a16_policy_m_32>(
+        *q,a,b,scales,d,n,k,rows,experts,ne,atomic);
+}
+
+extern "C" void grimoire_xe2_grouped_mxfp4_bf16_full(
+    sycl::queue* q, const void* a, const unsigned char* b,
+    const unsigned char* scales, void* d, int n, int k, const int* rows,
+    const int* experts, int ne, int* atomic) {
+    launch_mxfp4<MoE::w4a16_policy>(
         *q,a,b,scales,d,n,k,rows,experts,ne,atomic);
 }
 
@@ -151,14 +146,16 @@ extern "C" void grimoire_xe2_grouped_mxfp4_bf16_m8(
     sycl::queue* q, const void* a, const unsigned char* b,
     const unsigned char* scales, void* d, int n, int k, const int* rows,
     const int* experts, int ne, int* atomic) {
-    launch_mxfp4<m8x128_g>(*q,a,b,scales,d,n,k,rows,experts,ne,atomic);
+    launch_mxfp4<MoE::w4a16_policy_m_8>(
+        *q,a,b,scales,d,n,k,rows,experts,ne,atomic);
 }
 
 extern "C" void grimoire_xe2_grouped_mxfp4_bf16_m16(
     sycl::queue* q, const void* a, const unsigned char* b,
     const unsigned char* scales, void* d, int n, int k, const int* rows,
     const int* experts, int ne, int* atomic) {
-    launch_mxfp4<m16x128_g>(*q,a,b,scales,d,n,k,rows,experts,ne,atomic);
+    launch_mxfp4<MoE::w4a16_policy_m_16>(
+        *q,a,b,scales,d,n,k,rows,experts,ne,atomic);
 }
 
 extern "C" int grimoire_xe2_dense_mxfp4_autotune(sycl::queue*,const void*,
