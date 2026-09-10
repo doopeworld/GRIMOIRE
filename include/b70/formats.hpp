@@ -63,7 +63,11 @@ inline float f16_to_f32(uint16_t h) {
 // round-to-nearest-even fp32 -> bf16
 inline bf16_t f32_to_bf16(float f) {
     uint32_t u = f32_to_bits(f);
-    if (((u >> 23) & 0xFF) == 0xFF) return bf16_t{uint16_t(u >> 16)};   // inf/nan
+    if (((u >> 23) & 0xFF) == 0xFF) {
+        // A NaN whose payload lives only in the discarded bits must not
+        // become infinity when narrowed.
+        return bf16_t{uint16_t((u >> 16) | ((u & 0x7FFFFFu) ? 0x40u : 0u))};
+    }
     uint32_t rounding = 0x7FFFu + ((u >> 16) & 1u);
     return bf16_t{uint16_t((u + rounding) >> 16)};
 }

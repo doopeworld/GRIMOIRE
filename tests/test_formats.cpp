@@ -13,6 +13,8 @@
 #include <cmath>
 #include <random>
 #include <vector>
+#include <limits>
+#include <stdexcept>
 
 using namespace b70;
 
@@ -97,6 +99,9 @@ static void test_bf16() {
     std::printf("BF16 conversion\n");
     CHECK(bf16_to_f32(f32_to_bf16(1.0f)) == 1.0f, "1.0");
     CHECK(bf16_to_f32(f32_to_bf16(-2.5f)) == -2.5f, "-2.5");
+    uint32_t tiny_nan = 0x7f800001u;
+    float nan; std::memcpy(&nan, &tiny_nan, sizeof nan);
+    CHECK(std::isnan(bf16_to_f32(f32_to_bf16(nan))), "NaN payload must not narrow to infinity");
     // bf16 has an 8-bit exponent, so scaling by a power of two is exact.
     // This is the property that makes MX shared scales free of error when
     // folded into the dequantized tile.
@@ -104,6 +109,46 @@ static void test_bf16() {
         float s = std::ldexp(1.0f, e);
         float v = 1.3125f;   // exactly representable in bf16
         CHECK(bf16_to_f32(f32_to_bf16(v * s)) == v * s, "scale 2^%d not exact", e);
+    }
+}
+
+static void test_int4_one_sided() {
+    std::printf("INT4 one-sided and constant groups\n");
+    // Different rows AND groups expose wrong scale/zero strides as well as
+    // the historical zero-point clamp bug (10..11 reconstructed near 1).
+    constexpr int N = 3, K = 256;
+    std::vector<float> src(N * K);
+    for (int k = 0; k < K; ++k) {
+        src[k] = k < 128 ? 10.0f + float(k) / 127 : -11.0f + float(k - 128) / 127;
+        src[K + k] = k < 128 ? 3.25f : -7.5f;
+        src[2 * K + k] = k < 128 ? 0.0f : float(k - 192) / 32;
+    }
+    const auto packed = quantize(src.data(), N, K, Fmt::INT4);
+    const auto w = packed.view();
+    for (int n = 0; n < N; ++n) for (int k = 0; k < K; ++k) {
+        const float a = src[n * K + k], b = w.at(n, k);
+        CHECK(std::isfinite(b) && std::fabs(a - b) <= 0.75f,
+              "one-sided group [%d,%d]: %g -> %g", n, k, a, b);
+        if (n < 2) CHECK(a * b > 0, "one-sided group changed sign or collapsed");
+        if (a == 0) CHECK(b == 0, "zero must remain exact");
+    }
+}
+
+static void test_invalid_quantization() {
+    std::printf("Quantizer rejects invalid input\n");
+    float src[128]{};
+    auto rejected = [&](const float* p, int n, int k, Fmt f) {
+        try { (void)quantize(p, n, k, f); return false; }
+        catch (const std::invalid_argument&) { return true; }
+    };
+    CHECK(rejected(nullptr, 1, 128, Fmt::INT4), "null input accepted");
+    CHECK(rejected(src, 0, 128, Fmt::INT4), "empty matrix accepted");
+    CHECK(rejected(src, 1, 127, Fmt::INT4), "partial INT4 group accepted");
+    CHECK(rejected(src, 1, 31, Fmt::MXFP4), "partial MX group accepted");
+    CHECK(rejected(src, 1, 128, static_cast<Fmt>(255)), "unknown format accepted");
+    for (float bad : {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        src[127] = bad;
+        CHECK(rejected(src, 1, 128, Fmt::INT4), "non-finite weight accepted");
     }
 }
 
@@ -225,6 +270,8 @@ int main() {
     test_e2m1();
     test_fp8();
     test_bf16();
+    test_int4_one_sided();
+    test_invalid_quantization();
     test_roundtrip();
     test_outliers();
     test_gemv();

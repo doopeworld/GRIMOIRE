@@ -7,6 +7,8 @@
 #include "b70/weights.hpp"
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 namespace b70 {
 namespace {
@@ -22,7 +24,7 @@ inline float absmax(const float* p, int n, int stride = 1) {
 //   X = clamp(floor(log2(amax)) - emax_elem + 127, 0, 254)
 uint8_t pick_e8m0(float amax, int emax_elem) {
     if (!(amax > 0.0f) || !std::isfinite(amax)) return 127;   // 2^0
-    int e = int(std::floor(std::log2(amax))) - emax_elem;
+    int e = std::ilogb(amax) - emax_elem;
     e += 127;
     if (e < 0)   e = 0;
     if (e > 254) e = 254;
@@ -32,6 +34,23 @@ uint8_t pick_e8m0(float amax, int emax_elem) {
 } // namespace
 
 PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
+    if (!src || N <= 0 || K <= 0 || K > std::numeric_limits<int>::max() / 2)
+        throw std::invalid_argument("quantize: invalid matrix dimensions or null input");
+    switch (fmt) {
+    case Fmt::BF16: case Fmt::FP8_E4M3: case Fmt::FP8_E5M2:
+    case Fmt::INT8: case Fmt::INT4: case Fmt::MXFP8: case Fmt::MXFP4: break;
+    default: throw std::invalid_argument("quantize: unknown format");
+    }
+    const int block = fmt == Fmt::INT4 ? kInt4Group :
+        (fmt == Fmt::MXFP4 || fmt == Fmt::MXFP8) ? kMXBlock : 1;
+    if (K % block)
+        throw std::invalid_argument("quantize: row width is not a whole number of groups");
+    if (size_t(N) > std::numeric_limits<size_t>::max() / size_t(K) / sizeof(float))
+        throw std::overflow_error("quantize: matrix size overflow");
+    const size_t count = size_t(N) * size_t(K);
+    for (size_t i = 0; i < count; ++i)
+        if (!std::isfinite(src[i]))
+            throw std::invalid_argument("quantize: non-finite input weight");
     PackedWeight w;
     w.fmt = fmt; w.N = N; w.K = K;
     w.row_bytes  = bytes_per_row(fmt, K);
@@ -67,11 +86,11 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
             const float* in  = src + int64_t(n) * K;
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             const float  am  = absmax(in, K);
-            const float  s   = (am > 0.0f) ? am / target : 1.0f;
+            const float  s   = am > 0.0f ? float(std::max(double(am) / target,
+                double(std::numeric_limits<float>::min()))) : 1.0f;
             sc[n] = s;
-            const float inv = 1.0f / s;
             for (int k = 0; k < K; ++k) {
-                const float v = in[k] * inv;
+                const float v = float(double(in[k]) / s);
                 if (fmt == Fmt::INT8) {
                     int q = int(std::nearbyint(v));
                     q = std::max(-127, std::min(127, q));
@@ -100,26 +119,34 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             for (int g = 0; g < G; ++g) {
                 const int base = g * kInt4Group;
-                float lo = in[base], hi = in[base];
-                for (int i = 1; i < kInt4Group; ++i) {
+                // The stored zero point is an integer in [0,15], so zero
+                // must lie inside the represented range. Clamping only the
+                // zero point after using [min,max] collapses one-sided groups.
+                float lo = 0.0f, hi = 0.0f;
+                for (int i = 0; i < kInt4Group; ++i) {
                     lo = std::min(lo, in[base + i]);
                     hi = std::max(hi, in[base + i]);
                 }
-                float s = (hi - lo) / 15.0f;
+                float s = float((double(hi) - double(lo)) / 15.0);
                 if (!(s > 0.0f)) s = 1.0f;
                 // Round the scale to bf16 *before* choosing the codes, so
                 // the packer quantizes against the value the kernel will
                 // actually see. Skipping this is a classic silent 2x
                 // error amplifier at group boundaries.
-                const bf16_t sb = f32_to_bf16(s);
+                bf16_t sb = f32_to_bf16(s);
+                if (sb.bits == 0) sb.bits = 1; // smallest positive BF16 scale
                 s = bf16_to_f32(sb);
-                int z = int(std::nearbyint(-lo / s));
+                if (!std::isfinite(s) || !(s > 0.0f))
+                    throw std::overflow_error("quantize: INT4 scale is not representable");
+                int z = int(std::nearbyint(-double(lo) / s));
                 z = std::max(0, std::min(15, z));
                 sc[int64_t(n) * G + g] = sb;
                 w.zeros[int64_t(n) * G + g] = uint8_t(z);
                 for (int i = 0; i < kInt4Group; ++i) {
-                    int q = int(std::nearbyint(in[base + i] / s)) + z;
+                    int q = int(std::nearbyint(double(in[base + i]) / s)) + z;
                     q = std::max(0, std::min(15, q));
+                    if (!std::isfinite(float((double(q) - z) * s)))
+                        throw std::overflow_error("quantize: INT4 reconstructed value overflows");
                     const int k = base + i;
                     if (k & 1) row[k >> 1] = uint8_t((row[k >> 1] & 0x0F) | (q << 4));
                     else       row[k >> 1] = uint8_t((row[k >> 1] & 0xF0) | q);
