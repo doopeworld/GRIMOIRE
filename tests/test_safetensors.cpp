@@ -209,14 +209,27 @@ static void test_malformed() {
     {   // garbage header length
         const char* p = "/tmp/b70_bad_len.safetensors";
         FILE* f = std::fopen(p, "wb");
-        uint64_t h = 0xFFFFFFFFFFULL;
+        uint64_t h = UINT64_MAX;
         std::fwrite(&h, 8, 1, f);
         std::fclose(f);
         SafeTensors st;
         CHECK(!st.open(p, err), "should reject bogus header length");
         std::remove(p);
     }
-    std::printf("  4 malformed inputs rejected cleanly\n");
+    const std::vector<std::string> invalid_headers={
+        R"({"x":{"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,4]}})",
+        R"({"x":{"dtype":"F32","shape":[-1],"data_offsets":[0,4]}})",
+        R"({"x":{"dtype":"F32","shape":[1e999],"data_offsets":[0,4]}})",
+        R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,18446744073709551615]}})",
+        R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})"
+    };
+    for(const auto& header:invalid_headers){
+        const char* p="/tmp/b70_bad_integer.safetensors";FILE* f=std::fopen(p,"wb");
+        const uint64_t len=header.size();const float value=1;
+        std::fwrite(&len,8,1,f);std::fwrite(header.data(),1,header.size(),f);std::fwrite(&value,4,1,f);std::fclose(f);
+        SafeTensors st;CHECK(!st.open(p,err),"accepted unsafe shape/offset or duplicate name");std::remove(p);
+    }
+    std::printf("  9 malformed inputs rejected cleanly\n");
 }
 
 // ---------------------------------------------------------------------
@@ -282,9 +295,34 @@ static void test_pipeline() {
     std::remove(path);
 }
 
+static void test_unaligned() {
+    std::printf("Unaligned tensor payload conversion\n");
+    const char* path="/tmp/b70_unaligned.safetensors";
+    const std::vector<Entry> entries={
+        {"pad","U8",{1},{0}},
+        {"f64","F64",{1},raw(std::vector<double>{1.25})},
+        {"bf16","BF16",{1},raw(std::vector<uint16_t>{0x3fa0})},
+        {"f16","F16",{1},raw(std::vector<uint16_t>{0x3d00})},
+        {"i16","I16",{1},raw(std::vector<int16_t>{-17})},
+        {"i32","I32",{1},raw(std::vector<int32_t>{-33})},
+        {"i64","I64",{1},raw(std::vector<int64_t>{-129})},
+        {"f32","F32",{1},raw(std::vector<float>{1.25f})}
+    };
+    const float expected[]={0,1.25f,1.25f,1.25f,-17,-33,-129,1.25f};
+    CHECK(write_safetensors(path,entries),"write unaligned fixture");
+    SafeTensors st;std::string err;
+    CHECK(st.open(path,err),"open unaligned fixture: %s",err.c_str());
+    for(size_t i=0;i<entries.size();++i){
+        const auto* t=st.find(entries[i].name);float out=0;
+        CHECK(t && st.read_f32(*t,&out,err) && out==expected[i],"unaligned %s conversion",entries[i].name.c_str());
+    }
+    std::remove(path);
+}
+
 int main() {
     std::printf("=== safetensors ingest tests ===\n\n");
     test_parse();
+    test_unaligned();
     test_malformed();
     test_pipeline();
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL PASS", g_fail);

@@ -7,8 +7,27 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
 
-.PHONY: all test clean
+.PHONY: all test clean tools
 all: test
+
+HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp
+tools: bin/grimoire-quantize bin/inspect_native_model
+
+bin/grimoire-quantize: tools/b70_compile_model.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+bin/inspect_native_model: tools/inspect_native_model.cpp src/native_model.cpp $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+bin/test_native_model: tests/test_native_model.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp) | bin/grimoire-quantize
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+.PHONY: test-native
+test-native: bin/test_native_model bin/grimoire-quantize
+	./bin/test_native_model ./bin/grimoire-quantize
 
 bin/test_gptq: tests/test_gptq.cpp src/gptq.cpp src/quantize.cpp
 	@mkdir -p bin
@@ -54,3 +73,38 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/
 
 clean:
 	rm -rf bin
+
+# Standalone C++/SYCL profile: external bridges (including Torch/vLLM)
+# are disabled at compile time. The default image is AOT for Battlemage G31.
+# For compilation on a host without ocloc, use SYCL_TARGET=spir64.
+SYCL_CXX ?= icpx
+SYCL_TARGET ?= intel_gpu_bmg_g31
+NATIVE_DIR = bin/native-$(SYCL_TARGET)
+NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
+ -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
+NATIVE_SRC = grimoire qwen35_loader native_model safetensors quantize gptq \
+ gemv_decode gemm_xmx attention deltanet moe_kernels moe_ref ops prefill tokenizer
+NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
+
+.PHONY: native
+native: $(NATIVE_DIR)/grimoire $(NATIVE_DIR)/grimoire-server tools
+
+$(NATIVE_DIR)/%.o: src/%.cpp
+	@mkdir -p $(NATIVE_DIR)
+	$(SYCL_CXX) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
+
+$(NATIVE_DIR)/cli.o: tools/grimoire_main.cpp
+	@mkdir -p $(NATIVE_DIR)
+	$(SYCL_CXX) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
+
+$(NATIVE_DIR)/server.o: tools/grimoire_server.cpp
+	@mkdir -p $(NATIVE_DIR)
+	$(SYCL_CXX) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
+
+$(NATIVE_DIR)/grimoire: $(NATIVE_OBJ) $(NATIVE_DIR)/cli.o
+	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+
+$(NATIVE_DIR)/grimoire-server: $(NATIVE_OBJ) $(NATIVE_DIR)/server.o
+	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+
+-include $(wildcard $(NATIVE_DIR)/*.d)

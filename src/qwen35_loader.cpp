@@ -61,6 +61,15 @@ bool   cfg_b(const std::string& j, const char* k, bool d) {
 
 } // namespace
 
+bool keep_qwen_bf16(const std::string& name) {
+    auto ends=[&](const char* suffix){const size_t n=std::strlen(suffix);
+        return name.size()>=n && name.compare(name.size()-n,n,suffix)==0;};
+    return name.rfind("mtp.",0)==0 || name.find("embed_tokens")!=std::string::npos ||
+        name=="lm_head.weight" || ends(".lm_head.weight") ||
+        ends(".linear_attn.in_proj_a.weight") || ends(".linear_attn.in_proj_b.weight") ||
+        ends(".mlp.gate.weight") || ends(".mlp.shared_expert_gate.weight");
+}
+
 bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                        bool index_only) {
     dir = d;
@@ -150,8 +159,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     shards.clear();
     index.clear();
     native_model.reset();
-    const std::string native_path=dir+"/model-v2.b70";
-    if (::access(native_path.c_str(),R_OK)==0) {
+    std::string native_path=dir+"/model-v3.b70";
+    if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
+    if (::access(native_path.c_str(),F_OK)==0) {
         native_model=std::make_unique<NativeModel>();
         if(!native_model->open(native_path,err))return false;
         const auto* rec=native_model->records();
@@ -327,14 +337,19 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             auto fused_slice = [](const TensorRef& src, uint64_t elem0,
                                   int n, int k, const char* suffix) {
                 TensorRef r;
-                if (!src.ok() || src.t.dtype != STDtype::BF16) return r;
+                if (!src.ok() || src.t.dtype != STDtype::BF16 || n<=0 || k<=0 ||
+                    src.t.shape.size()!=3 || src.t.shape.back()!=k || elem0%uint64_t(k) ||
+                    src.t.numel()<=0 || elem0>uint64_t(src.t.numel()) ||
+                    uint64_t(n)*k>uint64_t(src.t.numel())-elem0) return r;
                 r = src;
                 r.t.name += suffix;
-                if(src.native && src.native->encoding==
-                    uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2)){
-                    r.native_payload_offset += elem0/2;
-                    r.native_scale_offset += (elem0/uint64_t(k))*(k/32);
-                    r.t.begin=0;r.t.end=uint64_t(n)*k/2;
+                if(src.native){
+                    NativeLayout l; std::string error;
+                    if (!native_layout(*src.native,l,error) || l.K!=k) return TensorRef{};
+                    const uint64_t row=elem0/uint64_t(k);
+                    r.native_payload_offset += row*l.row_payload_bytes;
+                    r.native_scale_offset += row*l.row_scale_bytes;
+                    r.t.begin=0;r.t.end=uint64_t(n)*l.row_payload_bytes;
                 }else{
                     r.t.begin = src.t.begin + elem0 * 2;
                     r.t.end = r.t.begin + uint64_t(n) * k * 2;
@@ -429,6 +444,42 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         err = buf;
         return false;
     }
+    return true;
+}
+
+bool Qwen35Model::native_view(const TensorRef& r, QuantWeight& out, std::string& err) const {
+    if (!r.native || !native_model || r.t.shape.size()!=2) {
+        err="expected a native matrix"; return false;
+    }
+    NativeLayout l;
+    if (!native_layout(*r.native,l,err)) return false;
+    if (r.t.shape[0]<=0 || r.t.shape[0]>INT32_MAX || r.t.shape[1]!=l.K ||
+        r.native_payload_offset%l.row_payload_bytes) {
+        err="invalid native matrix slice geometry"; return false;
+    }
+    return native_model->view(*r.native,r.native_payload_offset/l.row_payload_bytes,
+                              int(r.t.shape[0]),out,err);
+}
+
+bool Qwen35Model::read_native_f32(const TensorRef& r,float* dst,std::string& err) const {
+    if (!r.native || !dst) { err="native tensor or destination missing"; return false; }
+    if (r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
+        QuantWeight w;
+        if (!native_view(r,w,err)) return false;
+        for (int n=0;n<w.N;++n) for (int k=0;k<w.K;++k)
+            dst[size_t(n)*w.K+k]=w.at(n,k);
+        return true;
+    }
+    const int64_t n=r.t.numel();
+    const auto dtype=STDtype(r.native->source_dtype);
+    const size_t unit=size_t(st_dtype_size(dtype));
+    if (!unit || n<=0 || uint64_t(n)>SIZE_MAX/unit ||
+        r.native_payload_offset>r.native->payload_bytes ||
+        uint64_t(n)*unit>r.native->payload_bytes-r.native_payload_offset) {
+        err="unsupported native RAW dtype or invalid slice"; return false;
+    }
+    const auto* p=static_cast<const uint8_t*>(data(r));
+    st_to_f32(p,dtype,n,dst);
     return true;
 }
 

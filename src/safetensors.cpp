@@ -64,24 +64,27 @@ static STDtype parse_dtype(const std::string& s) {
 // f16_to_f32 lives in b70/formats.hpp -- one definition, shared with the
 // GPTQ decoder, which also reads F16 scales.
 
+template<class T> static T st_load_unaligned(const void* src,int64_t i) {
+    T value;
+    std::memcpy(&value,static_cast<const uint8_t*>(src)+uint64_t(i)*sizeof(T),sizeof(T));
+    return value;
+}
+
 void st_to_f32(const void* src, STDtype dtype, int64_t n, float* dst) {
     switch (dtype) {
         case STDtype::F32:
             std::memcpy(dst, src, size_t(n) * 4);
             break;
         case STDtype::F64: {
-            const double* p = static_cast<const double*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = float(p[i]);
+            for (int64_t i = 0; i < n; ++i) dst[i] = float(st_load_unaligned<double>(src,i));
             break;
         }
         case STDtype::BF16: {
-            const uint16_t* p = static_cast<const uint16_t*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = bf16_to_f32(bf16_t{p[i]});
+            for (int64_t i = 0; i < n; ++i) dst[i] = bf16_to_f32(bf16_t{st_load_unaligned<uint16_t>(src,i)});
             break;
         }
         case STDtype::F16: {
-            const uint16_t* p = static_cast<const uint16_t*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = f16_to_f32(p[i]);
+            for (int64_t i = 0; i < n; ++i) dst[i] = f16_to_f32(st_load_unaligned<uint16_t>(src,i));
             break;
         }
         case STDtype::F8_E4M3: {
@@ -105,18 +108,15 @@ void st_to_f32(const void* src, STDtype dtype, int64_t n, float* dst) {
             break;
         }
         case STDtype::I16: {
-            const int16_t* p = static_cast<const int16_t*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = float(p[i]);
+            for (int64_t i = 0; i < n; ++i) dst[i] = float(st_load_unaligned<int16_t>(src,i));
             break;
         }
         case STDtype::I32: {
-            const int32_t* p = static_cast<const int32_t*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = float(p[i]);
+            for (int64_t i = 0; i < n; ++i) dst[i] = float(st_load_unaligned<int32_t>(src,i));
             break;
         }
         case STDtype::I64: {
-            const int64_t* p = static_cast<const int64_t*>(src);
-            for (int64_t i = 0; i < n; ++i) dst[i] = float(p[i]);
+            for (int64_t i = 0; i < n; ++i) dst[i] = float(st_load_unaligned<int64_t>(src,i));
             break;
         }
         default:
@@ -181,6 +181,19 @@ struct Json {
         return v;
     }
 
+    // Shapes and byte offsets are integers, not floating-point numbers.
+    // Parsing through double loses large offsets and can make casts undefined.
+    uint64_t integer(uint64_t limit) {
+        ws(); uint64_t v=0;
+        if(p==end || *p<'0' || *p>'9'){ok=false;return 0;}
+        while(p<end && *p>='0' && *p<='9') {
+            const uint64_t digit=uint64_t(*p++-'0');
+            if(v>(limit-digit)/10){ok=false;return 0;}
+            v=v*10+digit;
+        }
+        return v;
+    }
+
     // Skip any value, used for config keys we do not care about.
     void skip() {
         ws();
@@ -238,7 +251,7 @@ bool SafeTensors::open(const std::string& path, std::string& err) {
 
     uint64_t hlen = 0;
     std::memcpy(&hlen, base_, 8);
-    if (hlen == 0 || hlen + 8 > size_) {
+    if (hlen == 0 || hlen > size_-8) {
         err = path + ": bogus header length"; close(); return false;
     }
     data_off_ = 8 + hlen;
@@ -278,14 +291,14 @@ bool SafeTensors::open(const std::string& path, std::string& err) {
                     } else if (f == "shape") {
                         if (!j.eat('[')) { j.ok = false; break; }
                         if (j.peek() != ']')
-                            for (;;) { t.shape.push_back(int64_t(j.num()));
+                            for (;;) { t.shape.push_back(int64_t(j.integer(INT64_MAX)));
                                        if (!j.eat(',')) break; }
                         j.eat(']');
                     } else if (f == "data_offsets") {
                         if (!j.eat('[')) { j.ok = false; break; }
-                        t.begin = uint64_t(j.num());
+                        t.begin = j.integer(UINT64_MAX);
                         j.eat(',');
-                        t.end = uint64_t(j.num());
+                        t.end = j.integer(UINT64_MAX);
                         j.eat(']');
                     } else {
                         j.skip();
@@ -301,15 +314,24 @@ bool SafeTensors::open(const std::string& path, std::string& err) {
                     err = path + ": tensor '" + t.name + "' has an unsupported dtype";
                     close(); return false;
                 }
-                if (t.end < t.begin || data_off_ + t.end > size_) {
+                if (t.end < t.begin || data_off_>size_ || t.end>size_-data_off_) {
                     err = path + ": tensor '" + t.name + "' offsets run past end of file";
                     close(); return false;
                 }
-                if (uint64_t(t.numel()) * uint64_t(esz) != t.end - t.begin) {
+                uint64_t count=1;
+                for(int64_t d:t.shape) {
+                    if(d<0 || (d && count>uint64_t(INT64_MAX)/uint64_t(d))) {
+                        err=path+": tensor shape overflows";close();return false;
+                    }
+                    count*=uint64_t(d);
+                }
+                if (count>UINT64_MAX/uint64_t(esz) || count*uint64_t(esz) != t.end - t.begin) {
                     err = path + ": tensor '" + t.name + "' shape does not match its byte range";
                     close(); return false;
                 }
-                tensors_[t.name] = t;
+                if (!tensors_.emplace(t.name,t).second) {
+                    err=path+": duplicate tensor name";close();return false;
+                }
             }
             if (!j.eat(',')) break;
         }
@@ -327,6 +349,8 @@ const STTensor* SafeTensors::find(const std::string& name) const {
 
 bool SafeTensors::read_raw(const STTensor& t, void* dst, std::string& err) const {
     if (fd_ < 0) { err = "no file open"; return false; }
+    if (t.end<t.begin || data_off_>size_ || t.end>size_-data_off_ ||
+        (!dst && t.end!=t.begin)) { err="invalid tensor read range"; return false; }
     size_t   n   = size_t(t.end - t.begin);
     off_t    off = off_t(data_off_ + t.begin);
     uint8_t* p   = static_cast<uint8_t*>(dst);

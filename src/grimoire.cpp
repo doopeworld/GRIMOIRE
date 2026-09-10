@@ -55,6 +55,17 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 
 namespace b70 {
 
+// The standalone native profile must never load a framework-backed bridge.
+// Generic SYCL/XMX kernels remain available when bridges are disabled.
+static void* open_bridge(const char* path,int flags) {
+#ifdef GRIMOIRE_NATIVE_ONLY
+    (void)path; (void)flags;
+    return nullptr;
+#else
+    return ::dlopen(path,flags);
+#endif
+}
+
 using Xe2GroupedW4A16 = void (*)(sycl::queue*, const void*, const unsigned char*,
     const void*, void*, int, int, const int*, const int*, int, int, int*);
 
@@ -70,7 +81,7 @@ static Xe2GroupedW4A16 load_xe2_grouped() {
                            "/bridge/libgrimoire_xe2_bridge.so"};
     for (const char* path : paths) {
         if (!path || !*path) continue;
-        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        handle = open_bridge(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) continue;
         fn = reinterpret_cast<Xe2GroupedW4A16>(
             dlsym(handle, "grimoire_xe2_grouped_w4a16"));
@@ -99,7 +110,7 @@ static Xe2DenseMXFP4 load_xe2_dense_mxfp4() {
                            "/bridge/libgrimoire_xe2_grouped.so"};
     for (const char* path : paths) {
         if (!path || !*path) continue;
-        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        handle = open_bridge(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) continue;
         fn = reinterpret_cast<Xe2DenseMXFP4>(
             dlsym(handle, "grimoire_xe2_dense_mxfp4_bf16"));
@@ -118,7 +129,7 @@ static Xe2DenseMXFP4 load_xe2_dense_mxfp4_f32() {
     const char* paths[]={env,"src/libgrimoire_xe2_grouped.so",
         "/work/src/libgrimoire_xe2_grouped.so","/bridge/libgrimoire_xe2_grouped.so"};
     for(const char* path:paths){if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
         fn=reinterpret_cast<Xe2DenseMXFP4>(
             dlsym(handle,"grimoire_xe2_dense_mxfp4_f32"));
         if(fn)break;dlclose(handle);handle=nullptr;}
@@ -145,7 +156,7 @@ static Xe2DenseW4A8 load_xe2_dense_w4a8(const char* sym) {
     const char* paths[]={env,"src/libgrimoire_xe2_grouped.so",
         "/work/src/libgrimoire_xe2_grouped.so","/bridge/libgrimoire_xe2_grouped.so"};
     for(const char* path:paths){if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
         auto fn=reinterpret_cast<Xe2DenseW4A8>(dlsym(handle,sym));
         if(fn)return fn;
         dlclose(handle);handle=nullptr;}
@@ -158,7 +169,7 @@ static Xe2GroupedMXFP4 load_xe2_grouped_sym(const char* sym) {
     const char* paths[]={env,"src/libgrimoire_xe2_grouped.so",
         "/work/src/libgrimoire_xe2_grouped.so","/bridge/libgrimoire_xe2_grouped.so"};
     for(const char* path:paths){if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
         auto fn=reinterpret_cast<Xe2GroupedMXFP4>(dlsym(handle,sym));
         if(fn)return fn;
         dlclose(handle);handle=nullptr;}
@@ -177,7 +188,7 @@ static Xe2GroupedMXFP4 load_xe2_grouped_mxfp4() {
                            "/bridge/libgrimoire_xe2_grouped.so"};
     for (const char* path : paths) {
         if (!path || !*path) continue;
-        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        handle = open_bridge(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) continue;
         fn = reinterpret_cast<Xe2GroupedMXFP4>(
             dlsym(handle, "grimoire_xe2_grouped_mxfp4_bf16"));
@@ -197,7 +208,7 @@ static Xe2FusedGateUpMXFP4 load_xe2_fused_gate_up_mxfp4() {
     const char* paths[]={env,"src/libgrimoire_xe2_fused_moe.so",
         "/bridge/libgrimoire_xe2_fused_moe.so"};
     for(const char* path:paths){if(!path||!*path)continue;
-      handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+      handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
       fn=reinterpret_cast<Xe2FusedGateUpMXFP4>(dlsym(handle,
         "grimoire_xe2_fused_moe_gate_up_mxfp4_silu_bf16"));
       if(fn)break;dlclose(handle);handle=nullptr;}
@@ -225,7 +236,7 @@ static Xe2DFlashPagedF16 load_xe2_dflash_paged_f16() {
         "/opt/grimoire/lib/libgrimoire_xe2_attention_raw.so"};
     for(const char* path:paths){
         if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);
         if(!handle)continue;
         fn=reinterpret_cast<Xe2DFlashPagedF16>(
             dlsym(handle,"grimoire_xe2_dflash_paged_f16"));
@@ -263,7 +274,7 @@ static bool load_bestla(int nlayers){
         "/grimoire/src/libgrimoire_bestla.so"};
     void* h=nullptr;
     for(const char* pth:paths){ if(!pth||!*pth)continue;
-        h=dlopen(pth,RTLD_NOW|RTLD_GLOBAL); if(h)break; }
+        h=open_bridge(pth,RTLD_NOW|RTLD_GLOBAL); if(h)break; }
     if(!h){ std::fprintf(stderr,"  BesTLA: %s\n",dlerror()); return false; }
     g_bestla_init=reinterpret_cast<BestlaInitAll>(dlsym(h,"grimoire_bestla_init_all"));
     g_bestla_ffn =reinterpret_cast<BestlaFfn>(dlsym(h,"grimoire_bestla_ffn"));
@@ -299,7 +310,7 @@ static Xe2ChunkPrefill load_xe2_chunk_prefill() {
             "/grimoire/src/libgrimoire_xe2_fa2.so","/bridge/libgrimoire_xe2_fa2.so"};
         for(const char* path:fpaths){
             if(!path||!*path)continue;
-            void* fh=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!fh)continue;
+            void* fh=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!fh)continue;
             auto av=reinterpret_cast<int(*)()>(dlsym(fh,"grimoire_xe2_fa2_available"));
             auto pf=reinterpret_cast<Xe2ChunkPrefill>(
                 dlsym(fh,"grimoire_xe2_fa2_prefill_bf16"));
@@ -315,7 +326,7 @@ static Xe2ChunkPrefill load_xe2_chunk_prefill() {
         "/bridge/libgrimoire_xe2_attention_bridge.so"};
     for(const char* path:paths){
         if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
         fn=reinterpret_cast<Xe2ChunkPrefill>(
             dlsym(handle,"grimoire_xe2_chunk_prefill_bf16"));
         if(fn)break;dlclose(handle);handle=nullptr;
@@ -334,7 +345,7 @@ static Xe2ChunkGdn load_xe2_chunk_gdn() {
     const char* env=std::getenv("GRIMOIRE_XE2_ATTN_BRIDGE");
     const char* paths[]={env,"src/libgrimoire_xe2_attention_bridge.so",
         "/work/src/libgrimoire_xe2_attention_bridge.so","/bridge/libgrimoire_xe2_attention_bridge.so"};
-    for(const char* path:paths){if(!path||!*path)continue;handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+    for(const char* path:paths){if(!path||!*path)continue;handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);
         if(!handle)continue;fn=reinterpret_cast<Xe2ChunkGdn>(dlsym(handle,"grimoire_xe2_chunk_gdn_bf16"));
         if(fn)break;dlclose(handle);handle=nullptr;}
     if(!fn)std::fprintf(stderr,"  Xe2 chunk GDN unavailable; using fallback\n");
@@ -350,7 +361,7 @@ static Xe2ChunkGdnRaw load_xe2_chunk_gdn_raw(){
     const char* env=std::getenv("GRIMOIRE_XE2_GDN_RAW_BRIDGE");
     const char* paths[]={env,"src/libgrimoire_xe2_gdn_raw.so","/work/src/libgrimoire_xe2_gdn_raw.so",
         "/bridge/libgrimoire_xe2_gdn_raw.so"};
-    for(const char* path:paths){if(!path||!*path)continue;handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);
+    for(const char* path:paths){if(!path||!*path)continue;handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);
         if(!handle)continue;fn=reinterpret_cast<Xe2ChunkGdnRaw>(dlsym(handle,"grimoire_xe2_chunk_gdn_raw_bf16"));
         if(fn)break;dlclose(handle);handle=nullptr;}
     return fn;
@@ -419,7 +430,7 @@ static OneDnnF16Api load_onednn_f16() {
         "/opt/grimoire/lib/libgrimoire_onednn.so"};
     for(const char* path:paths){
         if(!path||!*path)continue;
-        handle=dlopen(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
+        handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(
             dlsym(handle,"grimoire_onednn_f16_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(
@@ -442,7 +453,7 @@ static OneDnnBF16Api load_onednn_bf16() {
     const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
         "/bridge/libgrimoire_onednn.so"};
     for(const char* path:paths){
-        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        if(!path||!*path)continue; handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_bf16_f32_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_bf16_f32_scratch_size"));
         api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_bf16_f32_execute"));
@@ -459,7 +470,7 @@ static OneDnnMXApi load_onednn_mx() {
     const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
         "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
     for(const char* path:paths){
-        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        if(!path||!*path)continue; handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_scratch_size"));
         api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_execute"));
@@ -477,7 +488,7 @@ static OneDnnW4A8Api load_onednn_w4a8() {
     const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
         "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
     for(const char* path:paths){
-        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        if(!path||!*path)continue; handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_w4a8_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_w4a8_scratch_size"));
         api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_w4a8_execute"));
@@ -495,7 +506,7 @@ static OneDnnS4Api load_onednn_s4() {
     const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
         "/bridge/libgrimoire_onednn.so","/opt/grimoire/lib/libgrimoire_onednn.so"};
     for(const char* path:paths){
-        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        if(!path||!*path)continue; handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_s4a16_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_s4a16_scratch_size"));
         api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_s4a16_execute"));
@@ -513,7 +524,7 @@ static OneDnnW4Api load_onednn_w4() {
     const char* paths[]={env,"src/libgrimoire_onednn.so","/work/src/libgrimoire_onednn.so",
         "/bridge/libgrimoire_onednn.so"};
     for(const char* path:paths){
-        if(!path||!*path)continue; handle=dlopen(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
+        if(!path||!*path)continue; handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL); if(!handle)continue;
         api.create=reinterpret_cast<decltype(api.create)>(dlsym(handle,"grimoire_onednn_w4a16_create"));
         api.scratch_size=reinterpret_cast<decltype(api.scratch_size)>(dlsym(handle,"grimoire_onednn_w4a16_scratch_size"));
         api.execute=reinterpret_cast<decltype(api.execute)>(dlsym(handle,"grimoire_onednn_w4a16_execute"));
@@ -683,7 +694,8 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
             }
         } else {
             std::vector<float> f32(count);
-            if (!ck.shards[r.shard]->read_f32(r.t, f32.data(), rerr)) {
+            if (!(r.native ? ck.read_native_f32(r,f32.data(),rerr) :
+                  ck.shards[r.shard]->read_f32(r.t, f32.data(), rerr))) {
                 std::printf("\n  conversion failed for %s: %s\n", what, rerr.c_str());
                 *ok = false; return nullptr;
             }
@@ -800,29 +812,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
-    // Native artifacts keep the precision-critical 2-D weights (the delta-rule
-    // gates, the MoE router, the shared-expert gate) at RAW BF16.  They have no
-    // safetensors shard behind them, so read them straight out of the native
-    // payload instead of indexing ck.shards.
-    if (r.native) {
-        if (r.native->encoding != uint32_t(NativeEncoding::RAW)) {
-            err = "packed native tensor requested as a float matrix"; return false;
-        }
-        const int64_t n = r.t.numel();
-        const auto* p = static_cast<const uint8_t*>(
-            ck.native_model->payload(*r.native)) + r.native_payload_offset;
-        if (r.native->source_dtype == uint32_t(STDtype::BF16)) {
-            for (int64_t i = 0; i < n; ++i)
-                dst[i] = bf16_to_f32(bf16_t{uint16_t(uint16_t(p[2*i]) |
-                                                    (uint16_t(p[2*i+1]) << 8))});
-            return true;
-        }
-        if (r.native->source_dtype == uint32_t(STDtype::F32)) {
-            std::memcpy(dst, p, size_t(n) * sizeof(float));
-            return true;
-        }
-        err = "unsupported native RAW dtype for a float matrix"; return false;
-    }
+    if (r.native) return ck.read_native_f32(r,dst,err);
     if (!r.gptq) {
         if (!ck.shards[r.shard]->read_f32(r.t, dst, err)) return false;
         if (r.row_scaled) {
@@ -914,7 +904,7 @@ sycl::half* upload_f16_vector_t(sycl::queue& q,const Qwen35Model& ck,
     const size_t count=size_t(r.t.numel());
     std::vector<float> f32(count);
     std::string err;
-    if(!ck.shards[r.shard]->read_f32(r.t,f32.data(),err)){
+    if(!read_matrix_f32(ck,r,f32.data(),err)){
         std::printf("\n  conversion failed for %s: %s\n",what,err.c_str());
         *ok=false;return nullptr;
     }
@@ -1070,31 +1060,18 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         use = Fmt::BF16;
     }
 
-    // A caller asking for BF16 means the tensor is precision-critical.  If the
-    // artifact stores it packed anyway it predates the converter's exclusion
-    // list, and the precision is already gone -- say so instead of silently
-    // honouring the file over the caller.
-    if(fmt==Fmt::BF16 && r.native &&
-       r.native->encoding==uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2))
-        std::printf("\n  WARNING: %s must stay BF16 but this artifact packs it "
-                    "as MXFP4 -- reconvert the model.\n", what);
-    if(r.native && r.native->encoding==
-       uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2)){
-        const size_t pb=size_t(N)*K/2,sb=size_t(N)*K/kMXBlock;
-        const auto* p=static_cast<const uint8_t*>(ck.native_model->payload(*r.native))+
-                      r.native_payload_offset;
-        const auto* s=static_cast<const uint8_t*>(ck.native_model->scales(*r.native))+
-                      r.native_scale_offset;
-        d.payload=dev_copy<uint8_t>(q,p,pb);d.scales=dev_copy<uint8_t>(q,s,sb);
-        d.w=QuantWeight{Fmt::MXFP4,N,K,d.payload,d.scales,nullptr,
-                        int64_t(K/2),K/kMXBlock};
-        if(!d.payload||!d.scales)*ok=false;
-        return d;
-    }
-
     std::string rerr;
     PackedWeight p;
-    if (r.compressed_int4 && use == Fmt::INT4) {
+    if (r.native && (r.native->encoding!=uint32_t(NativeEncoding::RAW) ||
+                     ck.native_model->header().version>=3)) {
+        QuantWeight w;
+        if (!ck.native_view(r,w,rerr) || (keep_qwen_bf16(r.t.name) && w.fmt!=Fmt::BF16 &&
+                                       ck.native_model->header().version>=3)) {
+            std::printf("\n  native upload refused for %s: %s (critical tensors require BF16)\n",what,rerr.c_str());
+            *ok=false; return d;
+        }
+        p=copy_packed(w); // Saved precision is authoritative; no second quantization.
+    } else if (r.compressed_int4 && use == Fmt::INT4) {
         if (!read_compressed_int4_ref(ck, r, p, rerr)) {
             std::printf("\n  direct compressed INT4 read failed for %s: %s\n",
                         what, rerr.c_str());
@@ -1162,32 +1139,6 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     Fmt use = fmt;
     if (blk > 1 && (K % blk) != 0) use = Fmt::BF16;
 
-    const bool native_mx = ra.native && rb.native &&
-      ra.native->encoding==uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2) &&
-      rb.native->encoding==uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2);
-    if(fmt==Fmt::BF16 && native_mx)
-        std::printf("\n  WARNING: %s must stay BF16 but this artifact packs it "
-                    "as MXFP4 -- reconvert the model.\n", what);
-    if(native_mx){
-        const size_t pba=size_t(Na)*K/2,pbb=size_t(Nb)*K/2;
-        const size_t sba=size_t(Na)*K/kMXBlock,sbb=size_t(Nb)*K/kMXBlock;
-        std::vector<uint8_t> hp(pba+pbb),hs(sba+sbb);
-        std::memcpy(hp.data(),static_cast<const uint8_t*>(ck.native_model->payload(*ra.native))+
-                    ra.native_payload_offset,pba);
-        std::memcpy(hp.data()+pba,static_cast<const uint8_t*>(ck.native_model->payload(*rb.native))+
-                    rb.native_payload_offset,pbb);
-        std::memcpy(hs.data(),static_cast<const uint8_t*>(ck.native_model->scales(*ra.native))+
-                    ra.native_scale_offset,sba);
-        std::memcpy(hs.data()+sba,static_cast<const uint8_t*>(ck.native_model->scales(*rb.native))+
-                    rb.native_scale_offset,sbb);
-        d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
-        d.scales=dev_copy<uint8_t>(q,hs.data(),hs.size());
-        d.w=QuantWeight{Fmt::MXFP4,N,K,d.payload,d.scales,nullptr,
-                        int64_t(K/2),K/kMXBlock};
-        if(!d.payload||!d.scales)*ok=false;
-        return d;
-    }
-
     // compressed-tensors weight_packed (HF safetensors): same MXFP4 layout,
     // read via read_raw and concatenate gate|up along N.
     const bool hf_packed = !ra.native && !rb.native &&
@@ -1215,7 +1166,19 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     std::string rerr;
     PackedWeight p;
-    if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4) {
+    if (ra.native && rb.native && (ck.native_model->header().version>=3 ||
+        (ra.native->encoding!=0 && rb.native->encoding!=0))) {
+        QuantWeight a,b;
+        if (!ck.native_view(ra,a,rerr) || !ck.native_view(rb,b,rerr) || a.fmt!=b.fmt ||
+            ((keep_qwen_bf16(ra.t.name) || keep_qwen_bf16(rb.t.name)) && a.fmt!=Fmt::BF16 && ck.native_model->header().version>=3)) {
+            std::printf("\n  native concat refused for %s: %s (formats must match; critical tensors require BF16)\n",what,rerr.c_str());
+            *ok=false; return d;
+        }
+        p=copy_packed(a); auto tail=copy_packed(b); p.N=N;
+        p.payload.insert(p.payload.end(),tail.payload.begin(),tail.payload.end());
+        p.scales_raw.insert(p.scales_raw.end(),tail.scales_raw.begin(),tail.scales_raw.end());
+        p.zeros.insert(p.zeros.end(),tail.zeros.begin(),tail.zeros.end());
+    } else if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4) {
         PackedWeight a,b;
         if(!read_compressed_int4_ref(ck,ra,a,rerr)||
            !read_compressed_int4_ref(ck,rb,b,rerr)){
@@ -1710,16 +1673,7 @@ struct Grimoire {
                     dq.i4s + size_t(begin) * srow, x, y + begin,
                     half, dq.w.K, deps);
             } else {
-                QuantWeight w = dq.w;
-                w.N = half;
-                w.payload = dq.w.payload + int64_t(begin) * dq.w.row_bytes;
-                if (dq.w.scales) {
-                    const size_t ss = dq.w.fmt == Fmt::INT4 ? sizeof(bf16_t) : 1;
-                    w.scales = static_cast<const uint8_t*>(dq.w.scales) +
-                        int64_t(begin) * dq.w.row_scales * ss;
-                }
-                if (dq.w.zeros)
-                    w.zeros = dq.w.zeros + int64_t(begin) * dq.w.row_scales;
+                QuantWeight w = slice_quant_rows(dq.w,begin,half);
                 ev = launch_gemv(q, w, x, y + begin, deps);
             }
             ev.wait();
@@ -2038,6 +1992,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     if (!ck.load(dir, err)) return false;
     cfg = ck.cfg;
+    // The optional MTP MoE loader still assumes MXFP4-only expert buffers.
+    // Reject that combination before allocating device weights.
+    if (ck.native_model && ck.native_model->header().version>=3 && cfg.is_moe() && mtp_enabled()) {
+        err="native v3 MoE artifacts currently require GRIMOIRE_MTP=0; MTP expert loading is not format-aware";
+        return false;
+    }
     max_seq = opt.max_seq;
 
     if (pp_enabled() && tp_enabled()) {
@@ -2258,22 +2218,30 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // Experts: concatenate gate and up into one [E][2I][H] block
             // and copy the packed bytes verbatim. No dequantize, no
             // requantize -- the on-disk layout IS the kernel layout.
-            const Fmt EF = (!src.e_gate_p.empty() && src.e_gate_p[0].gptq)
-                         ? Fmt::INT4 : Fmt::MXFP4;
+            Fmt EF = (!src.e_gate_p.empty() && src.e_gate_p[0].gptq) ? Fmt::INT4 : Fmt::MXFP4;
+            if (!src.e_gate_p.empty() && src.e_gate_p[0].native) {
+                QuantWeight view;
+                if (!ck.native_view(src.e_gate_p[0],view,err)) return false;
+                EF=view.fmt;
+            }
             const size_t gu_row  = bytes_per_row(EF, H);
-            const size_t gu_srow = scales_per_row(EF, H) * (EF == Fmt::INT4 ? sizeof(bf16_t) : 1);
+            const size_t gu_srow = scales_per_row(EF, H) * scale_element_bytes(EF);
             const size_t dn_row  = bytes_per_row(EF, I);
-            const size_t dn_srow = scales_per_row(EF, I) * (EF == Fmt::INT4 ? sizeof(bf16_t) : 1);
+            const size_t dn_srow = scales_per_row(EF, I) * scale_element_bytes(EF);
             const size_t gu_zrow = EF == Fmt::INT4 ? scales_per_row(EF, H) : 0;
             const size_t dn_zrow = EF == Fmt::INT4 ? scales_per_row(EF, I) : 0;
 
             d.gu_pack  = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_row, lq);
-            d.gu_scale = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_srow, lq);
+            if (gu_srow) d.gu_scale = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_srow, lq);
             d.dn_pack  = sycl::malloc_device<uint8_t>(size_t(E) * H * dn_row, lq);
-            d.dn_scale = sycl::malloc_device<uint8_t>(size_t(E) * H * dn_srow, lq);
+            if (dn_srow) d.dn_scale = sycl::malloc_device<uint8_t>(size_t(E) * H * dn_srow, lq);
             if (gu_zrow) d.gu_zero = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_zrow, lq);
             if (dn_zrow) d.dn_zero = sycl::malloc_device<uint8_t>(size_t(E) * H * dn_zrow, lq);
 
+            if (!d.gu_pack || !d.dn_pack || (gu_srow && !d.gu_scale) || (dn_srow && !d.dn_scale) ||
+                (gu_zrow && !d.gu_zero) || (dn_zrow && !d.dn_zero)) {
+                err="expert device allocation failed"; return false;
+            }
             // Same mmap hazard: stage each expert through host memory.
             // Build the whole layer's block on the host, then do four
             // large device copies instead of 1536 small ones.
@@ -2291,18 +2259,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     const bool packed = !r.gptq && !r.row_scaled &&
                                         r.t.name.find("weight_packed") != std::string::npos;
                     if (packed) return ck.read_raw(r, payload, rr);
-                    if(r.native && r.native->encoding==
-                       uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2)){
-                        const size_t pb=size_t(N)*row_bytes;
-                        const size_t sb=size_t(N)*scale_bytes;
-                        std::memcpy(payload,static_cast<const uint8_t*>(
-                          ck.native_model->payload(*r.native))+r.native_payload_offset,pb);
-                        std::memcpy(scales,static_cast<const uint8_t*>(
-                          ck.native_model->scales(*r.native))+r.native_scale_offset,sb);
-                        return true;
-                    }
                     PackedWeight pw;
-                    if (r.gptq) {
+                    if (r.native) {
+                        QuantWeight view;
+                        if (!ck.native_view(r,view,rr)) return false;
+                        if (view.fmt!=EF || view.N!=N || view.K!=K) {
+                            rr="native expert format or shape differs within layer"; return false;
+                        }
+                        pw=copy_packed(view);
+                    } else if (r.gptq) {
                         if (!repack_gptq_ref(ck, r, pw, rr)) return false;
                     } else {
                         std::vector<float> f32(size_t(N) * K);
@@ -2314,7 +2279,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         rr = "expert requantized layout mismatch"; return false;
                     }
                     std::memcpy(payload, pw.payload.data(), pw.payload.size());
-                    std::memcpy(scales, pw.scales_raw.data(), pw.scales_raw.size());
+                    if (!pw.scales_raw.empty()) std::memcpy(scales, pw.scales_raw.data(), pw.scales_raw.size());
                     if (zero_bytes) {
                         if (pw.zeros.size() != size_t(N) * zero_bytes) {
                             rr = "expert zero layout mismatch"; return false;
@@ -2344,13 +2309,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                            && ck.read_raw(src.e_down_s[e], h_ds.data() + size_t(e) * H * dn_srow, rr);
                     } else {
                         rok = stage_expert(src.e_gate_p[e], h_gu.data() + goff * gu_row,
-                                           h_gs.data() + goff * gu_srow, gu_zrow ? h_gz.data() + goff * gu_zrow : nullptr,
+                                           gu_srow ? h_gs.data() + goff * gu_srow : nullptr, gu_zrow ? h_gz.data() + goff * gu_zrow : nullptr,
                                            I, H, gu_row, gu_srow, gu_zrow, rr)
                            && stage_expert(src.e_up_p[e], h_gu.data() + (goff + I) * gu_row,
-                                           h_gs.data() + (goff + I) * gu_srow, gu_zrow ? h_gz.data() + (goff + I) * gu_zrow : nullptr,
+                                           gu_srow ? h_gs.data() + (goff + I) * gu_srow : nullptr, gu_zrow ? h_gz.data() + (goff + I) * gu_zrow : nullptr,
                                            I, H, gu_row, gu_srow, gu_zrow, rr)
                            && stage_expert(src.e_down_p[e], h_dn.data() + size_t(e) * H * dn_row,
-                                           h_ds.data() + size_t(e) * H * dn_srow, dn_zrow ? h_dz.data() + size_t(e) * H * dn_zrow : nullptr,
+                                           dn_srow ? h_ds.data() + size_t(e) * H * dn_srow : nullptr, dn_zrow ? h_dz.data() + size_t(e) * H * dn_zrow : nullptr,
                                            H, I, dn_row, dn_srow, dn_zrow, rr);
                     }
                     if (!rok) { err = "expert read failed: " + rr; return false; }
@@ -2374,12 +2339,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     }
                 }
                 lq.memcpy(d.gu_pack,  h_gu.data(), h_gu.size());
-                q.memcpy(d.gu_scale, h_gs.data(), h_gs.size());
+                if (d.gu_scale) lq.memcpy(d.gu_scale, h_gs.data(), h_gs.size());
                 lq.memcpy(d.dn_pack,  h_dn.data(), h_dn.size());
-                q.memcpy(d.dn_scale, h_ds.data(), h_ds.size());
-                if (d.gu_zero) q.memcpy(d.gu_zero, h_gz.data(), h_gz.size());
-                if (d.dn_zero) q.memcpy(d.dn_zero, h_dz.data(), h_dz.size());
-                q.wait();
+                if (d.dn_scale) lq.memcpy(d.dn_scale, h_ds.data(), h_ds.size());
+                if (d.gu_zero) lq.memcpy(d.gu_zero, h_gz.data(), h_gz.size());
+                if (d.dn_zero) lq.memcpy(d.dn_zero, h_dz.data(), h_dz.size());
+                lq.wait_and_throw();
             }
             acct(size_t(E) * (2 * I * (gu_row + gu_srow + gu_zrow)
                             + H * (dn_row + dn_srow + dn_zrow)));
@@ -7149,11 +7114,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                                               M,cfg.top_k,H);
                     }else{
                     auto sub=[&](const QuantWeight& w,int row0,int n){
-                        QuantWeight z=w; z.N=n; z.payload=w.payload+int64_t(row0)*w.row_bytes;
-                        const size_t ss=(w.fmt==Fmt::INT4)?sizeof(bf16_t):1;
-                        if(w.scales) z.scales=(uint8_t*)w.scales+int64_t(row0)*w.row_scales*ss;
-                        if(w.zeros) z.zeros=w.zeros+int64_t(row0)*w.row_scales;
-                        return z;
+                        return slice_quant_rows(w,row0,n);
                     };
                     for(int e=0;e<cfg.n_experts;++e) if(count[e]){
                         auto w=sub(d.moe.gate_up,e*2*I,2*I);

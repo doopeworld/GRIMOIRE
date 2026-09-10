@@ -42,6 +42,10 @@ namespace b70 {
 
 enum class LayerKind { LINEAR_ATTN, FULL_ATTN };
 
+// Shared by offline conversion and upload validation: never pack these
+// Qwen/Ornith weights. A runtime --proj option cannot override this policy.
+bool keep_qwen_bf16(const std::string& name);
+
 struct Qwen35Config {
     // core dims
     int hidden          = 0;
@@ -151,6 +155,8 @@ struct Qwen35Model {
     // Open every shard, parse config, resolve all tensor names.
     bool load(const std::string& dir, std::string& err, bool skip_vision = true,
               bool index_only = false);
+    bool native_view(const TensorRef& r, QuantWeight& out, std::string& err) const;
+    bool read_native_f32(const TensorRef& r, float* dst, std::string& err) const;
 
     const void* data(const TensorRef& r) const {
         if(r.native)return static_cast<const uint8_t*>(native_model->payload(*r.native))+
@@ -165,6 +171,10 @@ struct Qwen35Model {
                 err = "packed native tensor requested as raw"; return false;
             }
             const size_t bytes = size_t(r.t.end-r.t.begin);
+            if (r.t.end < r.t.begin || r.native_payload_offset > r.native->payload_bytes ||
+                bytes > r.native->payload_bytes-r.native_payload_offset) {
+                err = "native raw slice out of bounds"; return false;
+            }
             std::memcpy(dst, static_cast<const uint8_t*>(native_model->payload(*r.native))+
                         r.native_payload_offset, bytes);
             return true;
@@ -181,8 +191,7 @@ struct Qwen35Model {
     void unmap_all() { for (auto& s : shards) if (s) s->unmap(); }
 
     int64_t bytes(const TensorRef& r) const {
-        return r.native ? int64_t(r.native->payload_bytes) :
-               (r.ok() ? int64_t(r.t.end - r.t.begin) : 0);
+        return r.ok() ? int64_t(r.t.end - r.t.begin) : 0;
     }
 
     // Build a QuantWeight over an already-packed MXFP4 tensor pair.

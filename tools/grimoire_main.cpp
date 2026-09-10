@@ -52,15 +52,16 @@ int main(int argc, char** argv) {
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
               "  grimoire -m <model_dir> [--proj FORMAT] [--ctx N]\n\n"
               "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16\n"
-              "  --proj   format for the projections quantized at load.\n"
-              "           int4 is the default: it takes the deltanet\n"
-              "           projections and lm_head from 3.0 GB to 0.8 GB\n"
-              "           per token, the largest single win in decode.\n"
-              "           bf16 keeps them as the checkpoint stores them.\n"
+              "  --proj   format for projections converted from safetensors at load.\n"
+              "           Native v3 artifacts preserve their saved formats.\n"
+              "           Use grimoire-quantize to choose formats offline.\n"
               "  --ctx    KV cache capacity for the full-attention layers.\n"
               "           The linear layers do not grow with context.\n"
               "  -p       prompt to generate from. Without it, runs benchmarks.\n"
               "  -n       tokens to generate (default 128).\n");
+#ifdef GRIMOIRE_NATIVE_ONLY
+            std::printf("\n  Standalone native build: external framework bridges disabled.\n");
+#endif
             return 0;
         }
     }
