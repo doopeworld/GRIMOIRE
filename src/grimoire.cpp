@@ -6913,7 +6913,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             sycl_bf16* native_fk=native_rec?xperm+native_qe:nullptr;
             sycl_bf16* native_fv=native_rec?xperm+2*native_qe:nullptr;
             sycl::event aux_ab_ready,aux_z_ready;
-            const bool parallel_dn=parallel_prefill&&!fused_in;
+            // RULE 1: GRIMOIRE_W4A8 FREES the MXFP4 payload of a converted
+            // weight, and mm_aux() dereferences w.w.payload directly on
+            // q_aux instead of routing through mm().  A converted weight
+            // still reports fmt==MXFP4, so only the POINTER is a safe test.
+            // la_z is 256-aligned and IS converted; falling back to the
+            // serial mm() path costs the aux overlap and keeps the card on
+            // the bus.  parallel_dn is re-tested at both consumption sites,
+            // so narrowing it here keeps all three in agreement.
+            const bool parallel_dn=parallel_prefill&&!fused_in&&
+                d.la_ab.w.payload&&d.la_z.w.payload;
             if(parallel_dn){
                 wait_on(q_aux,input_bf_ready);
                 aux_ab_ready=mm_aux(d.la_ab,bn,aux0);
@@ -7158,7 +7167,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         a8_cached_bf=fused_ffn_quant?bn_bf:nullptr;
         if(cfg.is_moe()){
             sycl::event shared_ready;
-            if(parallel_prefill||parallel_shared){
+            // RULE 1: as parallel_dn above -- mm_aux() reads sh_gu/sh_down's
+            // MXFP4 payload, which W4A8 frees.  This MUST stay a single
+            // boolean: the wait below re-tests the same condition, and
+            // skipping the projection while still waiting on a default-
+            // constructed event would leave r1 unwritten (silent garbage).
+            const bool shared_aux=(parallel_prefill||parallel_shared)&&
+                d.sh_gu.w.payload&&d.sh_down.w.payload;
+            if(shared_aux){
                 wait_on(q_aux,post_bf_ready);
                 mm_aux(d.sh_gu,bn,aux0);
                 launch_swiglu_batched(q_aux,aux0,aux1,M,d.sh_gu.w.N/2);
@@ -7347,7 +7363,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_moe_down_batched(q,d.moe,rex,rwt,mh,r0,M);
             }
             pp_mark("routed MoE");
-            if(parallel_prefill||parallel_shared) wait_on(q,shared_ready);
+            if(shared_aux) wait_on(q,shared_ready);
             else {
                 if(!mlp_bf16(d.sh_gu,d.sh_down,r1,li)){
                     const int SI=d.sh_gu.w.N/2;
