@@ -328,6 +328,21 @@ sycl::event launch_router_topk_batched(
     sycl::queue& q, const float* logits, int tokens, int n_experts, int top_k,
     int32_t* out_expert, float* out_weight, bool normalize,
     const std::vector<sycl::event>& deps = {});
+// ---- K2-Horizon ------------------------------------------------------
+// zero_centered is FALSE for K2 (weight initialised to ones, applied
+// directly); Qwen3.5's norms are zero-centered and apply (1 + w).
+sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residual,
+    const bf16_t* weight, float* out, int n, int n_groups, float eps,
+    bool zero_centered, const std::vector<sycl::event>& deps = {});
+sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
+    const float* gate, float* out, int64_t n, float beta,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_router_topk_k2(
+    sycl::queue& q, const float* logits, const float* bias,
+    int tokens, int n_experts, int top_k,
+    int32_t* out_expert, float* out_weight, bool normalize, float scaling,
+    const std::vector<sycl::event>& deps = {});
+
 sycl::event launch_router_topk_bf16_batched(
     sycl::queue& q, const sycl_bf16* logits, int tokens, int n_experts,
     int top_k, int32_t* out_expert, float* out_weight, bool normalize,

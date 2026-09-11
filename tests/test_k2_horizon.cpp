@@ -8,6 +8,8 @@
 #include <cmath>
 #include <random>
 #include <vector>
+#include <climits>
+#include <limits>
 
 using namespace b70;
 static int g_fail = 0;
@@ -181,6 +183,88 @@ static void test_layer_classification() {
     CHECK(k2::is_sparse_layer(4, mlp_only, 3, 100, 2) == false, "step=2: layer 4 -> (5)%%2!=0 dense");
 }
 
+// Emulates src/ops.cpp launch_router_topk_k2 lane for lane, SG_SIZE wide.
+// The kernel cannot be compiled on a host without SYCL, so the SELECTION
+// logic -- the sub-group max/min reduction, the per-lane `taken` slot
+// mask, the tie-break -- is replayed here and diffed against the
+// reference.  This is what catches a reduction that picks the right
+// value but the wrong index, or a slot mask that lets one expert be
+// selected twice.
+static void router_k2_subgroup(const float* row, const float* bias,
+                               int n_experts, int top_k, bool normalize,
+                               float scaling, int* oe, float* ow) {
+    constexpr int SG = 16;                       // SG_SIZE
+    auto sig = [](float v){ return 1.0f/(1.0f+std::exp(-v)); };
+    std::vector<uint64_t> taken(SG, 0);          // per work-item
+    for (int s = 0; s < top_k; ++s) {
+        std::vector<float> cv(SG, -std::numeric_limits<float>::infinity());
+        std::vector<int>   ci(SG, INT_MAX), cs(SG, -1);
+        for (int lane = 0; lane < SG; ++lane)
+            for (int e = lane, slot = 0; e < n_experts; e += SG, ++slot) {
+                if (slot < 64 && (taken[size_t(lane)] & (1ull << slot))) continue;
+                const float v = sig(row[e]) + (bias ? bias[e] : 0.0f);
+                if (v > cv[size_t(lane)] ||
+                    (v == cv[size_t(lane)] && e < ci[size_t(lane)])) {
+                    cv[size_t(lane)] = v; ci[size_t(lane)] = e; cs[size_t(lane)] = slot;
+                }
+            }
+        float bv = -std::numeric_limits<float>::infinity();
+        for (int l = 0; l < SG; ++l) bv = std::max(bv, cv[size_t(l)]);
+        int bi = INT_MAX;
+        for (int l = 0; l < SG; ++l)
+            if (cv[size_t(l)] == bv && ci[size_t(l)] != INT_MAX)
+                bi = std::min(bi, ci[size_t(l)]);
+        for (int l = 0; l < SG; ++l)
+            if (ci[size_t(l)] == bi && cs[size_t(l)] >= 0 && cs[size_t(l)] < 64)
+                taken[size_t(l)] |= 1ull << cs[size_t(l)];
+        oe[s] = bi;
+        ow[s] = sig(row[bi]);                    // UNBIASED, recomputed
+    }
+    if (normalize) {
+        float sum = 0.0f; for (int s = 0; s < top_k; ++s) sum += ow[s];
+        if (sum > 0.0f) for (int s = 0; s < top_k; ++s) ow[s] /= sum;
+    }
+    if (scaling != 1.0f) for (int s = 0; s < top_k; ++s) ow[s] *= scaling;
+}
+
+static void test_router_kernel_parity() {
+    std::printf("\nRouter KERNEL emulation vs reference (lane for lane)\n");
+    struct { int n, k; const char* what; } geom[] = {
+        {64,  4, "MoVA  64 experts top-4"},
+        {100, 8, "MoE  100 experts top-8"},
+        {17,  3, "ragged n_experts (not a multiple of SG_SIZE)"},
+    };
+    std::mt19937 rng(11); std::normal_distribution<float> nd(0,1);
+    for (const auto& g : geom) {
+        int mism_idx = 0, mism_w = 0;
+        double worst = 0;
+        for (int t = 0; t < 400; ++t) {
+            std::vector<float> lg(size_t(g.n)), bs(size_t(g.n));
+            for (int e = 0; e < g.n; ++e) {
+                lg[size_t(e)] = nd(rng) * 2.0f;
+                bs[size_t(e)] = nd(rng) * 0.3f;
+            }
+            const float* bp = (t % 3) ? bs.data() : nullptr;   // exercise no-bias too
+            std::vector<int> ia(size_t(g.k)), ib(size_t(g.k));
+            std::vector<float> wa(size_t(g.k)), wb(size_t(g.k));
+            k2::router_topk(lg.data(), bp, g.n, g.k, true, true, 2.5f,
+                            ia.data(), wa.data());
+            router_k2_subgroup(lg.data(), bp, g.n, g.k, true, 2.5f,
+                               ib.data(), wb.data());
+            for (int s = 0; s < g.k; ++s) {
+                if (ia[size_t(s)] != ib[size_t(s)]) ++mism_idx;
+                const double d = std::fabs(double(wa[size_t(s)]) - wb[size_t(s)]);
+                worst = std::max(worst, d);
+                if (d > 1e-5) ++mism_w;
+            }
+        }
+        std::printf("  %-44s %d idx, %d weight mismatches (max %.2e)\n",
+                    g.what, mism_idx, mism_w, worst);
+        CHECK(mism_idx == 0, "%s: kernel selects different experts", g.what);
+        CHECK(mism_w == 0, "%s: kernel returns different weights", g.what);
+    }
+}
+
 int main() {
     std::printf("=== K2-Horizon operators ===\n\n");
     test_grouped_rmsnorm();
@@ -188,6 +272,7 @@ int main() {
     test_router();
     test_mova_combine();
     test_layer_classification();
+    test_router_kernel_parity();
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

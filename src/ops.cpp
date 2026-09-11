@@ -1249,4 +1249,166 @@ sycl::event launch_dflash2_path_walk(
     });
 }
 
+
+// =====================================================================
+//  K2-Horizon operators.  The host reference and the properties these
+//  must satisfy live in include/b70/k2_horizon.hpp and
+//  tests/test_k2_horizon.cpp; keep the two in step.
+// =====================================================================
+
+// GROUPED RMSNorm (layernorm_num_groups).  The variance is taken per
+// contiguous group, so hidden 2560 with 2 groups is two independent
+// 1280-wide normalizations, and the weight still spans the full row.
+//
+// zero_centered is FALSE for K2: K2HorizonRMSNorm initialises its weight
+// to ONES and multiplies directly.  Qwen3.5 stores the weight centred on
+// zero and applies (1 + w); using that convention here would scale every
+// norm output by roughly 10x, forty-eight times over.
+//
+// One work-group per row, groups walked in sequence -- n_groups is 2, so
+// there is nothing to gain from splitting them across work-groups and the
+// sequential form lets the partial-sum scratch be reused.
+sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residual,
+                                   const bf16_t* weight, float* out,
+                                   int n, int n_groups, float eps,
+                                   bool zero_centered,
+                                   const std::vector<sycl::event>& deps) {
+    const int WG = norm_wg();
+    const int gn = n / n_groups;           // caller guarantees n % n_groups == 0
+    return q.submit([&](sycl::handler& hd) {
+        hd.depends_on(deps);
+        sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);
+        hd.parallel_for(
+            sycl::nd_range<1>(WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg  = it.get_sub_group();
+                const int  lid = int(it.get_local_id(0));
+                const int  sgid= int(sg.get_group_id()[0]);
+                const int  lane= int(sg.get_local_id()[0]);
+                const int  wgz = int(it.get_local_range(0));
+                const int  nsg = wgz / SG_SIZE;
+
+                for (int g = 0; g < n_groups; ++g) {
+                    const int base = g * gn;
+                    float ss = 0.0f;
+                    for (int i = lid; i < gn; i += wgz) {
+                        const float v = residual ? (h[base + i] + residual[base + i])
+                                                 : h[base + i];
+                        if (residual) h[base + i] = v;   // keep for the next residual
+                        ss = sycl::fma(v, v, ss);
+                    }
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    if (lane == 0) partial[sgid] = ss;
+                    sycl::group_barrier(it.get_group());
+
+                    float total = 0.0f;
+                    for (int i = 0; i < nsg; ++i) total += partial[i];
+                    const float scale = sycl::rsqrt(total / float(gn) + eps);
+
+                    for (int i = lid; i < gn; i += wgz) {
+                        const float wv = bf16_to_f32(weight[base + i]);
+                        out[base + i] = h[base + i] * scale
+                                      * (zero_centered ? (1.0f + wv) : wv);
+                    }
+                    // partial[] is reused by the next group: no thread may
+                    // race ahead and overwrite it while others still read.
+                    sycl::group_barrier(it.get_group());
+                }
+            });
+    });
+}
+
+// SOFTPLUS attention gate.  out = attn * softplus(gate, beta), applied to
+// the attention output BEFORE o_proj.  torch falls back to the identity
+// once beta*x passes threshold (20) so the exp cannot overflow; match that
+// or a large gate produces inf instead of a linear response.
+sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
+                                 const float* gate, float* out,
+                                 int64_t n, float beta,
+                                 const std::vector<sycl::event>& deps) {
+    constexpr int WG = 256;
+    const int64_t groups = (n + WG - 1) / WG;
+    return q.submit([&](sycl::handler& hd) {
+        hd.depends_on(deps);
+        hd.parallel_for(
+            sycl::nd_range<1>(size_t(groups) * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int64_t i = int64_t(it.get_global_id(0));
+                if (i >= n) return;
+                const float gv = gate[i];
+                const float bx = beta * gv;
+                const float sp = bx > 20.0f ? gv
+                               : sycl::log(1.0f + sycl::exp(bx)) / beta;
+                out[i] = attn[i] * sp;
+            });
+    });
+}
+
+// SIGMOID router with a SELECTION-ONLY bias.
+//
+// The bias is added to the value top-k ranks on; the weight returned for
+// an expert is the UNBIASED sigmoid.  Folding the bias into the weight is
+// silent -- the routes stay plausible and only the mixture is wrong -- so
+// the winner's score is recomputed from its own logit rather than carried
+// through the reduction.
+//
+// Normalization is a plain sum, NOT the softmax launch_router_topk_batched
+// applies: K2 divides the gathered sigmoids by their sum and then
+// multiplies by router_scaling_factor.
+sycl::event launch_router_topk_k2(
+    sycl::queue& q, const float* logits, const float* bias,
+    int tokens, int n_experts, int top_k,
+    int32_t* out_expert, float* out_weight,
+    bool normalize, float scaling,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens) * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int t = int(it.get_group(0));
+                const float* row = logits + int64_t(t) * n_experts;
+                int32_t* oe = out_expert + int64_t(t) * top_k;
+                float* ow = out_weight + int64_t(t) * top_k;
+
+                uint64_t taken = 0;
+                for (int s = 0; s < top_k; ++s) {
+                    float cv = -std::numeric_limits<float>::infinity();
+                    int ci = INT_MAX, cs = -1;
+                    for (int e = lane, slot = 0; e < n_experts;
+                         e += SG_SIZE, ++slot) {
+                        if (slot < 64 && (taken & (1ull << slot))) continue;
+                        // rank on sigmoid(logit) + bias, never on the logit:
+                        // the bias is defined against the post-sigmoid score.
+                        const float sc = 1.0f / (1.0f + sycl::exp(-row[e]));
+                        const float v  = sc + (bias ? bias[e] : 0.0f);
+                        if (v > cv || (v == cv && e < ci)) { cv = v; ci = e; cs = slot; }
+                    }
+                    const float bv = sycl::reduce_over_group(
+                        sg, cv, sycl::maximum<float>());
+                    const int bi = sycl::reduce_over_group(
+                        sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
+                        sycl::minimum<int>());
+                    if (ci == bi && cs >= 0 && cs < 64) taken |= 1ull << cs;
+                    if (lane == 0) {
+                        oe[s] = bi;
+                        ow[s] = 1.0f / (1.0f + sycl::exp(-row[bi]));  // UNBIASED
+                    }
+                }
+                if (lane == 0) {
+                    if (normalize) {
+                        float sum = 0.0f;
+                        for (int s = 0; s < top_k; ++s) sum += ow[s];
+                        if (sum > 0.0f)
+                            for (int s = 0; s < top_k; ++s) ow[s] /= sum;
+                    }
+                    if (scaling != 1.0f)
+                        for (int s = 0; s < top_k; ++s) ow[s] *= scaling;
+                }
+            });
+    });
+}
+
 } // namespace b70
