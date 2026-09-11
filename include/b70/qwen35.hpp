@@ -77,6 +77,26 @@ struct Qwen35Config {
     int shared_inter    = 0;
     int dense_inter     = 0;      // dense variant FFN width
 
+    // ---- K2-Horizon ------------------------------------------------
+    // Qwen3-MoE geometry with grouped norms, a softplus attention gate,
+    // a sigmoid router whose bias steers selection only, and MoVA: the
+    // value projection replaced by a routed bank of experts.
+    bool  is_k2           = false;
+    int   norm_groups     = 1;      // layernorm_num_groups (1 == plain RMSNorm)
+    int   mova_experts    = 0;      // mova_num_experts (0 == no MoVA)
+    int   mova_top_k      = 0;      // mova_num_experts_per_tok
+    bool  moe_gate_bias   = false;  // router bias present
+    bool  router_sigmoid  = false;  // router_score_func == "sigmoid"
+    bool  norm_topk_prob  = true;
+    float router_scale    = 1.0f;   // router_scaling_factor
+    int   rope_head_dim   = 0;      // 0 == same as head_dim (no split rope)
+    int   sparse_step     = 1;      // decoder_sparse_step
+    int   n_shared_expert = 0;      // num_shared_experts
+    int   attn_gate       = 0;      // 0 none, 1 silu, 2 softplus
+    bool  query_key_norm  = false;
+    std::vector<int>  mlp_only_layers;
+    std::vector<bool> k2_sparse;    // per layer: MoVA attention + routed MoE
+
     std::vector<LayerKind> layer_types;
     // Muse uses sliding RoPE attention for three layers followed by one
     // full NoPE layer. Keep the checkpoint distinction; both map to the

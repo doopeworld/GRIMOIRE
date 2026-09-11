@@ -2,6 +2,8 @@
 //  qwen35_loader.cpp
 // =====================================================================
 #include "b70/qwen35.hpp"
+#include "b70/k2_horizon.hpp"
+#include <cctype>
 #include "b70/tensor_layout.hpp"
 #include <cstdio>
 #include <cstring>
@@ -68,7 +70,12 @@ bool keep_qwen_bf16(const std::string& name) {
     return name.rfind("mtp.",0)==0 || name.find("embed_tokens")!=std::string::npos ||
         name=="lm_head.weight" || ends(".lm_head.weight") ||
         ends(".linear_attn.in_proj_a.weight") || ends(".linear_attn.in_proj_b.weight") ||
-        ends(".mlp.gate.weight") || ends(".mlp.shared_expert_gate.weight");
+        ends(".mlp.gate.weight") || ends(".mlp.shared_expert_gate.weight") ||
+        // K2-Horizon MoVA value router: [mova_num_experts, hidden] = [64,2560].
+        // N=64 is not a multiple of 256, so it must never reach a W4A8 tile
+        // (the B 2-D block loads do not clamp), and a router is the last
+        // place to spend precision -- it is 0.16 MB of a 36B model.
+        ends(".self_attn.v_router.weight");
 }
 
 bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
@@ -124,8 +131,83 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         float ex = cfg_f(cj, "scale_query_by", 0.0f);
         cfg.query_prescale = ex > 0.0f ? ex : (qk > 0.0f ? qk : 1.0f);
     }
+    // ---- K2-Horizon --------------------------------------------------
+    // model_type "k2_horizon".  rope_head_dim == head_dim here, so the
+    // split/interleave rope path in the reference never runs; refuse a
+    // checkpoint that would need it rather than silently using plain rope.
+    cfg.is_k2 = model_type.find("k2_horizon") != std::string::npos;
+    if (cfg.is_k2) {
+        cfg.norm_groups     = cfg_i(cj, "layernorm_num_groups", 1);
+        cfg.mova_experts    = cfg_i(j, "mova_num_experts", 0);
+        cfg.mova_top_k      = cfg_i(j, "mova_num_experts_per_tok", 0);
+        cfg.moe_gate_bias   = cfg_b(j, "moe_gate_bias", false);
+        cfg.norm_topk_prob  = cfg_b(j, "norm_topk_prob", true);
+        cfg.router_scale    = cfg_f(j, "router_scaling_factor", 1.0f);
+        cfg.rope_head_dim   = cfg_i(cj, "rope_head_dim", 0);
+        cfg.sparse_step     = cfg_i(j, "decoder_sparse_step", 1);
+        cfg.n_shared_expert = cfg_i(j, "num_shared_experts", 0);
+        cfg.query_key_norm  = cfg_b(j, "query_key_norm", false);
+        cfg.rope_theta      = cfg_f(j, "rope_theta", cfg.rope_theta);
+
+        std::string score; find_scalar(j, "router_score_func", score);
+        cfg.router_sigmoid = score.find("sigmoid") != std::string::npos;
+
+        std::string gate; find_scalar(j, "attention_gate_func", gate);
+        cfg.attn_gate = gate.find("softplus") != std::string::npos ? 2
+                      : gate.find("silu")     != std::string::npos ? 1 : 0;
+        cfg.attn_out_gate = cfg.attn_gate != 0;
+
+        // rope_theta lives under "rope_parameters" in this config, not at
+        // the top level where cfg_f above looked for it.
+        {
+            const size_t rp = j.find("\"rope_parameters\"");
+            if (rp != std::string::npos) {
+                const size_t b = j.find('{', rp), e = j.find('}', b);
+                if (b != std::string::npos && e != std::string::npos)
+                    cfg.rope_theta = cfg_f(j.substr(b, e - b), "rope_theta", cfg.rope_theta);
+            }
+        }
+
+        // The shared expert is one MLP of moe_intermediate_size *
+        // num_shared_experts.  The config has no shared_expert_intermediate_size
+        // key, so without this the shared expert would load as width 0.
+        if (cfg.n_shared_expert > 0 && cfg.shared_inter == 0)
+            cfg.shared_inter = cfg.moe_inter * cfg.n_shared_expert;
+
+        // mlp_only_layers is a plain int array
+        cfg.mlp_only_layers.clear();
+        {
+            const size_t p = j.find("\"mlp_only_layers\"");
+            if (p != std::string::npos) {
+                const size_t a = j.find('[', p), b = j.find(']', a);
+                if (a != std::string::npos && b != std::string::npos) {
+                    const std::string arr = j.substr(a + 1, b - a - 1);
+                    size_t q = 0;
+                    while (q < arr.size()) {
+                        while (q < arr.size() && !std::isdigit(static_cast<unsigned char>(arr[q]))) ++q;
+                        if (q >= arr.size()) break;
+                        size_t e2 = q;
+                        while (e2 < arr.size() && std::isdigit(static_cast<unsigned char>(arr[e2]))) ++e2;
+                        cfg.mlp_only_layers.push_back(std::atoi(arr.substr(q, e2 - q).c_str()));
+                        q = e2;
+                    }
+                }
+            }
+        }
+    }
+
     if (cfg.hidden <= 0 || cfg.n_layers <= 0) {
         err = "config.json missing hidden_size or num_hidden_layers"; return false;
+    }
+    if (cfg.is_k2) {
+        if (cfg.rope_head_dim && cfg.head_dim && cfg.rope_head_dim != cfg.head_dim) {
+            err = "k2_horizon: rope_head_dim != head_dim needs the split/interleave "
+                  "rope path, which is not implemented"; return false;
+        }
+        if (cfg.norm_groups <= 0 || cfg.hidden % cfg.norm_groups) {
+            err = "k2_horizon: hidden_size is not divisible by layernorm_num_groups";
+            return false;
+        }
     }
 
     // ---- layer_types -------------------------------------------------
@@ -154,6 +236,19 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 }
             }
         }
+    }
+
+    // ---- K2 per-layer sparsity ---------------------------------------
+    // A sparse layer runs MoVA attention and the routed MoE; a dense one
+    // runs plain attention and a single intermediate_size MLP.  Both
+    // shapes coexist (layers 0-2 dense, 3-47 sparse in the 36B-A4B), so
+    // nothing downstream may assume one kind.
+    cfg.k2_sparse.assign(cfg.n_layers, false);
+    if (cfg.is_k2) {
+        for (int i = 0; i < cfg.n_layers; ++i)
+            cfg.k2_sparse[size_t(i)] = k2::is_sparse_layer(
+                i, cfg.mlp_only_layers.empty() ? nullptr : cfg.mlp_only_layers.data(),
+                int(cfg.mlp_only_layers.size()), cfg.n_experts, cfg.sparse_step);
     }
 
     // ---- shards ------------------------------------------------------
