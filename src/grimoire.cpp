@@ -166,6 +166,27 @@ static Xe2DenseW4A8 load_xe2_dense_w4a8(const char* sym) {
     return nullptr;
 }
 
+// GRIMOIRE_W4A8 FREES a converted weight's MXFP4 payload, so a weight may
+// only be converted when the tiles that consume int4 actually exist.  The
+// decode selection chain always falls back to the _big symbols, so those two
+// are the real requirement.  A STALE libgrimoire_xe2_grouped.so still
+// resolves the older mxfp4 symbols but not these -- build_b70.sh does not
+// rebuild the bridges -- and mmb()/mmbb() would then fall through to the
+// freed payload with a live function pointer, which is a DEVICE_LOST and a
+// power cycle, not a clean error.  Refuse the conversion and stay on MXFP4.
+static bool w4a8_tiles_available() {
+    static const bool v = [] {
+        const bool ok = load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_f32")
+                     && load_xe2_dense_w4a8("grimoire_xe2_dense_w4a8_bf16");
+        if (!ok)
+            std::fprintf(stderr,
+                "  W4A8 requested but the w4a8 tiles are missing from the "
+                "bridge -- staying on MXFP4 (run tools/build_bridges_b70.sh)\n");
+        return ok;
+    }();
+    return v;
+}
+
 static Xe2GroupedMXFP4 load_xe2_grouped_sym(const char* sym) {
     void* handle=nullptr;
     const char* env=std::getenv("GRIMOIRE_XE2_GROUPED_BRIDGE");
@@ -2599,7 +2620,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // device from the MXFP4 originals.  Opt-in because it costs ~9 GB of
         // VRAM on top of the model: the MXFP4 weights stay because decode's
         // GEMV beats any GEMM at M=1.
-        if (w4a8_enabled() && ok) {
+        if (w4a8_enabled() && w4a8_tiles_available() && ok) {
             // Convert EVERY projection, not just the FFN.  Measured with the
             // M16 tile: la_qkv 2.78 ms at M=4 against the decode GEMV's 3.44,
             // q+gate 1.03 vs 1.20 -- and flat all the way to M=16, which is
@@ -2658,7 +2679,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // projections so the verifier can stream it once for all rows.  Decode
     // also consumes this representation through gemv_any(), so there is no
     // second copy and no decode/verify weight mismatch.
-    if (w4a8_enabled() && lm_head.w.fmt == Fmt::MXFP4 && lm_head.payload &&
+    if (w4a8_enabled() && w4a8_tiles_available() &&
+        lm_head.w.fmt == Fmt::MXFP4 && lm_head.payload &&
         lm_head.w.K % 128 == 0 && lm_head.w.N % 256 == 0) {
         const int N = lm_head.w.N, K = lm_head.w.K;
         uint8_t* pack = sycl::malloc_device<uint8_t>(size_t(N) * (K / 2), q);
