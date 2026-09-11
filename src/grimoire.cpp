@@ -23,6 +23,8 @@
 // =====================================================================
 #include "kernels.hpp"
 #include "b70/engine.hpp"
+#include "b70/grimoire_api.hpp"
+#include "b70/http_request.hpp"
 #include "b70/qwen35.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -1303,8 +1305,6 @@ struct Grimoire {
     // token's device time actually goes. Profiling is NOT free, so the
     // property is only requested when the timeline is asked for.
     static sycl::property_list queue_props() {
-        if (std::getenv("GRIMOIRE_DAG"))
-            return sycl::property_list{};
         if (std::getenv("GRIMOIRE_TIMELINE") ||
             std::getenv("GRIMOIRE_PROFILE_PREFILL"))
             return {sycl::property::queue::in_order(),
@@ -1634,7 +1634,7 @@ struct Grimoire {
     // everything submitted between them, gaps included. That measures the
     // real cost of a region without instrumenting 40 launch sites.
     bool  timeline = std::getenv("GRIMOIRE_TIMELINE") != nullptr;
-    bool  dag = std::getenv("GRIMOIRE_DAG") != nullptr;
+    bool  dag = false; // All model paths require in-order submission.
     int   dag_mask = 0; // 1 linear-attn, 2 full-attn, 4 MoE/shared overlap
     // Exhaustive B70 sweep: all four fusions preserve the token hash and,
     // together with GEMV 16/1, are the fastest coherent configuration.
@@ -1655,7 +1655,7 @@ struct Grimoire {
     int   probe_layer = 0;
     float* probe_buf = nullptr;
     void probe(const char* tag, const float* p, int n);
-    void sync() { q.wait(); }     // forward() no longer drains; callers that
+    void sync() { q.wait_and_throw(); }     // forward() no longer drains; callers that
                                   // time a region must end it with this.
 
     // Any decode GEMV.  When a weight has been converted its MXFP4 payload is
@@ -1811,6 +1811,16 @@ struct Grimoire {
 
     bool build(const std::string& dir, const UploadOptions& opt, std::string& err);
     void reset();
+    // At the next decode step K/V is appended at p and attention reads [0,p+1).
+    // Capture values into a device command: never copy from a temporary host int.
+    void set_cursor(int p) {
+        int32_t* dp=s.d_pos; int32_t* ds=s.d_seq_len;
+        q.single_task([=] { *dp=p; *ds=p+1; });
+    }
+    void check_token(int t) const {
+        if(t<0 || t>=cfg.vocab)throw std::invalid_argument("token outside model vocabulary");
+        if(pos<0 || pos>=max_seq)throw std::out_of_range("context capacity exhausted");
+    }
     const float* forward(int token);      // returns device logits
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
@@ -3321,9 +3331,7 @@ void Grimoire::reset() {
         q.memset(mtp.L.k_cache, 0, kv_bytes);
         q.memset(mtp.L.v_cache, 0, kv_bytes);
     }
-    const int32_t z = 0, one = 1;
-    if (s.d_pos)     q.memcpy(s.d_pos, &z, sizeof(int32_t));
-    if (s.d_seq_len) q.memcpy(s.d_seq_len, &one, sizeof(int32_t));
+    if(s.d_pos && s.d_seq_len)set_cursor(0);
     q.wait();
     dag_tail.clear();
     dflash2.context_pos = 0;
@@ -3388,8 +3396,7 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
     q.memcpy(s.logits, prefix_cache.logits, size_t(cfg.vocab) * sizeof(float));
     pos = int(tokens.size());
-    q.memcpy(s.d_pos, &pos, sizeof(int32_t));
-    q.memcpy(s.d_seq_len, &pos, sizeof(int32_t)).wait();
+    set_cursor(pos); q.wait_and_throw();
     std::printf("  prefix cache HIT: %zu tokens\n", tokens.size());
     return true;
 }
@@ -3429,8 +3436,7 @@ void Grimoire::restore_recurrent(int saved_pos) {
         }
     }
     pos = saved_pos;
-    q.memcpy(s.d_pos, &saved_pos, sizeof(int32_t));
-    q.memcpy(s.d_seq_len, &saved_pos, sizeof(int32_t));
+    set_cursor(pos);
 }
 
 void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
@@ -3475,8 +3481,7 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
     q.memcpy(s.h, spec_hidden_steps + size_t(step) * cfg.hidden,
              size_t(cfg.hidden) * sizeof(float));
     pos = saved_pos + accepted;
-    q.memcpy(s.d_pos, &pos, sizeof(int32_t));
-    q.memcpy(s.d_seq_len, &pos, sizeof(int32_t));
+    set_cursor(pos);
 }
 
 void Grimoire::release() {
@@ -4474,6 +4479,7 @@ const float* Grimoire::forward_dag(int token) {
 
 // One decode step. Returns the device logits pointer.
 const float* Grimoire::forward_muse(int token) {
+    check_token(token);
     const int H = cfg.hidden, HD = cfg.head_dim;
     const int QH = cfg.n_heads, KVH = cfg.n_kv_heads;
     const int QW = QH * HD;                 // attention output width
@@ -4554,6 +4560,7 @@ const float* Grimoire::forward_muse(int token) {
 }
 
 const float* Grimoire::forward(int token) {
+    check_token(token);
     if (cfg.is_muse) return forward_muse(token);
     if (dag) return forward_dag(token);
     const int H  = cfg.hidden;
@@ -4951,9 +4958,7 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
     const std::vector<sycl::event> none{};
     LayerDev& d = mtp.L;
 
-    q.memcpy(s.d_pos, &position, sizeof(int32_t));
-    const int32_t seq = position + 1;
-    q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
+    set_cursor(position);
 
     // Same concat order as mtp_draft: EMBEDDING FIRST.
     launch_rmsnorm_residual(q, const_cast<float*>(hidden), nullptr, mtp.pre_h,
@@ -4982,9 +4987,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     LayerDev& d = mtp.L;
 
     // position for this draft: token t+1 sits at `position`
-    q.memcpy(s.d_pos, &position, sizeof(int32_t));
-    const int32_t seq = position + 1;
-    q.memcpy(s.d_seq_len, &seq, sizeof(int32_t));
+    set_cursor(position);
 
     // cat order.  DeepSeek/Qwen MTP is fc([norm(embedding) ; norm(hidden)]),
     // i.e. EMBEDDING FIRST.  Hidden-first measured 0/159 acceptance, which is
@@ -5928,8 +5931,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         launch_f16_to_f32(q,hidden,spec_hidden_steps,size_t(M)*H,{});
     launch_f16_to_f32(q,hidden+int64_t(M-1)*H,s.h,size_t(H),{});
     pos+=M;
-    q.memcpy(s.d_pos,&pos,sizeof(int32_t));
-    q.memcpy(s.d_seq_len,&pos,sizeof(int32_t));
+    set_cursor(pos);
     if(next_tokens){
         next_tokens->resize(M);
         q.memcpy(next_tokens->data(),outtok,size_t(M)*sizeof(int32_t));
@@ -5942,6 +5944,9 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens) {
+    if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
+        throw std::invalid_argument("prefill exceeds context capacity or is empty");
+    for(auto t:tokens)if(t<0||t>=cfg.vocab)throw std::invalid_argument("invalid prefill token");
     if (cfg.is_muse) {
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
         return prefill_muse(tokens,next_tokens);
@@ -7233,7 +7238,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (capture_spec)
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
     q.memcpy(s.h, bh + int64_t(M-1) * H, size_t(H) * sizeof(float));
-    pos+=M; q.memcpy(s.d_pos,&pos,sizeof(int)); q.memcpy(s.d_seq_len,&pos,sizeof(int));
+    pos+=M; set_cursor(pos);
     if (next_tokens) {
         next_tokens->resize(M);
         q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
@@ -7263,8 +7268,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                          start_pos + i);
             q.wait();
             // Restore the decode cursor that mtp_warm moved.
-            q.memcpy(s.d_pos, &pos, sizeof(int));
-            q.memcpy(s.d_seq_len, &pos, sizeof(int));
+            set_cursor(pos);
             q.wait();
         }
     }
@@ -7361,6 +7365,7 @@ bool Grimoire::build_graph() {
 }
 
 const float* Grimoire::step() {
+    if(pos<0 || pos>=max_seq)throw std::out_of_range("context capacity exhausted");
     if (graph_ok) {
         q.ext_oneapi_graph(*gexec).wait();
         ++pos;
@@ -7380,383 +7385,32 @@ namespace b70 {
 
 int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
                       const std::string& prompt, int n_predict) {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-
-    Tokenizer tk;
-    std::string err;
-    if (!tk.load(dir, err)) { std::printf("tokenizer: %s\n", err.c_str()); return 1; }
-
+    std::setvbuf(stdout,nullptr,_IONBF,0);
+    Tokenizer tk;std::string err;
+    if(!tk.load(dir,err)){std::fprintf(stderr,"tokenizer: %s\n",err.c_str());return 1;}
     Grimoire e;
-    UploadOptions opt;
-    opt.lm_head_fmt = proj_fmt;
-    opt.quantize_lm_head = (proj_fmt != Fmt::BF16);
-    opt.max_seq = max_seq;
-    if (!e.build(dir, opt, err)) { std::printf("\nload: %s\n", err.c_str()); return 1; }
-
-    const std::string templated = tk.apply_chat_template(prompt);
-    const std::vector<int32_t> ids = tk.encode(templated);
-    std::printf("\n  prompt: %zu tokens\n\n", ids.size());
-    if(const char* dd=std::getenv("GRIMOIRE_DFLASH_DUMP")){
-        std::string fn=std::string(dd)+"/g_00_prompt_ids.txt";
-        if(std::FILE* f=std::fopen(fn.c_str(),"w")){
-            for(size_t i=0;i<ids.size();++i)
-                std::fprintf(f,"%d%s",ids[i],i+1<ids.size()?",":"\n");
-            std::fclose(f);
-        }
+    if(!grimoire_load(e,dir,proj_fmt,max_seq,err)) {
+        std::fprintf(stderr,"load: %s\n",err.c_str());e.release();return 1;
     }
-
-    e.reset();
-
-    // GRIMOIRE_PREFILL_WARMUP=1 runs the prefill once and discards it, then
-    // times the second run. oneDNN keys its matmul primitives on (m,n,k), so a
-    // cold process JIT-compiles a fresh plan set for every distinct prompt
-    // length -- measured at ~181 ms in layer 0 alone (33.8 ms for qkv, 147.0 ms
-    // for the FFN down shape). A long-running server pays that once and
-    // amortises it; a fresh CLI process pays it on every invocation. Use this
-    // when comparing against the Fusion server, which has warm plans.
-    if (std::getenv("GRIMOIRE_PREFILL_WARMUP")) {
-        if (e.prefill(ids)) {
-            e.reset();
-        }
+    try {
+        const auto ids=tk.encode(tk.apply_chat_template(prompt));
+        std::vector<int32_t> out;
+        ResponseDecoder decoder(tk,tk.special_id("<|begin_of_text|>")>=0);
+        auto emit=[](const std::string& piece,bool) {
+            return std::fwrite(piece.data(),1,piece.size(),stdout)==piece.size();
+        };
+        FinishReason reason;
+        const auto start=std::chrono::steady_clock::now();
+        int n=grimoire_serve_generate(e,ids,n_predict,tk.eos(),out,tk.special_id("<|eot|>"),
+            [&](int32_t t){return decoder.push(t,emit);},&reason);
+        decoder.finish(emit);
+        std::printf("\n");
+        std::fprintf(stderr,"prompt=%zu generated=%d finish=%s elapsed=%.3fs\n",ids.size(),n,
+            finish_reason_name(reason),std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+        e.release();return 0;
+    }catch(const std::exception& ex) {
+        std::fprintf(stderr,"generation failed: %s\n",ex.what());e.release();return 1;
     }
-
-    const auto p0 = std::chrono::high_resolution_clock::now();
-    if (!e.prefill(ids)) {
-        std::printf("batched prefill unavailable, using sequential fallback\n");
-        for (size_t i = 0; i < ids.size(); ++i) {
-            e.forward(ids[i]);
-            if ((i & 63) == 63) e.sync();
-        }
-    }
-    e.sync();                      // pp must time execution, not submission
-    if (e.dflash2.ok &&
-        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr)) {
-        std::vector<int32_t> unused;
-        if (!e.dflash_draft(0, e.pos, unused, true)) {
-            std::fprintf(stderr,
-                "\n  DFlash context preparation failed at position %d\n", e.pos);
-            e.release();
-            return 1;
-        }
-    }
-    const auto p1 = std::chrono::high_resolution_clock::now();
-    const double pp_ms = std::chrono::duration<double, std::milli>(p1 - p0).count();
-
-    const bool gen_progress=std::getenv("GRIMOIRE_PREFILL_HOST_PROGRESS")!=nullptr;
-    if(gen_progress){std::fprintf(stderr,"    generate: prefill returned, calling argmax\n");
-        std::fflush(stderr);}
-    int tok = e.argmax_token();
-    if(gen_progress){std::fprintf(stderr,"    generate: first token id=%d\n",tok);
-        std::fflush(stderr);}
-    std::string out;
-    // Opt-in device-resident decode. The recorded graph submits all ~800
-    // per-token launches as one command list; its embed node reads s.d_tok,
-    // which argmax_token() has already written, so replay needs no rebind.
-    // Speculative paths call forward() directly and are unaffected.
-    const char* graph_env = std::getenv("GRIMOIRE_DECODE_GRAPH");
-    if (graph_env && *graph_env && std::atoi(graph_env) != 0) {
-        std::printf("  recording decode graph ... ");
-        std::fflush(stdout);
-        const bool ok = e.build_graph();
-        std::printf("%s\n", ok ? "ok" : "unavailable");
-        std::fflush(stdout);
-    }
-    const auto g0 = std::chrono::high_resolution_clock::now();
-    int n = 0;
-    const bool mtp_measure_only = std::getenv("GRIMOIRE_MTP_MEASURE") != nullptr;
-    const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok && !mtp_measure_only;
-    const bool dflash_spec = e.dflash2.ok &&
-        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
-    if (mtp_spec || dflash_spec) {
-        const int configured_k = dflash_spec ? 15 : [] {
-            const char* v = std::getenv("GRIMOIRE_MTP_K");
-            int k = v && *v ? std::atoi(v) : 3;
-            // Exact verification used to be pinned to the four-row FP32
-            // GEMV, whose cost is LINEAR in M -- so every extra draft token
-            // bought acceptance and paid for it twice over, and k>3 measured
-            // worse (ca865d3: k=3 27.73, k=4 17.98).  With verify on the
-            // w4a16 systolic path that term is gone, so the cap is worth
-            // re-sweeping.  GRIMOIRE_MTP_MAX_K overrides it without a
-            // rebuild; the default is unchanged until the sweep says so.
-            int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
-            if (const char* mk = std::getenv("GRIMOIRE_MTP_MAX_K"))
-                if (int v = std::atoi(mk)) max_k = std::max(1, std::min(15, v));
-            return std::max(0, std::min(max_k, k));
-        }();
-        int steps = 0, accepted_drafts = 0, attempted_drafts = 0;
-        int committed_total = 0, rollbacks = 0;
-        const bool profile_spec = std::getenv("GRIMOIRE_MTP_PROFILE") != nullptr;
-        double snapshot_ms = 0.0, draft_ms = 0.0, verify_ms = 0.0,
-               commit_ms = 0.0;
-        bool stop = false;
-
-        while (n < n_predict && !stop) {
-            if (tok == tk.eos() || e.pos >= e.max_seq) break;
-            const int k = std::min(configured_k, e.max_seq - e.pos - 1);
-            const int saved_pos = e.pos;
-            auto phase0 = std::chrono::high_resolution_clock::now();
-            e.snapshot_recurrent();
-            if (profile_spec) {
-                e.q.wait();
-                auto now = std::chrono::high_resolution_clock::now();
-                snapshot_ms += std::chrono::duration<double, std::milli>(now-phase0).count();
-                phase0 = now;
-            }
-
-            // candidates[0] is the already-known main token. Each MTP call
-            // predicts one token farther into the future.
-            std::vector<int32_t> candidates;
-            candidates.reserve(size_t(k) + 1);
-            candidates.push_back(tok);
-            if(dflash_spec){
-                std::vector<int32_t> block;
-                if(!e.dflash_draft(tok,saved_pos,block)){
-                    std::fprintf(stderr,"\n  DFlash draft failed at position %d\n",saved_pos);
-                    e.release();return 1;
-                }
-                const int take=std::min(k,int(block.size()));
-                candidates.insert(candidates.end(),block.begin(),block.begin()+take);
-            }else{
-                int draft = tok;
-                for (int j = 1; j <= k; ++j) {
-                    draft = e.mtp_draft(draft, saved_pos + j - 1, j > 1);
-                    if (draft < 0) break;
-                    candidates.push_back(draft);
-                }
-            }
-            if (profile_spec) {
-                e.q.wait();
-                auto now = std::chrono::high_resolution_clock::now();
-                draft_ms += std::chrono::duration<double, std::milli>(now-phase0).count();
-                phase0 = now;
-            }
-
-            std::vector<int32_t> verified;
-            if (!e.prefill(candidates, &verified) || verified.size() != candidates.size()) {
-                std::fprintf(stderr, "\n  %s verifier failed at position %d\n",
-                             dflash_spec?"DFlash":"MTP", saved_pos);
-                e.release();
-                return 1;
-            }
-            if (profile_spec) {
-                auto now = std::chrono::high_resolution_clock::now();
-                verify_ms += std::chrono::duration<double, std::milli>(now-phase0).count();
-                phase0 = now;
-            }
-
-            if (std::getenv("GRIMOIRE_DFLASH_DUMP")) {
-                static int vdump = 0;
-                if (vdump++ < 2) {
-                    // The committed token each step is verified[0]. If that is
-                    // wrong the target's batched verify forward is broken,
-                    // independent of draft quality.
-                    std::fprintf(stderr, "  verify@%d candidates:", saved_pos);
-                    for (size_t i = 0; i < candidates.size(); ++i)
-                        std::fprintf(stderr, " %d", candidates[i]);
-                    std::fprintf(stderr, "\n  verify@%d verified  :", saved_pos);
-                    for (size_t i = 0; i < verified.size(); ++i)
-                        std::fprintf(stderr, " %d", verified[i]);
-                    std::fprintf(stderr, "\n");
-                    std::fflush(stderr);
-                }
-            }
-            int accepted = 1;
-            for (; accepted < int(candidates.size()); ++accepted) {
-                ++attempted_drafts;
-                if (candidates[accepted] != verified[accepted - 1]) break;
-                ++accepted_drafts;
-            }
-            const int next = verified[accepted - 1];
-
-            // The optimistic verifier consumed every candidate. On a partial
-            // rejection, restore the exact recurrent state and replay only
-            // the prefix whose tokens matched the main model. KV cache slots
-            // are overwritten by that replay and therefore need no snapshot.
-            if (accepted < int(candidates.size())) {
-                ++rollbacks;
-                static bool state_checked = false;
-                const bool check_state = !state_checked &&
-                    std::getenv("GRIMOIRE_MTP_VALIDATE_STATE");
-                if (check_state) {
-                    state_checked = true;
-                    e.commit_spec_prefix(saved_pos, accepted);
-                    e.q.wait();
-                    std::vector<float> got_dn(e.spec_dn_elems),
-                                       got_cv(e.spec_conv_elems),
-                                       got_h(size_t(e.cfg.hidden));
-                    size_t d0 = 0, c0 = 0;
-                    const size_t dn_n = size_t(e.cfg.lin_v_heads) *
-                        e.cfg.lin_v_dim * e.cfg.lin_k_dim;
-                    const size_t cv_n = size_t(2 * e.cfg.lin_k_heads * e.cfg.lin_k_dim +
-                        e.cfg.lin_v_heads * e.cfg.lin_v_dim) * (e.cfg.conv_kernel - 1);
-                    for (const auto& ld : e.L) {
-                        if (ld.dn_state) { e.q.memcpy(got_dn.data()+d0,ld.dn_state,
-                            dn_n*sizeof(float)); d0+=dn_n; }
-                        if (ld.conv_ring) { e.q.memcpy(got_cv.data()+c0,ld.conv_ring,
-                            cv_n*sizeof(float)); c0+=cv_n; }
-                    }
-                    e.q.memcpy(got_h.data(),e.s.h,size_t(e.cfg.hidden)*sizeof(float)).wait();
-
-                    e.restore_recurrent(saved_pos);
-                    std::vector<int32_t> prefix(candidates.begin(),
-                                                candidates.begin() + accepted);
-                    // Replay through the same verifier path. Passing no
-                    // output vector selects ordinary prompt-prefill kernels,
-                    // including fused projections whose summation differs
-                    // from exact speculative verification; comparing those
-                    // states produced a false parity failure.
-                    std::vector<int32_t> replay_verified;
-                    e.prefill(prefix, &replay_verified);
-                    std::vector<float> ref_dn(e.spec_dn_elems),
-                                       ref_cv(e.spec_conv_elems),
-                                       ref_h(size_t(e.cfg.hidden));
-                    d0=0;c0=0;
-                    for (const auto& ld : e.L) {
-                        if (ld.dn_state) { e.q.memcpy(ref_dn.data()+d0,ld.dn_state,
-                            dn_n*sizeof(float)); d0+=dn_n; }
-                        if (ld.conv_ring) { e.q.memcpy(ref_cv.data()+c0,ld.conv_ring,
-                            cv_n*sizeof(float)); c0+=cv_n; }
-                    }
-                    e.q.memcpy(ref_h.data(),e.s.h,size_t(e.cfg.hidden)*sizeof(float)).wait();
-                    auto report_diff=[](const char* name,const std::vector<float>& a,
-                                        const std::vector<float>& b){
-                        double max_abs=0.0, sum=0.0; size_t bad=0;
-                        for(size_t i=0;i<a.size();++i){
-                            const double d=std::abs(double(a[i])-double(b[i]));
-                            max_abs=std::max(max_abs,d);sum+=d;if(d!=0.0)++bad;
-                        }
-                        std::fprintf(stderr,"\n  MTP state %-8s: %zu/%zu differ, "
-                            "max %.7g mean %.7g\n",name,bad,a.size(),max_abs,
-                            a.empty()?0.0:sum/a.size());
-                    };
-                    report_diff("deltanet",got_dn,ref_dn);
-                    report_diff("conv",got_cv,ref_cv);
-                    report_diff("hidden",got_h,ref_h);
-                } else {
-                    e.commit_spec_prefix(saved_pos, accepted);
-                }
-            }
-            if (profile_spec) {
-                e.q.wait();
-                auto now = std::chrono::high_resolution_clock::now();
-                commit_ms += std::chrono::duration<double, std::milli>(now-phase0).count();
-            }
-
-            ++steps;
-            committed_total += accepted;
-            for (int i = 0; i < accepted; ++i) {
-                const int t = candidates[i];
-                if (t == tk.eos() || n >= n_predict) { stop = true; break; }
-                const std::string piece = tk.decode_one(t);
-                out += piece;
-                std::printf("%s", piece.c_str());
-                ++n;
-            }
-            tok = next;
-        }
-
-        const auto g1 = std::chrono::high_resolution_clock::now();
-        const double tg_ms = std::chrono::duration<double, std::milli>(g1 - g0).count();
-        std::printf("\n\n  pp %zu tokens in %.0f ms -> %.1f tok/s\n",
-                    ids.size(), pp_ms, 1000.0 * ids.size() / pp_ms);
-        std::printf("  %s(k=%d) tg %d tokens in %.0f ms -> %.1f tok/s\n",
-                    dflash_spec?"DFlash":"MTP",configured_k, n, tg_ms,
-                    n > 0 ? 1000.0 * n / tg_ms : 0.0);
-        std::printf("  %s steps %d, %.2f committed/step, draft accepts %d/%d, "
-                    "rollbacks %d\n",
-                    dflash_spec?"DFlash":"MTP",steps,
-                    steps ? double(committed_total) / steps : 0.0,
-                    accepted_drafts, attempted_drafts, rollbacks);
-        if (profile_spec)
-            std::printf("  %s profile snapshot %.1f ms, draft %.1f ms, verify %.1f ms, "
-                        "commit %.1f ms\n",dflash_spec?"DFlash":"MTP",
-                        snapshot_ms, draft_ms, verify_ms, commit_ms);
-        e.release();
-        return 0;
-    }
-    // MTP ACCEPTANCE MEASUREMENT.  No speculation yet: run the draft head
-    // every step and check, one step later, whether it called the token the
-    // model actually produced.  This is the number that decides whether the
-    // verify + rollback machinery is worth building -- measure it before
-    // building it.
-    const bool mtp_meas = Grimoire::mtp_enabled() && mtp_measure_only;
-    int mtp_hit = 0, mtp_tot = 0;
-    // A draft made at the end of iteration i is a prediction for the token
-    // that arrives at the start of iteration i+2 -- mtp_draft(T) predicts the
-    // token AFTER T, and T itself is only emitted next iteration.  So the
-    // check needs a two-deep pipeline; comparing one step early reads 0-2%
-    // on a head that is actually working.
-    // A draft of depth j made at iteration i predicts the token that arrives
-    // at iteration i+1+j.  Chained drafts feed the head its own hidden state.
-    const int MTPK = [] { const char* v = std::getenv("GRIMOIRE_MTP_K");
-        int k = v && *v ? std::atoi(v) : 4; return k < 1 ? 1 : (k > 8 ? 8 : k); }();
-    std::vector<std::array<int, 9>> pend(size_t(n_predict) + 16);
-    for (auto& a : pend) a.fill(-1);
-    std::array<int, 9> hit_d{}, tot_d{};
-    for (; n < n_predict; ++n) {
-        if (tok == tk.eos()) break;
-        if (mtp_meas) {
-            for (int j = 1; j <= MTPK; ++j) {
-                const int d = pend[size_t(n)][j];
-                if (d < 0) continue;
-                ++tot_d[j];
-                if (d == tok) ++hit_d[j];
-                if (j == 1) { ++mtp_tot; if (d == tok) ++mtp_hit; }
-            }
-        }
-        const std::string piece = tk.decode_one(tok);
-        out += piece;
-        std::printf("%s", piece.c_str());
-        // argmax_token() left this token in s.d_tok, which is exactly what
-        // the recorded graph's embed node reads, so replay needs no rebind.
-        if (e.graph_ok) e.step(); else e.forward(tok);
-        tok = e.argmax_token();
-        if (mtp_meas) {
-            int t = tok;
-            for (int j = 1; j <= MTPK; ++j) {
-                t = e.mtp_draft(t, e.pos + j - 1, j > 1);
-                const size_t slot = size_t(n) + 1 + size_t(j);
-                if (t < 0) break;
-                if (slot < pend.size()) pend[slot][j] = t;
-            }
-        }
-    }
-    const auto g1 = std::chrono::high_resolution_clock::now();
-    const double tg_ms = std::chrono::duration<double, std::milli>(g1 - g0).count();
-
-    std::printf("\n\n  pp %zu tokens in %.0f ms -> %.1f tok/s\n",
-                ids.size(), pp_ms, 1000.0 * ids.size() / pp_ms);
-    std::printf("  tg %d tokens in %.0f ms -> %.1f tok/s\n",
-                n, tg_ms, n > 0 ? 1000.0 * n / tg_ms : 0.0);
-    if (mtp_meas && tot_d[1] > 0) {
-        std::printf("\n  MTP acceptance by draft depth (%d chained):\n", MTPK);
-        double expected = 1.0, run = 1.0;
-        for (int j = 1; j <= MTPK; ++j) {
-            if (!tot_d[j]) continue;
-            const double pj = double(hit_d[j]) / double(tot_d[j]);
-            // a depth-j draft is only usable if every shallower one was right
-            run = (j == 1) ? pj : run * (pj > 0 ? pj : 0);
-            expected += run;
-            std::printf("    depth %d: %4d/%4d = %5.1f%%   cumulative accept %.2f tok/step\n",
-                        j, hit_d[j], tot_d[j], 100.0 * pj, expected);
-        }
-        const double base_ms = tg_ms / std::max(1, n);
-        // one verify step (~1.10x a plain step for a small batch) plus the
-        // draft heads, against `expected` committed tokens
-        const double step_ms = base_ms * 1.10 + double(MTPK) * 1.55;
-        std::printf("    -> %.2f tok per %.1f ms step  ->  %.1f tok/s projected\n",
-                    expected, step_ms, 1000.0 * expected / step_ms);
-    }
-    if (mtp_meas && mtp_tot > 0) {
-        const double acc = 100.0 * double(mtp_hit) / double(mtp_tot);
-        std::printf("  MTP acceptance %d/%d = %.1f%%\n", mtp_hit, mtp_tot, acc);
-        // With one draft token: a step commits 1 + acc tokens on average and
-        // costs about one verify step plus the draft head.
-        std::printf("  -> at %.1f%% and a 1.05x verify step, projected TG ~%.1f tok/s\n",
-                    acc, 1000.0 * n / tg_ms * (1.0 + acc / 100.0) / 1.10);
-    }
-    e.release();
-    return 0;
 }
 
 // =====================================================================
@@ -7779,206 +7433,29 @@ bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
 // greedy fallback share the same resident engine state.
 int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              int n_predict, int eos_id, std::vector<int32_t>& out_ids,
-                             int eot_id,
-                             const std::function<bool(int32_t)>& on_token) {
-    auto is_stop = [&](int t) { return t == eos_id || (eot_id >= 0 && t == eot_id); };
-    // Streaming clients (llama-benchy, open-webui) need each token as it is
-    // produced, not one JSON blob at the end -- without it they cannot measure
-    // time-to-first-token and llama-benchy reports "No results collected".
-    // Returning false from the callback stops generation (client disconnected).
-    bool cancelled = false;
-    auto emit = [&](int32_t t) {
-        out_ids.push_back(t);
-        if (on_token && !on_token(t)) cancelled = true;
-    };
-    const auto rs_t0 = std::chrono::steady_clock::now();
-    e.reset();
-    std::fprintf(stderr, "    [reset] %.0f ms\n",
-        std::chrono::duration<double,std::milli>(
-            std::chrono::steady_clock::now()-rs_t0).count());
-    std::fflush(stderr);
-    const auto pf_t0 = std::chrono::steady_clock::now();
-    const bool pf_ok = e.prefill(prompt_ids);
-    if (!pf_ok) {
-        std::fprintf(stderr, "    [prefill] BATCHED PREFILL FAILED -- falling "
-            "back to per-token forward (this is ~100x slower)\n");
-        for (size_t i = 0; i < prompt_ids.size(); ++i) {
-            e.forward(prompt_ids[i]);
-            if ((i & 63) == 63) e.sync();
-        }
-    }
-    e.sync();
-    if (e.dflash2.ok &&
-        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr)) {
-        std::vector<int32_t> unused;
-        if (!e.dflash_draft(0, e.pos, unused, true)) {
-            std::fprintf(stderr,
-                "    [prefill] DFlash context preparation failed at position %d\n",
-                e.pos);
-            return 0;
-        }
-    }
-    {
-        const double pf_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - pf_t0).count();
-        std::fprintf(stderr, "    [prefill] %zu tokens in %.0f ms -> %.1f tok/s\n",
-            prompt_ids.size(), pf_ms,
-            pf_ms > 0.0 ? 1000.0 * double(prompt_ids.size()) / pf_ms : 0.0);
-    }
-    const auto am_t0 = std::chrono::steady_clock::now();
-    int tok = e.argmax_token();
-    std::fprintf(stderr, "    [argmax] %.0f ms\n",
-        std::chrono::duration<double,std::milli>(
-            std::chrono::steady_clock::now()-am_t0).count());
-    std::fflush(stderr);
-    out_ids.clear();
-    out_ids.reserve(size_t(n_predict));
-    int n = 0;
-
-    // Speculative decode, same accept/reject contract as the CLI path: draft a
-    // block, verify it with one batched forward, accept the matching prefix,
-    // and on partial rejection restore the recurrent state to the accepted
-    // prefix (commit_spec_prefix) so the next step starts from exact state.
-    // Falls through to plain greedy below when no drafter is loaded.
-    const bool mtp_spec = Grimoire::mtp_enabled() && e.mtp.ok;
-    const bool dflash_spec = e.dflash2.ok &&
-        (!e.dflash2.v2 || std::getenv("GRIMOIRE_DFLASH2") != nullptr);
-    // The CLI has used this graph-replay path since c957f2f, but the server
-    // fallback still submitted every kernel in forward() separately. Build
-    // the same reusable graph once for non-speculative server decode. The
-    // graph reads the current token from s.d_tok, which argmax_token() wrote.
-    const char* graph_env = std::getenv("GRIMOIRE_DECODE_GRAPH");
-    if (!mtp_spec && !dflash_spec && graph_env && *graph_env &&
-        std::atoi(graph_env) != 0 && !e.graph_ok) {
-        const bool ok = e.build_graph();
-        std::fprintf(stderr, "    [decode] command graph %s\n",
-                     ok ? "ready" : "unavailable; using direct submission");
-        std::fflush(stderr);
-    }
-    // The first token is already known from the prefill argmax. Emitting it
-    // before the first speculation round removes a whole draft+verify cycle
-    // from time-to-first-token. A benchmark charges that to prefill, which is
-    // why reported PP read ~1790 against ~2070 of real prefill compute.
-    int skip_first = 0;
-    if ((mtp_spec || dflash_spec) && on_token && n < n_predict && !is_stop(tok)) {
-        emit(tok);
-        ++n;
-        skip_first = 1;
-    }
-    // Acceptance/verify accounting for the server path. GRIMOIRE_MTP_PROFILE
-    // only ever instrumented the CLI loop, which is why a slow server decode
-    // could never be attributed to acceptance vs verify cost.
-    const bool spec_profile = std::getenv("GRIMOIRE_MTP_PROFILE") != nullptr;
-    int spec_rounds = 0, spec_drafted = 0, spec_accepted = 0;
-    double spec_draft_ms = 0.0, spec_verify_ms = 0.0;
-    const auto spec_t0 = std::chrono::steady_clock::now();
-    if (mtp_spec || dflash_spec) {
-        const int configured_k = dflash_spec ? 15 : [] {
-            const char* v = std::getenv("GRIMOIRE_MTP_K");
-            int k = v && *v ? std::atoi(v) : 3;
-            // Exact verification used to be pinned to the four-row FP32
-            // GEMV, whose cost is LINEAR in M -- so every extra draft token
-            // bought acceptance and paid for it twice over, and k>3 measured
-            // worse (ca865d3: k=3 27.73, k=4 17.98).  With verify on the
-            // w4a16 systolic path that term is gone, so the cap is worth
-            // re-sweeping.  GRIMOIRE_MTP_MAX_K overrides it without a
-            // rebuild; the default is unchanged until the sweep says so.
-            int max_k = std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") ? 3 : 7;
-            if (const char* mk = std::getenv("GRIMOIRE_MTP_MAX_K"))
-                if (int v = std::atoi(mk)) max_k = std::max(1, std::min(15, v));
-            return std::max(0, std::min(max_k, k));
-        }();
-        bool stop = false;
-        while (n < n_predict && !stop) {
-            if (is_stop(tok) || e.pos >= e.max_seq) break;
-            const int k = std::min(configured_k, e.max_seq - e.pos - 1);
-            if (k <= 0) break;
-            const int saved_pos = e.pos;
-            e.snapshot_recurrent();
-            // Match the proven CLI MTP path: profiling drains the checkpoint
-            // before starting the timed draft phase.
-            if (spec_profile) e.q.wait();
-
-            const auto dr_t0 = std::chrono::steady_clock::now();
-            std::vector<int32_t> candidates;
-            candidates.reserve(size_t(k) + 1);
-            candidates.push_back(tok);
-            if (dflash_spec) {
-                std::vector<int32_t> block;
-                if (!e.dflash_draft(tok, saved_pos, block)) break;
-                const int take = std::min(k, int(block.size()));
-                candidates.insert(candidates.end(), block.begin(),
-                                  block.begin() + take);
-            } else {
-                int draft = tok;
-                for (int j = 1; j <= k; ++j) {
-                    draft = e.mtp_draft(draft, saved_pos + j - 1, j > 1);
-                    if (draft < 0) break;
-                    candidates.push_back(draft);
-                }
-            }
-            if (candidates.size() < 2) break;   // drafter produced nothing
-
-            spec_draft_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - dr_t0).count();
-
-            const auto vf_t0 = std::chrono::steady_clock::now();
-            std::vector<int32_t> verified;
-            if (!e.prefill(candidates, &verified) ||
-                verified.size() != candidates.size()) break;
-            spec_verify_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - vf_t0).count();
-
-            int accepted = 1;
-            for (; accepted < int(candidates.size()); ++accepted)
-                if (candidates[accepted] != verified[accepted - 1]) break;
-            ++spec_rounds;
-            spec_drafted  += int(candidates.size()) - 1;
-            spec_accepted += accepted - 1;
-            const int next = verified[accepted - 1];
-
-            if (accepted < int(candidates.size()))
-                e.commit_spec_prefix(saved_pos, accepted);
-
-            for (int i = skip_first; i < accepted; ++i) {
-                const int t = candidates[i];
-                if (is_stop(t) || n >= n_predict) { stop = true; break; }
-                emit(t);
-                ++n;
-                if (cancelled) { stop = true; break; }
-            }
-            skip_first = 0;
-            tok = next;
-        }
-        if (spec_profile && spec_rounds > 0) {
-            const double tot_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - spec_t0).count();
-            std::fprintf(stderr,
-                "    [spec] %d rounds  accept %d/%d = %.1f%%  %.2f tok/round"
-                "  draft %.0f ms  verify %.0f ms  other %.0f ms -> %.1f tok/s\n",
-                spec_rounds, spec_accepted, spec_drafted,
-                spec_drafted ? 100.0 * spec_accepted / spec_drafted : 0.0,
-                double(n) / spec_rounds, spec_draft_ms, spec_verify_ms,
-                tot_ms - spec_draft_ms - spec_verify_ms,
-                tot_ms > 0.0 ? 1000.0 * n / tot_ms : 0.0);
-            std::fflush(stderr);
-        }
+                             int eot_id, const std::function<bool(int32_t)>& on_token,
+                             FinishReason* finish) {
+    GenerationOptions o;
+    o.max_tokens=n_predict; o.eos=eos_id; o.eot=eot_id;
+    o.dflash=e.dflash2.ok;
+    const char* depth=std::getenv("GRIMOIRE_MTP_K");
+    o.draft_depth=o.dflash?15:std::clamp(depth?std::atoi(depth):3,0,15);
+    o.mtp=Grimoire::mtp_enabled() && e.mtp.ok && o.draft_depth>0;
+    const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
+    o.graph=graph && std::atoi(graph)!=0;
+    FinishReason reason=FinishReason::Length;
+    try {
+        const int n=generate_tokens(e,prompt_ids,o,out_ids,on_token,reason);
+        if(finish)*finish=reason;
         return n;
+    } catch(...) {
+        // A failed verifier may have advanced recurrent state. A subsequent
+        // request must start clean; never return a successful empty response.
+        e.sync();e.reset();throw;
     }
-
-    for (; n < n_predict; ++n) {
-        if (is_stop(tok)) break;
-        emit(tok);
-        if (cancelled) { ++n; break; }
-        if (e.graph_ok) e.step(); else e.forward(tok);
-        tok = e.argmax_token();
-    }
-    // Deliberately no e.release() here: the engine stays resident across
-    // requests. release() is only correct at process shutdown, which this
-    // server does not currently hook (process exit reclaims the GPU context
-    // regardless).
-    return n;
 }
+
+void grimoire_delete(Grimoire* e) { if(e){e->release();delete e;} }
 
 } // namespace b70
 

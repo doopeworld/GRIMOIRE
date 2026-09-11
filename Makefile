@@ -10,6 +10,19 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
 .PHONY: all test clean tools
 all: test
 
+bin/test_generation: tests/test_generation.cpp include/b70/generation.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+bin/test_http: tests/test_http.cpp include/b70/http_request.hpp include/b70/json.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+.PHONY: test-correctness
+test-correctness: bin/test_generation bin/test_http
+	./bin/test_generation
+	./bin/test_http
+
 HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp
 tools: bin/grimoire-quantize bin/inspect_native_model
 
