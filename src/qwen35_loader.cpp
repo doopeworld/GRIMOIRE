@@ -2,6 +2,7 @@
 //  qwen35_loader.cpp
 // =====================================================================
 #include "b70/qwen35.hpp"
+#include "b70/tensor_layout.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -334,29 +335,6 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             lay.e_down_p.resize(cfg.n_experts); lay.e_down_s.resize(cfg.n_experts);
             const TensorRef fused_gu = get(m + "experts.gate_up_proj");
             const TensorRef fused_dn = get(m + "experts.down_proj");
-            auto fused_slice = [](const TensorRef& src, uint64_t elem0,
-                                  int n, int k, const char* suffix) {
-                TensorRef r;
-                if (!src.ok() || src.t.dtype != STDtype::BF16 || n<=0 || k<=0 ||
-                    src.t.shape.size()!=3 || src.t.shape.back()!=k || elem0%uint64_t(k) ||
-                    src.t.numel()<=0 || elem0>uint64_t(src.t.numel()) ||
-                    uint64_t(n)*k>uint64_t(src.t.numel())-elem0) return r;
-                r = src;
-                r.t.name += suffix;
-                if(src.native){
-                    NativeLayout l; std::string error;
-                    if (!native_layout(*src.native,l,error) || l.K!=k) return TensorRef{};
-                    const uint64_t row=elem0/uint64_t(k);
-                    r.native_payload_offset += row*l.row_payload_bytes;
-                    r.native_scale_offset += row*l.row_scale_bytes;
-                    r.t.begin=0;r.t.end=uint64_t(n)*l.row_payload_bytes;
-                }else{
-                    r.t.begin = src.t.begin + elem0 * 2;
-                    r.t.end = r.t.begin + uint64_t(n) * k * 2;
-                }
-                r.t.shape = {n, k};
-                return r;
-            };
             for (int e = 0; e < cfg.n_experts; ++e) {
                 const std::string x = m + "experts." + std::to_string(e) + ".";
                 lay.e_gate_p[e] = get(x + "gate_proj.weight_packed");
@@ -383,15 +361,15 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 // [E,2I,H] and [E,H,I].  Resolve zero-copy logical slices so
                 // the B70 upload path can quantize them directly to MXFP4.
                 if (!lay.e_gate_p[e].ok() && fused_gu.ok()) {
-                    lay.e_gate_p[e] = fused_slice(fused_gu,
+                    lay.e_gate_p[e] = fused_expert_slice(fused_gu,
                         uint64_t(e) * 2 * cfg.moe_inter * cfg.hidden,
                         cfg.moe_inter, cfg.hidden, ".gate");
-                    lay.e_up_p[e] = fused_slice(fused_gu,
+                    lay.e_up_p[e] = fused_expert_slice(fused_gu,
                         (uint64_t(e) * 2 * cfg.moe_inter + cfg.moe_inter) * cfg.hidden,
                         cfg.moe_inter, cfg.hidden, ".up");
                 }
                 if (!lay.e_down_p[e].ok() && fused_dn.ok())
-                    lay.e_down_p[e] = fused_slice(fused_dn,
+                    lay.e_down_p[e] = fused_expert_slice(fused_dn,
                         uint64_t(e) * cfg.hidden * cfg.moe_inter,
                         cfg.hidden, cfg.moe_inter, ".down");
             }
