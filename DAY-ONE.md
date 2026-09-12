@@ -39,6 +39,13 @@ order, and stops at the first required failure:
 | `bin/test_model_matrix` | 3 architectures × 7 projection formats |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
 | `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU |
+
+**Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say
+REFUSED (no batched verify there, and the engine will not speculate
+without one). On your B70 they run for real and must say `identical at
+K=1,2,3,5`. If either says `CHANGED THE OUTPUT`, stop: that is
+speculation on a Qwen3.5/Ornith-shaped model not reproducing the model's
+own output, which is the path the verified 49.8 TG MTP recipe uses.
 | generate | real model, real prompt — **you read the output** |
 
 Green preflight means the box is sane. It does not mean anything is

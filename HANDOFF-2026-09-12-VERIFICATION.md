@@ -117,7 +117,7 @@ test_parallel_e2e   ALL PASS   7 cases, PP and TP token-identical,
                                including DeltaNet state across a split
 test_spec_e2e       ALL PASS   dense and moe, bf16 and fp8, identical at
                                K=1,2,3,5, single process + TP + PP;
-                               hybrid correctly REFUSES here
+                               hybrid REFUSES here (see below)
 make test                      11 suites
 make test-correctness          2 suites
 bin/grimoire, bin/grimoire-server   compile and link
@@ -129,9 +129,19 @@ bin/grimoire, bin/grimoire-server   compile and link
   container, so every gate above ran the sequential decode path.
   Prompt processing uses the batched path. Treat the first long prompt on
   the card as that path's first run.
-- **The batched speculative verify on a recurrent model** — same reason.
-  That is the path bug (12) says must be used for hybrids, and it is the
-  one Ian's verified 49.8 TG Qwen MTP recipe exercises.
+- **Speculation on a recurrent model has NOT been shown exact anywhere.**
+  This is the gap that matters most, so be precise about it: the hybrid
+  rows of `test_spec_e2e` report REFUSED here, because this container has
+  no batched verify and the engine will not speculate without one. On a
+  B70 the batched verify IS available, so the engine will speculate and
+  those same rows will run a real exactness check instead.
+
+  **That makes `bin/test_spec_e2e` the first thing to read on the Tower.**
+  The hybrid rows should say `identical at K=1,2,3,5`. If either says
+  `CHANGED THE OUTPUT`, that is a genuine bug in the batched
+  verify/rollback on a recurrent model — and it is the path Ian's verified
+  49.8 TG Qwen MTP recipe runs on, so it would mean that number came from
+  a configuration that was not reproducing the model's own output.
 - Every XMX tile, the AOT `bmg_g31` image, the bridges, the OCuLink link,
   and every throughput number.
 
