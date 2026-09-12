@@ -108,15 +108,28 @@ down mid-submission and drops the card off the bus. Always launch through
 which wrap `b70run.sh`'s safe `--init` + in-container `timeout` + detached
 `docker wait` pattern.
 
-**7. Multi-GPU on this box is currently on a USB4/Thunderbolt link for one
-card.** Ian is swapping to OCuLink Gen4 x4 PCIe soon. Until then: raw
-single-process cross-device allocation fails once the process holds a large
-host mmap (measured, not theoretical — see `ORNITH-2026-08-27.md`).
-Multiprocess PP/TP (matching vLLM's own architecture: one process per GPU,
-socket/IPC handoff) IS the working approach on this hardware — see
-`tools/pp2run.sh`, `tools/tp2run.sh`, `HANDOFF-2026-08-27-PP-TP-COMPLETE.md`.
-Do not re-attempt single-process multi-device until OCuLink is confirmed
-installed.
+**7. Multi-GPU: OCuLink Gen4 x4 IS NOW INSTALLED (confirmed by Ian,
+2026-09-12).** GPU1 is no longer on the USB4/Thunderbolt link. The old rule
+said not to re-attempt single-process multi-device until OCuLink landed —
+that condition is now met, so single-process cross-device IS worth
+re-attempting. The original failure (raw cross-device allocation fails once
+the process holds a large host mmap — measured, see `ORNITH-2026-08-27.md`)
+was a link-related limitation and has NOT been retested on OCuLink.
+
+Multiprocess PP/TP still works and is still the proven path —
+`tools/pp2run.sh`, `tools/tp2run.sh`,
+`HANDOFF-2026-08-27-PP-TP-COMPLETE.md`. But know what it costs: the PP
+boundary stages the hidden state through PINNED HOST MEMORY and a file
+descriptor (`pp_send_hidden` / `pp_recv_hidden`), device -> host -> pipe ->
+host -> device, synchronously, at every layer-group boundary. OCuLink makes
+the device/host copies faster; it does NOT remove the host round trip. The
+real win now available is single-process device-to-device, which skips the
+staging entirely.
+
+Also note: **speculation is hard-disabled whenever TP or PP is on**
+(`grimoire.cpp`: `mtp_enabled() && !tp_enabled() && !pp_enabled()`). Dual-GPU
+today means no MTP/DFlash. That is a real trade, not an oversight to
+"fix" casually — but it is the thing to solve if dual-GPU TG matters.
 
 **8. Never quote a benchmark number from a config that never generated text.**
 Multiple false leads in this project (BesTLA, DAG, several kernel "wins")
