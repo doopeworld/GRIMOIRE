@@ -60,54 +60,60 @@ parameter; K2 passes **false**.
 
 ## Written but NEVER COMPILED
 
-Three kernels at the end of `src/ops.cpp`, declared in `kernels.hpp`:
+Nothing in `src/grimoire.cpp`, `src/ops.cpp` or `src/prefill.cpp` has
+been through a compiler in this session. The new kernels are:
 
-- `launch_rmsnorm_grouped`
+- `launch_rmsnorm_grouped` (grouped, batched, weight_offset)
 - `launch_softplus_gate`
 - `launch_router_topk_k2`
+- `launch_silu_scale_accum`
 
 **If the native build fails, look here first.** They are the last ~150
 lines of `ops.cpp` and can be commented out to unblock anything else in
 the same translation unit. The `group_barrier` placement in the grouped
 norm is the part with no host analogue and is entirely unproven.
 
-## NOT started — the engine wiring
+## Engine wiring — DONE, uncompiled
 
-`src/grimoire.cpp` has no K2 path. **The model will not load.** This is
-the remaining work, and it needs a compile loop; it was left undone
-rather than written blind into the file the audit fixes also live in.
+`src/grimoire.cpp` now has a K2 path. Everything is gated on `cfg.is_k2`
+or `d.k2_sparse`, so Qwen and Ornith paths are unchanged.
 
-Measured surface:
+- **Upload** — a sparse layer's `v_proj` is not requested (it does not
+  exist); `v_router` uploads BF16 and unsharded (N=64 cannot reach a
+  W4A8 tile, rule 4); 64 `v_experts` upload per sparse layer at the
+  projection format; `mlp.gate.bias` and the softplus `gate_proj` upload
+  alongside.
+- **MoVA value** — `mova_value_m1()`: router logits, top-k on
+  `sigmoid + bias`, weight from the UNBIASED sigmoid, then
+  `sum_j w_j * silu(expert_j @ x)` through `launch_silu_scale_accum`.
+  Wired at all five decode sites and both prefill sites. The fused bf16
+  QKV fast path excludes MoVA layers explicitly.
+- **Softplus gate** — applied where `cfg.attn_gate == 2`, at both gate
+  sites, instead of `launch_gate_sigmoid_mul`.
+- **K2 router** — `launch_router_topk_k2` in the batched MoE path with
+  the bias, `norm_topk_prob` and `router_scaling_factor`. The bf16
+  router fast path is disabled for K2: it softmaxes the top-k and has no
+  bias input, so it cannot express this routing.
+- **Grouped norm** — handled by ONE convention set in `build()`
+  (`set_norm_convention`) that both `launch_rmsnorm_residual` and
+  `launch_rmsnorm_residual_batched` delegate on. Doing it there rather
+  than at ~60 call sites is what stops prefill and decode ending up on
+  different conventions, which would be silent. For non-K2 models the
+  predicate is false and behaviour is unchanged.
 
-| touch point | sites |
-| --- | --- |
-| `v_proj` | 39 |
-| `launch_rmsnorm*` | 59 |
-| attention gate / swiglu | 28 |
-| `launch_router_topk*` | 8 |
+### The one deliberate compromise
 
-Order of work:
+`mova_value_m1` reads the routing table back to the host so the selected
+experts can go through the proven `gemv_any`. One sync per layer at M=1;
+**O(M) syncs per layer in prefill**, which is fine for a short prompt and
+useless at 4096 tokens. It is correct and it reuses kernels that already
+work, which is the right trade for a first bring-up — get text worth
+reading, then optimise.
 
-1. **Upload MoVA weights.** `Qwen35Layer::v_experts[]` and `v_router`
-   already resolve. They need a `DevQuant` bank per sparse layer, same
-   treatment as `d.moe.gate_up`. 64 experts x 45 layers.
-   Rule 4: `v_router` is `[64,2560]` and `mlp.gate` is `[100,2560]` —
-   neither N divides 256, both must stay BF16 and off any W4A8 tile.
-   `keep_qwen_bf16` covers them offline; make sure no runtime conversion
-   path picks them up.
-2. **Attention value path.** When `lay.k2_sparse`, replace the `v_proj`
-   GEMM with `launch_router_topk_k2` over `v_router` then a grouped GEMM
-   over the selected experts, SiLU on the expert output, weighted
-   accumulate. The existing grouped-MoE dispatch is the closest model.
-   Shapes are identical to an MoE expert bank, so the 64-row tile and
-   the `B70_MOE_SLOTS` machinery should apply.
-3. **Norms.** Route every K2 norm through `launch_rmsnorm_grouped` with
-   `n_groups = cfg.norm_groups` and `zero_centered = false`.
-4. **Attention gate.** `cfg.attn_gate == 2` means softplus, not silu.
-5. **MoE router.** `launch_router_topk_k2` with `cfg.router_sigmoid`,
-   `lay.router_bias`, `cfg.norm_topk_prob`, `cfg.router_scale`.
-
-Gate all of it on `cfg.is_k2` so Qwen and Ornith paths stay bit-identical.
+The fix is to pack the 64 experts expert-major into a single weight so a
+grouped GEMV can index them with no readback, exactly the shape the
+routed MoE already uses (`d.gu_pack` / `d.moe.gate_up`). Do that before
+quoting any PP number.
 
 ## Quantization
 

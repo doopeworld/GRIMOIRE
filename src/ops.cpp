@@ -16,6 +16,23 @@
 
 namespace b70 {
 
+// The norm convention for the loaded model, set once by Grimoire::build.
+// K2 takes the variance per contiguous group and applies the weight
+// DIRECTLY (its parameter is initialised to ones); Qwen3.5 takes it over
+// the whole row and applies (1 + w).  Holding it here rather than at ~60
+// call sites means a path cannot silently keep the wrong one.
+int   g_norm_groups = 1;
+float g_norm_weight_offset = 1.0f;
+void set_norm_convention(int groups, float weight_offset) {
+    g_norm_groups = groups > 0 ? groups : 1;
+    g_norm_weight_offset = weight_offset;
+}
+bool norm_is_grouped(int hidden) {
+    return (g_norm_groups > 1 || g_norm_weight_offset != 1.0f)
+        && g_norm_groups > 0 && (hidden % g_norm_groups) == 0;
+}
+
+
 // Stage-1 partials for the two-stage argmax. Allocated once by the engine
 // (Grimoire::build) rather than per call: 512 floats plus 512 ints.
 float*   g_argmax_pv = nullptr;
@@ -138,6 +155,10 @@ sycl::event launch_rmsnorm_residual(sycl::queue& q, float* h, const float* resid
                                     const bf16_t* weight, float* out,
                                     int n, float eps,
                                     const std::vector<sycl::event>& deps = {}) {
+    if (norm_is_grouped(n))
+        return launch_rmsnorm_grouped(q, h, residual, nullptr, weight, out,
+                                      nullptr, 1, n, g_norm_groups, eps,
+                                      g_norm_weight_offset, deps);
     if (norm_split() && n >= 1024)
         return rmsnorm_split(q, h, residual, nullptr, weight, out, n, eps,
                              residual != nullptr, deps);
@@ -1268,18 +1289,20 @@ sycl::event launch_dflash2_path_walk(
 // One work-group per row, groups walked in sequence -- n_groups is 2, so
 // there is nothing to gain from splitting them across work-groups and the
 // sequential form lets the partial-sum scratch be reused.
-sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residual,
+sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h,
+                                   const float* r0, const float* r1,
                                    const bf16_t* weight, float* out,
-                                   int n, int n_groups, float eps,
-                                   bool zero_centered,
+                                   sycl_bf16* out_bf,
+                                   int tokens, int hidden, int n_groups,
+                                   float eps, float weight_offset,
                                    const std::vector<sycl::event>& deps) {
     const int WG = norm_wg();
-    const int gn = n / n_groups;           // caller guarantees n % n_groups == 0
+    const int gn = hidden / n_groups;   // caller guarantees hidden % n_groups == 0
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);
         sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);
         hd.parallel_for(
-            sycl::nd_range<1>(WG, WG),
+            sycl::nd_range<1>(size_t(tokens) * WG, WG),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const auto sg  = it.get_sub_group();
                 const int  lid = int(it.get_local_id(0));
@@ -1287,14 +1310,16 @@ sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residu
                 const int  lane= int(sg.get_local_id()[0]);
                 const int  wgz = int(it.get_local_range(0));
                 const int  nsg = wgz / SG_SIZE;
+                const int64_t row = int64_t(it.get_group(0)) * hidden;
 
                 for (int g = 0; g < n_groups; ++g) {
-                    const int base = g * gn;
+                    const int64_t base = row + int64_t(g) * gn;
                     float ss = 0.0f;
                     for (int i = lid; i < gn; i += wgz) {
-                        const float v = residual ? (h[base + i] + residual[base + i])
-                                                 : h[base + i];
-                        if (residual) h[base + i] = v;   // keep for the next residual
+                        float v = h[base + i];
+                        if (r0) v += r0[base + i];
+                        if (r1) v += r1[base + i];
+                        if (r0 || r1) h[base + i] = v;   // keep for the next residual
                         ss = sycl::fma(v, v, ss);
                     }
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
@@ -1306,9 +1331,11 @@ sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residu
                     const float scale = sycl::rsqrt(total / float(gn) + eps);
 
                     for (int i = lid; i < gn; i += wgz) {
-                        const float wv = bf16_to_f32(weight[base + i]);
-                        out[base + i] = h[base + i] * scale
-                                      * (zero_centered ? (1.0f + wv) : wv);
+                        const int64_t o = base + i;
+                        const float wv = bf16_to_f32(weight[int64_t(g) * gn + i]);
+                        const float y = h[o] * scale * (weight_offset + wv);
+                        if (out)    out[o] = y;
+                        if (out_bf) out_bf[o] = sycl_bf16(y);
                     }
                     // partial[] is reused by the next group: no thread may
                     // race ahead and overwrite it while others still read.

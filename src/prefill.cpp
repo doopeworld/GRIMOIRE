@@ -203,6 +203,14 @@ sycl::event launch_rmsnorm_residual_batched(
     const bf16_t* weight, float* out, int tokens, int hidden, float eps,
     sycl_bf16* out_bf,
     const std::vector<sycl::event>& deps, float weight_offset) {
+    // K2's norms are grouped and not zero-centered.  Delegating here
+    // rather than at the call sites means prefill and decode cannot end
+    // up on different conventions, which would be silent.
+    if (norm_is_grouped(hidden))
+        return launch_rmsnorm_grouped(q, h, r0, r1, weight, out, out_bf,
+                                      tokens, hidden, g_norm_groups, eps,
+                                      g_norm_weight_offset, deps);
+    (void)weight_offset;
     constexpr int WG = 256;
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);

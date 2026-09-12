@@ -331,9 +331,18 @@ sycl::event launch_router_topk_batched(
 // ---- K2-Horizon ------------------------------------------------------
 // zero_centered is FALSE for K2 (weight initialised to ones, applied
 // directly); Qwen3.5's norms are zero-centered and apply (1 + w).
-sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residual,
-    const bf16_t* weight, float* out, int n, int n_groups, float eps,
-    bool zero_centered, const std::vector<sycl::event>& deps = {});
+// weight_offset is 1.0 for Qwen3.5's zero-centered norms ((1 + w)) and
+// 0.0 for K2, whose norm weight is initialised to ones and applied
+// directly.  set_norm_convention is called once by Grimoire::build so no
+// call site can keep the wrong convention.
+void set_norm_convention(int groups, float weight_offset);
+bool norm_is_grouped(int hidden);
+extern int   g_norm_groups;
+extern float g_norm_weight_offset;
+sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h,
+    const float* r0, const float* r1, const bf16_t* weight, float* out,
+    sycl_bf16* out_bf, int tokens, int hidden, int n_groups, float eps,
+    float weight_offset, const std::vector<sycl::event>& deps = {});
 sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
     const float* gate, float* out, int64_t n, float beta,
     const std::vector<sycl::event>& deps = {});

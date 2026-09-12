@@ -147,6 +147,7 @@ using Xe2DenseW4A8 = void (*)(sycl::queue*, const void*, const unsigned char*,
 // GRIMOIRE_W4A8=1 turns on the int8xint4 prefill path.  Off by default: it
 // costs ~9 GB of VRAM and, until the weights come from the BF16 original
 // rather than the MXFP4 artifact, it quantizes a quantization.
+static const float kK2GateBeta = 0.6931472f;   // log 2
 static bool w4a8_enabled() {
     static const bool v = []{ const char* e = std::getenv("GRIMOIRE_W4A8");
         return e && *e && std::atoi(e) != 0; }();
@@ -2772,6 +2773,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     std::printf("\n");
 
+    // Fix the norm convention for this model once, before any forward
+    // pass: K2 is grouped with a plain weight, everything else is
+    // whole-row and zero-centered.
+    set_norm_convention(cfg.is_k2 ? cfg.norm_groups : 1,
+                        cfg.is_k2 ? 0.0f : 1.0f);
+
     // MoVA scratch: router logits, the top-k table and one expert output
     // row, reused by every sparse layer.
     if (cfg.is_k2 && cfg.mova_experts > 0) {
@@ -4850,9 +4857,15 @@ const float* Grimoire::forward_muse(int token) {
         ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
         launch_flash_decode(q, ap, none);
         launch_flash_merge(q, ap, none);
-        // per-head sigmoid attention output gate (separate projection).
+        // per-head attention output gate (separate projection).  K2 uses
+        // softplus(beta=log 2) here where Qwen/Muse use sigmoid; applying
+        // the wrong one is silent, it just reshapes every attention output.
         gemv_any(d.o_gate, s.h2, s.gsplit, none);
-        launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, QW, none);
+        if (cfg.attn_gate == 2)
+            launch_softplus_gate(q, s.attn_out, s.gsplit, s.attn_out,
+                                 QW, kK2GateBeta, none);
+        else
+            launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, QW, none);
         gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
@@ -5116,9 +5129,14 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("FA attn core", s.attn_out, qheads * cfg.head_dim);
 
             // apply the output gate before projecting back
-            if (gated)
-                launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit,
-                                        cfg.n_heads * cfg.head_dim, none);
+            if (gated) {
+                const int gn = cfg.n_heads * cfg.head_dim;
+                if (cfg.attn_gate == 2)
+                    launch_softplus_gate(q, s.attn_out, s.gsplit, s.attn_out,
+                                         gn, kK2GateBeta, none);
+                else
+                    launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, gn, none);
+            }
             if (i == probe_layer) probe("FA after gate", s.attn_out, qheads * cfg.head_dim);
             MK("  attn out gate");
             gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
@@ -7340,7 +7358,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         q_aux,r1,aux0,M,H);
                 }
             }
-            const bool bf16_router=std::getenv("GRIMOIRE_BF16_ROUTER")&&
+            // the bf16 router kernel softmaxes the top-k and has no bias
+            // input, so it cannot express K2's routing.
+            const bool bf16_router=!cfg.is_k2&&std::getenv("GRIMOIRE_BF16_ROUTER")&&
                 xe2_dense_mxfp4&&d.router.w.fmt==Fmt::MXFP4&&d.router.payload;
             if(bf16_router){
                 xe2_dense_mxfp4(&q,bn_bf,d.router.w.payload,
@@ -7350,7 +7370,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     cfg.top_k,rex,rwt,true);
             }else{
                 mm(d.router,bn,rlog);
-                launch_router_topk_batched(q,rlog,M,cfg.n_experts,cfg.top_k,rex,rwt,true);
+                // K2: sigmoid scores, bias steers SELECTION ONLY, plain
+                // sum-normalise, then router_scaling_factor.  The generic
+                // kernel ranks raw logits and softmaxes the top-k -- a
+                // different mixture entirely.
+                if (cfg.is_k2)
+                    launch_router_topk_k2(q, rlog, d.router_bias, M,
+                        cfg.n_experts, cfg.top_k, rex, rwt,
+                        cfg.norm_topk_prob, cfg.router_scale);
+                else
+                    launch_router_topk_batched(q,rlog,M,cfg.n_experts,cfg.top_k,rex,rwt,true);
             }
             if (spec_route_diag) {
                 std::vector<int32_t> routes(size_t(M) * cfg.top_k);
