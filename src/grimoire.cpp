@@ -2229,7 +2229,31 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             q_aux = sycl::queue{shared, d0, queue_props()};
             q1    = std::make_unique<sycl::queue>(shared, d1, queue_props());
             pipeline = true;
+            // BE HONEST ABOUT WHAT THIS DOES TODAY.  qL(i) places layer i's
+            // WEIGHTS on device 1 past the split, but forward()/prefill()
+            // submit every kernel to `q`, which is device 0's queue -- the
+            // engine is built around that single member queue and every
+            // launcher (gemv_any, mm, mmb, the ops.cpp wrappers) takes it
+            // implicitly.  The shared context makes the device-1 pointers
+            // legal to dereference, so this RUNS and is NUMERICALLY CORRECT;
+            // it is not a fault.  But those weights are then read across the
+            // link on every token instead of out of local VRAM, which is the
+            // opposite of what pipeline parallelism is for.
+            //
+            // It is therefore only worth using to fit a model that does not
+            // fit on one card, and even then the multiprocess launchers
+            // (tools/pp2run.sh) are the faster path because each rank runs
+            // its own layers on its own device.
+            //
+            // Making this real means threading a per-layer queue through the
+            // execution layer so layer i's kernels are submitted to qL(i),
+            // with per-device scratch and a boundary transfer of the hidden
+            // state.  That is an architectural change, not a patch.
             std::printf("  pipeline: 2x B70 on one shared context\n");
+            std::printf("  WARNING: GRIMOIRE_PIPELINE splits WEIGHT PLACEMENT only.\n"
+                        "           All kernels run on device 0; device-1 weights are\n"
+                        "           read over the link every token. Correct but slow.\n"
+                        "           Use tools/pp2run.sh for real pipeline execution.\n");
         }
     }
     {   // Say which device we actually got. There are two GPUs on the target
@@ -4655,6 +4679,14 @@ int grimoire_prefix_cache_test(const std::string& dir, Fmt proj_fmt, int max_seq
 namespace b70 {
 
 const float* Grimoire::forward_dag(int token) {
+    // This path walks all cfg.n_layers with no stage bounds, so it cannot
+    // run a pipeline rank that only holds a slice.  Refuse rather than
+    // read weights this rank never loaded.
+    if (pp_enabled()) {
+        std::fprintf(stderr,
+            "forward_dag does not implement pipeline stages; use forward()\n");
+        return nullptr;
+    }
     const int H = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -4811,11 +4843,33 @@ const float* Grimoire::forward_muse(int token) {
     const float eps = cfg.rms_eps;
     const float sm_scale = cfg.query_prescale / std::sqrt(float(HD));
 
-    // embed, then SCALELESS RMSNorm on the token embedding (Muse: no sqrt(H)).
-    if(!embed_one(token,s.h2))return nullptr;
-    launch_rmsnorm_residual(q, s.h2, nullptr, muse_zero, s.h, H, eps, none);
+    // ---- pipeline stage ownership ---------------------------------
+    // build() loads ONLY [pp_begin, pp_end) on this rank, omits the
+    // embedding table on every rank but the first, and omits the final
+    // norm and lm_head on every rank but the last.  This function used to
+    // embed, walk all cfg.n_layers and run the head unconditionally,
+    // which on a later rank dereferences weights and caches that were
+    // never allocated.  Mirror forward()'s stage discipline exactly.
+    const bool pp_first = !pp_enabled() || pp_rank == 0;
+    const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
 
-    for (int i = 0; i < cfg.n_layers; ++i) {
+    if (pp_first) {
+        // embed, then SCALELESS RMSNorm on the token embedding (Muse: no sqrt(H)).
+        if(!embed_one(token,s.h2))return nullptr;
+        launch_rmsnorm_residual(q, s.h2, nullptr, muse_zero, s.h, H, eps, none);
+    } else {
+        // A later stage joins mid-network: it must NOT re-embed (no table
+        // here) and must NOT re-apply the scaleless input norm, which
+        // belongs to the first stage only.  s.h is the residual stream.
+        if (!pp_recv_hidden(s.h, size_t(H))) {
+            std::fprintf(stderr, "PP rank %d: Muse hidden receive failed\n", pp_rank);
+            return nullptr;
+        }
+    }
+
+    const int layer_begin = pp_enabled() ? pp_begin : 0;
+    const int layer_end   = pp_enabled() ? pp_end   : cfg.n_layers;
+    for (int i = layer_begin; i < layer_end; ++i) {
         LayerDev& d = L[i];
         if (dflash2.ok) {
             for (size_t tap = 0; tap < dflash2.target_layers.size(); ++tap) {
@@ -4879,6 +4933,18 @@ const float* Grimoire::forward_muse(int token) {
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_ff_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, s.h, s.sh_out, H, none);
+    }
+    if (!pp_last) {
+        // hand the residual stream to the next stage; fnorm and lm_head
+        // live on the last rank only.
+        if (!pp_send_hidden(s.h, size_t(H))) {
+            std::fprintf(stderr, "PP rank %d: Muse hidden send failed\n", pp_rank);
+            return nullptr;
+        }
+        launch_incr_pos(q, s.d_pos, none);
+        launch_incr_pos(q, s.d_seq_len, none);
+        ++pos;
+        return s.logits;
     }
     // final norm + lm_head
     launch_rmsnorm_residual_batched(q, s.h, nullptr, nullptr, fnorm, s.h2,
