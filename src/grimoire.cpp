@@ -1405,6 +1405,27 @@ struct Grimoire {
         if (!e || !*e) e = std::getenv("GRIMOIRE_TP_RANK");
         const int rank = e && *e ? std::atoi(e) : 0;
         if (rank >= 0 && rank < int(b70.size())) return b70[size_t(rank)];
+        // GRIMOIRE_DEVICE_ANY: run on whatever SYCL device exists when
+        // there is no GPU at all.  This is a CORRECTNESS harness, not a
+        // fallback -- it is what lets tools/test_k2_e2e_device.cpp drive
+        // the whole engine on a host with an OpenCL CPU device, so a path
+        // like K2's can be shown to run before it ever reaches the card.
+        // It is deliberately opt-in, it never fires when a GPU is present,
+        // and it says so loudly, because a timing taken here would be
+        // meaningless and rule 8 already says what happens when a number
+        // gets quoted from a config nobody looked at.
+        if (const char* any = std::getenv("GRIMOIRE_DEVICE_ANY");
+            any && *any && *any != '0') {
+            const auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+            if (gpus.empty()) {
+                sycl::device d{sycl::default_selector_v};
+                std::fprintf(stderr,
+                    "\n  *** GRIMOIRE_DEVICE_ANY: no GPU -- running on '%s'.\n"
+                    "  *** CORRECTNESS ONLY.  Do not benchmark this.\n\n",
+                    d.get_info<sycl::info::device::name>().c_str());
+                return d;
+            }
+        }
         return sycl::device{sycl::gpu_selector_v};
     }
     sycl::queue   q{rank_device(), queue_props()};
@@ -1524,6 +1545,10 @@ struct Grimoire {
         // [mova_experts, hidden] -- N=64 does not divide 256, so it stays
         // BF16 and must never reach a W4A8 tile (rule 4).
         bool k2_sparse = false;
+        // Routed FFN is decided PER LAYER, not per model: a K2 layer in
+        // mlp_only_layers has a plain MLP while the model as a whole is
+        // MoE.  Every forward path branches on this, never on cfg.is_moe().
+        bool moe_layer = false;
         DevQuant v_router;
         bf16_t*  v_router_bias = nullptr;
         std::vector<DevQuant> v_experts;
@@ -2562,7 +2587,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
 
         // ---- FFN ------------------------------------------------------
-        if (cfg.is_moe()) {
+        // cfg.is_moe() is a property of the MODEL; being routed is a
+        // property of the LAYER.  K2 is the first architecture where those
+        // differ: layers in mlp_only_layers have no router and no experts,
+        // just one intermediate_size MLP, which the loader already maps
+        // into sh_gate/sh_up/sh_down.  Asking such a layer for mlp.gate
+        // fails the upload -- and the engine then walked on and
+        // dereferenced the router it never got.
+        d.moe_layer = cfg.is_moe() && !(cfg.is_k2 && !src.k2_sparse);
+        if (d.moe_layer) {
             const int I=cfg.moe_inter,Efull=cfg.n_experts;
             d.expert_begin=tp_enabled()?(Efull*tp_rank)/tp_world:0;
             const int expert_end=tp_enabled()?(Efull*(tp_rank+1))/tp_world:Efull;
@@ -3685,7 +3718,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
     // ---- scratch ------------------------------------------------------
     const int TK = cfg.is_moe() ? cfg.top_k : 1;
-    const int SI = cfg.is_moe() ? cfg.shared_inter : cfg.dense_inter;
+    // Size the FFN scratch from the layers that were ACTUALLY uploaded, the
+    // way qkv_max and aux_max below already do -- not from one model-wide
+    // config field.  K2 is the case that breaks the assumption: its three
+    // dense layers carry a full intermediate_size MLP (6144) in sh_gu while
+    // the sparse layers' shared expert is moe_intermediate_size (768), so
+    // `cfg.is_moe() ? shared_inter : dense_inter` picks 768 and every dense
+    // layer then writes 2*6144 floats into a 2*768 buffer.  That is a 46 KB
+    // device heap overrun three times per token: DEVICE_LOST on a B70, and
+    // nothing in a self-check would have named it.
+    int SI = cfg.is_moe() ? cfg.shared_inter : cfg.dense_inter;
+    for (const auto& dl : L) {
+        const int half = dl.sh_gu.w.N / 2;        // sh_gu holds gate|up
+        if (half > SI) SI = half;
+    }
+    if (SI <= 0) SI = 1;
     s.h       = sycl::malloc_device<float>(H, q);
     s.h2      = sycl::malloc_device<float>(H, q);
     s.resid   = sycl::malloc_device<float>(H, q);
@@ -3806,8 +3853,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                                              : "pipeline parallel");
         else                   std::printf("    speculation   none\n");
 
+        // A device with no XMX cannot run the batched path at all (see
+        // Grimoire::prefill).  Saying "batched" there would be the exact
+        // silent-fallback problem this matrix exists to remove.
+        const bool xmx = q.get_device().has(sycl::aspect::ext_intel_matrix);
         std::printf("    prefill       %s\n",
             tp_enabled() ? "SEQUENTIAL fallback (no batched TP prefill) -- "
+                           "do not benchmark this as prompt-processing throughput"
+          : !xmx         ? "SEQUENTIAL fallback (device has no matrix hardware) -- "
                            "do not benchmark this as prompt-processing throughput"
                          : "batched");
         std::printf("    norms         %s\n",
@@ -4989,7 +5042,8 @@ const float* Grimoire::forward_dag(int token) {
 
         e_h = launch_rmsnorm_residual(q, s.h, s.moe_y, d.post_norm,
                                       s.h2, H, cfg.rms_eps, deps({e_attn}));
-        if (cfg.is_moe()) {
+        // per LAYER, not per model -- see LayerDev::moe_layer
+        if (d.moe_layer) {
             sycl::event e_router = gemv_any(d.router, s.h2, s.rlogits, deps({e_h}));
             sycl::event e_top = launch_router_topk(q, s.rlogits, cfg.n_experts,
                 cfg.top_k, s.d_expert, s.d_weight, true, deps({e_router}));
@@ -5414,7 +5468,7 @@ const float* Grimoire::forward(int token) {
         launch_rmsnorm_residual(q, s.h, s.moe_y, d.post_norm, s.h2, H, cfg.rms_eps, none);
         MK("  post_norm");
 
-        if (cfg.is_moe()) {
+        if (d.moe_layer) {
             const int I = cfg.moe_inter;
             gemv_any(d.router, s.h2, s.rlogits, none);
             MK("  router gemv");
@@ -6615,6 +6669,25 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         throw std::invalid_argument("prefill exceeds context capacity or is empty");
     for(auto t:tokens)if(t<0||t>=cfg.vocab)throw std::invalid_argument("invalid prefill token");
     if(tp_enabled())return false;
+    // The batched path is XMX/DPAS from end to end.  On a device with no
+    // matrix hardware the runtime does not raise -- it takes the process
+    // down with a SIGSEGV somewhere inside the JIT -- so refuse here and
+    // let the caller's documented sequential fallback run instead.  A B70
+    // always has the aspect, so this never fires on the Tower; it is what
+    // lets the engine be driven on any SYCL device for verification.
+    {
+        static const bool has_matrix =
+            q.get_device().has(sycl::aspect::ext_intel_matrix);
+        if (!has_matrix) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "    no matrix hardware on this device: "
+                    "batched prefill disabled, falling back to sequential\n");
+            }
+            return false;
+        }
+    }
     if (cfg.is_muse) {
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
         return prefill_muse(tokens,next_tokens);
@@ -6664,7 +6737,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // into the next head), which is why synthetic tokens survived and real text
     // hung.  See csrc/xpu/gdn_attn/gdn_attn_interface.cpp.
     const size_t gdn_tokens=size_t(M)+63;
-    float* alpha=df(gdn_tokens*Hv); float* beta=df(gdn_tokens*Hv);
+    // Same trap as alloc_top_k above, missed one line below the comment
+    // that describes it: a model with NO linear-attention layers has
+    // Hv == 0, the zero-byte USM allocation returns null, the null sweep
+    // below reads that as an allocation failure, and the ENTIRE batched
+    // prefill is abandoned for the token-at-a-time fallback.  Nothing
+    // fails and nothing is wrong in the output -- prompt processing is
+    // just quietly ~50x slower, behind one line on stderr.  That is every
+    // pure-attention checkpoint, K2 included, not some corner case.
+    const size_t gdn_elems=std::max<size_t>(1, gdn_tokens*size_t(Hv));
+    float* alpha=df(gdn_elems); float* beta=df(gdn_elems);
     const int R=M*std::max(1,cfg.top_k);
     const int I=std::max(1,cfg.moe_inter);
     const int E=std::max(1,cfg.n_experts);
@@ -6793,9 +6875,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     int8_t* od_zp=od ? sycl::malloc_device<int8_t>(1,q) : nullptr;
     if(od_zp){const int8_t z=8;q.memcpy(od_zp,&z,1);mem.push_back(od_zp);}
     for (size_t mi=0;mi<mem.size();++mi) if (!mem[mi]) {
+        // MUST match the `mem` initialiser above element for element.
+        // It did not: bn_bf was missing, so every name from index 11 on
+        // named the PREVIOUS buffer -- a null `alpha` was reported as
+        // "beta", which sends you looking at the wrong allocation.
         static const char* const base_names[]={"bh","bn","r0","r1","t0","t1","t2","t3","t4",
-            "la_fused","xb","dtok","rex","rwt","rlog","mh","alpha","beta","xperm","yperm",
-            "ptoken","pinv"};
+            "la_fused","xb","bn_bf","dtok","rex","rwt","rlog","mh","alpha","beta","xperm",
+            "yperm","ptoken","pinv"};
+        static_assert(sizeof(base_names)/sizeof(base_names[0]) == 23,
+                      "base_names must name every entry of the mem vector");
         const char* name=mi<sizeof(base_names)/sizeof(base_names[0])?base_names[mi]:"optional";
         std::fprintf(stderr,"    prefill allocation failed: %s (M=%d H=%d W=%d R=%d I=%d)\n",
                      name,M,H,W,R,I);
@@ -7630,7 +7718,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             pp_mark("full attention");
         }
-        const bool fused_ffn_quant=!exact_verify&&!cfg.is_moe()&&a8&&a8s&&
+        const bool fused_ffn_quant=!exact_verify&&!d.moe_layer&&a8&&a8s&&
             xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4;
         auto post_bf_ready=exact_verify
             ? norm_rows(bh,r0,nullptr,d.post_norm,bn)
@@ -7641,7 +7729,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     q,bh,r0,nullptr,d.post_norm,norm_bf_only?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
         a8_cached_src=nullptr;
         a8_cached_bf=fused_ffn_quant?bn_bf:nullptr;
-        if(cfg.is_moe()){
+        if(d.moe_layer){
             sycl::event shared_ready;
             // RULE 1: as parallel_dn above -- mm_aux() reads sh_gu/sh_down's
             // MXFP4 payload, which W4A8 frees.  This MUST stay a single

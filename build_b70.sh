@@ -170,6 +170,21 @@ icpx -fsycl -fsycl-targets="$TARGET" \
      -o bin/test_k2_kernels \
   && echo "built  : bin/test_k2_kernels" || echo "warn: k2 kernel test failed"
 
+# End-to-end gate for the K2 path: writes a miniature K2 checkpoint with
+# random weights, loads it through the real public entry points and
+# generates.  It needs no model and no tokenizer.  Nothing else in the
+# tree actually CALLS forward() on a K2 layer.
+#   ./bin/test_k2_e2e
+icpx -fsycl -fsycl-targets="$TARGET" \
+     -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -I include -I src \
+     tools/test_k2_e2e_device.cpp src/grimoire.cpp src/qwen35_loader.cpp \
+     src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
+     src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
+     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/tokenizer.cpp -o bin/test_k2_e2e \
+  && echo "built  : bin/test_k2_e2e" || echo "warn: k2 e2e test failed"
+
 # ---------------------------------------------------------------------
 if [[ "$REQUIRED_FAILED" -ne 0 ]]; then
   echo
