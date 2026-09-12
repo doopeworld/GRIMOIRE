@@ -1356,7 +1356,7 @@ sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
 // applies: K2 divides the gathered sigmoids by their sum and then
 // multiplies by router_scaling_factor.
 sycl::event launch_router_topk_k2(
-    sycl::queue& q, const float* logits, const float* bias,
+    sycl::queue& q, const float* logits, const bf16_t* bias,
     int tokens, int n_experts, int top_k,
     int32_t* out_expert, float* out_weight,
     bool normalize, float scaling,
@@ -1383,7 +1383,7 @@ sycl::event launch_router_topk_k2(
                         // rank on sigmoid(logit) + bias, never on the logit:
                         // the bias is defined against the post-sigmoid score.
                         const float sc = 1.0f / (1.0f + sycl::exp(-row[e]));
-                        const float v  = sc + (bias ? bias[e] : 0.0f);
+                        const float v  = sc + (bias ? bf16_to_f32(bias[e]) : 0.0f);
                         if (v > cv || (v == cv && e < ci)) { cv = v; ci = e; cs = slot; }
                     }
                     const float bv = sycl::reduce_over_group(
@@ -1407,6 +1407,28 @@ sycl::event launch_router_topk_k2(
                     if (scaling != 1.0f)
                         for (int s = 0; s < top_k; ++s) ow[s] *= scaling;
                 }
+            });
+    });
+}
+
+
+// MoVA accumulate: out += w * silu(in).  The SiLU is on the EXPERT
+// OUTPUT and applies before the router weight scales it, per
+// combine_routed_experts(activation=F.silu).
+sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
+                                    float w, int n,
+                                    const std::vector<sycl::event>& deps) {
+    constexpr int WG = 256;
+    const int groups = (n + WG - 1) / WG;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(groups) * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int i = int(it.get_global_id(0));
+                if (i >= n) return;
+                const float v = in[i];
+                out[i] += w * (v / (1.0f + sycl::exp(-v)));
             });
     });
 }

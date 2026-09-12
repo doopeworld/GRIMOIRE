@@ -1517,12 +1517,31 @@ struct Grimoire {
         uint8_t *sh_gu_i4 = nullptr, *sh_dn_i4 = nullptr;
         float   *sh_gu_ws = nullptr, *sh_dn_ws = nullptr;
 
+        // ---- K2-Horizon MoVA -------------------------------------
+        // A sparse layer has NO v_proj: the value is a routed mixture over
+        // v_experts[], each [kv_heads*head_dim, hidden].  v_router is
+        // [mova_experts, hidden] -- N=64 does not divide 256, so it stays
+        // BF16 and must never reach a W4A8 tile (rule 4).
+        bool k2_sparse = false;
+        DevQuant v_router;
+        bf16_t*  v_router_bias = nullptr;
+        std::vector<DevQuant> v_experts;
+        bf16_t*  router_bias = nullptr;      // mlp.gate.bias
+
         float *dn_state = nullptr, *conv_ring = nullptr;
         uint8_t *k_cache = nullptr, *v_cache = nullptr;
         sycl::half *k_cache_f16 = nullptr, *v_cache_f16 = nullptr;
         bool muse_sliding = false;
     };
     std::vector<LayerDev> L;
+
+    // MoVA scratch, one set reused by every layer: router logits, the
+    // top-k table, and one expert output row.  Tiny -- 64 + 4 + 4 + 1024
+    // floats -- and allocated once in build().
+    float*   mova_logits = nullptr;
+    int32_t* mova_rex = nullptr;
+    float*   mova_rwt = nullptr;
+    float*   mova_expert_out = nullptr;
 
     // Cached raw oneDNN W4A16 primitives used by Muse prompt prefill and
     // DFlash verification. vLLM's XPUwNa16LinearKernel caches the primitive
@@ -1753,6 +1772,49 @@ struct Grimoire {
 
     // Any decode GEMV.  When a weight has been converted its MXFP4 payload is
     // gone, so every decode call site must come through here.
+    // ---- K2-Horizon MoVA value projection (M=1 decode) ------------
+    // A sparse layer has no v_proj.  The value is a routed mixture:
+    //   logits = v_router @ x                       [mova_experts]
+    //   top-k on sigmoid(logits) + bias, and the weight that scales an
+    //   expert is the UNBIASED sigmoid -- the bias steers SELECTION only
+    //   value  = sum_j w_j * silu(v_experts[idx_j] @ x)
+    // The SiLU sits on the EXPERT OUTPUT, before the router weight.
+    //
+    // BRING-UP PATH.  The routing table comes back to the host once per
+    // layer so the chosen experts can go through the proven gemv_any.
+    // That is one sync per layer and it will NOT be fast; it is correct,
+    // it reuses kernels that already work, and it produces text to read,
+    // which is the bar before any speed claim.  The device-resident form
+    // wants the 64 experts packed expert-major into a single weight so a
+    // grouped GEMV can index them with no sync at all.
+    sycl::event mova_value_m1(LayerDev& d, const float* x, float* y,
+                              const std::vector<sycl::event>& deps) {
+        const int E = int(d.v_experts.size());
+        const int K = std::min(cfg.mova_top_k, E);
+        const int N = d.v_experts.empty() ? 0 : d.v_experts[0].w.N;
+        if (E <= 0 || K <= 0 || N <= 0) return q.submit([&](sycl::handler& h){
+            h.depends_on(deps); h.single_task([=](){}); });
+
+        sycl::event ev = gemv_any(d.v_router, x, mova_logits, deps);
+        ev = launch_router_topk_k2(q, mova_logits, d.v_router_bias,
+                                   1, E, K, mova_rex, mova_rwt,
+                                   /*normalize=*/K > 1, cfg.router_scale, {ev});
+        // one readback per layer -- see the note above
+        int32_t idx[16]; float wts[16];
+        q.memcpy(idx, mova_rex, size_t(K) * sizeof(int32_t), {ev});
+        q.memcpy(wts, mova_rwt, size_t(K) * sizeof(float)).wait();
+
+        q.memset(y, 0, size_t(N) * sizeof(float)).wait();
+        sycl::event last;
+        for (int j = 0; j < K; ++j) {
+            const int e = idx[j];
+            if (e < 0 || e >= E) continue;          // router produced no route
+            last = gemv_any(d.v_experts[size_t(e)], x, mova_expert_out, {});
+            last = launch_silu_scale_accum(q, mova_expert_out, y, wts[j], N, {last});
+        }
+        return last;
+    }
+
     sycl::event gemv_any(const DevQuant& dq, const float* x, float* y,
                          const std::vector<sycl::event>& deps) {
         if (tp_enabled() && dq.tp_sharded()) {
@@ -2381,8 +2443,39 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         } else {
             d.q_proj = quantize_upload_t(lq, ck, src.q_proj, PF, "self_attn.q_proj", &ok);
             d.k_proj = quantize_upload_t(lq, ck, src.k_proj, PF, "self_attn.k_proj", &ok);
-            d.v_proj = quantize_upload_t(lq, ck, src.v_proj, PF, "self_attn.v_proj", &ok);
-            shard(d.q_proj,lq);shard(d.k_proj,lq);shard(d.v_proj,lq);
+            // K2: only a DENSE layer has v_proj.  On a sparse layer MoVA
+            // replaces it entirely, so asking for it would report a missing
+            // tensor for something the checkpoint correctly does not have.
+            const bool k2_mova = cfg.is_k2 && src.k2_sparse && cfg.mova_experts > 0;
+            if (!k2_mova)
+                d.v_proj = quantize_upload_t(lq, ck, src.v_proj, PF, "self_attn.v_proj", &ok);
+            shard(d.q_proj,lq);shard(d.k_proj,lq);
+            if (!k2_mova) shard(d.v_proj,lq);
+            if (cfg.is_k2) {
+                d.k2_sparse = src.k2_sparse;
+                // Softplus output gate, present on EVERY K2 layer.
+                if (cfg.attn_gate && src.attn_gate.ok())
+                    d.o_gate = quantize_upload_t(lq, ck, src.attn_gate, PF,
+                        "self_attn.gate_proj", &ok);
+                if (k2_mova) {
+                    // BF16 and unsharded: 0.16 MB, and N=64 cannot go on a
+                    // 256-wide tile.
+                    d.v_router = quantize_upload_t(lq, ck, src.v_router,
+                        Fmt::BF16, "self_attn.v_router", &ok);
+                    if (src.v_router_bias.ok())
+                        d.v_router_bias = dev_copy_t<bf16_t>(lq, ck, src.v_router_bias,
+                            "self_attn.v_router.bias", &ok);
+                    d.v_experts.resize(size_t(cfg.mova_experts));
+                    for (int e = 0; e < cfg.mova_experts && ok; ++e) {
+                        const std::string vn =
+                            "self_attn.v_experts." + std::to_string(e);
+                        d.v_experts[size_t(e)] = quantize_upload_t(
+                            lq, ck, src.v_experts[size_t(e)], PF, vn.c_str(), &ok);
+                        shard(d.v_experts[size_t(e)], lq);
+                        acct(d.v_experts[size_t(e)].w.bytes());
+                    }
+                }
+            }
             if(cfg.is_muse&&PF==Fmt::INT4&&!tp_enabled()){
                 d.qkv_proj=concat_upload_many_int4_t(lq,ck,
                     {src.q_proj,src.k_proj,src.v_proj},"self_attn.qkv_proj",&ok);
@@ -2436,6 +2529,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.expert_count=E;
             if(E<1){err="TP world size exceeds expert count";return false;}
             d.router = quantize_upload_t(lq, ck, src.router, Fmt::BF16, "mlp.gate", &ok);
+            // K2's router bias steers SELECTION only; without it the top-k
+            // is taken on unbiased scores and the routes are wrong.
+            if (cfg.is_k2 && src.router_bias.ok())
+                d.router_bias = dev_copy_t<bf16_t>(lq, ck, src.router_bias,
+                    "mlp.gate.bias", &ok);
             shard(d.router,lq);
 
             // Experts: concatenate gate and up into one [E][2I][H] block
@@ -2673,6 +2771,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         std::fflush(stdout);
     }
     std::printf("\n");
+
+    // MoVA scratch: router logits, the top-k table and one expert output
+    // row, reused by every sparse layer.
+    if (cfg.is_k2 && cfg.mova_experts > 0) {
+        const int NV = cfg.n_kv_heads * cfg.head_dim;
+        mova_logits     = sycl::malloc_device<float>(size_t(cfg.mova_experts), q);
+        mova_rex        = sycl::malloc_device<int32_t>(size_t(cfg.mova_top_k), q);
+        mova_rwt        = sycl::malloc_device<float>(size_t(cfg.mova_top_k), q);
+        mova_expert_out = sycl::malloc_device<float>(size_t(NV), q);
+        if (!mova_logits || !mova_rex || !mova_rwt || !mova_expert_out) {
+            err = "MoVA scratch allocation failed"; return false;
+        }
+    }
 
     // Verification needs one vocabulary projection per candidate.  Convert
     // the head to the same symmetric-int4 representation as the W4A8 model
@@ -4598,8 +4709,10 @@ const float* Grimoire::forward_dag(int token) {
 
             sycl::event e_kp = gemv_any(d.k_proj, s.h2, s.zbuf,
                 deps({(dag_mask & 2) ? e_in : e_qready}));
-            sycl::event e_vp = gemv_any(d.v_proj, s.h2, s.bbuf,
-                deps({(dag_mask & 2) ? e_in : e_kp}));
+            sycl::event e_vp = d.k2_sparse
+                ? mova_value_m1(d, s.h2, s.bbuf, deps({(dag_mask & 2) ? e_in : e_kp}))
+                : gemv_any(d.v_proj, s.h2, s.bbuf,
+                    deps({(dag_mask & 2) ? e_in : e_kp}));
             sycl::event e_qn = e_qready;
             if (d.q_norm)
                 e_qn = launch_rmsnorm_heads(q, qvec, d.q_norm, cfg.n_heads,
@@ -4713,7 +4826,8 @@ const float* Grimoire::forward_muse(int token) {
         launch_rmsnorm_residual(q, s.h, nullptr, d.in_norm, s.h2, H, eps, none);
         gemv_any(d.q_proj, s.h2, s.qkv, none);
         gemv_any(d.k_proj, s.h2, s.zbuf, none);
-        gemv_any(d.v_proj, s.h2, s.bbuf, none);
+        if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
+        else gemv_any(d.v_proj, s.h2, s.bbuf, none);
         // scaleless QK-norm over head_dim (zero weight -> (1+0)), BEFORE RoPE.
         launch_rmsnorm_heads(q, s.qkv,  muse_zero, QH,  HD, eps, true, none);
         launch_rmsnorm_heads(q, s.zbuf, muse_zero, KVH, HD, eps, true, none);
@@ -4927,7 +5041,8 @@ const float* Grimoire::forward(int token) {
             float* qvec = gated ? s.qsplit : s.qkv;
             MK("  q gemv + split");
             gemv_any(d.k_proj, s.h2, s.zbuf, none);
-            gemv_any(d.v_proj, s.h2, s.bbuf, none);
+            if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
+        else gemv_any(d.v_proj, s.h2, s.bbuf, none);
             MK("  k+v gemv");
 
             const int qheads = cfg.n_heads;
@@ -5198,7 +5313,8 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
     launch_rmsnorm_residual(q, mtp.x, nullptr, d.in_norm, s.h2, H, cfg.rms_eps, none);
 
     gemv_any(d.k_proj, s.h2, s.zbuf, none);
-    gemv_any(d.v_proj, s.h2, s.bbuf, none);
+    if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
+    else gemv_any(d.v_proj, s.h2, s.bbuf, none);
     if (d.k_norm)
         launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
                              cfg.head_dim, cfg.rms_eps, true, none);
@@ -5260,7 +5376,8 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
                            cfg.n_heads, cfg.head_dim, none);
     float* qvec = gated ? s.qsplit : s.qkv;
     gemv_any(d.k_proj, s.h2, s.zbuf, none);
-    gemv_any(d.v_proj, s.h2, s.bbuf, none);
+    if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
+    else gemv_any(d.v_proj, s.h2, s.bbuf, none);
 
     if ((fusion_mask & 2) && d.q_norm && d.k_norm) {
         launch_qk_norm_rope(q, qvec, s.zbuf, d.q_norm, d.k_norm,
@@ -7060,7 +7177,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             const bool bfqkv=std::getenv("GRIMOIRE_BF16_QKV")&&xe2_attention&&
                 xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&pos==0&&M>=32&&
                 d.q_proj.w.fmt==Fmt::MXFP4&&d.k_proj.w.fmt==Fmt::MXFP4&&
-                d.v_proj.w.fmt==Fmt::MXFP4&&d.o_proj.w.fmt==Fmt::MXFP4;
+                d.v_proj.w.fmt==Fmt::MXFP4&&d.o_proj.w.fmt==Fmt::MXFP4&&
+                // a MoVA layer has no v_proj at all; it must take the
+                // routed path below, not this fused bf16 one.
+                !d.k2_sparse;
             if(bfqkv){
                 const size_t qe=size_t(M)*cfg.n_heads*cfg.head_dim;
                 const size_t ke=size_t(M)*cfg.n_kv_heads*cfg.head_dim;
@@ -7087,7 +7207,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             pp_mark("attn q proj");
             float* qv=t0;
             if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,cfg.head_dim);qv=t1;}
-            mm(d.k_proj,bn,t3); mm(d.v_proj,bn,t4);
+            mm(d.k_proj,bn,t3);
+            if (d.k2_sparse) {
+                // BRING-UP: one routed value per token through the M=1
+                // path.  That is O(M) readbacks per layer -- fine for a
+                // short prompt, useless for a 4096-token prefill.  Real PP
+                // needs the 64 experts packed expert-major so the grouped
+                // GEMV can index them with no sync, the same shape the
+                // routed MoE already uses.
+                const int NV = cfg.n_kv_heads * cfg.head_dim;
+                for (int m = 0; m < M; ++m)
+                    mova_value_m1(d, bn + size_t(m) * cfg.hidden,
+                                  t4 + size_t(m) * NV, {});
+                q.wait();
+            } else mm(d.v_proj,bn,t4);
             pp_mark("attn kv proj");
             launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
                 cfg.n_kv_heads,cfg.head_dim,pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps);

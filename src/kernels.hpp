@@ -337,8 +337,10 @@ sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h, const float* residu
 sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
     const float* gate, float* out, int64_t n, float beta,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
+    float w, int n, const std::vector<sycl::event>& deps = {});
 sycl::event launch_router_topk_k2(
-    sycl::queue& q, const float* logits, const float* bias,
+    sycl::queue& q, const float* logits, const bf16_t* bias,
     int tokens, int n_experts, int top_k,
     int32_t* out_expert, float* out_weight, bool normalize, float scaling,
     const std::vector<sycl::event>& deps = {});
