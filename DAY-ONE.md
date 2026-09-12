@@ -20,6 +20,12 @@ git pull
 tools/preflight_b70.sh /models/<your-model-dir>
 ```
 
+It needs the vllm-xpu-kernels checkout for the bridge build and finds it
+at `/mnt/user/appdata/vllm-xpu-kernels` or `/mnt/cache/appdata/...`; if
+yours is elsewhere, `KERNELS=/path/to/it tools/preflight_b70.sh ...`.
+`SKIP_BUILD=1` re-runs only the gates against the build you already have
+-- use it to re-check, never to skip past a broken build.
+
 That builds in the right order (bridges first — rule 3), then runs, in
 order, and stops at the first required failure:
 

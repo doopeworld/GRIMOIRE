@@ -3866,13 +3866,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // A device with no XMX cannot run the batched path at all (see
         // Grimoire::prefill).  Saying "batched" there would be the exact
         // silent-fallback problem this matrix exists to remove.
-        const bool xmx = q.get_device().has(sycl::aspect::ext_intel_matrix);
+        // Same predicate Grimoire::prefill uses, for the same reason.
+        const bool batched_ok = q.get_device().is_gpu() ||
+            q.get_device().has(sycl::aspect::ext_intel_matrix);
         std::printf("    prefill       %s\n",
-            tp_enabled() ? "SEQUENTIAL fallback (no batched TP prefill) -- "
-                           "do not benchmark this as prompt-processing throughput"
-          : !xmx         ? "SEQUENTIAL fallback (device has no matrix hardware) -- "
-                           "do not benchmark this as prompt-processing throughput"
-                         : "batched");
+            tp_enabled()  ? "SEQUENTIAL fallback (no batched TP prefill) -- "
+                            "do not benchmark this as prompt-processing throughput"
+          : !batched_ok   ? "SEQUENTIAL fallback (not a GPU, no matrix hardware) -- "
+                            "do not benchmark this as prompt-processing throughput"
+                          : "batched");
         std::printf("    norms         %s\n",
             cfg.is_k2 ? "grouped, weight applied directly (K2)"
                       : "whole-row, zero-centered (1 + w)");
@@ -6686,13 +6688,22 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // always has the aspect, so this never fires on the Tower; it is what
     // lets the engine be driven on any SYCL device for verification.
     {
-        static const bool has_matrix =
-            q.get_device().has(sycl::aspect::ext_intel_matrix);
-        if (!has_matrix) {
+        // Gated on is_gpu() FIRST and deliberately.  If this asked only
+        // about the matrix aspect and a B70 driver did not report it, the
+        // Tower would silently lose batched prefill and run prompts one
+        // token at a time -- a ~50x prompt-processing regression hiding
+        // behind one stderr line, which is precisely the class of bug
+        // this branch has been clearing out.  A B70 is a GPU, so on the
+        // card this predicate is false and behaviour is exactly as
+        // before; the escape hatch exists only for a non-GPU device.
+        static const bool no_matrix =
+            !q.get_device().is_gpu() &&
+            !q.get_device().has(sycl::aspect::ext_intel_matrix);
+        if (no_matrix) {
             static bool said = false;
             if (!said) {
                 said = true;
-                std::fprintf(stderr, "    no matrix hardware on this device: "
+                std::fprintf(stderr, "    not a GPU and no matrix hardware: "
                     "batched prefill disabled, falling back to sequential\n");
             }
             return false;

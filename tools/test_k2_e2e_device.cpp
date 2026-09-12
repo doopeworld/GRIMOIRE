@@ -110,8 +110,8 @@ int main() {
         // Say which path actually ran.  Without matrix hardware the engine
         // refuses the batched path and the caller retries sequentially, so
         // calling this "batched prefill verified" would be a lie.
-        const bool xmx = sycl::device{sycl::default_selector_v}
-                             .has(sycl::aspect::ext_intel_matrix);
+        const sycl::device dev{sycl::default_selector_v};
+        const bool xmx = dev.is_gpu() || dev.has(sycl::aspect::ext_intel_matrix);
         std::printf("48-token prompt: ok (%d tokens) -- %s prefill\n", nc,
                     xmx ? "BATCHED" : "sequential (device has no matrix hardware, "
                                       "the batched path was NOT exercised)");
