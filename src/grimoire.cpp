@@ -3736,6 +3736,47 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     vram_gb = double(bytes) / 1073741824.0;
     load_seconds = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - t0).count();
+
+    // ---- capability matrix ----------------------------------------
+    // Several features degrade SILENTLY: speculation simply does not load
+    // under TP or PP, and TP prompt processing falls back to a
+    // token-at-a-time path.  A run that quietly lost speculation looks
+    // like a slow model rather than a disabled feature, and benchmarking
+    // it as though it were the full configuration is how a fallback ends
+    // up being reported as a result.  State what is actually active.
+    {
+        std::printf("  capabilities:\n");
+        if (tp_enabled())
+            std::printf("    parallel      TENSOR, rank %d of %d\n", tp_rank, tp_world);
+        else if (pp_enabled())
+            std::printf("    parallel      PIPELINE, rank %d of %d, layers [%d,%d)\n",
+                        pp_rank, pp_world, pp_begin, pp_end);
+        else if (pipeline)
+            std::printf("    parallel      single-process weight split "
+                        "(kernels all on device 0 -- see the warning above)\n");
+        else
+            std::printf("    parallel      none (single device)\n");
+
+        const bool par = tp_enabled() || pp_enabled();
+        if (mtp.ok)            std::printf("    speculation   MTP\n");
+        else if (dflash2.ok)   std::printf("    speculation   DFlash%s%s\n",
+                                   dflash2.v2 ? "2" : "",
+                                   dflash2.selector_ok ? " + candidate selector"
+                                                       : " (argmax draft, no selector)");
+        else if (par && (mtp_enabled() || std::getenv("GRIMOIRE_DFLASH_MODEL")))
+            std::printf("    speculation   DISABLED -- requested, but not "
+                        "supported with %s\n", tp_enabled() ? "tensor parallel"
+                                                             : "pipeline parallel");
+        else                   std::printf("    speculation   none\n");
+
+        std::printf("    prefill       %s\n",
+            tp_enabled() ? "SEQUENTIAL fallback (no batched TP prefill) -- "
+                           "do not benchmark this as prompt-processing throughput"
+                         : "batched");
+        std::printf("    norms         %s\n",
+            cfg.is_k2 ? "grouped, weight applied directly (K2)"
+                      : "whole-row, zero-centered (1 + w)");
+    }
     return true;
 }
 
