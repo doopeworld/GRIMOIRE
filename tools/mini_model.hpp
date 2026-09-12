@@ -138,11 +138,55 @@ inline Arch k2() {
     return a;
 }
 
+// ---- MTP head -------------------------------------------------------
+// One extra decoder layer plus the fc that mixes the previous hidden
+// state with the next token's embedding.  Shapes are exactly what
+// Grimoire::build checks; anything else is refused at load, which is the
+// point -- a drafter whose geometry does not match its target is a
+// silent accuracy loss, not a crash.
+inline void add_mtp(std::vector<Tn>& t, int H, int Q, int KV, int HD,
+                    int I, int n_experts, int moe_inter) {
+    t.push_back({"mtp.fc.weight", {H, 2*H}});
+    t.push_back({"mtp.pre_fc_norm_hidden.weight", {H}});
+    t.push_back({"mtp.pre_fc_norm_embedding.weight", {H}});
+    t.push_back({"mtp.norm.weight", {H}});
+    const std::string b = "mtp.layers.0.";
+    t.push_back({b+"input_layernorm.weight", {H}});
+    t.push_back({b+"post_attention_layernorm.weight", {H}});
+    const std::string a = b + "self_attn.";
+    t.push_back({a+"q_proj.weight", {Q,H}});
+    t.push_back({a+"k_proj.weight", {KV,H}});
+    t.push_back({a+"v_proj.weight", {KV,H}});
+    t.push_back({a+"o_proj.weight", {H,Q}});
+    t.push_back({a+"q_norm.weight", {HD}});
+    t.push_back({a+"k_norm.weight", {HD}});
+    const std::string m = b + "mlp.";
+    if (n_experts > 0) {
+        t.push_back({m+"gate.weight", {n_experts,H}});
+        for (int e = 0; e < n_experts; ++e) {
+            const std::string x = m+"experts."+std::to_string(e)+".";
+            t.push_back({x+"gate_proj.weight", {moe_inter,H}});
+            t.push_back({x+"up_proj.weight",   {moe_inter,H}});
+            t.push_back({x+"down_proj.weight", {H,moe_inter}});
+        }
+        // A routed MTP head carries its own shared expert.  Deliberately
+        // NO shared_expert_gate: the engine documents that one as
+        // optional, so leaving it out is the case worth covering.
+        t.push_back({m+"shared_expert.gate_proj.weight", {moe_inter,H}});
+        t.push_back({m+"shared_expert.up_proj.weight",   {moe_inter,H}});
+        t.push_back({m+"shared_expert.down_proj.weight", {H,moe_inter}});
+    } else {
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+    }
+}
+
 // ---- plain dense transformer (Qwen3 shape, no MoE, no linear attn) ----
 // This is the "any model" case: a stock architecture with none of
 // GRIMOIRE's own features.  It is also the shape that exposed the
 // Hv == 0 prefill bug.
-inline Arch dense(int L = 4) {
+inline Arch dense(int L = 4, bool mtp = false) {
     const int H=64, Q=64, KV=32, I=128, V=128;
     std::ostringstream c;
     c << R"JSON({
@@ -152,7 +196,7 @@ inline Arch dense(int L = 4) {
   "intermediate_size": 128, "rms_norm_eps": 1e-06,
   "tie_word_embeddings": false, "rope_theta": 1000000.0
 })JSON";
-    Arch a{"dense", c.str(), {}, V, L};
+    Arch a{mtp ? "dense+mtp" : "dense", c.str(), {}, V, L};
     auto& t = a.tensors;
     t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
           {"lm_head.weight", {V,H}} };
@@ -172,12 +216,13 @@ inline Arch dense(int L = 4) {
         t.push_back({m+"up_proj.weight",   {I,H}});
         t.push_back({m+"down_proj.weight", {H,I}});
     }
+    if (mtp) add_mtp(t, H, Q, KV, 16, I, 0, 0);
     return a;
 }
 
 // ---- routed MoE with a shared expert (Qwen3-MoE shape) ----------------
 // Exercises the routed path, the shared expert and TP expert sharding.
-inline Arch moe(int L = 4) {
+inline Arch moe(int L = 4, bool mtp = false) {
     const int H=64, Q=64, KV=32, MI=32, SI=32, E=8, V=128;
     std::ostringstream c;
     c << R"JSON({
@@ -190,7 +235,7 @@ inline Arch moe(int L = 4) {
   "mlp_only_layers": [], "norm_topk_prob": true,
   "rms_norm_eps": 1e-06, "tie_word_embeddings": false, "rope_theta": 1000000.0
 })JSON";
-    Arch a{"moe", c.str(), {}, V, L};
+    Arch a{mtp ? "moe+mtp" : "moe", c.str(), {}, V, L};
     auto& t = a.tensors;
     t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
           {"lm_head.weight", {V,H}} };
@@ -218,6 +263,7 @@ inline Arch moe(int L = 4) {
         t.push_back({m+"shared_expert.down_proj.weight", {H,SI}});
         t.push_back({m+"shared_expert_gate.weight",      {1,H}});
     }
+    if (mtp) add_mtp(t, H, Q, KV, 16, 0, E, MI);
     return a;
 }
 

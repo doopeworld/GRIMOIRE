@@ -181,10 +181,35 @@ pipeline on OCuLink and see where it actually lands. Single-process
 device-to-device is still worth trying (see above), but it is no longer
 obviously the bigger win.
 
-Also note: **speculation is hard-disabled whenever TP or PP is on**
-(`grimoire.cpp`: `mtp_enabled() && !tp_enabled() && !pp_enabled()`). Dual-GPU
-today means no MTP/DFlash. That is a real trade, not an oversight to
-"fix" casually — but it is the thing to solve if dual-GPU TG matters.
+**MTP speculation now works under BOTH TP and PP (2026-09-12).** The old
+note here said speculation was hard-disabled whenever TP or PP was on, and
+that dual-GPU meant no drafter. That is no longer true:
+
+- **TP**: the MTP head is small, so it loads REPLICATED on every rank and
+  each rank drafts identically with no extra collective. Two spots needed
+  fixing — the embedding table is row-sharded under TP (the head must go
+  through `embed_one`, not `launch_embed`), and the reduced-draft-vocab
+  lm_head shortcut skipped the all-gather.
+- **PP**: only the last stage owns the final hidden state, so it hosts the
+  head, drafts, and pushes each draft token backward on the same channel
+  `argmax_token` already uses. The verified tokens the head chose go back
+  the same way (`pp_sync_tokens`), so every stage computes the same
+  acceptance count and rolls back to the same position. The stages agree
+  on whether speculation is on at all via a one-hop handshake in
+  `pp_connect` — deciding locally would let one rank draft while another
+  did not, and they would deadlock on the next collective.
+  The last stage also loads the embedding table (the head embeds every
+  token it drafts), which costs one extra copy on one card.
+
+Verified by `bin/test_spec_e2e`: speculative output is IDENTICAL to plain
+greedy output, single process and across two processes, TP and PP, dense
+and MoE, BF16 and FP8. That is the right test because speculation is an
+exactness claim, not an approximation.
+
+**DFlash is still single-GPU only.** Its drafter reads aux hidden states
+from specific target layers, which under PP live on different ranks, and
+its batched embed path is not TP-aware. So: DFlash where it wins on one
+card, MTP for dual-GPU. The capability matrix says which one is live.
 
 **8. Never quote a benchmark number from a config that never generated text.**
 Multiple false leads in this project (BesTLA, DAG, several kernel "wins")

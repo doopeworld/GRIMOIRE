@@ -1497,6 +1497,17 @@ struct Grimoire {
             if(n<0&&errno==EINTR)continue;return false;} return true;
     }
     bool pp_connect(std::string& err);
+    // Whether speculation is live for the WHOLE pipeline.  Under PP only
+    // the last stage owns the MTP head, so the ranks cannot each decide
+    // for themselves: they would take different branches of the decode
+    // loop and deadlock on the next collective.  The last stage publishes
+    // one answer at connect time and everyone uses it.
+    int  pp_spec = 0;
+    bool spec_active() const {
+        if (pp_enabled()) return pp_spec != 0;
+        return mtp_enabled() && mtp.ok;
+    }
+    bool pp_sync_tokens(std::vector<int32_t>& toks);
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
     int  pp_sync_token(int token);
@@ -2136,9 +2147,35 @@ bool Grimoire::pp_connect(std::string& err) {
             tp_peer_fd[0]=fd;
         }
     }
-    std::printf("  %s rank %d/%d: connected\n",tp_enabled()?"TP":"PP",
-                comm_rank(),(tp_enabled()?tp_world:pp_world));
+    if (pp_enabled()) {
+        // One backward hop, same shape as pp_sync_token: the last stage
+        // says whether it loaded an MTP head and every earlier stage
+        // adopts that answer.  Deciding locally would let rank 0 draft
+        // while rank 1 did not.
+        pp_spec = pp_sync_token(mtp.ok ? 1 : 0);
+        if (pp_spec < 0) { err = "PP speculation handshake failed"; return false; }
+    }
+    std::printf("  %s rank %d/%d: connected%s\n",tp_enabled()?"TP":"PP",
+                comm_rank(),(tp_enabled()?tp_world:pp_world),
+                pp_enabled() ? (pp_spec ? ", speculation ON" : ", speculation off") : "");
     std::fflush(stdout);return true;
+}
+
+// Broadcast the verified tokens backward along the pipeline.  Only the
+// last stage runs the head, so only it knows what the target chose; every
+// earlier stage needs the same answer to compute the same acceptance
+// count and roll back to the same position.  Size is known to all ranks
+// (the candidate count), so only the payload travels.
+bool Grimoire::pp_sync_tokens(std::vector<int32_t>& toks) {
+    if (toks.empty()) return true;
+    const size_t bytes = toks.size() * sizeof(int32_t);
+    if (pp_rank == pp_world - 1) {
+        if (pp_rank > 0 && !fd_write_all(pp_prev_fd, toks.data(), bytes)) return false;
+    } else {
+        if (!fd_read_all(pp_next_fd, toks.data(), bytes)) return false;
+        if (pp_rank > 0 && !fd_write_all(pp_prev_fd, toks.data(), bytes)) return false;
+    }
+    return true;
 }
 
 bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
@@ -2382,7 +2419,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // ---- embeddings ---------------------------------------------------
     std::printf("  embed_tokens  %.2f GiB ... ", double(ck.bytes(ck.embed)) / 1073741824.0);
     std::fflush(stdout);
-    if(!pp_enabled()||pp_rank==0)
+    // Rank 0 embeds the input tokens.  The LAST stage needs the table too
+    // when it hosts the MTP head: the head is fc([norm(embed(next_token));
+    // norm(hidden)]), so it embeds every token it drafts.  Without this it
+    // would read a null pointer on the first draft -- and only under PP,
+    // which is the configuration hardest to debug.  The cost is one copy
+    // of the embedding table on one extra card, and only when MTP is on.
+    const bool need_embed = !pp_enabled() || pp_rank == 0 ||
+                            (mtp_enabled() && pp_rank == pp_world - 1);
+    if(need_embed)
         embed=dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
     if (!ok) { err = "embed upload failed"; return false; }
     embed_begin=0;embed_count=cfg.vocab;
@@ -2899,7 +2944,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
 
     // ---- MTP head -----------------------------------------------------
-    if(mtp_enabled()&&!tp_enabled()&&!pp_enabled()) {
+    // TP: the MTP head is small and is loaded REPLICATED on every rank --
+    // no shard() call below -- so each rank drafts identically with no
+    // extra collective.  Its two TP-sensitive spots (the sharded
+    // embedding table, and the reduced-draft-vocab lm_head shortcut) are
+    // handled in mtp_draft/mtp_warm.  PP is still excluded: the head
+    // needs the final hidden state, which only the last stage has.
+    if(mtp_enabled()&&(!pp_enabled()||pp_rank==pp_world-1)) {
         std::printf("\n  mtp head      ");
         std::fflush(stdout);
         auto ref = [&](const char* n) -> TensorRef {
@@ -3016,9 +3067,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                           "mtp.shared.gate_up", &mok);
                 m.sh_down = quantize_upload_t(q, ck, t_sd, mtp_fmt(t_sd),
                                               "mtp.shared.down", &mok);
-                m.sh_gate_q = quantize_upload_t(q, ck, t_sgw, Fmt::BF16,
-                                                "mtp.shared.gate", &mok);
-                m.has_sh_gate = t_sgw.ok();
+                // shared_expert_gate is OPTIONAL -- the very next line
+                // says so.  Uploading it unconditionally set ok=false
+                // through the "missing tensor" path, so any MoE
+                // checkpoint whose MTP head has no shared_expert_gate
+                // failed to load at all, with speculation reported as a
+                // load failure rather than as an absent sub-weight.
+                if (t_sgw.ok()) {
+                    m.sh_gate_q = quantize_upload_t(q, ck, t_sgw, Fmt::BF16,
+                                                    "mtp.shared.gate", &mok);
+                    m.has_sh_gate = true;
+                }
                 mtp_ffn_bytes = gu_rows * (gu_row + gu_srow + gu_zrow)
                               + dn_rows * (dn_row + dn_srow + dn_zrow)
                               + m.router.w.bytes() + m.sh_gu.w.bytes()
@@ -3686,7 +3745,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         mtp.resid = sycl::malloc_device<float>(size_t(cfg.hidden), q);
     }
 
-    if (mtp.ok || dflash2.ok) {
+    // EVERY pipeline stage needs these, not just the one holding the head:
+    // each stage rolls back its OWN layers when a draft is rejected.  The
+    // predicate is the request (an env var every rank reads) rather than
+    // mtp.ok, because mtp.ok is false on the early stages by design -- and
+    // pp_connect, which publishes the pipeline's answer, has not run yet.
+    // If the last stage then fails to load a head, these go unused.
+    if (mtp.ok || dflash2.ok || (pp_enabled() && mtp_enabled())) {
         // One exact rollback image for the hybrid recurrent state. This is
         // about 157 MiB on Qwen3.8-27B and is copied device-to-device.
         for (const auto& d : L) {
@@ -3742,6 +3807,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const int half = dl.sh_gu.output_rows() / 2;   // sh_gu is gate|up
         if (half > SI) SI = half;
     }
+    // The MTP head is a layer too and shares this scratch, but it is not
+    // in L.  Its FFN is usually the same width as the target's; "usually"
+    // is not a guarantee worth a device heap overrun.
+    if (mtp.ok) SI = std::max(SI, mtp.L.sh_gu.output_rows() / 2);
     if (SI <= 0) SI = 1;
     s.h       = sycl::malloc_device<float>(H, q);
     s.h2      = sycl::malloc_device<float>(H, q);
@@ -3852,15 +3921,22 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             std::printf("    parallel      none (single device)\n");
 
         const bool par = tp_enabled() || pp_enabled();
-        if (mtp.ok)            std::printf("    speculation   MTP\n");
+        if (mtp.ok)            std::printf("    speculation   MTP%s\n",
+                                   pp_enabled() ? " (head on this, the last stage)" : "");
+        else if (pp_enabled() && pp_spec)
+            std::printf("    speculation   MTP (head on the last stage; this "
+                        "stage drafts in lockstep with it)\n");
         else if (dflash2.ok)   std::printf("    speculation   DFlash%s%s\n",
                                    dflash2.v2 ? "2" : "",
                                    dflash2.selector_ok ? " + candidate selector"
                                                        : " (argmax draft, no selector)");
-        else if (par && (mtp_enabled() || std::getenv("GRIMOIRE_DFLASH_MODEL")))
-            std::printf("    speculation   DISABLED -- requested, but not "
-                        "supported with %s\n", tp_enabled() ? "tensor parallel"
-                                                             : "pipeline parallel");
+        else if (par && std::getenv("GRIMOIRE_DFLASH_MODEL"))
+            std::printf("    speculation   DISABLED -- DFlash is not supported "
+                        "with %s (MTP is)\n", tp_enabled() ? "tensor parallel"
+                                                            : "pipeline parallel");
+        else if (par && mtp_enabled())
+            std::printf("    speculation   DISABLED -- MTP requested but the "
+                        "head did not load\n");
         else                   std::printf("    speculation   none\n");
 
         // A device with no XMX cannot run the batched path at all (see
@@ -4077,8 +4153,15 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
             xoff += size_t(kSpecBatch) * channels;
         }
     }
-    q.memcpy(s.h, spec_hidden_steps + size_t(step) * cfg.hidden,
-             size_t(cfg.hidden) * sizeof(float));
+    // Restoring the accepted token's hidden state matters only to the NEXT
+    // draft, not to correctness: the target reads the KV cache and the
+    // token id.  The sequential verify fallback never captures these steps
+    // (it has no batch to capture from), so skip rather than read a buffer
+    // that was never written -- speculation stays exact there, the drafts
+    // after a partial rejection are just worse.
+    if (spec_hidden_steps)
+        q.memcpy(s.h, spec_hidden_steps + size_t(step) * cfg.hidden,
+                 size_t(cfg.hidden) * sizeof(float));
     pos = saved_pos + accepted;
     set_cursor(pos);
 }
@@ -5654,7 +5737,11 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
     // Same concat order as mtp_draft: EMBEDDING FIRST.
     launch_rmsnorm_residual(q, const_cast<float*>(hidden), nullptr, mtp.pre_h,
                             mtp.cat + H, H, cfg.rms_eps, none);
-    launch_embed(q, embed, next_token, mtp.resid, H, none);
+    // embed_one, not launch_embed: under TP the embedding table is row
+    // sharded, so a global token id indexes the WRONG row on every rank
+    // that does not own it (and off the end of the last one).
+    if(!embed_one(next_token, mtp.resid))
+        throw std::runtime_error("MTP warm embedding all-reduce failed");
     launch_rmsnorm_residual(q, mtp.resid, nullptr, mtp.pre_e, mtp.cat,
                             H, cfg.rms_eps, none);
     launch_gemv(q, mtp.fc.w, mtp.cat, mtp.x, none);
@@ -5673,6 +5760,13 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
 }
 
 int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
+    // Only the last pipeline stage owns the MTP head and the final hidden
+    // state, so it drafts and the earlier stages receive -- the same
+    // backward hop argmax_token already uses to keep every rank's decode
+    // loop in lockstep.  Every rank ends up with identical candidates,
+    // which is what makes the acceptance count agree without a second
+    // round trip.
+    if (pp_enabled() && pp_rank < pp_world - 1) return pp_sync_token(-1);
     if (!mtp.ok) return -1;
     if(position<0||position>=max_seq||next_token<0||next_token>=cfg.vocab)throw std::out_of_range("invalid MTP draft position/token");
     const int H = cfg.hidden;
@@ -5707,7 +5801,9 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     const float* hsrc = from_mtp_hidden ? (chain_old ? mtp.x : mtp.h2) : s.h;
     launch_rmsnorm_residual(q, const_cast<float*>(hsrc), nullptr, mtp.pre_h,
                             p_hid, H, cfg.rms_eps, none);
-    launch_embed(q, embed, next_token, mtp.resid, H, none);
+    // TP-aware: see the note in mtp_warm.
+    if(!embed_one(next_token, mtp.resid))
+        throw std::runtime_error("MTP draft embedding all-reduce failed");
     launch_rmsnorm_residual(q, mtp.resid, nullptr, mtp.pre_e, p_emb,
                             H, cfg.rms_eps, none);
     launch_gemv(q, mtp.fc.w, mtp.cat, mtp.x, none);      // [H] = [H][2H] x [2H]
@@ -5800,7 +5896,11 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         return v && *v ? std::atoi(v) : 0;
     }();
     const int dv = draft_vocab > 0 ? std::min(draft_vocab, cfg.vocab) : cfg.vocab;
-    if (dv < cfg.vocab && lm_head.has_i4())
+    // The reduced-vocabulary shortcut writes s.logits directly and so
+    // skips the all-gather gemv_any would have done: under TP that
+    // leaves every rank holding only its own slice of the draft logits
+    // and the argmax below picks from a fraction of the vocabulary.
+    if (dv < cfg.vocab && lm_head.has_i4() && !lm_head.tp_sharded())
         launch_gemv_int4sym(q, lm_head.i4, lm_head.i4s, mtp.h2, s.logits,
                             dv, H, none);
     else
@@ -5808,7 +5908,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
-    return int(tok);
+    return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
 }
 
 int Grimoire::argmax_token() {
@@ -6675,6 +6775,12 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
     return true;
 }
 
+// INVARIANT, relied on by the speculative verify fallback in
+// generation.hpp: every `return false` below happens BEFORE any kernel is
+// submitted, so a false return leaves pos, the KV cache and the recurrent
+// state exactly as they were and the caller may redo the work
+// sequentially.  Keep it that way -- a late bail-out would silently
+// double-process tokens.
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens) {
     if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
@@ -6717,10 +6823,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (M <= 0 || pos + M > max_seq) return false;
     const int start_pos = pos;
     if (!next_tokens && start_pos == 0 && restore_prefix(tokens)) return true;
-    if (pp_enabled() && next_tokens) {
-        std::fprintf(stderr, "multiprocess PP does not yet support verifier prefill\n");
-        return false;
-    }
+
     const int H = cfg.hidden, Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
     const int qkv_ch = 2 * Hk * Dk + Hv * Dv;
@@ -8061,9 +8164,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     pos+=M; set_cursor(pos);
     if (next_tokens) {
         next_tokens->resize(M);
-        q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
+        // dtok is only computed where the head runs.  Under PP that is
+        // the last stage; the earlier stages leave the buffer alone and
+        // take the answer from the backward hop below.
+        if (!pp_enabled() || pp_rank == pp_world - 1)
+            q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
     }
     q.wait();
+    if (next_tokens && pp_enabled() && !pp_sync_tokens(*next_tokens)) {
+        std::fprintf(stderr, "PP rank %d: verified-token sync failed\n", pp_rank);
+        for(void* z:mem) if(z) sycl::free(z,q);
+        return false;
+    }
 
     // Populate MTP context in one batch using the same format-aware matrix
     // path as target prefill. Verification replaces draft-conditioned K/V with
@@ -8259,7 +8371,10 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     o.dflash=e.dflash2.ok;
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
     o.draft_depth=o.dflash?15:std::clamp(depth?std::atoi(depth):3,0,15);
-    o.mtp=Grimoire::mtp_enabled() && e.mtp.ok && o.draft_depth>0;
+    // spec_active() is the PIPELINE's answer, not this rank's: under PP
+    // only the last stage holds the head, and if the ranks disagreed
+    // here they would run different decode loops and deadlock.
+    o.mtp=e.spec_active() && o.draft_depth>0;
     const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
     o.graph=graph && std::atoi(graph)!=0;
     // GRIMOIRE_SPEC_STATS=1 prints accepted-per-step per request.  This is

@@ -162,6 +162,7 @@ run_gate bin/test_k2_kernels
 run_gate bin/test_k2_e2e
 run_gate bin/test_model_matrix
 run_gate bin/test_parallel_e2e
+run_gate bin/test_spec_e2e
 
 # ---------------------------------------------------------------------
 say "5. real model"

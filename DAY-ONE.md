@@ -38,6 +38,7 @@ order, and stops at the first required failure:
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
 | `bin/test_model_matrix` | 3 architectures × 7 projection formats |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
+| `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU |
 | generate | real model, real prompt — **you read the output** |
 
 Green preflight means the box is sane. It does not mean anything is
@@ -80,11 +81,20 @@ dense model, a routed-MoE model and K2, in BF16 and FP8. What was NOT
 verified there is the link itself — that is what these two commands
 measure and nothing else can.
 
-**Speculation is off whenever TP or PP is on.** `mtp_enabled() &&
-!tp_enabled() && !pp_enabled()`. Dual-GPU today means no MTP and no
-DFlash, so dual-GPU TG is slower per token than a single card that fits
-the model. That is a real trade, not a bug to patch in a hurry. The load
-banner says which mode you are in — read it.
+**Speculation now works on dual GPU.** Add `GRIMOIRE_MTP=1` (and
+`GRIMOIRE_MTP_K=3`) to either launcher. Under PP the last stage hosts the
+MTP head and drives the drafting for the whole pipeline; under TP the head
+is replicated and every rank drafts identically. Verified token-for-token
+against single-process plain decode — speculation is exact, so if it ever
+changes the output that is a bug, not a trade.
+
+DFlash is still single-GPU only: its drafter needs aux hidden states from
+target layers that PP puts on different ranks. So DFlash on one card, MTP
+on two. The load banner prints which is live — read it.
+
+Prompt processing differs between the two modes: **PP has batched prefill,
+TP does not** (it falls back to token-at-a-time and says so in the banner).
+For anything prompt-heavy on two cards, use PP.
 
 ## 3. Which format
 

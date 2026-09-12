@@ -5,18 +5,29 @@
 struct Engine {
     struct {int vocab=64;}cfg;
     int max_seq=64,pos=0,resets=0,forward_calls=0,draft_calls=0,commits=0;
-    int reject_at=-1, batch_count=0;
-    bool graph_ok=false, fail_verify=false, fail_prompt=false;
+    int reject_at=-1, batch_count=0, batch_verifies=0;
+    // decline_verify models the REAL contract: Grimoire::prefill returns
+    // false only before submitting any work, so the caller may redo the
+    // verify sequentially.  fail_forward is the genuine hard failure.
+    bool graph_ok=false, decline_verify=false, fail_prompt=false;
+    // fail the Nth forward onwards, so the PROMPT can succeed and the
+    // failure lands inside the speculative verify where it belongs.
+    int fail_forward_after=-1;
     std::vector<int32_t> history;
     float logits=0;
     void reset(){++resets;pos=0;history.clear();}
     void sync(){}
     int argmax_token(){assert(!history.empty());return (history.back()+1)%cfg.vocab;}
-    const float* forward(int t){assert(pos<max_seq);++forward_calls;history.push_back(t);++pos;return &logits;}
+    const float* forward(int t){
+        if(fail_forward_after>=0&&forward_calls>=fail_forward_after)return nullptr;
+        assert(pos<max_seq);++forward_calls;history.push_back(t);++pos;return &logits;}
     bool prefill(const std::vector<int32_t>& ids,std::vector<int32_t>* next=nullptr){
-        if(next&&fail_verify){forward(ids[0]);return false;}
+        // No work submitted before declining -- that is the invariant the
+        // sequential verify fallback in generation.hpp depends on.
+        if(next&&decline_verify)return false;
         if(!next&&fail_prompt){fail_prompt=false;forward(ids[0]);return false;}
         for(int t:ids){forward(t);if(next)next->push_back(argmax_token());}
+        if(next)++batch_verifies;
         batch_count=0;return true;
     }
     bool build_graph(){return false;}
@@ -56,7 +67,28 @@ int main(){
     assert(retry.resets==2&&out==std::vector<int32_t>({7,8,9,10,11}));
     Engine zero;o.mtp=true;o.draft_depth=0;
     generate_tokens(zero,prompt,o,out,{},reason);assert(out.size()==5&&zero.draft_calls==0);
-    Engine failure;failure.fail_verify=true;o.draft_depth=3;
+    // A batched verify that DECLINES must fall back to a token-at-a-time
+    // verify and produce exactly what it would have produced anyway --
+    // not throw.  Before the fallback existed, any engine without a
+    // usable batched path failed every speculative request outright.
+    {
+        o.draft_depth=3;
+        Engine plain;GenerationOptions po{20,-1,-1,0,false,false,false};
+        std::vector<int32_t> want;
+        generate_tokens(plain,prompt,po,want,{},reason);
+        for(bool df:{false,true}){
+            Engine dec;dec.decline_verify=true;
+            GenerationOptions so{20,-1,-1,3,df,!df,false};
+            std::vector<int32_t> got;
+            generate_tokens(dec,prompt,so,got,{},reason);
+            assert(got==want);
+            assert(dec.batch_verifies==0);  // the batched path really declined
+            assert(dec.draft_calls>0||df); // and drafting still happened
+        }
+    }
+    // A verify whose forward actually fails is still a hard failure.
+    Engine failure;failure.decline_verify=true;
+    failure.fail_forward_after=int(prompt.size())+1;o.draft_depth=3;o.mtp=true;
     throws([&]{generate_tokens(failure,prompt,o,out,{},reason);});
     Engine one;o.max_tokens=1;o.mtp=false;
     generate_tokens(one,prompt,o,out,{},reason);assert(one.forward_calls==4);

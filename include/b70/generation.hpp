@@ -94,7 +94,23 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             }
             for(int t:candidates)if(t<0||t>=e.cfg.vocab)throw std::runtime_error("invalid draft token");
             std::vector<int32_t> verified;
-            if(!e.prefill(candidates,&verified)||verified.size()!=candidates.size())
+            if(!e.prefill(candidates,&verified)) {
+                // The batched verify declined.  prefill() returns false
+                // only BEFORE it submits any work -- an unavailable
+                // batched path, or scratch it could not allocate -- so
+                // the engine state is untouched and the same verify can
+                // be done a token at a time.  Without this, a degraded
+                // batched path turned every speculative request into a
+                // hard failure: correct output was available and the
+                // request threw anyway.
+                verified.clear();
+                for(size_t i=0;i<candidates.size();++i){
+                    if(!e.forward(candidates[i]))
+                        throw std::runtime_error("speculative verification failed");
+                    verified.push_back(e.argmax_token());
+                }
+            }
+            if(verified.size()!=candidates.size())
                 throw std::runtime_error("speculative verification failed");
             int accepted=1;
             while(accepted<int(candidates.size())&&candidates[accepted]==verified[accepted-1])++accepted;
