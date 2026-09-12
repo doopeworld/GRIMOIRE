@@ -2,7 +2,34 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-As of 2026-08-28, the top-of-list next task is:
+**As of 2026-09-12: Ian is away until roughly 2026-09-19 and comes back
+to a Tower with two B70s on OCuLink. The job is that the box WORKS the
+day he powers it on — dual GPU, FP8, pipeline parallel.**
+
+Start at `DAY-ONE.md`, and run `tools/preflight_b70.sh /models/<dir>`
+before anything else. It builds in the right order (bridges first, rule
+3), runs every gate, and finishes by generating text for a human to read
+(rule 8). Do not touch performance work until it is green.
+
+What is already verified, off the card, in a container with a real
+oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
+
+- every SYCL source compiles; `bin/grimoire` and `bin/grimoire-server` link
+- the new kernels RUN and match their host references (`test_k2_kernels`)
+- 3 architectures x 7 projection formats all load and generate
+  (`test_model_matrix`)
+- PP and TP produce token-identical output to a single process, in BF16
+  and FP8, for dense, MoE and K2 (`test_parallel_e2e`)
+
+What is NOT verified and only the Tower can settle: the OCuLink link
+itself, every XMX tile, the AOT image, and every number.
+
+Below this line is the previous priority. It is still real work and
+still wanted -- but it is second until the box is known good.
+
+---
+
+Previously (2026-08-28), the top-of-list task was:
 
 **Implement DFlash speculative decoding for Ornith-1.5-35B-A3B.**
 Reference: ultimatechris/Ornith-1.5-35B-A3B-DFlash-SGLang — block-level
