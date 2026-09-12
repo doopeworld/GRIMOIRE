@@ -6,6 +6,7 @@ struct Engine {
     struct {int vocab=64;}cfg;
     int max_seq=64,pos=0,resets=0,forward_calls=0,draft_calls=0,commits=0;
     int reject_at=-1, batch_count=0, batch_verifies=0;
+    int snapshots=0, restores=0;
     // decline_verify models the REAL contract: Grimoire::prefill returns
     // false only before submitting any work, so the caller may redo the
     // verify sequentially.  fail_forward is the genuine hard failure.
@@ -32,7 +33,10 @@ struct Engine {
     }
     bool build_graph(){return false;}
     const float* step(){return forward(argmax_token());}
-    void snapshot_recurrent(){}
+    void snapshot_recurrent(){++snapshots;}
+    // Models the real thing: back to the pre-draft state, and the caller
+    // replays the accepted tokens itself.
+    void restore_recurrent(int saved){++restores;history.resize(size_t(saved));pos=saved;}
     void commit_spec_prefix(int saved,int n){++commits;history.resize(saved+n);pos=saved+n;}
     int mtp_draft(int t,int,bool){++draft_calls;return (t+1+(batch_count++==reject_at?7:0))%cfg.vocab;}
     bool dflash_draft(int t,int,std::vector<int32_t>& block,bool context=false){
@@ -76,14 +80,22 @@ int main(){
         Engine plain;GenerationOptions po{20,-1,-1,0,false,false,false};
         std::vector<int32_t> want;
         generate_tokens(plain,prompt,po,want,{},reason);
-        for(bool df:{false,true}){
-            Engine dec;dec.decline_verify=true;
+        // rejected == -1 accepts everything, so nothing would ever roll
+        // back; the point of this case is the ROLLBACK, so drive both.
+        for(bool df:{false,true})for(int rejected:{-1,0,1,2}){
+            Engine dec;dec.decline_verify=true;dec.reject_at=rejected;
             GenerationOptions so{20,-1,-1,3,df,!df,false};
             std::vector<int32_t> got;
             generate_tokens(dec,prompt,so,got,{},reason);
-            assert(got==want);
+            assert(got==want);              // exact, whatever was rejected
             assert(dec.batch_verifies==0);  // the batched path really declined
-            assert(dec.draft_calls>0||df); // and drafting still happened
+            if(rejected>=0){
+                // Rollback went through restore+replay, never through
+                // commit_spec_prefix -- which would read per-step images
+                // the sequential verify never wrote.
+                assert(dec.restores>0);
+                assert(dec.commits==0);
+            }
         }
     }
     // A verify whose forward actually fails is still a hard failure.

@@ -1507,29 +1507,7 @@ struct Grimoire {
         if (pp_enabled()) return pp_spec != 0;
         return mtp_enabled() && mtp.ok;
     }
-    // Can a rejected draft be rolled back EXACTLY?
-    //
-    // A rejection restores the recurrent state, and the DeltaNet state and
-    // conv ring are replayed from spec_dn_steps / spec_conv_inputs, which
-    // only the BATCHED verify captures.  A sequential verify never writes
-    // them, so on a model with linear-attention layers it would restore
-    // state that was never saved and the output would quietly stop being
-    // the model's output -- measured: identical for ten tokens, then
-    // permanently divergent.  Speculation is an exactness claim, so when
-    // the batched verify is not available here, the answer is to not
-    // speculate, never to speculate approximately.
-    //
-    // Deliberately keyed on cfg, not on this rank's loaded layers: under
-    // PP one stage can own all the linear layers and another none, and if
-    // the ranks disagreed about whether to speculate they would deadlock
-    // on the next collective.  Every rank parses the same config.
-    bool spec_verify_available() const {
-        const bool recurrent = cfg.lin_v_heads > 0 && cfg.lin_v_dim > 0;
-        if (!recurrent) return true;         // nothing to restore
-        if (tp_enabled()) return false;      // prefill() always declines under TP
-        return q.get_device().is_gpu() ||
-               q.get_device().has(sycl::aspect::ext_intel_matrix);
-    }
+
     bool pp_sync_tokens(std::vector<int32_t>& toks);
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
@@ -4024,13 +4002,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             std::printf("    parallel      none (single device)\n");
 
         const bool par = tp_enabled() || pp_enabled();
-        if (!spec_verify_available() && (mtp.ok || dflash2.ok ||
-                                         (pp_enabled() && pp_spec)))
-            std::printf("    speculation   DISABLED -- this model has recurrent "
-                        "(linear-attention) layers and the batched verify is "
-                        "not available here, so a rejected draft could not be "
-                        "rolled back exactly\n");
-        else if (mtp.ok)       std::printf("    speculation   MTP%s\n",
+        if (mtp.ok)            std::printf("    speculation   MTP%s\n",
                                    pp_enabled() ? " (head on this, the last stage)" : "");
         else if (pp_enabled() && pp_spec)
             std::printf("    speculation   MTP (head on the last stage; this "
@@ -8486,13 +8458,13 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              FinishReason* finish) {
     GenerationOptions o;
     o.max_tokens=n_predict; o.eos=eos_id; o.eot=eot_id;
-    o.dflash=e.dflash2.ok && e.spec_verify_available();
+    o.dflash=e.dflash2.ok;
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
     o.draft_depth=o.dflash?15:std::clamp(depth?std::atoi(depth):3,0,15);
     // spec_active() is the PIPELINE's answer, not this rank's: under PP
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.
-    o.mtp=e.spec_active() && o.draft_depth>0 && e.spec_verify_available();
+    o.mtp=e.spec_active() && o.draft_depth>0;
     const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
     o.graph=graph && std::atoi(graph)!=0;
     // GRIMOIRE_SPEC_STATS=1 prints accepted-per-step per request.  This is
