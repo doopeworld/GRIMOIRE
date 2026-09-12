@@ -33,6 +33,8 @@ struct Engine {
     }
     bool build_graph(){return false;}
     const float* step(){return forward(argmax_token());}
+    bool recurrent=false;   // model has linear-attention layers
+    bool has_recurrent_state()const{return recurrent;}
     void snapshot_recurrent(){++snapshots;}
     // Models the real thing: back to the pre-draft state, and the caller
     // replays the accepted tokens itself.
@@ -89,13 +91,7 @@ int main(){
             generate_tokens(dec,prompt,so,got,{},reason);
             assert(got==want);              // exact, whatever was rejected
             assert(dec.batch_verifies==0);  // the batched path really declined
-            if(rejected>=0){
-                // Rollback went through restore+replay, never through
-                // commit_spec_prefix -- which would read per-step images
-                // the sequential verify never wrote.
-                assert(dec.restores>0);
-                assert(dec.commits==0);
-            }
+            if(rejected>=0)assert(dec.commits>0);   // rollback happened
         }
     }
     // A verify whose forward actually fails is still a hard failure.

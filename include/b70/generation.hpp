@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -94,8 +95,7 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             }
             for(int t:candidates)if(t<0||t>=e.cfg.vocab)throw std::runtime_error("invalid draft token");
             std::vector<int32_t> verified;
-            const bool batched_verify = e.prefill(candidates,&verified);
-            if(!batched_verify) {
+            if(!e.prefill(candidates,&verified)) {
                 // The batched verify declined.  prefill() returns false
                 // only BEFORE it submits any work -- an unavailable
                 // batched path, or scratch it could not allocate -- so
@@ -125,28 +125,24 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 o.stats->accepted += accepted-1;
             }
             if(accepted<int(candidates.size())) {
-                if(batched_verify) {
-                    e.commit_spec_prefix(saved,accepted);
-                } else {
-                    // The sequential verify captured no per-step images, so
-                    // commit_spec_prefix would restore a recurrent state
-                    // that was never saved -- measured on a DeltaNet model
-                    // as output that stays fluent and stops being the
-                    // model's.  Restore the exact pre-draft snapshot
-                    // instead and re-run the accepted tokens: forward() is
-                    // deterministic, so replaying them from the same state
-                    // reproduces it exactly, for the recurrent state, the
-                    // conv ring, the KV slots and the hidden state the next
-                    // draft reads.
-                    //
-                    // Cost is `accepted` extra forwards on a REJECTED round
-                    // only, and only where the batched verify is
-                    // unavailable.  At low acceptance that is one token.
-                    e.restore_recurrent(saved);
-                    for(int i=0;i<accepted;++i)
-                        if(!e.forward(candidates[i]))
-                            throw std::runtime_error("speculative replay failed");
-                }
+                // commit_spec_prefix is exact whenever there is no
+                // recurrent state to rebuild, whichever verify ran.  When
+                // there IS recurrent state, only the batched verify writes
+                // the per-step images it replays from -- and the engine
+                // refuses to speculate at all in that case
+                // (spec_verify_available), so this is never reached with a
+                // sequential verify and recurrent state.
+                //
+                // A restore-and-replay rollback was tried here and does NOT
+                // work: restore_recurrent alone is clean, but re-running
+                // forward() at a position that has already been processed
+                // corrupts memory on a DeltaNet model -- reproducible, and
+                // it surfaces as a SIGSEGV at teardown because USM on a CPU
+                // device is host malloc.  That is a latent bug in the
+                // linear-attention decode path worth chasing on the card;
+                // until it is, do not build a rollback on re-entering a
+                // position.
+                e.commit_spec_prefix(saved,accepted);
             }
             for(int i=1;i<accepted;++i)if(!emit(candidates[i]))return int(out.size());
             tok=verified[accepted-1];

@@ -135,6 +135,36 @@ bin/grimoire, bin/grimoire-server   compile and link
 - Every XMX tile, the AOT `bmg_g31` image, the bridges, the OCuLink link,
   and every throughput number.
 
+## A latent bug found and NOT fixed — worth chasing on the card
+
+**Re-running `forward()` at an already-processed position corrupts memory
+on a DeltaNet model.**
+
+Found while trying to make the sequential speculative rollback exact.
+The idea was: on rejection, `restore_recurrent(saved)` back to the
+pre-draft snapshot and replay the accepted tokens, since `forward()` is
+deterministic. Bisected with a switch:
+
+```
+restore only, no replay   exit 0
+restore + replay          SIGSEGV
+```
+
+So `restore_recurrent` is clean and the replay is not. The crash lands at
+teardown rather than in the loop, which is the signature of an
+out-of-bounds DEVICE write: USM on a CPU device is host malloc, so a
+kernel overrunning a buffer corrupts the host heap and the process dies
+at `free`. Pure-attention models are unaffected (dense, MoE and K2 all
+replay cleanly) — it is specific to the linear-attention decode path.
+
+That path is used by Qwen3.5 and Ornith, so it is worth understanding.
+Reproduce with `bin/test_spec_e2e` on a hybrid case, restoring the
+replay branch removed from `include/b70/generation.hpp`.
+
+Until it is understood: **do not build a rollback on re-entering a
+position**, and speculation on a recurrent model requires the batched
+verify (which a B70 always has; only TP loses it).
+
 ## Still open, in the order worth doing
 
 1. **Pack the MoVA experts expert-major** so the routing readback
