@@ -164,6 +164,34 @@ Multiple false leads in this project (BesTLA, DAG, several kernel "wins")
 were caught only because someone bothered to run `-p "prompt" -n N` and read
 the output. A PASS on a numeric self-check is not sufficient.
 
+**9. You CAN compile in a work container. Do it before handing off.**
+For weeks this project handed off code that had never been through a
+compiler, because "there is no SYCL toolchain here" was assumed. It is
+not true: `icpx` plus an OpenCL CPU device install from conda-forge in
+about ten minutes, no GPU needed. Procedure:
+`TOOLCHAIN-IN-A-CONTAINER.md`.
+
+The first run of it (2026-09-12) found that `src/grimoire.cpp` did not
+compile at all, that the K2 softplus gate was 2.5e-4 off torch, and --
+once the kernels were actually EXECUTED -- four engine bugs in a K2 path
+nobody had ever called, including a 46 KB device heap overrun that is a
+DEVICE_LOST on the card. None of that was findable by reading.
+
+Two gates now exist and take seconds: `bin/test_k2_kernels` (kernels vs
+their host references, on a device) and `bin/test_k2_e2e` (loads a
+miniature checkpoint and generates). Run them everywhere, and run them
+again on the Tower, where they additionally cover the XMX tiles and the
+batched prefill the CPU device cannot touch.
+
+Compile for `-fsycl-targets=spir64` in a container (AOT `bmg_g31` needs
+`ocloc`), and use `-fsycl-device-code-split=per_kernel` for anything you
+intend to RUN there — `off` puts every kernel in one image and the CPU
+runtime dies on the `joint_matrix` ones even when nothing calls them.
+`off` stays correct for the B70.
+
+This does NOT weaken rule 8. Nothing here produces a number, and a CPU
+device is not a B70. It is the floor, not the ceiling.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the
