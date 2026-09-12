@@ -1633,6 +1633,17 @@ struct Grimoire {
         bf16_t *hidden_norm=nullptr, *norm=nullptr;
         sycl::half *hidden_norm_f16=nullptr, *norm_f16=nullptr;
         bf16_t *predecessor=nullptr, *successor=nullptr;
+        // DFlash2 candidate selector.  rank comes from the hidden_projection
+        // weight itself (Linear(hidden -> rank)); top_k must come from the
+        // draft config, because launch_topk16_rows emits exactly 16 and a
+        // checkpoint asking for a different width must NOT be silently run
+        // at 16.
+        int selector_top_k=0, selector_rank=0;
+        bool selector_ok=false;
+        int32_t* sel_ids=nullptr;     // [steps*16] candidate token ids
+        float*   sel_unary=nullptr;   // [steps*16] their logits
+        float*   sel_hidden=nullptr;  // [steps*rank] hidden_projection(h)
+        float*   sel_scores=nullptr;  // [steps*K*K] edge scores
         // Token-major [max_seq,n_taps,H]. The draft fc consumes one
         // contiguous concatenated target-feature row per verified token.
         float *target_aux=nullptr;
@@ -3092,6 +3103,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     long(dflash2.rope_theta)));
                 dflash2.sliding_window=int(find_int("sliding_window",
                     dflash2.sliding_window));
+                dflash2.selector_top_k=int(find_int("selector_top_k",0));
+                dflash2.selector_rank=int(find_int("selector_rank",0));
             }
         }
         if(dflash2.q_heads<=0||dflash2.kv_heads<=0||dflash2.inter<=0)dok=false;
@@ -3170,6 +3183,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 "candidate_selector.predecessor_codebook","dflash2.predecessor");
             dflash2.successor=bload(
                 "candidate_selector.successor_codebook","dflash2.successor");
+            // The selector runs only when every piece is present AND the
+            // checkpoint's top_k matches what topk16_rows can emit.  Loading
+            // the weights is not the same as being able to use them: the old
+            // path took a bare argmax per position and never scored an edge,
+            // which is a different algorithm, not a faster one.
+            {
+                const int rank=dflash2.selector_hidden.w.N;
+                if(dflash2.selector_rank&&dflash2.selector_rank!=rank)
+                    std::printf("\n  dflash2 selector: config rank %d != "
+                        "hidden_projection rows %d -- selector disabled\n",
+                        dflash2.selector_rank,rank);
+                else if(dflash2.selector_top_k>16)
+                    std::printf("\n  dflash2 selector: selector_top_k %d > 16 "
+                        "(topk16_rows limit) -- selector disabled\n",
+                        dflash2.selector_top_k);
+                else if(dflash2.predecessor&&dflash2.successor&&rank>0){
+                    if(!dflash2.selector_top_k)dflash2.selector_top_k=16;
+                    dflash2.selector_rank=rank;
+                    const int steps=15;            // MMAX-1
+                    const int K=16;                // topk16_rows width
+                    dflash2.sel_ids=sycl::malloc_device<int32_t>(size_t(steps)*K,q);
+                    dflash2.sel_unary=sycl::malloc_device<float>(size_t(steps)*K,q);
+                    dflash2.sel_hidden=sycl::malloc_device<float>(size_t(steps)*rank,q);
+                    dflash2.sel_scores=sycl::malloc_device<float>(size_t(steps)*K*K,q);
+                    dflash2.selector_ok=dflash2.sel_ids&&dflash2.sel_unary&&
+                                        dflash2.sel_hidden&&dflash2.sel_scores;
+                    if(!dflash2.selector_ok)dok=false;
+                    else db+=size_t(steps)*(K*sizeof(int32_t)+K*sizeof(float)
+                             +size_t(rank)*sizeof(float)+size_t(K)*K*sizeof(float));
+                }
+            }
         }
         const size_t draft_kv_elems=size_t(dflash2.kv_heads)*dflash2.head_dim*max_seq;
         if(cfg.is_muse)dflash2.num_blocks=(max_seq+dflash2.block_size-1)/dflash2.block_size;
@@ -3901,6 +3945,10 @@ void Grimoire::release() {
     // partially loaded sidecar cannot leak USM when build() reports an error.
     dflash2.fc.release(q);
     dflash2.selector_hidden.release(q);
+    if(dflash2.sel_ids)sycl::free(dflash2.sel_ids,q);
+    if(dflash2.sel_unary)sycl::free(dflash2.sel_unary,q);
+    if(dflash2.sel_hidden)sycl::free(dflash2.sel_hidden,q);
+    if(dflash2.sel_scores)sycl::free(dflash2.sel_scores,q);
     dflash2.fused_context_kv.release(q);
     dflash2.shared_embed_f16.release(q);
     dflash2.shared_lm_head_f16.release(q);
@@ -6015,7 +6063,46 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         dflash2.draft_head_rows:cfg.vocab;
     const int draft_stride=dflash2.draft_logits_stride?
         dflash2.draft_logits_stride:draft_vocab;
-    for(int r=0;r<M-1;++r){
+    // ---- candidate selection -------------------------------------
+    // DFlash2 does NOT take a bare argmax per position.  It keeps the
+    // top-k candidates at each draft position and scores the EDGE from
+    // the previous choice to each candidate:
+    //
+    //   score[l,p,c] = unary[l,c]
+    //                + sum_r pred[pred_id[l,p],r] * hidden[l,r] * succ[cand[l,c],r]
+    //
+    // with pred_id[0,*] = the verified anchor, then walks greedily from
+    // the anchor, each step conditioned on the previous pick.  That is
+    // vLLM's _score_edges plus its _selector_walk_kernel; independent
+    // argmax is a different algorithm that ignores the codebooks
+    // entirely, which is why the weights loaded but nothing used them.
+    if(dflash2.selector_ok){
+        const int steps=M-1, K=16, TK=dflash2.selector_top_k;
+        const int rank=dflash2.selector_rank;
+        // topk16_rows assumes a packed row; the draft logits can be padded
+        // (draft_logits_stride != draft_vocab), so feed it one row at a time.
+        for(int r=0;r<steps;++r)
+            launch_topk16_rows(q,dflash2.logits+int64_t(r)*draft_stride,1,
+                               draft_vocab,dflash2.sel_ids+int64_t(r)*K,
+                               dflash2.sel_unary+int64_t(r)*K,{});
+        if(dflash2.draft_head_rows){
+            // candidates are rows of the REDUCED head; the codebooks are
+            // indexed by real vocabulary id, so map before scoring.
+            const int32_t* map=dflash2.draft_head_token_ids;
+            int32_t* ids=dflash2.sel_ids;
+            const int64_t n=int64_t(steps)*K;
+            q.parallel_for(sycl::range<1>(size_t(n)),[=](sycl::id<1> i){
+                ids[i[0]]=map[ids[i[0]]];
+            });
+        }
+        // hidden_projection(hidden_states) -> [steps, rank]
+        mm(dflash2.selector_hidden,dflash2.normed+H,dflash2.sel_hidden,steps);
+        launch_dflash2_selector_edges(q,dflash2.predecessor,dflash2.successor,
+            dflash2.sel_ids,dflash2.sel_unary,dflash2.sel_hidden,
+            int32_t(bonus_token),dflash2.sel_scores,steps,TK,rank,{});
+        launch_dflash2_path_walk(q,dflash2.sel_scores,dflash2.sel_ids,
+            dflash2.draft_ids,steps,TK,{});
+    }else for(int r=0;r<M-1;++r){
         launch_argmax(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
                       s.d_tok,s.d_val,{});
         if(dflash2.draft_head_rows){
