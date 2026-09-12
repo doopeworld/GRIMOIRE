@@ -10,9 +10,25 @@ enum class FinishReason { Stop, Length, Cancelled };
 inline const char* finish_reason_name(FinishReason r) {
     return r==FinishReason::Stop?"stop":(r==FinishReason::Length?"length":"cancelled");
 }
+// Speculation accounting.  tok/s alone cannot settle any question about a
+// drafter: it moves when the draft gets cheaper AND when it gets more
+// accurate, and those want opposite decisions.  accepted/steps is the half
+// that isolates proposal quality, so any A/B between two draft
+// configurations -- MTP vs DFlash2, selector on vs off, one K-norm
+// convention vs another -- needs it recorded, not inferred.
+struct SpecStats {
+    long long steps=0;      // speculative rounds entered
+    long long drafted=0;    // draft tokens proposed (anchor excluded)
+    long long accepted=0;   // draft tokens the verifier kept
+    double per_step() const { return steps ? double(accepted)/double(steps) : 0.0; }
+    double rate()     const { return drafted ? double(accepted)/double(drafted) : 0.0; }
+};
 struct GenerationOptions {
     int max_tokens=0, eos=-1, eot=-1, draft_depth=0;
     bool dflash=false, mtp=false, graph=false;
+    // Optional; nothing is recorded when null.  Declared last so the
+    // existing aggregate initialisations stay valid.
+    SpecStats* stats=nullptr;
 };
 inline int generation_budget(const std::vector<int32_t>& ids, int requested, int capacity, int vocab) {
     if(ids.empty())throw std::invalid_argument("prompt must contain at least one token");
@@ -82,6 +98,15 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 throw std::runtime_error("speculative verification failed");
             int accepted=1;
             while(accepted<int(candidates.size())&&candidates[accepted]==verified[accepted-1])++accepted;
+            // Counted BEFORE the emit loop below, which can return early on
+            // a stop token or a cancelled callback: the round happened and
+            // its proposals were judged either way, and dropping it would
+            // bias the rate upward on exactly the requests that end early.
+            if(o.stats) {
+                ++o.stats->steps;
+                o.stats->drafted  += int(candidates.size())-1;   // anchor is not a draft
+                o.stats->accepted += accepted-1;
+            }
             if(accepted<int(candidates.size()))e.commit_spec_prefix(saved,accepted);
             for(int i=1;i<accepted;++i)if(!emit(candidates[i]))return int(out.size());
             tok=verified[accepted-1];

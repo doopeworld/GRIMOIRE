@@ -1678,6 +1678,11 @@ struct Grimoire {
         // kernel_projection is [2*taps*groups, hidden].
         float *conv_delta=nullptr, *conv_scratch=nullptr;
         bool fp16_draft=true;   // drafter weights uploaded as FP16
+        // Context-K norm source for the Muse drafter.  false (default) =
+        // each layer's own checkpoint weight; true = layer 0's weight for
+        // every layer, which is what the Fusion reference was measured to
+        // apply.  See the load site for the numbers.
+        bool knorm_layer0=false;
         int ctx_chunk=16;       // rows per draft-context ingest iteration
         int conv_taps=0, conv_groups=0, conv_block=16;
         // Muse speculative verifier scratch, reused after the draft pass.
@@ -3380,11 +3385,43 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 dflash2.layers.size()*dflash2.head_dim,q);
             if(!dflash2.k_norm_all_f16)dok=false;
             else{
-                // Each layer uses its checkpoint norm. Reference-specific
-                // substitutions must not redefine the model's weights.
+                // Context-K norm source.  DEFAULT is each layer's own
+                // checkpoint weight -- the model-faithful thing, and the
+                // only defensible default: a loader that substitutes one
+                // layer's weight for another has redefined the model, and
+                // every acceptance number taken under it describes a
+                // different drafter than the one on disk.
+                //
+                // The compatibility mode below is kept because it is not a
+                // guess.  Measured against the running Fusion reference:
+                // the effective context-K weight recovered from Fusion's own
+                // pre-RoPE context K is IDENTICAL across all five draft
+                // layers (pairwise cos 1.0000, rms 1.08547) and equals
+                // layers.0.self_attn.k_norm.weight, while the checkpoint's
+                // five k_norm tensors genuinely differ (rms 1.085, 1.349,
+                // 0.895, 1.381, 0.955).  Under per-layer weights Grimoire's
+                // context K sits at cos 0.93-0.97 against Fusion; layer 0's
+                // weight everywhere raises every layer to ~0.99.
+                //
+                // So one of two things is true, and the measurement that
+                // separates them has not been run: either Fusion collapses
+                // the norm (and matching it buys acceptance against a
+                // reference that is itself wrong), or Grimoire feeds its
+                // context-K path something the per-layer weights then
+                // expose.  Until that A/B exists -- accepted tokens per
+                // step, same prompt, same seed, both modes -- the faithful
+                // weights are the default and the reference-matching mode
+                // is opt-in and named in the capability matrix, so no
+                // number can be quoted without saying which one produced
+                // it.
+                //
+                //   GRIMOIRE_MUSE_KNORM_LAYER0=1   Fusion-matching (cos ~0.99)
+                //   unset                          checkpoint per-layer
+                const char* kn0=std::getenv("GRIMOIRE_MUSE_KNORM_LAYER0");
+                dflash2.knorm_layer0=kn0&&*kn0&&*kn0!='0';
                 for(size_t i=0;i<dflash2.layers.size();++i)
                     q.memcpy(dflash2.k_norm_all_f16+i*dflash2.head_dim,
-                        dflash2.layers[i].k_norm_f16,
+                        dflash2.layers[dflash2.knorm_layer0?0:i].k_norm_f16,
                         size_t(dflash2.head_dim)*sizeof(sycl::half));
                 db+=dflash2.layers.size()*dflash2.head_dim*sizeof(sycl::half);
             }
@@ -3776,6 +3813,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         std::printf("    norms         %s\n",
             cfg.is_k2 ? "grouped, weight applied directly (K2)"
                       : "whole-row, zero-centered (1 + w)");
+        // An acceptance rate measured under the compatibility norm is not
+        // comparable to one measured under the checkpoint's own weights.
+        // Say which is live so the two never get averaged together.
+        if (cfg.is_muse && dflash2.ok)
+            std::printf("    draft ctx-K   %s\n", dflash2.knorm_layer0
+                ? "layer 0's k_norm for ALL layers "
+                  "(GRIMOIRE_MUSE_KNORM_LAYER0, Fusion-matching -- NOT the "
+                  "checkpoint)"
+                : "per-layer checkpoint k_norm");
     }
     return true;
 }
@@ -8107,10 +8153,25 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     o.mtp=Grimoire::mtp_enabled() && e.mtp.ok && o.draft_depth>0;
     const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
     o.graph=graph && std::atoi(graph)!=0;
+    // GRIMOIRE_SPEC_STATS=1 prints accepted-per-step per request.  This is
+    // the measurement an A/B needs and tok/s cannot give: a change that
+    // makes the draft cheaper and a change that makes it more accurate both
+    // move tok/s, and only one of them moves this.  Off by default so a
+    // server does not print a line per completion.
+    static const bool spec_stats=[]{ const char* s=std::getenv("GRIMOIRE_SPEC_STATS");
+        return s && *s && std::atoi(s)!=0; }();
+    SpecStats stats;
+    if(spec_stats && (o.dflash||o.mtp)) o.stats=&stats;
     FinishReason reason=FinishReason::Length;
     try {
         const int n=generate_tokens(e,prompt_ids,o,out_ids,on_token,reason);
         if(finish)*finish=reason;
+        if(o.stats && stats.steps)
+            std::printf("  spec: %s depth %d -- %.2f accepted/step "
+                        "(%lld of %lld drafted, %.1f%%) over %lld steps\n",
+                        o.dflash?(e.dflash2.v2?"DFlash2":"DFlash"):"MTP",
+                        o.draft_depth, stats.per_step(), stats.accepted,
+                        stats.drafted, 100.0*stats.rate(), stats.steps);
         return n;
     } catch(...) {
         // A failed verifier may have advanced recurrent state. A subsequent

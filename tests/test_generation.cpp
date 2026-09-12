@@ -62,6 +62,55 @@ int main(){
     generate_tokens(one,prompt,o,out,{},reason);assert(one.forward_calls==4);
     Engine eos;o.max_tokens=10;o.eos=9;
     generate_tokens(eos,prompt,o,out,{},reason);assert(out==std::vector<int32_t>({7,8})&&reason==FinishReason::Stop);
+    // ---- speculation accounting -------------------------------------
+    // An A/B between two drafters is only readable as accepted-per-step;
+    // tok/s moves for two reasons at once.  Pin the arithmetic: the anchor
+    // is never a draft, a rejected step still counts, and the totals match
+    // what the fake engine was told to reject.
+    for(bool df:{false,true})for(int depth=1;depth<=15;++depth)for(int rejected=-1;rejected<depth;++rejected) {
+        Engine se;se.reject_at=rejected;
+        SpecStats st;
+        // max_tokens is a whole number of full rounds (anchor + depth
+        // accepted), so with nothing rejected no round is truncated by the
+        // budget and the totals are exact rather than bounded.
+        const int rounds=3, budget=rounds*(depth+1);
+        GenerationOptions so{budget,-1,-1,depth,df,!df,false,&st};
+        generate_tokens(se,prompt,so,out,{},reason);
+        assert(st.steps>0);
+        assert(st.drafted<=st.steps*depth);            // anchor is never a draft
+        assert(st.drafted>=st.steps);                  // every counted round drafted
+        assert(st.accepted<=st.drafted);
+        if(rejected<0) {                               // verifier agrees throughout
+            assert(st.steps==rounds);
+            assert(st.drafted==st.steps*depth);
+            assert(st.accepted==st.drafted);
+        } else {
+            // The first mismatch is at index `rejected`, so a round that
+            // drafted its full depth contributes exactly that many.
+            assert(st.accepted<=st.steps*rejected);
+        }
+        // MTP drafts one token per call, so the engine's own call count is
+        // an independent check that nothing is double-counted.
+        if(!df)assert(st.drafted==se.draft_calls);
+        assert(st.per_step()==double(st.accepted)/double(st.steps));
+    }
+    {   // A request cancelled part-way through emitting a round's accepted
+        // tokens must still count that round: the draft was proposed and
+        // judged.  Dropping it would bias the rate upward on exactly the
+        // requests that end early.  (Cancelling on the very first token
+        // happens before any draft, so accept the anchor and refuse the
+        // next one.)
+        Engine ce;SpecStats st;int seen=0;
+        GenerationOptions co{40,-1,-1,4,false,true,false,&st};
+        generate_tokens(ce,prompt,co,out,[&](int){return ++seen<2;},reason);
+        assert(reason==FinishReason::Cancelled);
+        assert(st.steps==1&&st.drafted==4&&st.accepted==4);
+    }
+    {   // no stats pointer means no accounting and no crash
+        Engine ne;GenerationOptions no{8,-1,-1,4,false,true,false};
+        assert(no.stats==nullptr);
+        generate_tokens(ne,prompt,no,out,{},reason);
+    }
     throws([&]{generate_tokens(e,{},o,out,{},reason);});
     throws([&]{generate_tokens(e,{-1},o,out,{},reason);});
     throws([&]{generate_tokens(e,{64},o,out,{},reason);});

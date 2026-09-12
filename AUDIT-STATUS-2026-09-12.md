@@ -30,9 +30,9 @@ toolchain and no B70 in the container the work was done in. Host tests pass
 | F09 | 2 | TP/PP capability shortfall | **reported 2026-09-12** |
 | F10 | 1/2 | server corrupts valid prompts | **fixed** (Codex) |
 | F11 | 2 | MTP context and precision | **fixed** (Codex) |
-| F12 | 2 | Muse drafter copies layer 0's K-norm everywhere | **open** |
+| F12 | 2 | Muse drafter copies layer 0's K-norm everywhere | **fixed** (Codex) + A/B instrumented 2026-09-12 |
 | F13 | 2 | failed speculation looks like an empty success | **fixed** (Codex) |
-| F14 | 2 | build/benchmark evidence not tied to a binary | **open** |
+| F14 | 2 | build/benchmark evidence not tied to a binary | **fixed 2026-09-12** |
 
 ## Evidence for the closed items
 
@@ -109,6 +109,68 @@ running), whether prefill is batched or the sequential fallback, and the
 norm convention. The TP prefill line says outright not to benchmark it as
 prompt-processing throughput.
 
+**F12 — the norm default was already right; the A/B was missing.**
+Codex's `c771464` had already changed the Muse context-K norm from layer
+0's weight for all five draft layers to each layer's own checkpoint
+weight, which is the default the audit asked for. What that commit also
+did was delete the measurement that motivated the old behaviour, and that
+measurement is not a guess: against the running Fusion reference, the
+effective context-K weight is identical across all five layers
+(pairwise cos 1.0000, rms 1.08547) and equals
+`layers.0.self_attn.k_norm.weight`, while the checkpoint's five tensors
+genuinely differ (rms 1.085, 1.349, 0.895, 1.381, 0.955). Per-layer
+weights put Grimoire's context K at cos 0.93-0.97 against Fusion;
+layer 0's everywhere raises every layer to ~0.99.
+
+So either Fusion collapses the norm and matching it buys acceptance
+against a reference that is itself wrong, or Grimoire's context-K path
+is fed something the per-layer weights then expose. Nobody has run the
+measurement that separates those. The evidence is now back in the code,
+the faithful weights stay the default, and the reference-matching
+behaviour is `GRIMOIRE_MUSE_KNORM_LAYER0=1` and named in the capability
+matrix (`draft ctx-K`), so no acceptance number can be quoted without
+saying which produced it.
+
+The audit also asked for an A/B acceptance comparison, and there was
+nothing to measure it with: `generate_tokens` computed `accepted` per
+round and threw it away. `SpecStats` (steps / drafted / accepted) is now
+an optional out-parameter on `GenerationOptions`, filled before the emit
+loop so a cancelled or stop-terminated round still counts — otherwise
+the rate biases upward on exactly the requests that end early.
+`GRIMOIRE_SPEC_STATS=1` prints accepted-per-step per request. This is
+the number tok/s cannot give: a cheaper draft and a more accurate draft
+both move tok/s, and only one of them moves this. It applies to every
+speculation A/B, not just F12 — MTP vs DFlash2 and selector on/off are
+the same question. `tests/test_generation.cpp` pins the arithmetic over
+every depth and rejection prefix (anchor never counted as a draft, MTP
+totals cross-checked against the engine's own call count).
+
+**F14 — a failed build now fails.** `build_b70.sh` caught every failure
+with `|| { echo ...; }`, the one shape `set -e` does not fire on: it
+printed "GRIMOIRE BUILD FAILED", continued, and exited 0. Anything
+downstream then measured whatever older binary was still in `bin/` and
+attributed the result to the source tree. Both required targets now set
+`REQUIRED_FAILED` and the script exits 1 saying `bin/` may be stale.
+Auxiliary targets stay warn-only. `benchy_qwen.sh` had the same class of
+problem on the measurement side: no `pipefail`, so a crashed benchy read
+as "no output" rather than as a failure, and an unpinned
+`uvx llama-benchy`. It now fails loudly, takes `BENCHY_VERSION` to pin
+the harness, and stamps the sha256, mtime and commit of the server
+binary it is about to measure.
+
+## The A/B this leaves to run on the Tower
+
+```
+GRIMOIRE_SPEC_STATS=1 tools/tune.sh ... -p "<fixed prompt>" -n 128
+GRIMOIRE_SPEC_STATS=1 GRIMOIRE_MUSE_KNORM_LAYER0=1 tools/tune.sh ... (same)
+```
+
+Same prompt, same depth, both modes. Compare accepted/step, and read the
+text in both — per rule 8 a number from a config that never generated
+text is not evidence. If per-layer wins or ties, delete the compatibility
+mode. If layer 0 wins materially, the finding is in Grimoire's context-K
+path, not in the norm choice, and the flag is a marker for where to look.
+
 ## Still open
 
 **F07** — the audit says the single-process pipeline "does not execute
@@ -121,12 +183,7 @@ threading a per-layer queue through every launcher (`gemv_any`, `mm`,
 implicitly. That is architectural. The load path now prints what it
 actually does and points at `tools/pp2run.sh`.
 
-**F12** — Muse's drafter still copies layer 0's K-norm into all five draft
-context layers. Untouched.
-
-**F14** — build script still continues past a failed CLI/server target and
-can leave a successful exit status; `benchy_qwen.sh` still has no
-`pipefail` and no pinned llama-benchy. Untouched.
+That is the only finding still open.
 
 ## Retraction the audit did not catch
 
