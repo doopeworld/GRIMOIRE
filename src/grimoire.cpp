@@ -3104,6 +3104,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         double(mb) / 1073741824.0);
         }
     }
+    // The last pipeline stage loaded the embedding table only so the MTP
+    // head could embed the tokens it drafts.  If no head is live here,
+    // give it back -- on a big model that is over a gigabyte on the card
+    // that is short of VRAM, which is the reason PP is being used at all.
+    if (pp_enabled() && pp_rank == pp_world - 1 && pp_rank != 0 &&
+        !mtp.ok && embed) {
+        const size_t freed = size_t(embed_count) * H * sizeof(bf16_t);
+        sycl::free(embed, q);
+        embed = nullptr;
+        bytes -= std::min(bytes, freed);
+    }
 
     // ---- DFlash sidecar weights -------------------------------------
     const char* dpath=std::getenv("GRIMOIRE_DFLASH_MODEL");
