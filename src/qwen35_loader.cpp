@@ -67,8 +67,26 @@ bool   cfg_b(const std::string& j, const char* k, bool d) {
 bool keep_qwen_bf16(const std::string& name) {
     auto ends=[&](const char* suffix){const size_t n=std::strlen(suffix);
         return name.size()>=n && name.compare(name.size()-n,n,suffix)==0;};
+    // GRIMOIRE_QUANT_LM_HEAD=1 lets the output projection be packed.  It is
+    // the single largest per-token read that is not an expert -- 1.017 GB at
+    // BF16 for a 248320x2048 head, against 0.266 at int4, and test_ops puts
+    // that at ~1.6 ms per token, more than the whole fused MoE block.  It is
+    // read once per plain decode step and once per DRAFT step on top, so a
+    // k=6 speculative round pays it several times over.
+    //
+    // Off by default because it was never measured here, not because it was
+    // measured and rejected.  An independent B70 report (Qwen3.8-27B, GPTQ
+    // int4 + MTP) quantized this head and found perplexity and GSM8K
+    // largely unchanged -- worth reproducing on our own benchmark before
+    // making it the default.
+    static const bool quant_lm_head = [] {
+        const char* e = std::getenv("GRIMOIRE_QUANT_LM_HEAD");
+        return e && *e && std::atoi(e) != 0;
+    }();
+    const bool is_lm_head = name=="lm_head.weight" || ends(".lm_head.weight");
+    if (is_lm_head && quant_lm_head) return false;
     return name.rfind("mtp.",0)==0 || name.find("embed_tokens")!=std::string::npos ||
-        name=="lm_head.weight" || ends(".lm_head.weight") ||
+        is_lm_head ||
         ends(".linear_attn.in_proj_a.weight") || ends(".linear_attn.in_proj_b.weight") ||
         ends(".mlp.gate.weight") || ends(".mlp.shared_expert_gate.weight") ||
         // K2-Horizon MoVA value router: [mova_num_experts, hidden] = [64,2560].
