@@ -26,6 +26,7 @@
 // =====================================================================
 #include "b70/grimoire_api.hpp"
 #include "b70/formats.hpp"
+#include "mini_model.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -33,9 +34,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -46,108 +44,6 @@ static int g_fail = 0;
 #define CHECK(c, ...) do { if(!(c)){ std::printf("  FAIL "); \
     std::printf(__VA_ARGS__); std::printf("\n"); ++g_fail; } } while(0)
 
-// Same geometry as tests/test_k2_config.cpp's miniature checkpoint: 4
-// layers, 0-1 dense and 2-3 sparse, so one run covers BOTH shapes --
-// ordinary v_proj next to MoVA, and a plain MLP next to the routed MoE.
-static const char* kMiniConfig = R"JSON({
-  "model_type": "k2_horizon", "attention_gate_func": "softplus",
-  "hidden_size": 64, "num_hidden_layers": 4, "vocab_size": 128,
-  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
-  "intermediate_size": 48, "moe_intermediate_size": 32,
-  "num_experts": 4, "num_experts_per_tok": 2, "num_shared_experts": 1,
-  "mova_num_experts": 3, "mova_num_experts_per_tok": 2,
-  "mlp_only_layers": [0, 1], "decoder_sparse_step": 1,
-  "layernorm_num_groups": 2, "moe_gate_bias": true,
-  "router_score_func": "sigmoid", "router_scaling_factor": 2.5,
-  "norm_topk_prob": true, "query_key_norm": false, "rope_head_dim": 16,
-  "rms_norm_eps": 1e-06, "tie_word_embeddings": false,
-  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
-})JSON";
-
-struct Tn { std::string name; std::vector<int64_t> shape; };
-
-static std::vector<Tn> mini_tensors() {
-    const int H=64, KV=32, Q=64, I=48, MI=32, E=4, MV=3, V=128;
-    std::vector<Tn> t = {
-        {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
-        {"lm_head.weight", {V,H}},
-    };
-    for (int L = 0; L < 4; ++L) {
-        const std::string b = "model.layers." + std::to_string(L) + ".";
-        const bool sparse = (L >= 2);
-        t.push_back({b+"input_layernorm.weight", {H}});
-        t.push_back({b+"post_attention_layernorm.weight", {H}});
-        const std::string a = b + "self_attn.";
-        t.push_back({a+"q_proj.weight", {Q,H}});
-        t.push_back({a+"k_proj.weight", {KV,H}});
-        t.push_back({a+"o_proj.weight", {H,Q}});
-        t.push_back({a+"gate_proj.weight", {Q,H}});
-        if (sparse) {
-            t.push_back({a+"v_router.weight", {MV,H}});
-            t.push_back({a+"v_router.bias", {MV}});
-            for (int e = 0; e < MV; ++e)
-                t.push_back({a+"v_experts."+std::to_string(e)+".weight", {KV,H}});
-        } else {
-            t.push_back({a+"v_proj.weight", {KV,H}});
-        }
-        const std::string m = b + "mlp.";
-        if (sparse) {
-            t.push_back({m+"gate.weight", {E,H}});
-            t.push_back({m+"gate.bias", {E}});
-            for (int e = 0; e < E; ++e) {
-                const std::string x = m+"experts."+std::to_string(e)+".";
-                t.push_back({x+"gate_proj.weight", {MI,H}});
-                t.push_back({x+"up_proj.weight",   {MI,H}});
-                t.push_back({x+"down_proj.weight", {H,MI}});
-            }
-            for (const char* n : {"gate_proj","up_proj","down_proj"})
-                t.push_back({m+"shared_experts."+n+".weight",
-                             std::string(n)=="down_proj" ? std::vector<int64_t>{H,MI}
-                                                         : std::vector<int64_t>{MI,H}});
-        } else {
-            t.push_back({m+"gate_proj.weight", {I,H}});
-            t.push_back({m+"up_proj.weight",   {I,H}});
-            t.push_back({m+"down_proj.weight", {H,I}});
-        }
-    }
-    return t;
-}
-
-// Random BF16, small enough that four layers of residual cannot blow up
-// but never zero: a zeroed checkpoint makes a dead path indistinguishable
-// from a live one.
-static void write_model(const fs::path& dir) {
-    fs::create_directories(dir);
-    std::ofstream(dir/"config.json") << kMiniConfig;
-    const auto ts = mini_tensors();
-    std::ostringstream h; h << '{';
-    uint64_t off = 0;
-    for (size_t i = 0; i < ts.size(); ++i) {
-        if (i) h << ',';
-        size_t n = 1; for (auto d : ts[i].shape) n *= size_t(d);
-        h << '"' << ts[i].name << "\":{\"dtype\":\"BF16\",\"shape\":[";
-        for (size_t d = 0; d < ts[i].shape.size(); ++d) {
-            if (d) h << ',';
-            h << ts[i].shape[d];
-        }
-        h << "],\"data_offsets\":[" << off << ','; off += n*2; h << off << "]}";
-    }
-    h << '}';
-    std::string hs = h.str(); while (hs.size() % 8) hs += ' ';
-
-    std::mt19937 rng(20260912);
-    std::normal_distribution<float> nd(0.f, 0.05f);
-    std::vector<bf16_t> data(off/2);
-    for (auto& v : data) v = f32_to_bf16(nd(rng));
-
-    std::ofstream f(dir/"model.safetensors", std::ios::binary);
-    const uint64_t n = hs.size();
-    f.write(reinterpret_cast<const char*>(&n), 8);
-    f << hs;
-    f.write(reinterpret_cast<const char*>(data.data()),
-            std::streamsize(data.size()*sizeof(bf16_t)));
-}
-
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== K2 engine, end to end on a device ===\n\n");
@@ -155,7 +51,7 @@ int main() {
     char tmpl[] = "/tmp/grimoire-k2e2e-XXXXXX";
     if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
     const fs::path dir = tmpl;
-    write_model(dir);
+    mini::write_model(dir, mini::k2());
     std::printf("miniature checkpoint: %s\n", dir.string().c_str());
 
     // BF16 projections: the point here is the K2 operator path, not the

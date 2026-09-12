@@ -163,27 +163,46 @@ icpx -fsycl -fsycl-targets="$TARGET" \
 # decode are on the SAME norm convention -- a divergence there would be
 # completely silent.  It takes no model and runs in seconds.
 #   ./bin/test_k2_kernels
-icpx -fsycl -fsycl-targets="$TARGET" \
+icpx -fsycl -fsycl-targets=spir64 \
      -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -fsycl-device-code-split=per_kernel \
      -I include -I src \
      tools/test_k2_kernels_device.cpp src/ops.cpp src/prefill.cpp \
      -o bin/test_k2_kernels \
   && echo "built  : bin/test_k2_kernels" || echo "warn: k2 kernel test failed"
 
-# End-to-end gate for the K2 path: writes a miniature K2 checkpoint with
-# random weights, loads it through the real public entry points and
-# generates.  It needs no model and no tokenizer.  Nothing else in the
-# tree actually CALLS forward() on a K2 layer.
-#   ./bin/test_k2_e2e
-icpx -fsycl -fsycl-targets="$TARGET" \
-     -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
-     -I include -I src \
-     tools/test_k2_e2e_device.cpp src/grimoire.cpp src/qwen35_loader.cpp \
-     src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
-     src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
-     src/tokenizer.cpp -o bin/test_k2_e2e \
-  && echo "built  : bin/test_k2_e2e" || echo "warn: k2 e2e test failed"
+# Engine gates.  All three write their own synthetic checkpoints, so
+# they need no model, no tokenizer and no network, and they run in
+# seconds:
+#   bin/test_k2_e2e        the K2 path, loaded and generating
+#   bin/test_model_matrix  every architecture x every projection format
+#   bin/test_parallel_e2e  PP and TP must equal one process, token for token
+ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
+            src/safetensors.cpp src/quantize.cpp src/gptq.cpp
+            src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
+            src/deltanet.cpp src/moe_kernels.cpp src/moe_ref.cpp
+            src/ops.cpp src/prefill.cpp src/tokenizer.cpp)
+# These build for spir64 (JIT), not the AOT "$TARGET".  They are
+# CORRECTNESS gates: the kernel source is identical either way, and an
+# AOT device compile of the whole engine three more times would add
+# fifteen minutes to every build for no extra coverage.  They pay a
+# one-time JIT cost at launch instead, which nobody is timing.
+# GRIMOIRE_SKIP_GATES=1 skips them entirely.
+if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
+  for gate in test_k2_e2e_device:test_k2_e2e \
+              test_model_matrix:test_model_matrix \
+              test_parallel_e2e:test_parallel_e2e ; do
+    gsrc="${gate%%:*}"; gbin="${gate##*:}"
+    icpx -fsycl -fsycl-targets=spir64 \
+         -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+         -fsycl-device-code-split=per_kernel \
+         -I include -I src \
+         "tools/${gsrc}.cpp" "${ENGINE_SRC[@]}" -o "bin/${gbin}" \
+      && echo "built  : bin/${gbin}" || echo "warn: ${gbin} failed to build"
+  done
+else
+  echo "note : GRIMOIRE_SKIP_GATES set -- engine gates not built"
+fi
 
 # ---------------------------------------------------------------------
 if [[ "$REQUIRED_FAILED" -ne 0 ]]; then

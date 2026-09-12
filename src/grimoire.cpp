@@ -1833,7 +1833,12 @@ struct Grimoire {
                               const std::vector<sycl::event>& deps) {
         const int E = int(d.v_experts.size());
         const int K = std::min(cfg.mova_top_k, E);
-        const int N = d.v_experts.empty() ? 0 : d.v_experts[0].w.N;
+        // output_rows(), NOT w.N.  Under TP w.N is this rank's SHARD, while
+        // gemv_any all-gathers the full row into mova_expert_out -- so
+        // sizing the clear and the accumulate from w.N left the top
+        // (world-1)/world of every MoVA value vector holding whatever the
+        // previous layer wrote.  Silent: the shapes all still line up.
+        const int N = d.v_experts.empty() ? 0 : d.v_experts[0].output_rows();
         if (E <= 0 || K <= 0 || N <= 0) return q.submit([&](sycl::handler& h){
             h.depends_on(deps); h.single_task([=](){}); });
 
@@ -3727,9 +3732,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // layer then writes 2*6144 floats into a 2*768 buffer.  That is a 46 KB
     // device heap overrun three times per token: DEVICE_LOST on a B70, and
     // nothing in a self-check would have named it.
+    //
+    // output_rows(), NOT w.N: under TP w.N is this rank's SHARD while
+    // gemv_any all-gathers the FULL row into this buffer, so sizing from
+    // the shard under-allocates by (world-1)/world and the gather then
+    // writes past the end.
     int SI = cfg.is_moe() ? cfg.shared_inter : cfg.dense_inter;
     for (const auto& dl : L) {
-        const int half = dl.sh_gu.w.N / 2;        // sh_gu holds gate|up
+        const int half = dl.sh_gu.output_rows() / 2;   // sh_gu is gate|up
         if (half > SI) SI = half;
     }
     if (SI <= 0) SI = 1;
@@ -5054,7 +5064,7 @@ const float* Grimoire::forward_dag(int token) {
 
             sycl::event e_shgu = gemv_any(d.sh_gu, s.h2, s.sh_g,
                 deps({(dag_mask & 4) ? e_h : e_routed}));
-            const int SI = d.sh_gu.w.N / 2;
+            const int SI = d.sh_gu.output_rows() / 2;
             sycl::event e_sw = launch_swiglu(
                 q, s.sh_g, s.sh_g + SI, s.sh_g, SI, deps({e_shgu}));
             sycl::event e_shdown = launch_gemv(
@@ -5068,7 +5078,7 @@ const float* Grimoire::forward_dag(int token) {
             }
             e_moe = launch_add(q, s.moe_y, s.sh_out, H, deps({e_routed, e_shared}));
         } else {
-            const int FI = d.sh_gu.w.N / 2;
+            const int FI = d.sh_gu.output_rows() / 2;
             sycl::event e_gu = ffn_gemv(d, true, s.h2, s.sh_g, deps({e_h}));
             sycl::event e_sw = launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, deps({e_gu}));
             e_moe = ffn_gemv(d, false, s.sh_g, s.moe_y, deps({e_sw}));
@@ -5761,7 +5771,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         launch_moe_down(q, d.moe, s.d_expert, s.d_weight,
                         s.moe_h, s.moe_y, none);
 
-        const int SI = d.sh_gu.w.N / 2;
+        const int SI = d.sh_gu.output_rows() / 2;
         gemv_any(d.sh_gu, s.h2, s.sh_g, none);
         launch_swiglu(q, s.sh_g, s.sh_g + SI, s.sh_g, SI, none);
         gemv_any(d.sh_down, s.sh_g, s.sh_out, none);
@@ -5772,7 +5782,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         launch_add(q, s.moe_y, s.sh_out, H, none);
         (void)I;
     } else {
-        const int FI = d.sh_gu.w.N / 2;
+        const int FI = d.sh_gu.output_rows() / 2;
         gemv_any(d.sh_gu, s.h2, s.sh_g, none);
         launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, none);
         gemv_any(d.sh_down, s.sh_g, s.moe_y, none);

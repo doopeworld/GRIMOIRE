@@ -1,0 +1,227 @@
+// =====================================================================
+//  mini_model.hpp -- synthetic checkpoints for the device test tools.
+//
+//  Every architecture GRIMOIRE claims to support, written to disk as a
+//  real config.json + model.safetensors with RANDOM BF16 weights, small
+//  enough to load in under a second and big enough that every shape rule
+//  (head counts, group divisibility, expert counts) is exercised.
+//
+//  Random, never zero: a zeroed checkpoint makes a dead code path
+//  indistinguishable from a live one, which is exactly the failure these
+//  tools exist to catch.
+//
+//  These are NOT models.  Output from them is noise by construction.
+//  What they establish is that a path RUNS, stays finite, stays in
+//  vocabulary and is reproducible -- and, for the parallel tests, that
+//  two processes produce the same tokens as one.  Rule 8 is untouched:
+//  no number from here means anything.
+// =====================================================================
+#ifndef B70_MINI_MODEL_HPP
+#define B70_MINI_MODEL_HPP
+
+#include "b70/formats.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace b70 {
+namespace mini {
+
+namespace fs = std::filesystem;
+
+struct Tn { std::string name; std::vector<int64_t> shape; };
+
+// A named architecture and the tensors it needs.
+struct Arch {
+    const char* name;
+    std::string config;
+    std::vector<Tn> tensors;
+    int vocab;
+    int layers;
+};
+
+inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 20260912) {
+    fs::create_directories(dir);
+    std::ofstream(dir/"config.json") << a.config;
+    std::ostringstream h; h << '{';
+    uint64_t off = 0;
+    for (size_t i = 0; i < a.tensors.size(); ++i) {
+        if (i) h << ',';
+        size_t n = 1; for (auto d : a.tensors[i].shape) n *= size_t(d);
+        h << '"' << a.tensors[i].name << "\":{\"dtype\":\"BF16\",\"shape\":[";
+        for (size_t d = 0; d < a.tensors[i].shape.size(); ++d) {
+            if (d) h << ',';
+            h << a.tensors[i].shape[d];
+        }
+        h << "],\"data_offsets\":[" << off << ','; off += n*2; h << off << "]}";
+    }
+    h << '}';
+    std::string hs = h.str(); while (hs.size() % 8) hs += ' ';
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.f, 0.05f);
+    std::vector<bf16_t> data(off/2);
+    for (auto& v : data) v = f32_to_bf16(nd(rng));
+
+    std::ofstream f(dir/"model.safetensors", std::ios::binary);
+    const uint64_t n = hs.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f << hs;
+    f.write(reinterpret_cast<const char*>(data.data()),
+            std::streamsize(data.size()*sizeof(bf16_t)));
+}
+
+// ---- K2-Horizon: MoVA + grouped norm + softplus gate + sigmoid router --
+// Layers 0-1 dense, 2-3 sparse, so one model carries BOTH shapes.
+inline Arch k2() {
+    const int H=64, KV=32, Q=64, I=48, MI=32, E=4, MV=3, V=128, L=4;
+    Arch a{"k2-horizon", R"JSON({
+  "model_type": "k2_horizon", "attention_gate_func": "softplus",
+  "hidden_size": 64, "num_hidden_layers": 4, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 48, "moe_intermediate_size": 32,
+  "num_experts": 4, "num_experts_per_tok": 2, "num_shared_experts": 1,
+  "mova_num_experts": 3, "mova_num_experts_per_tok": 2,
+  "mlp_only_layers": [0, 1], "decoder_sparse_step": 1,
+  "layernorm_num_groups": 2, "moe_gate_bias": true,
+  "router_score_func": "sigmoid", "router_scaling_factor": 2.5,
+  "norm_topk_prob": true, "query_key_norm": false, "rope_head_dim": 16,
+  "rms_norm_eps": 1e-06, "tie_word_embeddings": false,
+  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
+})JSON", {}, V, L};
+    auto& t = a.tensors;
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+          {"lm_head.weight", {V,H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        const bool sparse = (l >= 2);
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"gate_proj.weight", {Q,H}});
+        if (sparse) {
+            t.push_back({s+"v_router.weight", {MV,H}});
+            t.push_back({s+"v_router.bias", {MV}});
+            for (int e = 0; e < MV; ++e)
+                t.push_back({s+"v_experts."+std::to_string(e)+".weight", {KV,H}});
+        } else {
+            t.push_back({s+"v_proj.weight", {KV,H}});
+        }
+        const std::string m = b + "mlp.";
+        if (sparse) {
+            t.push_back({m+"gate.weight", {E,H}});
+            t.push_back({m+"gate.bias", {E}});
+            for (int e = 0; e < E; ++e) {
+                const std::string x = m+"experts."+std::to_string(e)+".";
+                t.push_back({x+"gate_proj.weight", {MI,H}});
+                t.push_back({x+"up_proj.weight",   {MI,H}});
+                t.push_back({x+"down_proj.weight", {H,MI}});
+            }
+            for (const char* n : {"gate_proj","up_proj","down_proj"})
+                t.push_back({m+"shared_experts."+std::string(n)+".weight",
+                             std::string(n)=="down_proj" ? std::vector<int64_t>{H,MI}
+                                                         : std::vector<int64_t>{MI,H}});
+        } else {
+            t.push_back({m+"gate_proj.weight", {I,H}});
+            t.push_back({m+"up_proj.weight",   {I,H}});
+            t.push_back({m+"down_proj.weight", {H,I}});
+        }
+    }
+    return a;
+}
+
+// ---- plain dense transformer (Qwen3 shape, no MoE, no linear attn) ----
+// This is the "any model" case: a stock architecture with none of
+// GRIMOIRE's own features.  It is also the shape that exposed the
+// Hv == 0 prefill bug.
+inline Arch dense(int L = 4) {
+    const int H=64, Q=64, KV=32, I=128, V=128;
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "rms_norm_eps": 1e-06,
+  "tie_word_embeddings": false, "rope_theta": 1000000.0
+})JSON";
+    Arch a{"dense", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+          {"lm_head.weight", {V,H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        t.push_back({s+"v_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"q_norm.weight", {16}});
+        t.push_back({s+"k_norm.weight", {16}});
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+    }
+    return a;
+}
+
+// ---- routed MoE with a shared expert (Qwen3-MoE shape) ----------------
+// Exercises the routed path, the shared expert and TP expert sharding.
+inline Arch moe(int L = 4) {
+    const int H=64, Q=64, KV=32, MI=32, SI=32, E=8, V=128;
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen3_moe", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "moe_intermediate_size": 32,
+  "shared_expert_intermediate_size": 32,
+  "num_experts": 8, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
+  "mlp_only_layers": [], "norm_topk_prob": true,
+  "rms_norm_eps": 1e-06, "tie_word_embeddings": false, "rope_theta": 1000000.0
+})JSON";
+    Arch a{"moe", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+          {"lm_head.weight", {V,H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        t.push_back({s+"v_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"q_norm.weight", {16}});
+        t.push_back({s+"k_norm.weight", {16}});
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate.weight", {E,H}});
+        for (int e = 0; e < E; ++e) {
+            const std::string x = m+"experts."+std::to_string(e)+".";
+            t.push_back({x+"gate_proj.weight", {MI,H}});
+            t.push_back({x+"up_proj.weight",   {MI,H}});
+            t.push_back({x+"down_proj.weight", {H,MI}});
+        }
+        t.push_back({m+"shared_expert.gate_proj.weight", {SI,H}});
+        t.push_back({m+"shared_expert.up_proj.weight",   {SI,H}});
+        t.push_back({m+"shared_expert.down_proj.weight", {H,SI}});
+        t.push_back({m+"shared_expert_gate.weight",      {1,H}});
+    }
+    return a;
+}
+
+}  // namespace mini
+}  // namespace b70
+
+#endif
