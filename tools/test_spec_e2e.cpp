@@ -146,6 +146,12 @@ int main(int argc, char** argv) {
         { mini::dense(4, true), "fp8"  },
         { mini::moe(4,   true), "bf16" },
         { mini::moe(4,   true), "fp8"  },
+        // The one that actually exercises the rollback: a DeltaNet layer
+        // carries a recurrent state and a convolution ring, and rejecting
+        // a draft has to restore BOTH exactly.  Every other model here has
+        // no recurrent state at all, so nothing was testing that code.
+        { mini::hybrid(4, true), "bf16" },
+        { mini::hybrid(4, true), "fp8"  },
     };
 
     for (auto& c : cases) {

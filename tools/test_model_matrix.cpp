@@ -104,7 +104,8 @@ int main(int argc, char** argv) {
     const fs::path root = tmpl;
     const char* self = argv[0];
 
-    std::vector<mini::Arch> archs = { mini::dense(), mini::moe(), mini::k2() };
+    std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
+                                      mini::hybrid(), mini::k2() };
 
     std::printf("%-12s", "");
     for (const auto& f : kFormats) std::printf("%-10s", f.name);

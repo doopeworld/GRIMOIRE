@@ -159,6 +159,10 @@ int main(int argc, char** argv) {
         { mini::moe(4),   "bf16" },
         { mini::moe(4),   "fp8"  },
         { mini::k2(),     "bf16" },
+        // The hybrid carries DeltaNet layers: a recurrent state and a conv
+        // ring that a pipeline split has to keep consistent across ranks.
+        { mini::hybrid(4), "bf16" },
+        { mini::hybrid(4), "fp8"  },
     };
 
     for (size_t ci = 0; ci < cases.size(); ++ci) {

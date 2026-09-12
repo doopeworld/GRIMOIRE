@@ -220,6 +220,71 @@ inline Arch dense(int L = 4, bool mtp = false) {
     return a;
 }
 
+// ---- hybrid: DeltaNet linear attention + full attention ---------------
+// This is the Qwen3.5 / Ornith shape, and it was the one architecture with
+// no end-to-end coverage at all -- which matters, because the linear
+// layers are where the recurrent state, the conv ring and the speculative
+// ROLLBACK of both live.  Every other model in this file has Hv == 0 and
+// exercises none of it.
+//
+// Layer 0 and 2 are linear_attention, 1 and 3 full attention, so one model
+// carries both kinds and the boundary between them.
+inline Arch hybrid(int L = 4, bool mtp = false) {
+    const int H=64, Q=64, KV=32, I=128, V=128;
+    const int LK=2, LV=2, DK=16, DV=16, CONV=4;      // linear-attn geometry
+    const int QKV = 2*LK*DK + LV*DV;                 // 2*2*16 + 2*16 = 96
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen3_next", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "rms_norm_eps": 1e-06,
+  "tie_word_embeddings": false, "rope_theta": 1000000.0,
+  "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+  "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+  "linear_conv_kernel_dim": 4,
+  "layer_types": [)JSON";
+    for (int l = 0; l < L; ++l)
+        c << (l ? "," : "") << (l % 2 == 0 ? R"("linear_attention")"
+                                           : R"("full_attention")");
+    c << "]}";
+    Arch a{mtp ? "hybrid+mtp" : "hybrid", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+          {"lm_head.weight", {V,H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        if (l % 2 == 0) {
+            const std::string la = b + "linear_attn.";
+            t.push_back({la+"in_proj_qkv.weight", {QKV,H}});
+            t.push_back({la+"in_proj_z.weight",   {LV*DV,H}});
+            t.push_back({la+"in_proj_a.weight",   {LV,H}});
+            t.push_back({la+"in_proj_b.weight",   {LV,H}});
+            t.push_back({la+"conv1d.weight",      {QKV,1,CONV}});
+            t.push_back({la+"A_log",              {LV}});
+            t.push_back({la+"dt_bias",            {LV}});
+            t.push_back({la+"norm.weight",        {DV}});
+            t.push_back({la+"out_proj.weight",    {H,LV*DV}});
+        } else {
+            const std::string sa = b + "self_attn.";
+            t.push_back({sa+"q_proj.weight", {Q,H}});
+            t.push_back({sa+"k_proj.weight", {KV,H}});
+            t.push_back({sa+"v_proj.weight", {KV,H}});
+            t.push_back({sa+"o_proj.weight", {H,Q}});
+            t.push_back({sa+"q_norm.weight", {16}});
+            t.push_back({sa+"k_norm.weight", {16}});
+        }
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+    }
+    if (mtp) add_mtp(t, H, Q, KV, 16, I, 0, 0);
+    return a;
+}
+
 // ---- routed MoE with a shared expert (Qwen3-MoE shape) ----------------
 // Exercises the routed path, the shared expert and TP expert sharding.
 inline Arch moe(int L = 4, bool mtp = false) {
