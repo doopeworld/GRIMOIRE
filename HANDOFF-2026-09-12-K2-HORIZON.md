@@ -5,7 +5,7 @@ Session of 2026-09-11/12. Branch `codex/b70-audit-fixes-20260911`.
 Everything below was written WITHOUT a SYCL toolchain or a B70: this
 container has no `/dev/dri`, no oneAPI, and zero SYCL headers, so
 `src/grimoire.cpp` was never compiled here. Host-side work is tested and
-green; the three new kernels are unbuilt. Treat the split below as the
+green; the four new kernels and the whole engine path are unbuilt. Treat the split below as the
 boundary between "verified" and "needs a compiler".
 
 ## What the model is
@@ -38,8 +38,9 @@ confirms it. K2 gets plain decode with no speculation available.
 directly. Qwen3.5 stores the weight centred on zero and applies
 `(1 + w)`, and every existing `launch_rmsnorm_*` in `ops.cpp` hardcodes
 that. Using the Qwen form for K2 shrinks every norm output by roughly
-10x, 48 layers over. `launch_rmsnorm_grouped` takes `zero_centered` as a
-parameter; K2 passes **false**.
+10x, 48 layers over. This is now carried by `set_norm_convention`, called
+once in `build()`: `weight_offset` is 0.0 for K2 and 1.0 for everything
+else, and both norm entry points delegate on it.
 
 ## Done and host-tested
 
