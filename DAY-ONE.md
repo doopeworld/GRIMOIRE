@@ -96,6 +96,35 @@ Prompt processing differs between the two modes: **PP has batched prefill,
 TP does not** (it falls back to token-at-a-time and says so in the banner).
 For anything prompt-heavy on two cards, use PP.
 
+## 2b. Recommended launches
+
+Single card, model fits — the verified Qwen recipe (`QWEN-RECIPE.md`, and
+do not mix in the Ornith flags it warns about):
+
+```bash
+GPU=gpu0 LIM=900 EXTRA_ENV='GRIMOIRE_W4A8=1
+GRIMOIRE_MTP=1
+GRIMOIRE_MTP_K=3
+GRIMOIRE_MTP_DRAFT_VOCAB=131072'   bash tools/tune.sh qwen /grimoire/bin/grimoire   -m /models/<dir> --proj mxfp4 --ctx 8192 -p 'Explain why the sky is blue.' -n 256
+```
+
+Two cards, model does not fit — pipeline, with speculation:
+
+```bash
+GRIM_ENV='GRIMOIRE_MTP=1
+GRIMOIRE_MTP_K=3
+GRIMOIRE_MTP_DRAFT_VOCAB=131072' GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh renderD129 renderD130 1800 pp   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
+```
+
+One thing to know before comparing TG across the two modes:
+`GRIMOIRE_MTP_DRAFT_VOCAB` is the flag QWEN-RECIPE says acceptance depends
+on. It still applies under **PP** (the head and the lm_head both live on
+the last stage, unsharded). Under **TP** the lm_head is row-sharded, so
+the reduced-vocabulary shortcut would have each rank argmax over its own
+slice — it is routed through the full all-gathered projection instead.
+Correct, but the draft-vocab speedup is not available there. Another
+reason PP is the default choice for two cards.
+
 ## 3. Which format
 
 One card, model fits: `--proj int4` (the W4A8 path, int8 XMX, ~367 TOPS).
