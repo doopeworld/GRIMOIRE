@@ -3029,11 +3029,53 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         dflash2.v2=dr("candidate_selector.hidden_projection.weight").ok();
         dflash2.hidden=cfg.hidden;
         dflash2.head_dim=128;
-        dflash2.q_heads=int(dr("layers.0.self_attn.q_proj.weight").t.shape[0])/
-                           dflash2.head_dim;
-        dflash2.kv_heads=int(dr("layers.0.self_attn.k_proj.weight").t.shape[0])/
-                            dflash2.head_dim;
-        dflash2.inter=int(dr("layers.0.mlp.gate_proj.weight").t.shape[0]);
+        // ---- draft architecture validation ---------------------------
+        // dr() returns an EMPTY TensorRef for a name the checkpoint does not
+        // have, and .t.shape is then empty -- so reading shape[0] straight
+        // off it was out-of-bounds host indexing on any drafter whose layout
+        // differs from the dense one.  A MoE draft (e.g. the DaoCloud
+        // Ornith-1.5 2.6B-A0.3B variant) has no layers.0.mlp.gate_proj.weight
+        // at all, so it hit that path rather than being told it is
+        // unsupported.  Validate every tensor this geometry is derived from,
+        // and name what is missing.
+        std::string derr;
+        auto draft_rows=[&](const char* name)->int{
+            const TensorRef r=dr(name);
+            if(!r.ok()){
+                if(derr.empty())derr=std::string("no ")+name;
+                return 0;
+            }
+            if(r.t.shape.size()!=2){
+                if(derr.empty())derr=std::string(name)+" is rank "+
+                    std::to_string(r.t.shape.size())+", expected a 2-D matrix";
+                return 0;
+            }
+            return int(r.t.shape[0]);
+        };
+        const int q_rows =draft_rows("layers.0.self_attn.q_proj.weight");
+        const int kv_rows=draft_rows("layers.0.self_attn.k_proj.weight");
+        const int ff_rows=draft_rows("layers.0.mlp.gate_proj.weight");
+        if(derr.empty()&&dflash2.head_dim>0&&
+           (q_rows%dflash2.head_dim||kv_rows%dflash2.head_dim))
+            derr="q/k projection rows ("+std::to_string(q_rows)+"/"+
+                 std::to_string(kv_rows)+") are not a multiple of head_dim "+
+                 std::to_string(dflash2.head_dim);
+        if(!derr.empty()){
+            // Name the capability, not just the symptom: a MoE draft needs a
+            // routed draft FFN path that does not exist here, and DaoCloud's
+            // layout announces itself with aux_hidden_state_layer_ids where
+            // the dense drafts use target_layer_ids.
+            const bool moe_draft=dr("layers.0.mlp.experts.0.gate_proj.weight").ok()||
+                                 dr("layers.0.mlp.gate.weight").ok();
+            err="unsupported DFlash draft architecture: "+derr+
+                (moe_draft?". This looks like a MoE draft; only the DENSE "
+                           "draft layout is implemented."
+                         :". Only the dense draft layout is implemented.");
+            return false;
+        }
+        dflash2.q_heads =q_rows/dflash2.head_dim;
+        dflash2.kv_heads=kv_rows/dflash2.head_dim;
+        dflash2.inter   =ff_rows;
         if(cfg.is_muse){
             dflash2.layers.resize(5);
             dflash2.target_layers={1,13,25,37,49};
@@ -3098,6 +3140,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 if(nl>0)dflash2.layers.resize(size_t(nl));
                 const std::vector<int> tl=find_int_arr("target_layer_ids");
                 if(!tl.empty())dflash2.target_layers=tl;
+                else if(!find_int_arr("aux_hidden_state_layer_ids").empty())
+                    std::printf("\n  dflash2: draft config uses "
+                        "aux_hidden_state_layer_ids (DaoCloud layout); this "
+                        "loader reads target_layer_ids -- taps NOT applied\n");
                 dflash2.mask_token=int(find_int("mask_token_id",dflash2.mask_token));
                 dflash2.rope_theta=float(find_int("rope_theta",
                     long(dflash2.rope_theta)));
@@ -3123,8 +3169,25 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             cfg.is_muse && std::getenv("GRIMOIRE_MUSE_DRAFT_MXFP4") != nullptr;
         const bool muse_fp16_draft = cfg.is_muse && !muse_draft_q;
         dflash2.fp16_draft = muse_fp16_draft;
+        // The v2 drafter inherits the TARGET's projection format, so a BF16
+        // draft checkpoint is quantized automatically at load.  That may be
+        // fine, but it has never been measured here: acceptance is a
+        // property of the draft's numerics, and loading successfully proves
+        // nothing about it.  GRIMOIRE_DFLASH_DRAFT_BF16=1 keeps the draft in
+        // BF16 so the first acceptance comparison is against the reference
+        // precision rather than against a requantized copy of it.
+        static const bool draft_keep_bf16 =
+            std::getenv("GRIMOIRE_DFLASH_DRAFT_BF16") != nullptr;
         const Fmt dflash_fmt=muse_draft_q?Fmt::MXFP4
-            :(cfg.is_muse?Fmt::BF16:(dflash2.v2?PF:Fmt::BF16));
+            :(cfg.is_muse?Fmt::BF16
+              :(dflash2.v2&&!draft_keep_bf16?PF:Fmt::BF16));
+        std::printf("\n  dflash2 draft format: %s%s\n",
+            dflash_fmt==Fmt::BF16?"bf16":
+            dflash_fmt==Fmt::MXFP4?"mxfp4":
+            dflash_fmt==Fmt::INT4?"int4":"other",
+            (dflash2.v2&&!draft_keep_bf16&&dflash_fmt!=Fmt::BF16)
+                ? " (inherited from the target; GRIMOIRE_DFLASH_DRAFT_BF16=1 to keep bf16)"
+                : "");
         auto qload=[&](const std::string& n,const char* what){
             DevQuant d=muse_fp16_draft?upload_f16_t(q,dc,dr(n),what,&dok):
                 quantize_upload_t(q,dc,dr(n),dflash_fmt,what,&dok);
