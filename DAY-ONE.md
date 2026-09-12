@@ -33,7 +33,7 @@ order, and stops at the first required failure:
 | --- | --- |
 | build | bridges + engine actually compile on this box |
 | no-Torch check | the bridges are still pure SYCL/Level Zero |
-| `make test`, `make test-correctness` | 12 host suites |
+| `make test`, `make test-correctness` | 13 host suites |
 | `bin/test_k2_kernels` | every new kernel matches its host reference |
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
 | `bin/test_model_matrix` | 3 architectures × 7 projection formats |
@@ -42,6 +42,15 @@ order, and stops at the first required failure:
 
 Green preflight means the box is sane. It does not mean anything is
 fast: no stage above produces a number, deliberately.
+
+**One path in that list gets its first ever execution on your card.** The
+container used for all the verification above has no XMX, so the BATCHED
+PREFILL path could not run there — every gate above exercised the
+sequential decode path instead. Batched prefill is what prompt processing
+actually uses, so treat the first `-n 64` on a long prompt as the real
+first run: if something is going to be wrong, it is most likely there.
+`test_k2_e2e` prints which prefill path it took, by name, so you can see
+on the card that the batched one was finally exercised.
 
 ## 2. Dual GPU
 
