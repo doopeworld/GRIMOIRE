@@ -157,6 +157,16 @@ struct Qwen35Layer {
     std::vector<TensorRef> e_gate_p, e_gate_s;
     std::vector<TensorRef> e_up_p,   e_up_s;
     std::vector<TensorRef> e_down_p, e_down_s;
+
+    // --- K2-Horizon ------------------------------------------------
+    // MoVA: on a sparse layer v_proj does not exist.  The value is a
+    // routed mixture over v_experts[], each [kv_heads*head_dim, hidden],
+    // selected by v_router and put through SiLU before the router weight
+    // scales it.  Dense layers keep an ordinary v_proj.
+    bool k2_sparse = false;
+    TensorRef v_router, v_router_bias;
+    std::vector<TensorRef> v_experts;
+    TensorRef router_bias;                  // mlp.gate.bias (moe_gate_bias)
 };
 
 struct Qwen35Model {

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <string>
 #include <unistd.h>
 
 using namespace b70;
@@ -82,6 +83,146 @@ static void write_stub(const fs::path& dir, const char* cfg) {
     const uint64_t n = hs.size();
     f.write((const char*)&n, 8); f << hs;
     f.write((const char*)vals.data(), std::streamsize(vals.size()*2));
+}
+
+
+// ---------------------------------------------------------------------
+// A complete miniature K2 checkpoint: 4 layers, 0-1 dense and 2-3 sparse,
+// with the tensor names taken from the module paths in
+// modeling_k2_horizon.py.  Resolving every one of these is what proves
+// the loader's naming matches the checkpoint's.
+// ---------------------------------------------------------------------
+static const char* kMiniConfig = R"JSON({
+  "model_type": "k2_horizon", "attention_gate_func": "softplus",
+  "hidden_size": 64, "num_hidden_layers": 4, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 48, "moe_intermediate_size": 32,
+  "num_experts": 4, "num_experts_per_tok": 2, "num_shared_experts": 1,
+  "mova_num_experts": 3, "mova_num_experts_per_tok": 2,
+  "mlp_only_layers": [0, 1], "decoder_sparse_step": 1,
+  "layernorm_num_groups": 2, "moe_gate_bias": true,
+  "router_score_func": "sigmoid", "router_scaling_factor": 2.5,
+  "norm_topk_prob": true, "query_key_norm": false, "rope_head_dim": 16,
+  "rms_norm_eps": 1e-06, "tie_word_embeddings": false,
+  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
+})JSON";
+
+struct Tn { std::string name; std::vector<int64_t> shape; };
+
+static void write_model(const fs::path& dir, const char* cfg,
+                        const std::vector<Tn>& ts) {
+    fs::create_directories(dir);
+    std::ofstream(dir/"config.json") << cfg;
+    std::ostringstream h; h << '{'; uint64_t off = 0;
+    for (size_t i = 0; i < ts.size(); ++i) {
+        if (i) h << ',';
+        size_t n = 1; for (auto d : ts[i].shape) n *= size_t(d);
+        h << '"' << ts[i].name << "\":{\"dtype\":\"BF16\",\"shape\":[";
+        for (size_t d = 0; d < ts[i].shape.size(); ++d) {
+            if (d) h << ',';
+            h << ts[i].shape[d];
+        }
+        h << "],\"data_offsets\":[" << off << ','; off += n*2; h << off << "]}";
+    }
+    h << '}';
+    std::string hs = h.str(); while (hs.size() % 8) hs += ' ';
+    std::ofstream f(dir/"model.safetensors", std::ios::binary);
+    const uint64_t n = hs.size();
+    f.write((const char*)&n, 8); f << hs;
+    std::vector<bf16_t> zero(off/2, bf16_t{});
+    f.write((const char*)zero.data(), std::streamsize(off));
+}
+
+static std::vector<Tn> mini_tensors() {
+    const int H=64, KV=32, Q=64, I=48, MI=32, E=4, MV=3, V=128;
+    std::vector<Tn> t = {
+        {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+        {"lm_head.weight", {V,H}},
+    };
+    for (int L = 0; L < 4; ++L) {
+        const std::string b = "model.layers." + std::to_string(L) + ".";
+        const bool sparse = (L >= 2);
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string a = b + "self_attn.";
+        t.push_back({a+"q_proj.weight", {Q,H}});
+        t.push_back({a+"k_proj.weight", {KV,H}});
+        t.push_back({a+"o_proj.weight", {H,Q}});
+        t.push_back({a+"gate_proj.weight", {Q,H}});     // softplus attn gate
+        if (sparse) {
+            t.push_back({a+"v_router.weight", {MV,H}});
+            t.push_back({a+"v_router.bias", {MV}});
+            for (int e = 0; e < MV; ++e)
+                t.push_back({a+"v_experts."+std::to_string(e)+".weight", {KV,H}});
+        } else {
+            t.push_back({a+"v_proj.weight", {KV,H}});   // dense layers keep v_proj
+        }
+        const std::string m = b + "mlp.";
+        if (sparse) {
+            t.push_back({m+"gate.weight", {E,H}});
+            t.push_back({m+"gate.bias", {E}});
+            for (int e = 0; e < E; ++e) {
+                const std::string x = m+"experts."+std::to_string(e)+".";
+                t.push_back({x+"gate_proj.weight", {MI,H}});
+                t.push_back({x+"up_proj.weight",   {MI,H}});
+                t.push_back({x+"down_proj.weight", {H,MI}});
+            }
+            for (const char* n : {"gate_proj","up_proj","down_proj"})
+                t.push_back({m+"shared_experts."+n+".weight",
+                             std::string(n)=="down_proj" ? std::vector<int64_t>{H,MI}
+                                                         : std::vector<int64_t>{MI,H}});
+        } else {
+            t.push_back({m+"gate_proj.weight", {I,H}});
+            t.push_back({m+"up_proj.weight",   {I,H}});
+            t.push_back({m+"down_proj.weight", {H,I}});
+        }
+    }
+    return t;
+}
+
+static void test_tensor_mapping(const fs::path& root) {
+    std::printf("\nTensor mapping (miniature K2 checkpoint)\n");
+    const fs::path d = root / "mini";
+    write_model(d, kMiniConfig, mini_tensors());
+    Qwen35Model M; std::string e;
+    if (!M.load(d.string(), e, true, false)) {
+        std::printf("  FAIL loader rejected the mini model: %s\n", e.c_str());
+        ++g_fail; return;
+    }
+    CHECK(M.embed.ok() && M.lm_head.ok() && M.final_norm.ok(), "top-level tensors");
+    int missing = 0;
+    for (int L = 0; L < 4; ++L) {
+        const auto& l = M.layers[size_t(L)];
+        const bool sparse = (L >= 2);
+        EQ(l.k2_sparse, sparse, "k2_sparse flag");
+        if (!l.input_norm.ok() || !l.post_attn_norm.ok()) ++missing;
+        if (!l.q_proj.ok() || !l.k_proj.ok() || !l.o_proj.ok()) ++missing;
+        CHECK(l.attn_gate.ok(), "layer %d: softplus attn gate_proj missing", L);
+        if (sparse) {
+            CHECK(!l.v_proj.ok(), "layer %d: sparse layer must NOT have v_proj", L);
+            CHECK(l.v_router.ok(), "layer %d: v_router missing", L);
+            CHECK(l.v_router_bias.ok(), "layer %d: v_router.bias missing", L);
+            EQ(l.v_experts.size(), 3u, "MoVA expert count");
+            for (size_t x = 0; x < l.v_experts.size(); ++x)
+                CHECK(l.v_experts[x].ok(), "layer %d: v_experts.%zu missing", L, x);
+            CHECK(l.router.ok(), "layer %d: mlp.gate missing", L);
+            CHECK(l.router_bias.ok(), "layer %d: mlp.gate.bias missing", L);
+            CHECK(l.sh_gate.ok() && l.sh_up.ok() && l.sh_down.ok(),
+                  "layer %d: shared_experts (plural) missing", L);
+            for (int x = 0; x < 4; ++x)
+                CHECK(l.e_gate_p[size_t(x)].ok() && l.e_up_p[size_t(x)].ok() &&
+                      l.e_down_p[size_t(x)].ok(), "layer %d: expert %d missing", L, x);
+        } else {
+            CHECK(l.v_proj.ok(), "layer %d: dense layer needs v_proj", L);
+            CHECK(l.v_experts.empty(), "layer %d: dense layer must have no MoVA", L);
+            CHECK(!l.router.ok(), "layer %d: dense layer must have no router", L);
+            CHECK(l.sh_gate.ok() && l.sh_up.ok() && l.sh_down.ok(),
+                  "layer %d: dense mlp.{gate,up,down}_proj missing", L);
+        }
+    }
+    EQ(missing, 0, "core per-layer tensors missing");
+    std::printf("  4 layers resolved: 2 dense (v_proj + plain MLP), "
+                "2 sparse (MoVA + routed MoE)\n");
 }
 
 int main() {
@@ -184,6 +325,8 @@ int main() {
         std::printf("  %-46s %s\n", t.name, got ? "BF16" : "quantize");
         CHECK(got == t.keep, "%s: policy says %s", t.name, got ? "BF16" : "quantize");
     }
+
+    test_tensor_mapping(dir);
 
     std::error_code e; fs::remove_all(dir, e);
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

@@ -415,15 +415,49 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 lay.pre_ff_norm  = get(b + "pre_feedforward_layernorm.weight");
                 lay.post_ff_norm = get(b + "post_feedforward_layernorm.weight");
             }
+            if (cfg.is_k2) {
+                // Every K2 layer has the attention output gate; only the
+                // SPARSE ones replace v_proj with the MoVA bank.  Layers
+                // 0-2 are dense and keep the ordinary v_proj resolved
+                // above, so both shapes have to coexist here.
+                lay.k2_sparse = cfg.k2_sparse[size_t(L)];
+                if (cfg.attn_gate) lay.attn_gate = linear(a + "gate_proj");
+                if (lay.k2_sparse && cfg.mova_experts > 0) {
+                    lay.v_router      = linear(a + "v_router");
+                    lay.v_router_bias = get(a + "v_router.bias");
+                    lay.v_experts.resize(size_t(cfg.mova_experts));
+                    for (int e = 0; e < cfg.mova_experts; ++e)
+                        lay.v_experts[size_t(e)] =
+                            linear(a + "v_experts." + std::to_string(e));
+                }
+            }
         }
 
         const std::string m = b + "mlp.";
-        if (cfg.is_moe()) {
+        // K2: a DENSE layer has no router and no experts -- its FFN is one
+        // intermediate_size MLP under mlp.{gate,up,down}_proj.  cfg.is_moe()
+        // is true for the model as a whole, so without this the three dense
+        // layers would be sent looking for experts that do not exist.
+        if (cfg.is_k2 && !lay.k2_sparse) {
+            lay.sh_gate = linear(m + "gate_proj");
+            lay.sh_up   = linear(m + "up_proj");
+            lay.sh_down = linear(m + "down_proj");
+        } else if (cfg.is_moe()) {
             lay.router    = linear(m + "gate");
-            lay.sh_gate   = linear(m + "shared_expert.gate_proj");
-            lay.sh_up     = linear(m + "shared_expert.up_proj");
-            lay.sh_down   = linear(m + "shared_expert.down_proj");
-            lay.sh_gate_w = linear(m + "shared_expert_gate");
+            // K2 names the shared expert "shared_experts" (plural) and
+            // carries a router bias; Qwen uses "shared_expert" and a
+            // separate shared_expert_gate.
+            if (cfg.is_k2) {
+                lay.router_bias = get(m + "gate.bias");
+                lay.sh_gate = linear(m + "shared_experts.gate_proj");
+                lay.sh_up   = linear(m + "shared_experts.up_proj");
+                lay.sh_down = linear(m + "shared_experts.down_proj");
+            } else {
+                lay.sh_gate   = linear(m + "shared_expert.gate_proj");
+                lay.sh_up     = linear(m + "shared_expert.up_proj");
+                lay.sh_down   = linear(m + "shared_expert.down_proj");
+                lay.sh_gate_w = linear(m + "shared_expert_gate");
+            }
 
             lay.e_gate_p.resize(cfg.n_experts); lay.e_gate_s.resize(cfg.n_experts);
             lay.e_up_p.resize(cfg.n_experts);   lay.e_up_s.resize(cfg.n_experts);
@@ -501,11 +535,23 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             need(lay.q_proj, "self_attn.q_proj", L);
             need(lay.o_proj, "self_attn.o_proj", L);
         }
-        if (cfg.is_moe()) {
+        // K2 mixes both FFN shapes in one model: a dense layer has a plain
+        // MLP and no router at all, so requiring mlp.gate everywhere would
+        // reject a valid checkpoint.
+        if (cfg.is_k2 && !lay.k2_sparse) {
+            need(lay.sh_gate, "mlp.gate_proj", L);
+        } else if (cfg.is_moe()) {
             need(lay.router, "mlp.gate", L);
             need(lay.e_gate_p.empty() ? TensorRef{} : lay.e_gate_p[0], "experts.0.gate_proj", L);
         } else {
             need(lay.sh_gate, "mlp.gate_proj", L);
+        }
+        if (cfg.is_k2 && lay.k2_sparse && cfg.mova_experts > 0) {
+            // MoVA replaces v_proj entirely; if these are missing the value
+            // stream is silently absent rather than wrong.
+            need(lay.v_router, "self_attn.v_router", L);
+            need(lay.v_experts.empty() ? TensorRef{} : lay.v_experts[0],
+                 "self_attn.v_experts.0", L);
         }
     }
     if (missing) {
