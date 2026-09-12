@@ -92,6 +92,16 @@ DFlash is still single-GPU only: its drafter needs aux hidden states from
 target layers that PP puts on different ranks. So DFlash on one card, MTP
 on two. The load banner prints which is live — read it.
 
+One rule the engine now enforces for you: a model with linear-attention
+(DeltaNet) layers — Qwen3.5, Ornith — can only speculate when the BATCHED
+verify is available, because a rejected draft replays the recurrent state
+from buffers only that path captures. On the B70 it is available, so this
+never bites in normal use. Where it does bite is **TP**, which always
+falls back to token-at-a-time prefill: TP + a hybrid model + speculation
+comes up with speculation OFF and says so. PP is unaffected. This was
+found by testing, not reasoning — before the check, that configuration
+produced fluent output that was quietly not the model's output.
+
 Prompt processing differs between the two modes: **PP has batched prefill,
 TP does not** (it falls back to token-at-a-time and says so in the banner).
 For anything prompt-heavy on two cards, use PP.
