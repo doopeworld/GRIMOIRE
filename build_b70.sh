@@ -16,6 +16,13 @@
 # =====================================================================
 set -eo pipefail
 
+# A failed REQUIRED target must reach the exit status.  `set -e` does not
+# fire when a failure is caught by `|| { ... }`, so before this the script
+# printed "BUILD FAILED", carried on, and exited 0 -- which means a later
+# run tests whatever stale binary is still in bin/ and believes it tested
+# the source change.  Auxiliary targets stay warn-only.
+REQUIRED_FAILED=0
+
 : "${ONEAPI_ROOT:=/opt/intel/oneapi}"
 # Intel's vars.sh dereferences OCL_ICD_FILENAMES before assigning it, so
 # `set -u` kills the whole build at source time. Pre-seed it and keep -u
@@ -102,7 +109,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      src/tokenizer.cpp \
      -o bin/grimoire \
   && echo "built  : bin/grimoire" \
-  || { echo "=== GRIMOIRE BUILD FAILED ==="; }
+  || { echo "=== GRIMOIRE BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
 # ---------------------------------------------------------------------
 #  grimoire-server -- OpenAI-compatible HTTP front end (open-webui,
@@ -122,7 +129,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      -lpthread \
      -o bin/grimoire-server \
   && echo "built  : bin/grimoire-server" \
-  || { echo "=== GRIMOIRE-SERVER BUILD FAILED ==="; }
+  || { echo "=== GRIMOIRE-SERVER BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
 icpx -O2 -std=c++17 -I include \
      tools/verify_tokenizer.cpp src/tokenizer.cpp -o bin/b70-verify-tok \
@@ -147,3 +154,22 @@ icpx -fsycl -fsycl-targets="$TARGET" \
      -O2 -std=c++20 -fno-fast-math -I include -I src \
      tools/test_dflash_head.cpp -o bin/test_dflash_head -ldl \
   && echo "built  : bin/test_dflash_head" || echo "warn: dflash head test failed"
+
+# ---------------------------------------------------------------------
+if [[ "$REQUIRED_FAILED" -ne 0 ]]; then
+  echo
+  echo "=== BUILD FAILED: a required target did not build ==="
+  echo "    bin/ may still hold an OLDER binary.  Do not run or benchmark"
+  echo "    it: it does not contain this source tree."
+  exit 1
+fi
+
+# Rule 3: this script does NOT rebuild the bridge .so files.  Running it
+# alone after touching a bridge leaves a stale .so, which has previously
+# looked like a kernel bug and taken a card off the bus.
+if [[ -z "${GRIMOIRE_BRIDGES_BUILT:-}" ]]; then
+  echo
+  echo "note: bridges were NOT rebuilt by this script."
+  echo "      If you changed src/*_bridge.cpp, run tools/build_bridges_b70.sh"
+  echo "      instead -- it rebuilds the bridges and then calls this script."
+fi
