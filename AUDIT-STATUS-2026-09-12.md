@@ -11,9 +11,22 @@ inspect this branch, and said so:
 therefore already closed here. Each row below was checked against the code
 at HEAD, not assumed. Line numbers are this branch's.
 
-**Nothing on this branch has been through a compiler.** There is no SYCL
-toolchain and no B70 in the container the work was done in. Host tests pass
-(`make test`, 10 suites); every GPU path is unbuilt.
+**Compilation status (corrected 2026-09-12).** An earlier version of this
+file said nothing on the branch had been through a compiler, and that
+there was no SYCL toolchain available. The second half was simply wrong:
+a full oneAPI DPC++ toolchain and an OpenCL CPU device install into the
+work container in about ten minutes (`TOOLCHAIN-IN-A-CONTAINER.md`).
+
+Now: every SYCL source compiles for `spir64` with full device-code
+generation, `bin/grimoire` and `bin/grimoire-server` link, the new K2 and
+DFlash2-selector kernels RUN and match their references
+(`bin/test_k2_kernels`), and the K2 engine path loads a checkpoint and
+generates (`bin/test_k2_e2e`). Host suites pass: `make test` (10 suites)
+and `make test-correctness`.
+
+Still unverified, and only the Tower can do it: the AOT image for
+`intel_gpu_bmg_g31`, every XMX/DPAS tile, the batched prefill path, the
+bridges, and any number at all. Rule 8 is unchanged.
 
 ## Status
 

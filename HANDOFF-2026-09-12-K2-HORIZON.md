@@ -2,11 +2,13 @@
 
 Session of 2026-09-11/12. Branch `codex/b70-audit-fixes-20260911`.
 
-Everything below was written WITHOUT a SYCL toolchain or a B70: this
-container has no `/dev/dri`, no oneAPI, and zero SYCL headers, so
-`src/grimoire.cpp` was never compiled here. Host-side work is tested and
-green; the four new kernels and the whole engine path are unbuilt. Treat the split below as the
-boundary between "verified" and "needs a compiler".
+**Updated 2026-09-12.** This file originally said the work was written
+without a SYCL toolchain because the container had none. The container
+had none *installed*; one installs in about ten minutes, and the
+procedure is now written down in `TOOLCHAIN-IN-A-CONTAINER.md`. Once it
+was, the K2 path turned out not to work at all — see "What running it
+actually found" below. Everything marked NEVER COMPILED in the original
+text has since been compiled, run, and fixed.
 
 ## What the model is
 
@@ -59,22 +61,42 @@ else, and both norm entry points delegate on it.
 
 `make test` runs 9 suites, all passing, zero warnings.
 
-## Written but NEVER COMPILED
+## What running it actually found
 
-Nothing in `src/grimoire.cpp`, `src/ops.cpp` or `src/prefill.cpp` has
-been through a compiler in this session. The new kernels are:
+With the toolchain up, the four new kernels were diffed against
+`include/b70/k2_horizon.hpp` **on a device** (`bin/test_k2_kernels`) and
+the engine was driven end to end on a miniature random-weight K2
+checkpoint (`bin/test_k2_e2e`). That found:
+
+- `src/grimoire.cpp` did not compile at all (a duplicate `derr`).
+- `launch_softplus_gate` used `log(1 + exp x)` where torch uses
+  `log1p(exp x)`: 2.46e-4 relative error, now 1.98e-7. Same pattern
+  fixed in the DeltaNet gates in both `ops.cpp` and `prefill.cpp`.
+- K2's dense layers were sent looking for a MoE router they do not have,
+  and the engine then used the router it never got. `LayerDev::moe_layer`
+  now decides per layer.
+- `s.sh_g` was sized from the shared-expert width (768) while K2's dense
+  layers put a 6144-wide MLP in `sh_gu`: a 46 KB device heap overrun
+  three times per token, which on a B70 is DEVICE_LOST.
+- Batched prefill was silently disabled for **every** model without
+  DeltaNet layers (`Hv == 0` -> zero-byte allocation -> read as a
+  failure -> sequential fallback). Not K2-specific.
+
+All fixed and re-run. The kernels below are the ones that were new:
 
 - `launch_rmsnorm_grouped` (grouped, batched, weight_offset)
 - `launch_softplus_gate`
 - `launch_router_topk_k2`
 - `launch_silu_scale_accum`
 
-**If the native build fails, look here first.** They are the last ~150
-lines of `ops.cpp` and can be commented out to unblock anything else in
-the same translation unit. The `group_barrier` placement in the grouped
-norm is the part with no host analogue and is entirely unproven.
+All four now execute and match the host reference, including the
+`group_barrier` placement in the grouped norm, which has no host analogue
+and so could only ever be checked by running it (1/2/4 groups, both
+weight conventions, max 7.2e-07; and prefill vs decode agree to 0.000e+00
+under the K2 convention, which is what `set_norm_convention` exists to
+guarantee).
 
-## Engine wiring — DONE, uncompiled
+## Engine wiring — compiled, and now actually run
 
 `src/grimoire.cpp` now has a K2 path. Everything is gated on `cfg.is_k2`
 or `d.k2_sparse`, so Qwen and Ornith paths are unchanged.
@@ -151,11 +173,17 @@ counts until something generates text you can read.
 
 ```
 tools/build_bridges_b70.sh                 # rule 3, NOT build_b70.sh
+./bin/test_k2_kernels                      # kernel parity, ON the B70 this time
+./bin/test_k2_e2e                          # K2 engine end to end, WITH XMX
 ./bin/test_tokenizer <model-dir>           # covers 392b85a, skipped on hosts
 tools/tune.sh ... -p "prompt" -n 64        # rule 8, read the output
 GRIMOIRE_W4A8=1 GRIMOIRE_PARALLEL_SHARED=1 # the path the audit fix closed
 llama-benchy --pp 4096 --tg 32
 ```
+
+The first two run everywhere and take seconds. On the B70 they also cover
+what the CPU device could not: the XMX tiles and the batched prefill path,
+which `test_k2_e2e` reports by name rather than assuming.
 
 Verify the audit fixes first — they are complete and independent of all
 K2 work above.
