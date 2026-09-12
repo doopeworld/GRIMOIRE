@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
         // ---- same thing with MTP speculation on ---------------------
         // Several draft depths: an off-by-one in the accept loop or the
         // rollback usually survives one depth and not the others.
-        bool all_ok = true;
+        bool all_ok = true, spec_off = false;
         std::string last_stats;
         for (const char* k : {"1", "2", "3", "5"}) {
             const std::string out = (dir/(std::string("mtp")+k+".txt")).string();
@@ -200,8 +200,18 @@ int main(int argc, char** argv) {
                 continue;
             }
             last_stats = spec_line(log);
+            if (last_stats.empty()) spec_off = true;   // no rounds were run
         }
         if (all_ok) {
+            // "identical" is trivially true if no draft was ever made.
+            // Say which happened -- a silently disabled feature that
+            // reports PASS is the failure mode this whole file exists to
+            // prevent.
+            if (spec_off) {
+                std::printf("speculation REFUSED here (see the load banner) "
+                            "-- output matches plain decode, nothing drafted\n");
+                continue;
+            }
             std::printf("identical at K=1,2,3,5");
             if (!last_stats.empty()) std::printf("   [%s]", last_stats.c_str());
         } else {

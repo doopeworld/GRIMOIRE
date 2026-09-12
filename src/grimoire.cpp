@@ -1507,6 +1507,29 @@ struct Grimoire {
         if (pp_enabled()) return pp_spec != 0;
         return mtp_enabled() && mtp.ok;
     }
+    // Can a rejected draft be rolled back EXACTLY?
+    //
+    // A rejection restores the recurrent state, and the DeltaNet state and
+    // conv ring are replayed from spec_dn_steps / spec_conv_inputs, which
+    // only the BATCHED verify captures.  A sequential verify never writes
+    // them, so on a model with linear-attention layers it would restore
+    // state that was never saved and the output would quietly stop being
+    // the model's output -- measured: identical for ten tokens, then
+    // permanently divergent.  Speculation is an exactness claim, so when
+    // the batched verify is not available here, the answer is to not
+    // speculate, never to speculate approximately.
+    //
+    // Deliberately keyed on cfg, not on this rank's loaded layers: under
+    // PP one stage can own all the linear layers and another none, and if
+    // the ranks disagreed about whether to speculate they would deadlock
+    // on the next collective.  Every rank parses the same config.
+    bool spec_verify_available() const {
+        const bool recurrent = cfg.lin_v_heads > 0 && cfg.lin_v_dim > 0;
+        if (!recurrent) return true;         // nothing to restore
+        if (tp_enabled()) return false;      // prefill() always declines under TP
+        return q.get_device().is_gpu() ||
+               q.get_device().has(sycl::aspect::ext_intel_matrix);
+    }
     bool pp_sync_tokens(std::vector<int32_t>& toks);
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
@@ -1870,6 +1893,75 @@ struct Grimoire {
             last = gemv_any(d.v_experts[size_t(e)], x, mova_expert_out, {});
             last = launch_silu_scale_accum(q, mova_expert_out, y, wts[j], N, {last});
         }
+        return last;
+    }
+
+    // Batched MoVA value projection.
+    //
+    // mova_value_m1 costs TWO host stalls (the routing readback and the
+    // zeroing wait).  Calling it once per token in prefill is therefore
+    // 2*M stalls per sparse layer: at 4096 tokens over 45 sparse layers
+    // that is ~368,000 synchronous round trips, which is not "slow", it
+    // is unusable.
+    //
+    // This does the same arithmetic with ONE readback for the whole
+    // batch: route every token in a single top-k launch, bring the
+    // [M][K] table back once, then issue the expert GEMVs with no
+    // further synchronisation.  The kernel COUNT is unchanged -- what
+    // goes away is the stalling, which is the part that dominated.
+    //
+    // The remaining work, and it is the bigger win, is to pack the
+    // experts expert-major into one weight so a grouped GEMV indexes
+    // them on device and the readback disappears entirely.  That needs a
+    // new format-templated kernel (the MoE one does not fit: it is
+    // gate|up SwiGLU shaped, MoVA is a single matrix per expert), which
+    // is why it is not done here.
+    //
+    // Buffers: `logits`, `rex` and `rwt` are the caller's MoE routing
+    // scratch.  That is safe and deliberate -- MoVA runs in the ATTENTION
+    // half of the layer and the MoE stage recomputes its routing before
+    // using it -- but it is an ordering dependency, so if the FFN ever
+    // moves before attention this needs its own buffers.
+    sycl::event mova_value_batched(LayerDev& d, const float* x, float* y, int M,
+                                   float* logits, int32_t* rex, float* rwt,
+                                   std::vector<int32_t>& idx_host,
+                                   std::vector<float>& wt_host) {
+        const int E = int(d.v_experts.size());
+        const int K = std::min(cfg.mova_top_k, E);
+        const int N = d.v_experts.empty() ? 0 : d.v_experts[0].output_rows();
+        const int H = cfg.hidden;
+        if (E <= 0 || K <= 0 || N <= 0 || M <= 0)
+            return q.submit([&](sycl::handler& h){ h.single_task([=](){}); });
+
+        // Router: one GEMV per token, no stall between them.  NOT the
+        // batched GEMM -- v_router is N = mova_experts (64 on the real
+        // checkpoint), and rule 4 says a weight whose N is not a multiple
+        // of 256 must not reach a W4A8/XMX tile.
+        for (int m = 0; m < M; ++m)
+            gemv_any(d.v_router, x + size_t(m) * H, logits + size_t(m) * E, {});
+
+        sycl::event ev = launch_router_topk_k2(q, logits, d.v_router_bias,
+                                               M, E, K, rex, rwt,
+                                               /*normalize=*/K > 1,
+                                               cfg.router_scale, {});
+        idx_host.resize(size_t(M) * K);
+        wt_host.resize(size_t(M) * K);
+        q.memcpy(idx_host.data(), rex, size_t(M) * K * sizeof(int32_t), {ev});
+        q.memcpy(wt_host.data(), rwt, size_t(M) * K * sizeof(float));
+        q.memset(y, 0, size_t(M) * N * sizeof(float));
+        q.wait();                                   // the ONE stall
+
+        sycl::event last;
+        for (int m = 0; m < M; ++m)
+            for (int j = 0; j < K; ++j) {
+                const int e = idx_host[size_t(m) * K + j];
+                if (e < 0 || e >= E) continue;      // router produced no route
+                last = gemv_any(d.v_experts[size_t(e)], x + size_t(m) * H,
+                                mova_expert_out, {});
+                last = launch_silu_scale_accum(q, mova_expert_out,
+                                               y + size_t(m) * N,
+                                               wt_host[size_t(m) * K + j], N, {last});
+            }
         return last;
     }
 
@@ -3932,7 +4024,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             std::printf("    parallel      none (single device)\n");
 
         const bool par = tp_enabled() || pp_enabled();
-        if (mtp.ok)            std::printf("    speculation   MTP%s\n",
+        if (!spec_verify_available() && (mtp.ok || dflash2.ok ||
+                                         (pp_enabled() && pp_spec)))
+            std::printf("    speculation   DISABLED -- this model has recurrent "
+                        "(linear-attention) layers and the batched verify is "
+                        "not available here, so a rejected draft could not be "
+                        "rolled back exactly\n");
+        else if (mtp.ok)       std::printf("    speculation   MTP%s\n",
                                    pp_enabled() ? " (head on this, the last stage)" : "");
         else if (pp_enabled() && pp_spec)
             std::printf("    speculation   MTP (head on the last stage; this "
@@ -7523,6 +7621,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         prefill_layer_limit=std::max(1,std::min(cfg.n_layers,std::atoi(v)));
     const bool prefill_host_progress=
         std::getenv("GRIMOIRE_PREFILL_HOST_PROGRESS") != nullptr;
+    // MoVA routing table, read back once per sparse layer (K2 only).
+    std::vector<int32_t> mova_idx_host;
+    std::vector<float>   mova_wt_host;
     int raw_gdn_layer_limit=cfg.n_layers;
     if(const char* v=std::getenv("GRIMOIRE_RAW_GDN_LAYER_LIMIT"))
         raw_gdn_layer_limit=std::max(0,std::min(cfg.n_layers,std::atoi(v)));
@@ -7753,17 +7854,23 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,cfg.head_dim);qv=t1;}
             mm(d.k_proj,bn,t3);
             if (d.k2_sparse) {
-                // BRING-UP: one routed value per token through the M=1
-                // path.  That is O(M) readbacks per layer -- fine for a
-                // short prompt, useless for a 4096-token prefill.  Real PP
-                // needs the 64 experts packed expert-major so the grouped
-                // GEMV can index them with no sync, the same shape the
-                // routed MoE already uses.
+                // One readback for the whole batch instead of two stalls
+                // per token.  The MoE routing scratch is reused: MoVA runs
+                // in the attention half and the FFN recomputes its routing
+                // before using it -- see mova_value_batched.  If that
+                // scratch is not wide enough for the MoVA expert count,
+                // fall back rather than overrun it.
                 const int NV = cfg.n_kv_heads * cfg.head_dim;
-                for (int m = 0; m < M; ++m)
-                    mova_value_m1(d, bn + size_t(m) * cfg.hidden,
-                                  t4 + size_t(m) * NV, {});
-                q.wait();
+                if (cfg.mova_experts <= std::max(1, cfg.n_experts) &&
+                    cfg.mova_top_k <= alloc_top_k) {
+                    mova_value_batched(d, bn, t4, M, rlog, rex, rwt,
+                                       mova_idx_host, mova_wt_host);
+                } else {
+                    for (int m = 0; m < M; ++m)
+                        mova_value_m1(d, bn + size_t(m) * cfg.hidden,
+                                      t4 + size_t(m) * NV, {});
+                    q.wait();
+                }
             } else mm(d.v_proj,bn,t4);
             pp_mark("attn kv proj");
             launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
@@ -8379,13 +8486,13 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              FinishReason* finish) {
     GenerationOptions o;
     o.max_tokens=n_predict; o.eos=eos_id; o.eot=eot_id;
-    o.dflash=e.dflash2.ok;
+    o.dflash=e.dflash2.ok && e.spec_verify_available();
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
     o.draft_depth=o.dflash?15:std::clamp(depth?std::atoi(depth):3,0,15);
     // spec_active() is the PIPELINE's answer, not this rank's: under PP
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.
-    o.mtp=e.spec_active() && o.draft_depth>0;
+    o.mtp=e.spec_active() && o.draft_depth>0 && e.spec_verify_available();
     const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
     o.graph=graph && std::atoi(graph)!=0;
     // GRIMOIRE_SPEC_STATS=1 prints accepted-per-step per request.  This is
