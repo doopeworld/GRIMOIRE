@@ -14,8 +14,27 @@ in full before starting.
 
 **Latest implementation handoff:** `HANDOFF-2026-08-28-ORNITH-DFLASH.md`.
 The original z-lab DFlash drafter now loads; resume at context ingestion and
-the 16-query block forward described in that file. Do not switch back to Muse
-or the lower-acceptance DFlash2 sidecar.
+the 16-query block forward described in that file.
+
+**RETRACTION (2026-09-12): "the lower-acceptance DFlash2 sidecar" was
+measured with its candidate selector DEAD, so that verdict is void.**
+The selector kernels (`launch_dflash2_selector_edges`,
+`launch_dflash2_path_walk`) have existed in `ops.cpp` since the initial
+commit and were NEVER CALLED until 2026-09-12. Both judgements --
+`8e2fbc8` (2026-09-01, "97.6 TG, still LOSES to 125 TG plain decode") and
+`f677add` (2026-09-02, "LOSES to MTP -- drafter too expensive") -- predate
+any call site. What they measured was DFlash2 drafting by per-position
+argmax, which ignores the predecessor/successor codebooks entirely: the
+weights loaded, the scoring never ran. That is not a slower DFlash2, it is
+a different and structurally weaker algorithm.
+
+DFlash2's acceptance comes from scoring the EDGE between the previous
+choice and each candidate and walking a path from the verified anchor.
+With that removed, low acceptance was the expected result, not evidence
+about DFlash2. Ian's position (2026-09-12) is that DFlash2 beats MTP; the
+repo holds no valid measurement either way, because the only DFlash2
+numbers on record are from the selector-less build. Re-measure both on the
+same prompt before trusting any ranking, and read the output (rule 8).
 
 This supersedes the Muse Glimmer prefill work mentioned later in this file
 and in HANDOFF-2026-08-27-PP-TP-COMPLETE.md, which is real but lower
