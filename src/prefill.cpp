@@ -1411,7 +1411,9 @@ sycl::event launch_deltanet_gates_batched(sycl::queue& q, const float* ab,
         h.parallel_for(sycl::range<1>(size_t(tokens) * heads), [=](sycl::id<1> id) {
             const int64_t z = int64_t(id[0]); const int hd = int(z % heads), t = int(z / heads);
             const float dt = ab[int64_t(t) * 2 * heads + hd] + bf16_to_f32(dt_bias[hd]);
-            const float sp = dt > 20.0f ? dt : sycl::log(1.0f + sycl::exp(dt));
+            // log1p, matching the decode path in ops.cpp -- see the note
+            // there.  Prefill and decode must not disagree on this.
+            const float sp = dt > 20.0f ? dt : sycl::log1p(sycl::exp(dt));
             alpha[z] = sycl::exp(-sycl::exp(bf16_to_f32(A_log[hd])) * sp);
             beta[z] = 1.0f / (1.0f + sycl::exp(-ab[int64_t(t) * 2 * heads + heads + hd]));
         });

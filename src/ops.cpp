@@ -556,7 +556,11 @@ sycl::event launch_deltanet_gates(sycl::queue& q, const float* a_raw,
             const float dt = a_raw[i] + bf16_to_f32(dt_bias[i]);
             // softplus, guarded: for large dt the exp overflows and the
             // decay silently becomes NaN, which poisons the state forever.
-            const float sp = dt > 20.0f ? dt : sycl::log(1.0f + sycl::exp(dt));
+            // log1p(exp(dt)), not log(1 + exp(dt)): for negative dt the
+            // 1.0f + addition discards exp(dt)'s low bits before the log,
+            // which is ~2.5e-4 relative error against torch's softplus.
+            // Measured on the K2 gate, same formula; free to avoid.
+            const float sp = dt > 20.0f ? dt : sycl::log1p(sycl::exp(dt));
             alpha[i] = sycl::exp(-sycl::exp(bf16_to_f32(A_log[i])) * sp);
             beta[i]  = 1.0f / (1.0f + sycl::exp(-b_raw[i]));
         });
@@ -1364,8 +1368,14 @@ sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
                 if (i >= n) return;
                 const float gv = gate[i];
                 const float bx = beta * gv;
+                // log1p(exp(bx)), NOT log(1 + exp(bx)).  For a negative
+                // gate exp(bx) is small and the 1.0f + addition throws
+                // away its low bits before the log ever sees them:
+                // measured against torch's own softplus that is ~2.5e-4
+                // relative error around bx = -10, and it is zero with
+                // log1p.  Free to fix, so there is no reason to carry it.
                 const float sp = bx > 20.0f ? gv
-                               : sycl::log(1.0f + sycl::exp(bx)) / beta;
+                               : sycl::log1p(sycl::exp(bx)) / beta;
                 out[i] = attn[i] * sp;
             });
     });

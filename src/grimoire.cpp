@@ -3043,15 +3043,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // at all, so it hit that path rather than being told it is
         // unsupported.  Validate every tensor this geometry is derived from,
         // and name what is missing.
-        std::string derr;
+        std::string arch_err;
         auto draft_rows=[&](const char* name)->int{
             const TensorRef r=dr(name);
             if(!r.ok()){
-                if(derr.empty())derr=std::string("no ")+name;
+                if(arch_err.empty())arch_err=std::string("no ")+name;
                 return 0;
             }
             if(r.t.shape.size()!=2){
-                if(derr.empty())derr=std::string(name)+" is rank "+
+                if(arch_err.empty())arch_err=std::string(name)+" is rank "+
                     std::to_string(r.t.shape.size())+", expected a 2-D matrix";
                 return 0;
             }
@@ -3060,19 +3060,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const int q_rows =draft_rows("layers.0.self_attn.q_proj.weight");
         const int kv_rows=draft_rows("layers.0.self_attn.k_proj.weight");
         const int ff_rows=draft_rows("layers.0.mlp.gate_proj.weight");
-        if(derr.empty()&&dflash2.head_dim>0&&
+        if(arch_err.empty()&&dflash2.head_dim>0&&
            (q_rows%dflash2.head_dim||kv_rows%dflash2.head_dim))
-            derr="q/k projection rows ("+std::to_string(q_rows)+"/"+
+            arch_err="q/k projection rows ("+std::to_string(q_rows)+"/"+
                  std::to_string(kv_rows)+") are not a multiple of head_dim "+
                  std::to_string(dflash2.head_dim);
-        if(!derr.empty()){
+        if(!arch_err.empty()){
             // Name the capability, not just the symptom: a MoE draft needs a
             // routed draft FFN path that does not exist here, and DaoCloud's
             // layout announces itself with aux_hidden_state_layer_ids where
             // the dense drafts use target_layer_ids.
             const bool moe_draft=dr("layers.0.mlp.experts.0.gate_proj.weight").ok()||
                                  dr("layers.0.mlp.gate.weight").ok();
-            err="unsupported DFlash draft architecture: "+derr+
+            err="unsupported DFlash draft architecture: "+arch_err+
                 (moe_draft?". This looks like a MoE draft; only the DENSE "
                            "draft layout is implemented."
                          :". Only the dense draft layout is implemented.");

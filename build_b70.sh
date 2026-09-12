@@ -155,6 +155,21 @@ icpx -fsycl -fsycl-targets="$TARGET" \
      tools/test_dflash_head.cpp -o bin/test_dflash_head -ldl \
   && echo "built  : bin/test_dflash_head" || echo "warn: dflash head test failed"
 
+# Numeric parity gate for the K2 and DFlash2-selector kernels, RUN on a
+# real device rather than replayed on the host.  The host suites in tests/
+# pin the math; a kernel that never launches still passes them.  This one
+# submits the kernels from src/ops.cpp and src/prefill.cpp and diffs them
+# against include/b70/k2_horizon.hpp, and it also checks that prefill and
+# decode are on the SAME norm convention -- a divergence there would be
+# completely silent.  It takes no model and runs in seconds.
+#   ./bin/test_k2_kernels
+icpx -fsycl -fsycl-targets="$TARGET" \
+     -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -I include -I src \
+     tools/test_k2_kernels_device.cpp src/ops.cpp src/prefill.cpp \
+     -o bin/test_k2_kernels \
+  && echo "built  : bin/test_k2_kernels" || echo "warn: k2 kernel test failed"
+
 # ---------------------------------------------------------------------
 if [[ "$REQUIRED_FAILED" -ne 0 ]]; then
   echo
