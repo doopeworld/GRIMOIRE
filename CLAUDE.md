@@ -118,13 +118,22 @@ was a link-related limitation and has NOT been retested on OCuLink.
 
 Multiprocess PP/TP still works and is still the proven path —
 `tools/pp2run.sh`, `tools/tp2run.sh`,
-`HANDOFF-2026-08-27-PP-TP-COMPLETE.md`. But know what it costs: the PP
-boundary stages the hidden state through PINNED HOST MEMORY and a file
-descriptor (`pp_send_hidden` / `pp_recv_hidden`), device -> host -> pipe ->
-host -> device, synchronously, at every layer-group boundary. OCuLink makes
-the device/host copies faster; it does NOT remove the host round trip. The
-real win now available is single-process device-to-device, which skips the
-staging entirely.
+`HANDOFF-2026-08-27-PP-TP-COMPLETE.md`. The pipeline boundary stages the
+hidden state through pinned host memory and a file descriptor
+(`pp_send_hidden` / `pp_recv_hidden`): device -> host -> pipe -> host ->
+device, synchronously, at every layer-group boundary.
+
+EXPECT THAT TO BE MUCH CHEAPER NOW, AND RE-MEASURE BEFORE REDESIGNING.
+USB4 carries PCIe by TUNNELING it, which added large latency to every
+device/host transfer on GPU1 — and the staging above is two such transfers
+per boundary. OCuLink Gen4 x4 is native PCIe with no tunneling, so the link
+change attacks exactly the dominant cost. The host round trip remains in
+the code, but its price was mostly the tunnel, not the copy.
+
+So the first move is a measurement, not a rewrite: re-run the multiprocess
+pipeline on OCuLink and see where it actually lands. Single-process
+device-to-device is still worth trying (see above), but it is no longer
+obviously the bigger win.
 
 Also note: **speculation is hard-disabled whenever TP or PP is on**
 (`grimoire.cpp`: `mtp_enabled() && !tp_enabled() && !pp_enabled()`). Dual-GPU
