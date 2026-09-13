@@ -27,6 +27,7 @@
 //  if the reference changes, change this, do not re-derive it.
 // =====================================================================
 #include "b70/json.hpp"
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -111,6 +112,18 @@ struct Scopes {
         return v ? v->boolean : fallback;
     }
 };
+
+// A flag the config states explicitly, in either spelling.  Python's
+// bool() accepts 1/0, and silently ignoring an explicitly set key is the
+// exact failure this file exists to remove -- so read a number as one.
+inline std::optional<bool> stated_flag(const Json* obj, const char* key) {
+    if (!obj) return std::nullopt;
+    const Json* v = obj->find(key);
+    if (!v) return std::nullopt;
+    if (v->kind == Json::Kind::Boolean) return v->boolean;
+    if (v->kind == Json::Kind::Number)  return v->number != 0.0;
+    return std::nullopt;
+}
 
 inline std::vector<int> int_array(const Json& v) {
     std::vector<int> out;
@@ -225,9 +238,8 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
     // ---- attention shape, per layer ----------------------------------
     // _resolve_layer_attention + _dflash_layer_causal, transcribed.
     const Json* layer_types = typed(top, "layer_types", Kind::Array);
-    const Json* swa_flag =
-        dflash_cfg ? typed(*dflash_cfg, "use_swa", Kind::Boolean) : nullptr;
-    const bool use_swa = swa_flag && swa_flag->boolean;
+    const std::optional<bool> swa_flag = stated_flag(dflash_cfg, "use_swa");
+    const bool use_swa = swa_flag.value_or(false);
 
     bool any_sliding = false;
     if (layer_types)
@@ -237,12 +249,11 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
 
     // causal, resolved once: is_causal wins, then dflash_config.causal,
     // then "this layer is a sliding layer".
-    const Json* is_causal = typed(top, "is_causal", Kind::Boolean);
-    const Json* causal_override =
-        dflash_cfg ? typed(*dflash_cfg, "causal", Kind::Boolean) : nullptr;
+    const std::optional<bool> is_causal = stated_flag(&top, "is_causal");
+    const std::optional<bool> causal_override = stated_flag(dflash_cfg, "causal");
 
-    s.attn_from_config = layer_types != nullptr || swa_flag != nullptr ||
-                         is_causal != nullptr || causal_override != nullptr;
+    s.attn_from_config = layer_types != nullptr || swa_flag.has_value() ||
+                         is_causal.has_value() || causal_override.has_value();
 
     // layer_types shorter than the model is an IndexError in the reference,
     // so it is a broken config, not a layer to guess at.
@@ -275,8 +286,8 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
             (!layer_types || (use_swa && !any_sliding)) ? use_swa : typed_sliding;
 
         s.layers[i].window = is_sliding ? window : 0;
-        s.layers[i].causal = is_causal       ? is_causal->boolean
-                           : causal_override ? causal_override->boolean
+        s.layers[i].causal = is_causal       ? *is_causal
+                           : causal_override ? *causal_override
                                              : (layer_types && typed_sliding);
         if (is_sliding && window <= 0 && s.error.empty())
             s.error = "draft layer " + std::to_string(i) + " uses sliding "

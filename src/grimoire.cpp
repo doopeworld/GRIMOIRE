@@ -2195,6 +2195,11 @@ struct Grimoire {
     bool dflash_draft(int bonus_token, int position,
                       std::vector<int32_t>& draft_tokens,
                       bool context_only = false);
+    // Rows in the DFlash query block, anchor included, so M-1 tokens are
+    // drafted per step.  The caller reports it: an A/B of two block widths
+    // is read as accepted-per-step, and labelling every run "depth 15"
+    // when GRIMOIRE_DFLASH_M=4 drafts three makes that unreadable.
+    int          dflash_block_rows() const;
     int          argmax_token();
     void release();
 };
@@ -6301,18 +6306,23 @@ int Grimoire::argmax_token() {
 // caches, then evaluate [bonus, mask x 15] in one non-causal block. DFlash2
 // has additional grouped-conv/selector stages and deliberately does not enter
 // this path.
+// Ornith's verify slope is ~2.95 ms per extra verified token, so the
+// profitable block is far shorter than the drafter's native 16. Let the
+// width be tuned; M is the block INCLUDING the bonus row, so M=4 verifies
+// 3 drafts.
+int Grimoire::dflash_block_rows() const {
+    constexpr int MMAX=16;
+    static const int m_env=[]{const char* v=std::getenv("GRIMOIRE_DFLASH_M");
+        return v&&*v?std::atoi(v):0;}();
+    const int wide=dflash2.draft_head_rows?8:MMAX;
+    return (m_env>=2&&m_env<=MMAX)?m_env:wide;
+}
+
 bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens,
                             bool context_only) {
-    constexpr int MMAX=16;
-    // Ornith's verify slope is ~2.95 ms per extra verified token, so the
-    // profitable block is far shorter than the drafter's native 16. Let the
-    // depth be tuned; M is the block INCLUDING the bonus row, so M=4 verifies
-    // 3 drafts.
-    static const int m_env=[]{const char* v=std::getenv("GRIMOIRE_DFLASH_M");
-        return v&&*v?std::atoi(v):0;}();
-    int M=dflash2.draft_head_rows?8:MMAX;
-    if(m_env>=2&&m_env<=MMAX)M=m_env;
+    constexpr int MMAX=16;   // the host_tokens array below is this wide
+    const int M=dflash_block_rows();
     if(!dflash2.ok||position<0||position+M>max_seq){
         static bool once2=false;
         if(!once2){once2=true;std::fprintf(stderr,
@@ -8804,7 +8814,8 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     o.max_tokens=n_predict; o.eos=eos_id; o.eot=eot_id;
     o.dflash=e.dflash2.ok && e.spec_verify_available();
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
-    o.draft_depth=o.dflash?15:std::clamp(depth?std::atoi(depth):3,0,15);
+    o.draft_depth=o.dflash?e.dflash_block_rows()-1
+                          :std::clamp(depth?std::atoi(depth):3,0,15);
     // spec_active() is the PIPELINE's answer, not this rank's: under PP
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.

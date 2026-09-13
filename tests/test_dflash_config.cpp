@@ -175,6 +175,21 @@ int main() {
         EQ(s.layers[0].window, 64, "override does not change the window");
     }
 
+    {   // a flag written as 1/0 is still an explicitly stated flag.
+        // Python's bool() takes it, and silently dropping a key the
+        // checkpoint author set is the failure this file exists for.
+        const DFlashSettings s = parse_dflash_config(R"JSON({
+          "hidden_size": 512, "num_hidden_layers": 2,
+          "num_attention_heads": 8, "num_key_value_heads": 8,
+          "is_causal": 1, "dflash_config": {"use_swa": 1,
+                                            "swa_window_size": 256}
+        })JSON");
+        CHECK(s.error.empty(), "numeric-flag config rejected: %s", s.error.c_str());
+        CHECK(s.attn_from_config, "a numeric use_swa still describes the shape");
+        CHECK(s.layers[0].causal && s.layers[1].causal, "is_causal:1 is true");
+        EQ(s.layers[0].window, 256, "use_swa:1 slides");
+    }
+
     // ---- rope_theta: the reference's default is 1e6, not 1e7 -----------
     {
         const DFlashSettings s = parse_dflash_config(R"JSON({

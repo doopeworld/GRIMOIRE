@@ -444,11 +444,12 @@ int main(int argc, char** argv) {
                 std::printf("   forced-agreement drafter CHANGED THE OUTPUT"
                             "\n     plain:%s\n     spec :%s\n",
                             join(plain).c_str(), join(forced).c_str());
-            } else if (fstats.find(" 0 of ") != std::string::npos ||
-                       fstats.find("0.0%") != std::string::npos) {
-                // The whole point of this case is a non-zero acceptance.
-                // If it lands at zero the case proves nothing and must
-                // not pass quietly.
+            } else if (fstats.empty() || fstats.find("(0 of ") != std::string::npos) {
+                // The whole point of this case is a non-zero acceptance:
+                // at zero it proves nothing and must not pass quietly.
+                // Match the drafted COUNT, not the percentage -- "0.0%" is
+                // also a substring of "10.0%", so a rate check here would
+                // call a healthy 10% acceptance a failure.
                 ++g_fail;
                 std::printf("   forced-agreement drafter accepted NOTHING "
                             "(token %d appears %d times): %s\n",
