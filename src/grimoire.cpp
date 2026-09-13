@@ -2438,6 +2438,16 @@ struct Grimoire {
                     int count) {
         const std::vector<sycl::event> none{};
         if(count<=0)return true;
+        // A null table is a LOAD bug, not a runtime one -- under PP the
+        // embedding table is uploaded only on the stages that need it.
+        // Say so instead of faulting: on a GPU this dereference is a
+        // DEVICE_LOST and a power cycle, not a SIGSEGV.
+        if(!table){
+            std::fprintf(stderr,"  embed_rows: no embedding table on this "
+                "rank -- a drafter asked to embed %d token(s) where the "
+                "table was never uploaded\n",count);
+            return false;
+        }
         // Only the TARGET's table is sharded.  A drafter that ships its own
         // embed_tokens loaded it whole, so it must NOT be offset.
         if(!tp_enabled()||table!=embed){
@@ -2894,13 +2904,27 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::printf("  embed_tokens  %.2f GiB ... ", double(ck.bytes(ck.embed)) / 1073741824.0);
     std::fflush(stdout);
     // Rank 0 embeds the input tokens.  The LAST stage needs the table too
-    // when it hosts the MTP head: the head is fc([norm(embed(next_token));
-    // norm(hidden)]), so it embeds every token it drafts.  Without this it
-    // would read a null pointer on the first draft -- and only under PP,
-    // which is the configuration hardest to debug.  The cost is one copy
-    // of the embedding table on one extra card, and only when MTP is on.
-    const bool need_embed = !pp_enabled() || pp_rank == 0 ||
-                            (mtp_enabled() && pp_rank == pp_world - 1);
+    // when it hosts a DRAFTER, because every drafter embeds the tokens it
+    // proposes:
+    //   - the MTP head is fc([norm(embed(next_token)); norm(hidden)]);
+    //   - a DFlash drafter embeds its whole query block, and one that
+    //     ships no embed_tokens of its own does it from the TARGET's
+    //     table.
+    // Without this the last stage reads a null pointer on its first
+    // draft -- MEASURED, as a SIGSEGV on the last stage and a socket
+    // exception on every earlier one, and only under PP, which is the
+    // configuration hardest to debug.
+    //
+    // Whether a DFlash drafter ships its own table is not known here --
+    // it is read several hundred lines below -- so the table is loaded
+    // whenever a drafter is CONFIGURED.  That can be one unnecessary copy
+    // on one card for a drafter that turns out to have its own; the other
+    // way round is a crash, so pay the copy.
+    const char* dflash_env = std::getenv("GRIMOIRE_DFLASH_MODEL");
+    if (!dflash_env || !*dflash_env) dflash_env = std::getenv("GRIMOIRE_DFLASH2_MODEL");
+    const bool last_stage_drafts =
+        (mtp_enabled() || (dflash_env && *dflash_env)) && pp_rank == pp_world - 1;
+    const bool need_embed = !pp_enabled() || pp_rank == 0 || last_stage_drafts;
     if(need_embed)
         embed=dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
     if (!ok) { err = "embed upload failed"; return false; }
