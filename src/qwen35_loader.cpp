@@ -317,6 +317,23 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         if (cfg.lin_k_heads <= 0 || cfg.lin_v_heads <= 0) {
             err = "Agnes: no gated-DeltaNet geometry in the config"; return false;
         }
+        // The second thing this engine does not have.  attn_output_gate
+        // is parsed everywhere but only ever CONSUMED by Muse, which
+        // loads a separate self_attn.gate_proj into o_gate.  Agnes ships
+        // no such tensor -- its global_attn has exactly k_norm, k_proj,
+        // o_proj, q_norm, q_proj, v_proj -- so the gate is folded into a
+        // double-width q_proj, which means loading it here would both
+        // misread q_proj AND drop the gate.  Refuse: an ignored output
+        // gate is invisible in the output and shows up only as a model
+        // that is subtly worse than it should be.
+        if (cfg.attn_out_gate) {
+            err = "Agnes sets attn_output_gate, and this engine has no "
+                  "output-gate path for the Qwen3.5 attention shape (only "
+                  "Muse, which loads a separate gate_proj). Agnes ships no "
+                  "gate tensor, so the gate lives in a double-width q_proj "
+                  "and would be both misread and ignored";
+            return false;
+        }
     }
     if (cfg.is_k2) {
         if (cfg.rope_head_dim && cfg.head_dim && cfg.rope_head_dim != cfg.head_dim) {

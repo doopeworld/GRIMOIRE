@@ -56,7 +56,7 @@ static std::string layer_types_array() {
     return a + "]";
 }
 
-static std::string config(bool with_parallel_ffn) {
+static std::string config(bool with_parallel_ffn, bool with_attn_gate = false) {
     std::ostringstream c;
     c << R"JSON({
   "model_type": "agnes",
@@ -81,7 +81,7 @@ static std::string config(bool with_parallel_ffn) {
     "head_dim": 256,
     "attention_bias": false,
     "attention_dropout": 0.0,
-    "attn_output_gate": true,
+    "attn_output_gate": AGNES_GATE,
     "partial_rotary_factor": 0.25,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 48,
@@ -131,7 +131,13 @@ static std::string config(bool with_parallel_ffn) {
   "vision_end_token_id": 248054,
   "tie_word_embeddings": false
 })JSON";
-    return c.str();
+    std::string out = c.str();
+    // Both unimplemented features are refusals, so the "everything else"
+    // pass has to switch them off to reach the fields underneath.
+    const std::string tok = "AGNES_GATE";
+    const size_t g = out.find(tok);
+    out.replace(g, tok.size(), with_attn_gate ? "true" : "false");
+    return out;
 }
 
 // One real tensor so the loader's index is non-empty.
@@ -158,7 +164,7 @@ int main() {
     // ---- the real config: must REFUSE, and say why --------------------
     {
         const fs::path d = root / "real";
-        write_stub(d, config(true));
+        write_stub(d, config(true, true));
         Qwen35Model ld; std::string err;
         const bool ok = ld.load(d.string(), err, /*skip_vision=*/true, /*index_only=*/true);
         std::printf("parallel_ffn is refused, not approximated\n");
@@ -174,6 +180,19 @@ int main() {
     }
 
     // ---- everything else, with that one key removed -------------------
+    {   // attn_output_gate is the OTHER refusal: parsed everywhere,
+        // consumed only by Muse, and Agnes ships no gate tensor because
+        // the gate rides in a double-width q_proj.  Ignoring it is
+        // invisible -- the model just comes out subtly worse.
+        const fs::path d = root / "gate";
+        write_stub(d, config(false, true));
+        Qwen35Model l; std::string e;
+        const bool ok = l.load(d.string(), e, true, true);
+        CHECK(!ok, "attn_output_gate must refuse while there is no gate path");
+        CHECK(e.find("attn_output_gate") != std::string::npos,
+              "the refusal must name it: %s", e.c_str());
+    }
+
     const fs::path d = root / "nopffn";
     write_stub(d, config(false));
     Qwen35Model ld; std::string err;
@@ -201,7 +220,6 @@ int main() {
     CHECK(!c.tie_embeddings, "tie_word_embeddings");
 
     std::printf("attention\n");
-    CHECK(c.attn_out_gate, "attn_output_gate");
     CHECK(std::fabs(c.partial_rope - 0.25f) < 1e-6f,
           "partial_rotary_factor: got %g want 0.25", double(c.partial_rope));
     CHECK(std::fabs(c.rope_theta - 1.0e7f) < 1.0f,
