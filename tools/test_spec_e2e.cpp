@@ -151,6 +151,22 @@ static std::pair<int,int> spawn_two(const char* self, const std::string& dir,
     return { rcw, WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st) };
 }
 
+// Read a GRIMOIRE_DFLASH_DUMP file whole.  The drafter writes its
+// concatenated target-tap row as g_01_aux_<pos>.f32 on its first context
+// ingest, which is exactly the tensor a pipeline has to reassemble from
+// several stages.
+static std::vector<char> read_blob(const std::string& path) {
+    std::vector<char> v;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return v;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n > 0) { v.resize(size_t(n)); if (std::fread(v.data(),1,v.size(),f) != v.size()) v.clear(); }
+    std::fclose(f);
+    return v;
+}
+
 // The "(A of D drafted" counts out of a spec line, so two runs can be
 // compared on what the drafter PROPOSED rather than only on the final
 // tokens.  Speculation is exact, so the tokens match whether or not the
@@ -562,10 +578,9 @@ int main(int argc, char** argv) {
                                 "did not load or drafted nothing: %s\n",
                                 tstats.c_str());
                 } else if (spec_counts(tstats) != spec_counts(fstats)) {
-                    // Exact output is NOT enough: speculation is exact, so
-                    // the tokens match even if every draft was computed
-                    // from the wrong state and rejected.  What must also
-                    // match is what the drafter PROPOSED.
+                    // Exact output is NOT enough on its own: speculation is
+                    // exact, so the tokens match even when every draft was
+                    // computed from the wrong state and rejected.
                     ++g_fail;
                     std::printf("   TP+DFlash accepted a DIFFERENT number than "
                                 "one process -- the drafter saw different state"
@@ -617,11 +632,10 @@ int main(int argc, char** argv) {
                                 "did not load or drafted nothing: %s\n",
                                 pstats.c_str());
                 } else if (spec_counts(pstats) != spec_counts(fstats)) {
-                    // This is the assertion that actually covers the tap
-                    // forwarding.  Drop it and the drafter runs on a tap
-                    // row that is half zeros: the output stays identical
-                    // (the verifier rejects what it must), and only the
-                    // acceptance count says so.
+                    // A consistency check, not the tap check: this fixture
+                    // decodes every draft id to the same token, so bad taps
+                    // move the logits without moving the proposal.  The tap
+                    // comparison below is the one that covers forwarding.
                     ++g_fail;
                     std::printf("   PP+DFlash accepted a DIFFERENT number than "
                                 "one process -- the forwarded taps do not match"
@@ -630,6 +644,56 @@ int main(int argc, char** argv) {
                 } else {
                     std::printf("   PP+DFlash: identical, same acceptance   [%s]\n",
                                 pstats.c_str());
+                }
+
+                // ---- the taps themselves, byte for byte ---------------
+                // The assertion that actually covers the forwarding.  The
+                // drafter dumps its concatenated target-tap row on its
+                // first context ingest; in one process it builds that row
+                // from its own layers, and under PP it has to reassemble
+                // it from every stage.  Those must be the same bytes.
+                //
+                // Nothing else in this file can see a tap error: the
+                // verifier makes the OUTPUT identical either way, and
+                // this fixture decodes every draft id to the same token,
+                // so the proposal does not move either.
+                {
+                    const fs::path d1 = tdir/"dump-one", d2 = tdir/"dump-pp";
+                    fs::create_directories(d1); fs::create_directories(d2);
+                    const std::string s1 = (tdir/"dump1.txt").string();
+                    const std::string s2 = (tdir/"dump2.txt").string();
+                    spawn_run(self, tdir.string(), s1, fmt,
+                        {"GRIMOIRE_DFLASH_MODEL="+fdir.string(),
+                         "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_DEVICE_ANY=1",
+                         "GRIMOIRE_DFLASH_DUMP="+d1.string()},
+                        (tdir/"dump1.log").string());
+                    const std::string psock2 = (tdir/"df-ppd.sock").string();
+                    spawn_two(self, tdir.string(), s2, fmt,
+                        {"GRIMOIRE_PP_WORLD_SIZE=2", "GRIMOIRE_PP_SPLIT=2",
+                         "GRIMOIRE_PP_SOCKET="+psock2,
+                         "GRIMOIRE_DFLASH_MODEL="+fdir.string(),
+                         "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_DEVICE_ANY=1",
+                         "GRIMOIRE_DFLASH_DUMP="+d2.string()},
+                        "GRIMOIRE_PP_RANK", 1, tdir, "df-ppd");
+                    const auto a = read_blob((d1/"g_01_aux_0.f32").string());
+                    const auto b = read_blob((d2/"g_01_aux_0.f32").string());
+                    if (a.empty() || b.empty()) {
+                        ++g_fail;
+                        std::printf("   tap dump missing (one %zu bytes, pp %zu) "
+                                    "-- the comparison did not run\n",
+                                    a.size(), b.size());
+                    } else if (a != b) {
+                        ++g_fail;
+                        size_t diff = 0;
+                        for (size_t i = 0; i < std::min(a.size(), b.size()); ++i)
+                            if (a[i] != b[i]) ++diff;
+                        std::printf("   FORWARDED TAPS DIFFER from one process: "
+                                    "%zu vs %zu bytes, %zu differing\n",
+                                    a.size(), b.size(), diff);
+                    } else {
+                        std::printf("   PP taps: byte-identical to one process "
+                                    "(%zu bytes)\n", a.size());
+                    }
                 }
 
                 // ---- TP on the SHARED-head drafter ------------------

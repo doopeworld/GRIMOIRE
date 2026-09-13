@@ -418,21 +418,23 @@ inline Arch dflash_draft(int L = 2, bool own_head = false, bool own_embed = fals
         // draft id i to target id 2i, which is inside the target vocabulary
         // and is emphatically NOT the identity, so a build that drops the
         // mapping proposes different tokens rather than the same ones.
-        // Only HALF the forced vocabulary collapses onto the target.
+        // EVERY draft id maps to the forced target, which is what makes
+        // acceptance reliable rather than a coin flip on which head row
+        // random weights happen to favour.  (Collapsing only half the
+        // vocabulary was tried, to make the proposal tap-sensitive; it
+        // made acceptance depend on the argmax landing on an even row,
+        // and with these weights it does not -- the single-process run
+        // dropped to zero accepted.)
         //
-        // Mapping every draft id to one token made the fixture blind to
-        // the thing the parallel cases exist to check: with all ids equal,
-        // a wrong tap row changes the logits but not the proposed token,
-        // so acceptance could not move and "identical output" proved
-        // nothing about tap fidelity.  With the odd ids left alone the
-        // proposal depends on which row wins, which depends on the
-        // drafter's hidden state, which depends on the forwarded taps --
-        // so acceptance becomes tap-sensitive while staying non-zero.
+        // The cost is that this fixture cannot, on its own, tell a right
+        // tap row from a wrong one: every id decodes to the same token,
+        // so bad taps change the logits and not the proposal.  Tap
+        // fidelity is therefore asserted DIRECTLY in test_spec_e2e, by
+        // diffing the drafter's own tap dump between one process and a
+        // pipeline, instead of being inferred from acceptance.
         std::vector<float> d2t(size_t(rows), 0.0f);
         for (int i = 0; i < rows; ++i)
-            d2t[size_t(i)] = float(forced_target >= 0
-                ? (i % 2 == 0 ? forced_target - i : 0)
-                : i);
+            d2t[size_t(i)] = float(forced_target >= 0 ? forced_target - i : i);
         t.push_back({"d2t", {rows}, d2t});
     }
     return a;
