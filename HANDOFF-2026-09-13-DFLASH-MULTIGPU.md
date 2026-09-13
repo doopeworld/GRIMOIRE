@@ -155,3 +155,43 @@ follows this one does not record their results, they did not finish --
 block. It now names the DFlash mode explicitly — replicated under TP, or
 "drafter on the last stage; taps forwarded from every stage" under PP —
 because a silently disabled drafter looks exactly like a slow model.
+
+## OPEN, and the first thing to watch on the box
+
+**`test_spec_e2e` has an intermittent failure in `moe+mtp fp8` under
+PIPELINE parallel.** It is not in anything this session built -- MTP
+under PP predates it and was not modified -- but it must not be lost.
+
+Measured across six full runs of the gate on an OpenCL CPU device:
+
+| runs | PP+MTP cases | failures |
+| --- | --- | --- |
+| 4 | 4 of 4 match | 0 |
+| 2 | 3 of 4 match | 1, always `moe+mtp fp8` |
+
+A direct re-run of just that case passed. So: same binary, same fixture,
+same prompt, roughly 1 failure in 3 attempts, always the same case.
+
+Both ranks report `generate: MTP draft failed`, which is
+`generation.hpp` rejecting a drafted token outside the vocabulary. On an
+earlier stage `mtp_draft` is just `pp_sync_token(-1)`, so it reports the
+same thing whether it received a bad token or the last stage died first
+-- the logs do not say which rank originated it.
+
+**Unproven hypothesis, stated as one:** `launch_argmax` (src/ops.cpp)
+demands `reqd_sub_group_size(SG_SIZE)` with SG_SIZE 16 and reduces
+through `reduce_over_group`. That is native on Battlemage and EMULATED on
+an OpenCL CPU device. An intermittent wrong reduction there would produce
+exactly this symptom, and would be an artifact of the simulator rather
+than of the engine. Two things argue for it: the failure is timing-
+dependent, and the same argmax runs on every path yet only the pipelined
+MoE/FP8 case shows it.
+
+It has NOT been shown to be the simulator. Do not assume it is.
+
+**What settles it:** `tools/preflight_b70.sh` runs this exact gate on the
+card. If `moe+mtp fp8` is clean there over a few runs, it was the CPU
+device. If it fails there, it is real and it is a correctness bug in
+speculation under PP -- which is an exactness claim, so it would matter
+more than a slow path. Run the gate more than once before believing
+either answer; a single green run cannot distinguish them.
