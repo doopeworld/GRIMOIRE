@@ -291,6 +291,42 @@ int main() {
         sycl::free(d_in,q); sycl::free(d_out,q);
     }
 
+    // ---- 4a. quantize-then-append == append-then-quantize -------------
+    // The expert-major pack quantizes each expert on its own and appends,
+    // so the host never holds 64 of them as f32 at once.  That is only
+    // exact because every format here is ROW-LOCAL -- BF16 elementwise,
+    // FP8/INT8 per output channel, INT4 per group within a row, MX per
+    // 32-element block within a row.  Assert it instead of arguing it: if
+    // any format ever grew a cross-row term, the packed weight would stay
+    // finite and decode to slightly wrong numbers everywhere.
+    for (Fmt fmt : {Fmt::BF16, Fmt::FP8_E4M3, Fmt::FP8_E5M2, Fmt::INT8,
+                    Fmt::INT4, Fmt::MXFP8, Fmt::MXFP4}) {
+        const int P = 4, N = 24, K = 128;
+        std::vector<float> whole(size_t(P) * N * K);
+        for (auto& v : whole) v = nd(rng) * 0.7f;
+        PackedWeight all = quantize(whole.data(), P * N, K, fmt);
+
+        PackedWeight app;
+        app.fmt = fmt; app.N = P * N; app.K = K;
+        for (int i = 0; i < P; ++i) {
+            PackedWeight one = quantize(whole.data() + size_t(i) * N * K, N, K, fmt);
+            if (i == 0) { app.row_bytes = one.row_bytes; app.row_scales = one.row_scales; }
+            app.payload.insert(app.payload.end(), one.payload.begin(), one.payload.end());
+            app.scales_raw.insert(app.scales_raw.end(),
+                                  one.scales_raw.begin(), one.scales_raw.end());
+            app.zeros.insert(app.zeros.end(), one.zeros.begin(), one.zeros.end());
+        }
+        const bool same_bytes = app.payload == all.payload &&
+                                app.scales_raw == all.scales_raw &&
+                                app.zeros == all.zeros &&
+                                app.row_bytes == all.row_bytes &&
+                                app.row_scales == all.row_scales;
+        std::printf("pack append      %-9s %d x [%d,%d]                   %s\n",
+                    fmt_name(fmt), P, N, K, same_bytes ? "byte-identical" : "DIFFERS");
+        CHECK(same_bytes, "appending per-piece quantization is not identical to "
+                          "quantizing the concatenation (%s)", fmt_name(fmt));
+    }
+
     // ---- 4b. MoVA value projection, experts packed EXPERT-MAJOR ------
     // The kernel that replaces the per-expert GEMV plus the host readback.
     // It must produce EXACTLY what that path produced, so the reference

@@ -1277,6 +1277,72 @@ static DevQuant concat_rows_f32_t(sycl::queue& q, const Qwen35Model& ck,
     return upload_packed(q, quantize(m.data(), N, K, use));
 }
 
+// Pack many same-width tensors along N by quantizing each one SEPARATELY
+// and appending, so the host never holds more than ONE of them as f32.
+//
+// concat_rows_f32_t materialises the whole concatenation first, which is
+// right for a 4-way FFN fold and wrong for MoVA: the real K2 checkpoint
+// has 64 value experts per sparse layer, so that is a 64x jump in
+// load-time peak host memory on a box that is being pipelined precisely
+// because the model does not fit.  It would show up as an OOM on the
+// Tower and nowhere else.
+//
+// Appending is exact because EVERY format in this engine is row-local:
+// BF16 is elementwise, FP8/INT8 scale per output channel, INT4 per group
+// within a row, MX per 32-element block within a row.  No format's
+// encoding of row n depends on any other row, so quantize-then-append
+// equals append-then-quantize, bit for bit.  bin/test_k2_kernels asserts
+// that directly rather than leaving it as an argument.
+static DevQuant concat_rows_quantized_t(sycl::queue& q, const Qwen35Model& ck,
+                                        const std::vector<TensorRef>& refs,
+                                        Fmt fmt, const char* what, bool* ok) {
+    DevQuant d;
+    if (refs.empty()) { *ok = false; return d; }
+    const int K = int(refs[0].t.shape.size() == 2 ? refs[0].t.shape[1] : 0);
+    int N = 0;
+    for (const auto& r : refs) {
+        if (!r.ok() || r.t.shape.size() != 2 || int(r.t.shape[1]) != K) {
+            std::printf("\n  cannot row-concatenate %s (shape mismatch)\n", what);
+            *ok = false; return d;
+        }
+        N += int(r.t.shape[0]);
+    }
+    Fmt use = fmt;
+    const int blk = (fmt == Fmt::INT4) ? kInt4Group
+                  : (fmt == Fmt::MXFP4 || fmt == Fmt::MXFP8) ? kMXBlock : 1;
+    if (blk > 1 && (K % blk) != 0) use = Fmt::BF16;
+
+    PackedWeight out;
+    out.fmt = use; out.N = N; out.K = K;
+    std::vector<float> m;
+    std::string err;
+    bool first = true;
+    for (const auto& r : refs) {
+        const int n = int(r.t.shape[0]);
+        m.assign(size_t(n) * K, 0.0f);
+        if (!read_matrix_f32(ck, r, m.data(), err)) {
+            std::printf("\n  %s: %s\n", what, err.c_str()); *ok = false; return d;
+        }
+        PackedWeight pw = quantize(m.data(), n, K, use);
+        if (first) {
+            out.row_bytes = pw.row_bytes; out.row_scales = pw.row_scales;
+            first = false;
+        } else if (pw.row_bytes != out.row_bytes ||
+                   pw.row_scales != out.row_scales) {
+            // Same format and same K, so this cannot differ -- if it ever
+            // does, every row index past this point is wrong and the
+            // values stay finite.  Refuse instead.
+            std::printf("\n  %s: inconsistent packed row stride\n", what);
+            *ok = false; return d;
+        }
+        out.payload.insert(out.payload.end(), pw.payload.begin(), pw.payload.end());
+        out.scales_raw.insert(out.scales_raw.end(),
+                              pw.scales_raw.begin(), pw.scales_raw.end());
+        out.zeros.insert(out.zeros.end(), pw.zeros.begin(), pw.zeros.end());
+    }
+    return upload_packed(q, out);
+}
+
 // down' = [a | b] along K: row n is a's row n followed by b's row n.
 static DevQuant concat_cols_f32_t(sycl::queue& q, const Qwen35Model& ck,
                                   const TensorRef& ra, const TensorRef& rb,
@@ -3096,7 +3162,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         refs.reserve(size_t(cfg.mova_experts));
                         for (int e = 0; e < cfg.mova_experts; ++e)
                             refs.push_back(src.v_experts[size_t(e)]);
-                        d.v_experts_packed = concat_rows_f32_t(
+                        // Quantized per expert and appended: 64 experts
+                        // held as f32 at once would be a 64x load-time
+                        // spike on exactly the box that has no room.
+                        d.v_experts_packed = concat_rows_quantized_t(
                             lq, ck, refs, PF, "self_attn.v_experts.packed", &ok);
                         if (ok) {
                             const int rows = d.v_experts_packed.w.N;
