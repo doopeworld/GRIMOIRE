@@ -78,6 +78,7 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
         const int k=std::min({o.draft_depth,e.max_seq-e.pos-1,o.max_tokens-int(out.size())});
         if((o.dflash||o.mtp)&&k>0) {
             const int saved=e.pos;
+            bool degraded=false;   // draft discarded unjudged, see below
             e.snapshot_recurrent();
             std::vector<int32_t> candidates{tok};
             if(o.dflash) {
@@ -105,10 +106,29 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 // hard failure: correct output was available and the
                 // request threw anyway.
                 verified.clear();
-                for(size_t i=0;i<candidates.size();++i){
-                    if(!e.forward(candidates[i]))
+                if(e.has_recurrent_state()) {
+                    // A sequential verify on a recurrent model cannot be
+                    // rolled back: commit_spec_prefix replays from the
+                    // per-step images only the BATCHED verify writes, and
+                    // restore-and-replay corrupts memory (see below).  It
+                    // is not enough that the engine said a batched verify
+                    // was AVAILABLE -- spec_verify_available() answers for
+                    // the device, not for this call, and a scratch
+                    // allocation can still fail here.  Nothing has been
+                    // submitted yet, so degrade this round to a plain
+                    // step: forward the verified anchor alone and leave
+                    // the drafted suffix unused.
+                    degraded = true;
+                    candidates.resize(1);
+                    if(!e.forward(candidates[0]))
                         throw std::runtime_error("speculative verification failed");
                     verified.push_back(e.argmax_token());
+                } else {
+                    for(size_t i=0;i<candidates.size();++i){
+                        if(!e.forward(candidates[i]))
+                            throw std::runtime_error("speculative verification failed");
+                        verified.push_back(e.argmax_token());
+                    }
                 }
             }
             if(verified.size()!=candidates.size())
@@ -119,7 +139,11 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             // a stop token or a cancelled callback: the round happened and
             // its proposals were judged either way, and dropping it would
             // bias the rate upward on exactly the requests that end early.
-            if(o.stats) {
+            // A degraded round proposed a draft and then threw it away
+            // without the verifier ever judging it.  Counting it as a step
+            // with zero accepted would report an acceptance rate for a
+            // round that never happened.
+            if(o.stats && !degraded) {
                 ++o.stats->steps;
                 o.stats->drafted  += int(candidates.size())-1;   // anchor is not a draft
                 o.stats->accepted += accepted-1;

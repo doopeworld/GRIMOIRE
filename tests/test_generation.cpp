@@ -94,6 +94,30 @@ int main(){
             if(rejected>=0)assert(dec.commits>0);   // rollback happened
         }
     }
+    // A RECURRENT model whose batched verify declines must not commit a
+    // speculative prefix: the images commit_spec_prefix replays from are
+    // written only by the batched path.  spec_verify_available() answers
+    // for the device, not for the call, so this is reachable whenever a
+    // scratch allocation fails -- and the old code walked straight into
+    // it.  The round degrades to a plain step instead, which must still
+    // produce exactly the non-speculative tokens, and must not be counted
+    // as a speculative step because its draft was never judged.
+    {
+        Engine plain;GenerationOptions po{20,-1,-1,0,false,false,false};
+        std::vector<int32_t> want;
+        generate_tokens(plain,prompt,po,want,{},reason);
+        for(bool df:{false,true})for(int rejected:{-1,0,1,2}){
+            Engine rec;rec.recurrent=true;rec.decline_verify=true;rec.reject_at=rejected;
+            SpecStats st;
+            GenerationOptions so{20,-1,-1,3,df,!df,false,&st};
+            std::vector<int32_t> got;
+            generate_tokens(rec,prompt,so,got,{},reason);
+            assert(got==want);            // still exactly plain decode
+            assert(rec.commits==0);       // never committed an unsaved prefix
+            assert(rec.batch_verifies==0);
+            assert(st.steps==0);          // no round was ever judged
+        }
+    }
     // A verify whose forward actually fails is still a hard failure.
     Engine failure;failure.decline_verify=true;
     failure.fail_forward_after=int(prompt.size())+1;o.draft_depth=3;o.mtp=true;

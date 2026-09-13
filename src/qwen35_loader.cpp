@@ -596,6 +596,38 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             lay.pf_gate = linear(pf + "gate_proj");
             lay.pf_up   = linear(pf + "up_proj");
             lay.pf_down = linear(pf + "down_proj");
+            // The uploader folds only when all three are present, and
+            // otherwise takes the ordinary gate/up/down branch.  Silently.
+            // Since dense_inter has already been widened to the folded
+            // size, nothing downstream would notice either: the engine
+            // would just run a narrower FFN than the checkpoint has.  A
+            // declared parallel FFN with a missing projection is a broken
+            // checkpoint, so say which layer and which tensor.
+            const TensorRef* pfs[3] = {&lay.pf_gate, &lay.pf_up, &lay.pf_down};
+            const char* pfn[3] = {"gate_proj", "up_proj", "down_proj"};
+            for (int t = 0; t < 3; ++t) {
+                if (pfs[t]->ok()) continue;
+                err = "parallel_ffn_intermediate_size is " +
+                      std::to_string(cfg.parallel_ffn_inter) + " but layer " +
+                      std::to_string(L) + " has no " + pf + pfn[t];
+                return false;
+            }
+            // Paired widths, checked against the config rather than
+            // against each other alone: a gate/up pair that agree with
+            // one another but not with the declared width would fold into
+            // a matrix whose shape is self-consistent and wrong.
+            const int pg = int(lay.pf_gate.t.shape.size()==2 ? lay.pf_gate.t.shape[0] : 0);
+            const int pu = int(lay.pf_up.t.shape.size()==2   ? lay.pf_up.t.shape[0]   : 0);
+            const int pd = int(lay.pf_down.t.shape.size()==2 ? lay.pf_down.t.shape[1] : 0);
+            if (pg != cfg.parallel_ffn_inter || pu != cfg.parallel_ffn_inter ||
+                pd != cfg.parallel_ffn_inter) {
+                err = "layer " + std::to_string(L) + " parallel_ffn widths (" +
+                      std::to_string(pg) + "," + std::to_string(pu) + "," +
+                      std::to_string(pd) + ") disagree with "
+                      "parallel_ffn_intermediate_size " +
+                      std::to_string(cfg.parallel_ffn_inter);
+                return false;
+            }
         }
         // K2: a DENSE layer has no router and no experts -- its FFN is one
         // intermediate_size MLP under mlp.{gate,up,down}_proj.  cfg.is_moe()

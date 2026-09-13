@@ -848,9 +848,33 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
                          const TensorRef& ra, const TensorRef& rb,
                          Fmt fmt, const char* what, bool* ok);
 
+bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
+                              PackedWeight& p, std::string& err);
+
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
     if (r.native) return ck.read_native_f32(r,dst,err);
+    // compressed-tensors INT4 must be decoded, not read.  The loader
+    // rewrites this tensor's LOGICAL shape to [N][K] while the payload
+    // still holds K/8 int32 words per row, so falling through to the
+    // plain branch below asks read_f32 for N*K values from a buffer with
+    // N*K/8 -- an overread past the end of the mapping, with the group
+    // scales ignored on top.  Every earlier caller happened to hold a
+    // format this never reached; the FFN fold reaches it.
+    if (r.compressed_int4) {
+        PackedWeight p;
+        if (!read_compressed_int4_ref(ck, r, p, err)) {
+            if (err.empty()) err = "compressed INT4 tensor could not be decoded";
+            return false;
+        }
+        const QuantWeight w = p.view();
+        // at() is the reference dequant the GPU tiles must agree with bit
+        // for bit, so decoding through it cannot drift from the kernels.
+        for (int n = 0; n < w.N; ++n)
+            for (int k = 0; k < w.K; ++k)
+                dst[int64_t(n) * w.K + k] = w.at(n, k);
+        return true;
+    }
     if (!r.gptq) {
         if (!ck.shards[r.shard]->read_f32(r.t, dst, err)) return false;
         if (r.row_scaled) {
@@ -1548,19 +1572,41 @@ struct Grimoire {
         }
         const char* e = std::getenv("GRIMOIRE_PP_RANK");
         if (!e || !*e) e = std::getenv("GRIMOIRE_TP_RANK");
-        const int rank = e && *e ? std::atoi(e) : 0;
+        const bool rank_requested = e && *e;
+        const int rank = rank_requested ? std::atoi(e) : 0;
         if (rank >= 0 && rank < int(pick.size())) {
-            // Say which card this rank got.  On a mixed box the layer
-            // split depends on it, and "it was slow" is not debuggable
-            // without knowing which rank ran where.
+            // Say which card this rank got, with a PHYSICAL identity where
+            // the driver exposes one.  On a mixed box the layer split
+            // depends on which rank landed where, and the vector index
+            // alone is not an identity -- it moves with ZE_AFFINITY_MASK
+            // and with whatever the driver happened to enumerate.
             static bool said = false;
             if (!said) {
                 said = true;
-                std::fprintf(stderr, "  rank %d -> GPU %d/%zu: %s\n", rank, rank,
+                const auto& dev = pick[size_t(rank)];
+                std::string id;
+#ifdef SYCL_EXT_INTEL_DEVICE_INFO
+                if (dev.has(sycl::aspect::ext_intel_pci_address))
+                    id = " pci " + dev.get_info<
+                        sycl::ext::intel::info::device::pci_address>();
+#endif
+                std::fprintf(stderr, "  rank %d -> GPU %d/%zu: %s%s\n", rank, rank,
                              pick.size(),
-                             pick[size_t(rank)].get_info<sycl::info::device::name>().c_str());
+                             dev.get_info<sycl::info::device::name>().c_str(),
+                             id.c_str());
             }
             return pick[size_t(rank)];
+        }
+        // An explicitly ranked process whose device does not exist must
+        // NOT fall through to the default selector: every rank would then
+        // pick the same card, the collectives would still connect, and the
+        // run would look like it worked while two ranks fought over one
+        // GPU.  Fail where the cause is still visible.
+        if (rank_requested && !pick.empty()) {
+            throw std::runtime_error(
+                "GRIMOIRE rank " + std::to_string(rank) + " has no device: only " +
+                std::to_string(pick.size()) + " GPU(s) are visible. Check "
+                "ZE_AFFINITY_MASK and GRIMOIRE_DEVICES.");
         }
         // GRIMOIRE_DEVICE_ANY: run on whatever SYCL device exists when
         // there is no GPU at all.  This is a CORRECTNESS harness, not a
@@ -4131,17 +4177,26 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     int(dflash2.layers.size())*2*DKV,cfg.vocab});
                 dflash2.linear_in_f16=df16(size_t(DMC)*linear_in_width);
                 dflash2.linear_out_f16=df16(size_t(DMC)*linear_out_width);
-                dflash2.block_table=sycl::malloc_device<int32_t>(dflash2.num_blocks,q);
+                // The block table is SHARED with the target's own paged
+                // attention, which pages at 64 and indexes
+                // ceil(max_seq/64) entries.  Sizing it from the draft page
+                // alone is only safe while the draft page is <= 64: a
+                // configured or GRIMOIRE_DEFAULT-overridden 128 gives the
+                // table ceil(max_seq/128) entries and the target then
+                // reads twice that many.  Size it for BOTH consumers.
+                const int table_entries = std::max(
+                    dflash2.num_blocks, (max_seq + 63) / 64);
+                dflash2.block_table=sycl::malloc_device<int32_t>(size_t(table_entries),q);
                 dflash2.cu_q=sycl::malloc_device<int32_t>(2,q);
                 dflash2.cu_k=sycl::malloc_device<int32_t>(2,q);
                 dflash2.seqused_k=sycl::malloc_device<int32_t>(1,q);
-                db+=size_t(dflash2.num_blocks+5)*sizeof(int32_t);
+                db+=size_t(table_entries+5)*sizeof(int32_t);
                 if(!dflash2.q_f16||!dflash2.k_f16||!dflash2.v_f16||
                    !dflash2.attn_f16||!dflash2.linear_in_f16||
                    !dflash2.linear_out_f16||!dflash2.block_table||!dflash2.cu_q||
                    !dflash2.cu_k||!dflash2.seqused_k)dok=false;
                 if(dok){
-                    std::vector<int32_t> blocks(size_t(dflash2.num_blocks));
+                    std::vector<int32_t> blocks(size_t(table_entries), 0);
                     std::iota(blocks.begin(),blocks.end(),0);
                     const int32_t cuq[2]={0,DM};
                     const int32_t cuk[2]={0,0};
@@ -7551,8 +7606,30 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const bool need_aux=parallel_prefill||parallel_shared;
     const bool norm_bf_only=M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
         (!cfg.is_moe()||xe2_grouped_mxfp4)&&!need_aux;
+    // Deferred gathering leaves the routed result permuted in moe_res and
+    // makes the NEXT layer's input norm un-permute it
+    // (launch_rmsnorm_moe_residual_batched reads moe_res/pinv/rwt).  That
+    // is only valid if the previous layer actually routed.  cfg.is_moe()
+    // is a property of the MODEL: K2 is a MoE model whose first layers are
+    // DENSE, so with this on, layer 0 writes r0, layer 1 un-permutes
+    // routing buffers the dense layer never filled, and layer 0's real
+    // output is dropped -- with stale route indices free to read anywhere.
+    // The fused routine also normalises over the whole hidden width with
+    // (1 + weight), which is not K2's grouped, direct-weight convention,
+    // so even an all-routed K2 stage would be numerically wrong.
+    //
+    // Require every layer this process executes to be routed.  tools/nrun.sh
+    // sets GRIMOIRE_DEFER_MOE_GATHER=1, so this is a reachable launcher
+    // configuration, not a dormant helper.
+    bool all_layers_routed=cfg.is_moe();
+    {
+        const int lb=pp_enabled()?pp_begin:0, le=pp_enabled()?pp_end:cfg.n_layers;
+        for(int li=lb;li<le&&all_layers_routed;++li)
+            if(!L[size_t(li)].moe_layer)all_layers_routed=false;
+    }
     const bool defer_moe_gather=std::getenv("GRIMOIRE_DEFER_MOE_GATHER")&&
-        cfg.is_moe()&&M>=32&&xe2_grouped_mxfp4&&norm_bf_only;
+        cfg.is_moe()&&!cfg.is_k2&&all_layers_routed&&
+        M>=32&&xe2_grouped_mxfp4&&norm_bf_only;
     // Dense Qwen has no routed experts (R=M, I=1) but its fused MLP projection
     // is much wider than H.  Size bridge scratch from every real projection,
     // not from MoE geometry, or the native dense kernel writes past the end.

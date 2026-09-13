@@ -47,9 +47,28 @@ if docker ps --format '{{.Names}}' | grep -q '^grim-'; then
     echo "REFUSING: a grim-* container is already running" >&2; exit 3
 fi
 
-# 0,1,...,N-1 -- the visibility list every child shares, exactly as the
-# two-card script does.  Each child then selects its own device by rank.
-MASK=$(seq -s, 0 $((N-1)))
+# Build the visibility list from the NAMED nodes, not from their count.
+# A bare 0,1,...,N-1 exposes every card and then selects the first N, so
+# asking for renderD129,renderD130 on a three-card box would silently run
+# on renderD128,renderD129 instead -- the names would be validated and
+# then ignored.  Level Zero enumerates in the same order the render nodes
+# are numbered, so each node's position among ALL present renderD* nodes
+# is its device index.
+ALL_NODES=$(ls /dev/dri | grep '^renderD' | sort -V)
+MASK=""
+for NODE in "${NODE_LIST[@]}"; do
+    IDX=$(printf '%s
+' "$ALL_NODES" | grep -n -x "$NODE" | cut -d: -f1)
+    [ -n "$IDX" ] || { echo "cannot place $NODE among /dev/dri render nodes" >&2; exit 2; }
+    MASK="${MASK:+$MASK,}$((IDX-1))"
+done
+# Duplicates would give two ranks the same card and deadlock the
+# collectives rather than fail.
+if [ "$(printf '%s' "$MASK" | tr ',' '
+' | sort -u | wc -l)" -ne "$N" ]; then
+    echo "duplicate render nodes in '$NODES' -> mask $MASK" >&2; exit 2
+fi
+echo "device mask: $MASK  (from $NODES)"
 
 CNAME="grim-$NAME"
 docker rm -f "$CNAME" >/dev/null 2>&1 || true
@@ -101,8 +120,15 @@ echo "launched $CNAME ${CID:0:12} for $N GPU(s) [$NODES] mode=$MODE (limit ${LIM
 RC=$(docker wait "$CNAME" 2>/dev/null || echo wait-failed)
 docker logs "$CNAME" >"/tmp/$CNAME.log" 2>&1
 echo "exit=$RC log=/tmp/$CNAME.log"
+# Propagate the container's status.  Ending on the `else` branch returns
+# that echo's exit code, so a failed or timed-out run reported success to
+# every caller -- including any script that chains on it.
 if [ "$RC" = 0 ]; then
     docker rm "$CNAME" >/dev/null 2>&1
-else
-    echo "NON-ZERO EXIT -- container $CNAME kept for inspection" >&2
+    exit 0
 fi
+echo "NON-ZERO EXIT -- container $CNAME kept for inspection" >&2
+case "$RC" in
+    ''|*[!0-9]*) exit 125 ;;   # docker wait itself failed
+    *) exit "$RC" ;;
+esac

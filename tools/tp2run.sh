@@ -49,5 +49,15 @@ echo "launched $CNAME ${CID:0:12} for $NODE0+$NODE1 (limit ${LIMIT}s)"
 RC=$(docker wait "$CNAME" 2>/dev/null || echo wait-failed)
 docker logs "$CNAME" >"/tmp/$CNAME.log" 2>&1
 echo "exit=$RC log=/tmp/$CNAME.log"
-if [ "$RC" = 0 ]; then docker rm "$CNAME" >/dev/null 2>&1;
-else echo "NON-ZERO EXIT -- container $CNAME kept for inspection" >&2; fi
+# Propagate the container's status.  Ending on the `else` branch returns
+# that echo's exit code, so a failed or timed-out run reported success to
+# every caller -- including any script that chains on it.
+if [ "$RC" = 0 ]; then
+    docker rm "$CNAME" >/dev/null 2>&1
+    exit 0
+fi
+echo "NON-ZERO EXIT -- container $CNAME kept for inspection" >&2
+case "$RC" in
+    ''|*[!0-9]*) exit 125 ;;   # docker wait itself failed
+    *) exit "$RC" ;;
+esac

@@ -151,10 +151,18 @@ say "4. device gates (no model)"
 # and tune.sh supplies the node and the limit -- so the first thing WE
 # pass is the container NAME, not the binary.  Getting that wrong makes
 # the binary the container name and runs nothing.
+# A gate that was not BUILT is not a gate that passed.  build_b70.sh
+# treats device-test compile failures as warnings, so a missing binary
+# here means the build silently dropped a required check -- and skipping
+# it let preflight finish clean and exit 0.  These are required: treat a
+# missing one as a failure, not a skip.
 run_gate() {
   local bin="$1"; shift
   local name="${bin##*/}"
-  if [[ ! -x "$bin" ]]; then skip "$bin not built"; return; fi
+  if [[ ! -x "$bin" ]]; then
+    bad "$bin was not built -- the build dropped a required gate"
+    return
+  fi
   stage "$name" env GPU="$GPU" LIM=900 bash tools/tune.sh \
         "pf-${name//_/-}" "/grimoire/${bin}" "$@"
 }
