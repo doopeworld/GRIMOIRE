@@ -53,15 +53,27 @@ command -v ocloc >/dev/null || echo "warning: ocloc not on PATH, AOT will fail"
 # than the toolchain.  Battlemage wants compute-runtime 24.35 or newer,
 # from Intel's own repo, not the distro's.
 #
-# `ocloc ids` exits 0 either way, so the OUTPUT is what decides -- and an
-# ocloc too old to have the subcommand at all must not be read as a
-# refusal, so only the explicit "Unknown acronym" counts.
-ocloc_probe() {   # $1 = intel_gpu_<die>
-    local die="${1#intel_gpu_}"
-    local out; out="$(ocloc ids "$die" 2>&1)" || true
+# MEASURED: on this build `ocloc ids bmg_g31` exits 226, and an earlier
+# note here claiming it exits 0 either way was wrong -- that reading had
+# captured a pipeline's status, not ocloc's.  The probe below therefore
+# requires a POSITIVE answer (exit 0 AND "Matched ids") and does not care
+# which way a failure is expressed.
+# A probe that only looked for "Unknown acronym" accepted every OTHER way
+# ocloc can fail to answer: a build without the `ids` subcommand, a broken
+# install that cannot load its libraries, anything non-zero.  Require a
+# POSITIVE answer -- exit 0 and a "Matched ids" line -- and report anything
+# else, with the reason, rather than letting it through to the compiler.
+ocloc_probe() {   # $1 = intel_gpu_<die>; echoes "<die>|<reason>" on failure
+    local die="${1#intel_gpu_}" out rc
+    out="$(ocloc ids "$die" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "$die|ocloc ids exited $rc"
+        return
+    fi
     case "$out" in
-        *"Unknown acronym"*) echo "$die" ;;   # this ocloc cannot target it
-        *) ;;                                 # matched, or too old to know
+        *"Matched ids"*) ;;                          # this ocloc knows it
+        *"Unknown acronym"*) echo "$die|not a device this ocloc knows" ;;
+        *) echo "$die|ocloc gave no usable answer: $(echo "$out" | head -1)" ;;
     esac
 }
 
@@ -87,15 +99,17 @@ for _t in "${TARGET_LIST[@]}"; do
 done
 
 if command -v ocloc >/dev/null; then
-    UNKNOWN=""
+    BAD=""
     for _t in "${TARGET_LIST[@]}"; do
-        _bad="$(ocloc_probe "$_t")"
-        [ -n "$_bad" ] && UNKNOWN="$UNKNOWN $_bad"
+        _r="$(ocloc_probe "$_t")"
+        [ -n "$_r" ] && BAD="$BAD
+       ${_r%%|*}: ${_r#*|}"
     done
-    if [ -n "$UNKNOWN" ]; then
-        echo "ERROR: this ocloc does not know:$UNKNOWN" >&2
-        echo "       It is too old for Battlemage.  Install Intel's" >&2
-        echo "       compute-runtime (24.35+); the distro package is not it." >&2
+    if [ -n "$BAD" ]; then
+        echo "ERROR: this ocloc cannot target what is being built:$BAD" >&2
+        echo "       Battlemage needs Intel's compute-runtime 24.35+." >&2
+        echo "       Ubuntu's intel-ocloc is 23.43 and predates it -- it" >&2
+        echo "       installs cleanly and then cannot compile for bmg_g31." >&2
         echo "       B70_TARGET=... narrows the dies if that is what you want." >&2
         exit 1
     fi

@@ -1831,6 +1831,7 @@ struct Grimoire {
     bool pp_sync_tokens(std::vector<int32_t>& toks);
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
+    bool prefix_cache_usable() const;
     bool pp_send_taps(int first,int rows);
     bool pp_recv_taps(int first,int rows);
     int  pp_sync_token(int token);
@@ -3152,7 +3153,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     // through getenv on every load, not a function-local
                     // static, so a single process can load both ways.
                     const char* per_ex = std::getenv("GRIMOIRE_MOVA_PER_EXPERT");
-                    if (!tp_enabled() && !(per_ex && *per_ex && *per_ex != '0')) {
+                    const bool want_pack =
+                        !tp_enabled() && !(per_ex && *per_ex && *per_ex != '0');
+                    if (want_pack) {
                         // Expert-major: one [E*N][K] weight, so the routed
                         // value projection reads the routing table on the
                         // DEVICE instead of stalling on it once per layer.
@@ -3162,12 +3165,41 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         refs.reserve(size_t(cfg.mova_experts));
                         for (int e = 0; e < cfg.mova_experts; ++e)
                             refs.push_back(src.v_experts[size_t(e)]);
+                        // The packer goes through read_matrix_f32 +
+                        // quantize.  quantize_upload_t does NOT for a
+                        // checkpoint that already ships quantized weights:
+                        // it imports a native .b70, a compressed-INT4, a
+                        // GPTQ or a row-scaled FP8 tensor directly,
+                        // because saved precision is authoritative.
+                        // Packing such a tensor would DECODE AND RE-QUANTIZE
+                        // it -- a different model, not a different layout,
+                        // and since TP keeps the per-expert path the two
+                        // would load different effective models from one
+                        // checkpoint.  Refuse to pack those and say so;
+                        // a silent fall back to the slower path is its own
+                        // bug.  (BF16 is not in this list: bf16 -> f32 ->
+                        // bf16 is exact, so packing it changes nothing.)
+                        bool saved_precision = false;
+                        for (const auto& r : refs)
+                            if (r.native || r.compressed_int4 || r.gptq ||
+                                r.row_scaled) { saved_precision = true; break; }
                         // Quantized per expert and appended: 64 experts
                         // held as f32 at once would be a 64x load-time
                         // spike on exactly the box that has no room.
+                        if (saved_precision) {
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                std::printf("\n  MoVA: experts ship saved "
+                                    "precision (native/int4/gptq/fp8) -- keeping "
+                                    "the per-expert path so the checkpoint's own "
+                                    "weights are used verbatim; the packed path "
+                                    "would re-quantize them\n");
+                            }
+                        } else
                         d.v_experts_packed = concat_rows_quantized_t(
                             lq, ck, refs, PF, "self_attn.v_experts.packed", &ok);
-                        if (ok) {
+                        if (ok && d.v_experts_packed.w.N > 0) {
                             const int rows = d.v_experts_packed.w.N;
                             if (cfg.mova_experts <= 0 || rows % cfg.mova_experts) {
                                 // Refuse rather than divide wrongly: every
@@ -3184,7 +3216,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                             d.v_experts_n = rows / cfg.mova_experts;
                             acct(d.v_experts_packed.w.bytes());
                         }
-                    } else {
+                    }
+                    if (!want_pack || d.v_experts_packed.w.N == 0) {
                         d.v_experts.resize(size_t(cfg.mova_experts));
                         for (int e = 0; e < cfg.mova_experts && ok; ++e) {
                             const std::string vn =
@@ -4944,8 +4977,28 @@ void Grimoire::reset() {
     pos = 0;
 }
 
+// Prefix caching has to be a PIPELINE-WIDE decision.
+//
+// mtp.ok and dflash2.ok are LOCAL: under PP only the last stage holds
+// either, so asking them lets an earlier stage cache a prompt the last
+// stage declined to cache.  On the repeat that earlier stage restores and
+// returns from prefill WITHOUT sending the hidden state, while the last
+// stage blocks reading it -- and the two wait on each other.  Nothing
+// times out and nothing logs.
+//
+// pp_spec and pp_dflash are the handshake answers every stage shares, so
+// ask those instead.  Plain PP without a drafter is unaffected: every
+// stage then makes the same decision, which is what made caching safe
+// there in the first place.
+bool Grimoire::prefix_cache_usable() const {
+    if (!prefix_cache_enabled() || cfg.is_muse) return false;
+    if (mtp.ok || dflash2.ok) return false;
+    if (pp_enabled() && (pp_spec || pp_dflash > 0)) return false;
+    return true;
+}
+
 bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
-    if (!prefix_cache_enabled() || tokens.empty() || mtp.ok || dflash2.ok || cfg.is_muse) return false;
+    if (!prefix_cache_usable() || tokens.empty()) return false;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
@@ -4985,7 +5038,7 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
 }
 
 bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
-    if (!prefix_cache_enabled() || mtp.ok || dflash2.ok || cfg.is_muse || !prefix_cache.valid ||
+    if (!prefix_cache_usable() || !prefix_cache.valid ||
         prefix_cache.tokens != tokens) return false;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
@@ -5123,6 +5176,9 @@ void Grimoire::release() {
         d.sh_gu.release(q); d.sh_down.release(q);
         d.la_ab.release(q); d.sh_gate_q.release(q);
         d.router.release(q);
+        d.v_router.release(q);
+        d.v_experts_packed.release(q);
+        for (auto& ve : d.v_experts) ve.release(q);
         for (void* p : {(void*)d.in_norm, (void*)d.post_norm,
                         (void*)d.in_norm_f16, (void*)d.post_norm_f16,
                         (void*)d.pre_ff_norm_f16, (void*)d.post_ff_norm_f16,
@@ -6945,15 +7001,37 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             std::fprintf(stderr,"PP rank %d: draft block receive failed\n",pp_rank);
             return false;
         }
+        // The last stage marks a refusal with -1, which is not a legal
+        // token id.  Fail the same round it did, rather than verifying a
+        // block of -1 and throwing "invalid draft token" on every rank.
+        if(!draft_tokens.empty()&&draft_tokens[0]<0){
+            draft_tokens.clear();
+            return false;
+        }
         return true;
     }
     const int M=dflash_block_rows();
+    // Every refusal from here on must ALSO unblock the earlier stages, which
+    // are already sitting in pp_sync_tokens() waiting for a block: they
+    // committed to receiving one before this stage decided it could not
+    // produce it.  Without this they wait until the socket tears down --
+    // a CLI process exiting frees them by EOF, a surviving server does not.
+    // A block of -1 is the failure marker; it is not a legal token id, and
+    // the receiver turns it back into `return false` so every stage fails
+    // the same round the same way.
+    auto refuse=[&]()->bool{
+        if(pp_enabled()&&pp_rank==pp_world-1&&pp_world>1){
+            std::vector<int32_t> dead(size_t(std::max(0,pp_dflash-1)),-1);
+            if(!dead.empty())pp_sync_tokens(dead);
+        }
+        return false;
+    };
     if(!dflash2.ok||position<0||position+M>max_seq){
         static bool once2=false;
         if(!once2){once2=true;std::fprintf(stderr,
             "  DFlash2: entry guard ok=%d pos=%d M=%d max_seq=%d\n",
             int(dflash2.ok),position,M,max_seq);}
-        return false;}
+        return refuse();}
     // DFlash2 needs its dynamic convolutions; without them the draft is the
     // wrong function and acceptance collapses silently.
     if(dflash2.v2&&(!dflash2.conv_delta||!dflash2.conv_scratch)){
@@ -6962,8 +7040,8 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             "  DFlash2: conv buffers missing (taps %d groups %d delta %p scratch %p)\n",
             dflash2.conv_taps,dflash2.conv_groups,
             (void*)dflash2.conv_delta,(void*)dflash2.conv_scratch);}
-        return false;}
-    if(dflash2.v2&&cfg.is_muse)return false;
+        return refuse();}
+    if(dflash2.v2&&cfg.is_muse)return refuse();
     const int H=dflash2.hidden,QH=dflash2.q_heads,KVH=dflash2.kv_heads;
     const int HD=dflash2.head_dim,QW=QH*HD,KVW=KVH*HD,I=dflash2.inter;
     const int MASK=dflash2.mask_token;
@@ -9498,8 +9576,15 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     o.dflash=(e.pp_enabled()?e.pp_dflash>0:e.dflash2.ok) &&
              e.spec_verify_available();
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
-    o.draft_depth=o.dflash?e.dflash_block_rows()-1
-                          :std::clamp(depth?std::atoi(depth):3,0,15);
+    // Under PP the WIDTH must come from the handshake too, not from this
+    // rank's own dflash_block_rows().  pp_dflash already sizes the block
+    // each stage RECEIVES; if the depth it verifies came from a local
+    // GRIMOIRE_DFLASH_M the two would disagree, the hidden/tap messages
+    // would be different lengths, and the socket would desynchronise --
+    // with no error where it happened.
+    o.draft_depth=o.dflash
+        ?(e.pp_enabled()?e.pp_dflash-1:e.dflash_block_rows()-1)
+        :std::clamp(depth?std::atoi(depth):3,0,15);
     // spec_active() is the PIPELINE's answer, not this rank's: under PP
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.

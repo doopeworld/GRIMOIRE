@@ -142,7 +142,8 @@ for a specific reason rather than a vague one.
 
 `build_b70.sh` now probes each die with `ocloc ids` before it compiles
 anything and refuses with that explanation, instead of letting the build
-run to the device compile and fail with an error that names the die. Note
-that `ocloc ids` exits 0 whether or not it recognises the acronym, so the
-check reads its OUTPUT; an `ocloc` too old to have the subcommand at all
-is not treated as a refusal.
+run to the device compile and fail with an error that names the die. The probe requires a POSITIVE answer -- exit 0 and a `Matched ids` line --
+so a missing subcommand, a broken install, or any other way of failing to
+answer is caught too, not just the one error string. (An earlier note here
+said `ocloc ids` exits 0 either way. That was wrong: it exits 226 on this
+build. The reading behind it had captured a pipeline's status.)

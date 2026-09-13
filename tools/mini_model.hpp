@@ -418,9 +418,21 @@ inline Arch dflash_draft(int L = 2, bool own_head = false, bool own_embed = fals
         // draft id i to target id 2i, which is inside the target vocabulary
         // and is emphatically NOT the identity, so a build that drops the
         // mapping proposes different tokens rather than the same ones.
+        // Only HALF the forced vocabulary collapses onto the target.
+        //
+        // Mapping every draft id to one token made the fixture blind to
+        // the thing the parallel cases exist to check: with all ids equal,
+        // a wrong tap row changes the logits but not the proposed token,
+        // so acceptance could not move and "identical output" proved
+        // nothing about tap fidelity.  With the odd ids left alone the
+        // proposal depends on which row wins, which depends on the
+        // drafter's hidden state, which depends on the forwarded taps --
+        // so acceptance becomes tap-sensitive while staying non-zero.
         std::vector<float> d2t(size_t(rows), 0.0f);
         for (int i = 0; i < rows; ++i)
-            d2t[size_t(i)] = float(forced_target >= 0 ? forced_target - i : i);
+            d2t[size_t(i)] = float(forced_target >= 0
+                ? (i % 2 == 0 ? forced_target - i : 0)
+                : i);
         t.push_back({"d2t", {rows}, d2t});
     }
     return a;

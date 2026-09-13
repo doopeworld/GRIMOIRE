@@ -151,6 +151,19 @@ static std::pair<int,int> spawn_two(const char* self, const std::string& dir,
     return { rcw, WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st) };
 }
 
+// The "(A of D drafted" counts out of a spec line, so two runs can be
+// compared on what the drafter PROPOSED rather than only on the final
+// tokens.  Speculation is exact, so the tokens match whether or not the
+// drafter saw the right inputs -- the acceptance count is the only thing
+// that moves when a draft is computed from the wrong state.
+static std::pair<int,int> spec_counts(const std::string& line) {
+    const size_t a = line.find('(');
+    if (a == std::string::npos) return {-1,-1};
+    int acc = -1, drafted = -1;
+    if (std::sscanf(line.c_str()+a, "(%d of %d", &acc, &drafted) != 2) return {-1,-1};
+    return {acc, drafted};
+}
+
 // Pull the "spec:" line GRIMOIRE_SPEC_STATS prints, so a correct-but-
 // never-accepted drafter is visible rather than passing quietly.
 static std::string spec_line(const std::string& log) {
@@ -548,8 +561,18 @@ int main(int argc, char** argv) {
                     std::printf("   TP+DFlash accepted NOTHING -- the drafter "
                                 "did not load or drafted nothing: %s\n",
                                 tstats.c_str());
+                } else if (spec_counts(tstats) != spec_counts(fstats)) {
+                    // Exact output is NOT enough: speculation is exact, so
+                    // the tokens match even if every draft was computed
+                    // from the wrong state and rejected.  What must also
+                    // match is what the drafter PROPOSED.
+                    ++g_fail;
+                    std::printf("   TP+DFlash accepted a DIFFERENT number than "
+                                "one process -- the drafter saw different state"
+                                "\n     1proc:%s\n     tp   :%s\n",
+                                fstats.c_str(), tstats.c_str());
                 } else {
-                    std::printf("   TP+DFlash: identical   [%s]\n",
+                    std::printf("   TP+DFlash: identical, same acceptance   [%s]\n",
                                 tstats.c_str());
                 }
 
@@ -593,9 +616,53 @@ int main(int argc, char** argv) {
                     std::printf("   PP+DFlash accepted NOTHING -- the drafter "
                                 "did not load or drafted nothing: %s\n",
                                 pstats.c_str());
+                } else if (spec_counts(pstats) != spec_counts(fstats)) {
+                    // This is the assertion that actually covers the tap
+                    // forwarding.  Drop it and the drafter runs on a tap
+                    // row that is half zeros: the output stays identical
+                    // (the verifier rejects what it must), and only the
+                    // acceptance count says so.
+                    ++g_fail;
+                    std::printf("   PP+DFlash accepted a DIFFERENT number than "
+                                "one process -- the forwarded taps do not match"
+                                "\n     1proc:%s\n     pp   :%s\n",
+                                fstats.c_str(), pstats.c_str());
                 } else {
-                    std::printf("   PP+DFlash: identical   [%s]\n",
+                    std::printf("   PP+DFlash: identical, same acceptance   [%s]\n",
                                 pstats.c_str());
+                }
+
+                // ---- TP on the SHARED-head drafter ------------------
+                // The forced fixture always ships its own lm_head, so the
+                // cases above never reach the sharded-target-head branch
+                // TP needs.  This drafter shares both the head and the
+                // embedding table, which is the configuration where TP
+                // shards BOTH out from under it.  Acceptance is zero here
+                // (random weights), so the claim is exactness only.
+                if (!own) {
+                    const std::string ssock = (tdir/"df-tps.sock").string();
+                    const std::string sout  = (tdir/"df-tps.txt").string();
+                    const auto sr = spawn_two(self, tdir.string(), sout, fmt,
+                        {"GRIMOIRE_TP_WORLD_SIZE=2", "GRIMOIRE_TP_SOCKET="+ssock,
+                         "GRIMOIRE_DFLASH_MODEL="+ddir.string(),
+                         "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_SPEC_STATS=1",
+                         "GRIMOIRE_DEVICE_ANY=1"},
+                        "GRIMOIRE_TP_RANK", 0, tdir, "df-tps");
+                    if (sr.first != 0 || sr.second != 0) {
+                        ++g_fail;
+                        std::printf("   TP+DFlash(shared head) FAILED "
+                                    "(rank0 %d, rank1 %d): %s\n", sr.first,
+                                    sr.second,
+                                    spec_line((tdir/"df-tps0.log").string()).c_str());
+                    } else if (read_tokens(sout) != plain) {
+                        ++g_fail;
+                        std::printf("   TP+DFlash(shared head) CHANGED THE OUTPUT"
+                                    "\n     plain:%s\n     tp   :%s\n",
+                                    join(plain).c_str(),
+                                    join(read_tokens(sout)).c_str());
+                    } else {
+                        std::printf("   TP+DFlash(shared head): identical\n");
+                    }
                 }
             }
         }
