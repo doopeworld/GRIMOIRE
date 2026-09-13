@@ -242,6 +242,31 @@ int main() {
         })JSON");
         CHECK(!s.error.empty(), "layer_types shorter than the model must refuse");
     }
+    {   // But a LONGER list must NOT refuse.  A draft config that inherited
+        // its target's layer_types carries the target's layer count, and the
+        // reference just indexes the first num_hidden_layers.  Refusing here
+        // would keep a working drafter from loading at all -- a worse failure
+        // than any this file fixes.
+        const DFlashSettings s = parse_dflash_config(R"JSON({
+          "hidden_size": 512, "num_hidden_layers": 2,
+          "num_attention_heads": 8, "num_key_value_heads": 8,
+          "sliding_window": 512,
+          "layer_types": ["sliding_attention", "full_attention",
+                          "sliding_attention", "full_attention",
+                          "sliding_attention", "full_attention"]
+        })JSON");
+        CHECK(s.error.empty(), "a longer layer_types must load: %s",
+              s.error.c_str());
+        EQ(s.layers.size(), 2, "only the drafter's own layers are built");
+        EQ(s.layers[0].window, 512, "first entry read");
+        EQ(s.layers[1].window, 0,   "second entry read");
+        CHECK(s.layers[0].causal && !s.layers[1].causal,
+              "causality follows the same first-N entries");
+        bool noted = false;
+        for (const std::string& n : s.notes)
+            if (n.find("layer_types lists") != std::string::npos) noted = true;
+        CHECK(noted, "reading a prefix of layer_types is worth saying");
+    }
     {
         const DFlashSettings s = parse_dflash_config("{ not json");
         CHECK(!s.error.empty(), "invalid JSON must refuse, not throw");

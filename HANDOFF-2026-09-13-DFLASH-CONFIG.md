@@ -95,6 +95,32 @@ bounds. **This is the one change here that touches a Muse path with real
 measurements behind it, and it is compile-checked only — no Muse
 checkpoint runs in this container.**
 
+## The refusals were audited for the opposite mistake
+
+A refusal that fires when it should not is worse than the silence it
+replaces: it would keep a working drafter from loading at all on day one.
+So each of the seven was re-checked against what a real checkpoint
+plausibly looks like, and one was too strict.
+
+**`layer_types` had to be exactly `num_hidden_layers` long.** The
+reference indexes `layer_types[i]` for `i in range(num_hidden_layers)`,
+so a *shorter* list is an IndexError — but a *longer* one is fine, and a
+draft config that inherited its target's `layer_types` carries the
+target's layer count. That is an ordinary thing for an HF config to do,
+and it would have refused the drafter outright. It now refuses only a
+short list, reads the first N of a long one exactly as the reference
+does, and says so in a note. `any_sliding` is still computed over the
+whole list, matching the reference's `sum()`.
+
+The other six stand: each names a condition under which the drafter is
+structurally not the drafter on disk, and two of them (a tap with no
+capture point, an `fc` wider than taps x hidden) prevent a DEVICE read
+past the end of `target_aux`. One hazard checked and cleared: `fc.w.K`
+is never padded by quantization — `K` comes from the tensor shape, and a
+`K` that is not a whole number of groups falls back to BF16 rather than
+padding — so the `fc` width check cannot fire on a quantized drafter
+that is actually correct.
+
 ## What is new
 
 - **The drafter's own `lm_head`, `d2t` and `embed_tokens` are used when

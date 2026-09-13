@@ -255,13 +255,26 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
     s.attn_from_config = layer_types != nullptr || swa_flag.has_value() ||
                          is_causal.has_value() || causal_override.has_value();
 
-    // layer_types shorter than the model is an IndexError in the reference,
-    // so it is a broken config, not a layer to guess at.
+    // The reference indexes layer_types[i] for i in range(num_hidden_layers),
+    // so a SHORTER list is an IndexError -- a broken config, not a layer to
+    // guess at.  A LONGER one is not: a draft config that inherited its
+    // target's layer_types carries the target's layer count, and the
+    // reference simply reads the first num_hidden_layers of them.  Refusing
+    // that would have kept a perfectly good drafter from loading at all,
+    // which is a worse failure than the one this file is fixing.  (any_sliding
+    // above is computed over the WHOLE list, which is what the reference's
+    // sum() does too.)
     if (layer_types && s.n_layers > 0 &&
-        layer_types->array.size() != size_t(s.n_layers) && s.error.empty())
-        s.error = "draft config layer_types has " +
+        layer_types->array.size() < size_t(s.n_layers) && s.error.empty())
+        s.error = "draft config layer_types has only " +
                   std::to_string(layer_types->array.size()) + " entries for " +
                   std::to_string(s.n_layers) + " layers";
+    if (layer_types && s.n_layers > 0 &&
+        layer_types->array.size() > size_t(s.n_layers))
+        s.notes.push_back("layer_types lists " +
+            std::to_string(layer_types->array.size()) + " layers for a " +
+            std::to_string(s.n_layers) + "-layer drafter; reading the first " +
+            std::to_string(s.n_layers) + ", as the reference does");
 
     // The window, when a layer slides: dflash_config.swa_window_size, else
     // the top-level sliding_window.  The reference raises when a sliding
