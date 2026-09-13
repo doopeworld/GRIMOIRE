@@ -107,16 +107,48 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     std::string model_type; find_scalar(j, "model_type", model_type);
     const bool muse = model_type.find("muse_glimmer") != std::string::npos
                    || j.find("muse_glimmer_text") != std::string::npos;
-    std::string tj = j;
-    if (muse) {
-        size_t tp = j.find("\"text_config\"");
+    const bool agnes = model_type == "agnes" || model_type.rfind("agnes", 0) == 0
+                    || j.find("\"agnes_text\"") != std::string::npos;
+    // Any multimodal config nests the language model under "text_config".
+    // This used to be extracted for Muse alone, so every other nested
+    // config was read by scanning the WHOLE file -- which finds whichever
+    // copy of a key comes first.  For Agnes that happens to land on the
+    // text tower for every key that matters, i.e. it worked by the order
+    // the file was written in.  Extract it whenever it exists instead.
+    std::string tj;
+    bool nested = false;
+    {
+        const size_t tp = j.find("\"text_config\"");
         if (tp != std::string::npos) {
-            size_t b = j.find("{", tp); int depth = 0; size_t e = b;
-            for (; e < j.size(); ++e) { if (j[e]=='{') ++depth; else if (j[e]=='}') { if(--depth==0){++e;break;} } }
-            tj = j.substr(b, e - b);
+            const size_t b = j.find('{', tp);
+            if (b != std::string::npos) {
+                int depth = 0; size_t e = b;
+                for (; e < j.size(); ++e) {
+                    if (j[e]=='{') ++depth;
+                    else if (j[e]=='}') { if(--depth==0){++e;break;} }
+                }
+                if (depth == 0) { tj = j.substr(b, e - b); nested = true; }
+            }
         }
     }
-    const std::string& cj = muse ? tj : j;
+    const std::string& cj = nested ? tj : j;
+    // Text-model keys live in the nested block when there is one, but not
+    // every checkpoint puts all of them there.  Look in the text block
+    // first and fall back to the whole file, so this can only ever find
+    // MORE than the old whole-file scan, never less.
+    auto tcfg_i = [&](const char* k, int d) {
+        std::string v;
+        return (nested && find_scalar(tj, k, v)) ? std::atoi(v.c_str()) : cfg_i(j, k, d);
+    };
+    auto tcfg_f = [&](const char* k, float d) {
+        std::string v;
+        return (nested && find_scalar(tj, k, v)) ? float(std::atof(v.c_str())) : cfg_f(j, k, d);
+    };
+    auto tcfg_b = [&](const char* k, bool d) {
+        std::string v;
+        if (nested && find_scalar(tj, k, v)) return v == "true" || v == "1";
+        return cfg_b(j, k, d);
+    };
     cfg.hidden        = cfg_i(cj, "hidden_size", 0);
     cfg.n_layers      = cfg_i(cj, "num_hidden_layers", 0);
     cfg.vocab         = cfg_i(cj, "vocab_size", 0);
@@ -126,21 +158,67 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.rms_eps       = cfg_f(cj, "rms_norm_eps", 1e-6f);
     cfg.post_norm_eps = cfg_f(cj, "post_norm_eps", cfg.rms_eps);
     cfg.rope_theta    = cfg_f(cj, "rope_theta", 1e7f);
-    cfg.partial_rope  = cfg_f(j, "partial_rotary_factor", 1.0f);
-    cfg.attn_out_gate = cfg_b(j, "attn_output_gate", false);
+    cfg.partial_rope  = tcfg_f("partial_rotary_factor", 1.0f);
+    cfg.attn_out_gate = tcfg_b("attn_output_gate", false);
     cfg.tie_embeddings= cfg_b(j, "tie_word_embeddings", false);
 
-    cfg.lin_k_heads   = cfg_i(j, "linear_num_key_heads", 0);
-    cfg.lin_v_heads   = cfg_i(j, "linear_num_value_heads", 0);
-    cfg.lin_k_dim     = cfg_i(j, "linear_key_head_dim", 0);
-    cfg.lin_v_dim     = cfg_i(j, "linear_value_head_dim", 0);
-    cfg.conv_kernel   = cfg_i(j, "linear_conv_kernel_dim", 0);
+    cfg.lin_k_heads   = tcfg_i("linear_num_key_heads", 0);
+    cfg.lin_v_heads   = tcfg_i("linear_num_value_heads", 0);
+    cfg.lin_k_dim     = tcfg_i("linear_key_head_dim", 0);
+    cfg.lin_v_dim     = tcfg_i("linear_value_head_dim", 0);
+    cfg.conv_kernel   = tcfg_i("linear_conv_kernel_dim", 0);
 
     cfg.n_experts     = cfg_i(j, "num_experts", 0);
     cfg.top_k         = cfg_i(j, "num_experts_per_tok", 0);
     cfg.moe_inter     = cfg_i(j, "moe_intermediate_size", 0);
     cfg.shared_inter  = cfg_i(j, "shared_expert_intermediate_size", 0);
     cfg.dense_inter   = cfg_i(cj, "intermediate_size", 0);
+
+    // ---- Agnes -------------------------------------------------------
+    if (agnes) {
+        cfg.is_agnes = true;
+        cfg.parallel_ffn_inter = tcfg_i("parallel_ffn_intermediate_size", 0);
+        // rope_theta and partial_rotary_factor live under
+        // text_config.rope_parameters here, not beside the other text keys.
+        const size_t rp = cj.find("\"rope_parameters\"");
+        if (rp != std::string::npos) {
+            const size_t b = cj.find('{', rp);
+            size_t e = b; int depth = 0;
+            for (; b != std::string::npos && e < cj.size(); ++e) {
+                if (cj[e]=='{') ++depth;
+                else if (cj[e]=='}') { if(--depth==0){++e;break;} }
+            }
+            if (b != std::string::npos && depth == 0) {
+                const std::string rj = cj.substr(b, e - b);
+                cfg.rope_theta   = cfg_f(rj, "rope_theta", cfg.rope_theta);
+                cfg.partial_rope = cfg_f(rj, "partial_rotary_factor", cfg.partial_rope);
+                // mrope_section splits the rotary dims into t/h/w groups,
+                // each indexed by its own position.  For TEXT-ONLY input
+                // all three positions are the token index, so every group
+                // rotates by the same angle and the result is identical to
+                // plain RoPE -- interleaved or not.  That equivalence is
+                // why this loader can run an mRoPE checkpoint at all, and
+                // it holds only while no image is in the prompt.
+                const size_t ms = rj.find("\"mrope_section\"");
+                if (ms != std::string::npos) {
+                    cfg.mrope = true;
+                    const size_t a2 = rj.find('[', ms), b2 = rj.find(']', a2);
+                    if (a2 != std::string::npos && b2 != std::string::npos) {
+                        const std::string arr = rj.substr(a2 + 1, b2 - a2 - 1);
+                        size_t q = 0;
+                        while (q < arr.size()) {
+                            while (q < arr.size() && !std::isdigit((unsigned char)arr[q])) ++q;
+                            if (q >= arr.size()) break;
+                            size_t e2 = q;
+                            while (e2 < arr.size() && std::isdigit((unsigned char)arr[e2])) ++e2;
+                            cfg.mrope_section.push_back(std::atoi(arr.substr(q, e2 - q).c_str()));
+                            q = e2;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (muse) {
         cfg.is_muse = true;
@@ -217,6 +295,29 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     if (cfg.hidden <= 0 || cfg.n_layers <= 0) {
         err = "config.json missing hidden_size or num_hidden_layers"; return false;
     }
+    if (cfg.is_agnes) {
+        // The one thing in this architecture the engine does not have.
+        // Loading without it drops parallel_ffn_inter / (intermediate_size
+        // + parallel_ffn_inter) of every FFN -- about a tenth of the
+        // model's feed-forward capacity -- and the result still loads,
+        // still generates fluent text, and is not this model.  That is
+        // the failure mode this tree spent a whole session removing, so
+        // refuse until it is implemented rather than quietly approximate.
+        if (cfg.parallel_ffn_inter > 0) {
+            err = "Agnes declares parallel_ffn_intermediate_size " +
+                  std::to_string(cfg.parallel_ffn_inter) + ": a second SwiGLU "
+                  "per layer whose output is summed with the main MLP's. "
+                  "That is not implemented here, and running without it "
+                  "silently drops ~" +
+                  std::to_string(100 * cfg.parallel_ffn_inter /
+                                 std::max(1, cfg.dense_inter + cfg.parallel_ffn_inter)) +
+                  "% of every feed-forward block";
+            return false;
+        }
+        if (cfg.lin_k_heads <= 0 || cfg.lin_v_heads <= 0) {
+            err = "Agnes: no gated-DeltaNet geometry in the config"; return false;
+        }
+    }
     if (cfg.is_k2) {
         if (cfg.rope_head_dim && cfg.head_dim && cfg.rope_head_dim != cfg.head_dim) {
             err = "k2_horizon: rope_head_dim != head_dim needs the split/interleave "
@@ -245,8 +346,32 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     const size_t e = arr.find('"', s + 1);
                     if (e == std::string::npos) break;
                     const std::string v = arr.substr(s + 1, e - s - 1);
-                    cfg.layer_types[i] = (v == "linear_attention")
-                                      ? LayerKind::LINEAR_ATTN : LayerKind::FULL_ATTN;
+                    // Anything not recognised used to fall through to
+                    // FULL_ATTN.  That is the worst possible default: a
+                    // checkpoint naming its linear layers something this
+                    // loader has not seen runs every one of them as full
+                    // attention, loads cleanly, and produces fluent text
+                    // that is not the model's.  Agnes is exactly that case
+                    // -- it spells them "agnes_delta_attention" and
+                    // "agnes_global_attention" -- so recognise the names
+                    // that exist and REFUSE the ones that do not.
+                    const bool linear = v == "linear_attention" ||
+                                        v.find("delta") != std::string::npos;
+                    // Deliberately NOT a substring match on "attention":
+                    // that would swallow every future spelling back into
+                    // the silent FULL_ATTN default this check exists to
+                    // remove.  List what is known; refuse the rest.
+                    const bool full   = v == "full_attention" ||
+                                        v == "sliding_attention" ||
+                                        v.find("global") != std::string::npos;
+                    if (!linear && !full) {
+                        err = "config.json layer_types[" + std::to_string(i) +
+                              "] is \"" + v + "\", which this loader does not "
+                              "recognise as linear or full attention";
+                        return false;
+                    }
+                    cfg.layer_types[i] = linear ? LayerKind::LINEAR_ATTN
+                                                : LayerKind::FULL_ATTN;
                     cfg.muse_sliding_attention[i] =
                         (v == "sliding_attention");
                     ++i;
@@ -410,7 +535,11 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         lay.post_attn_norm = get(b + "post_attention_layernorm.weight");
 
         if (lay.kind == LayerKind::LINEAR_ATTN) {
-            const std::string a = b + "linear_attn.";
+            // Agnes names its two attention submodules delta_attn and
+            // global_attn where Qwen3.5 uses linear_attn and self_attn.
+            // Same modules, same tensor set (verified against the
+            // checkpoint's safetensors index), different spelling.
+            const std::string a = b + (cfg.is_agnes ? "delta_attn." : "linear_attn.");
             lay.la_in_qkv  = linear(a + "in_proj_qkv");
             lay.la_in_z    = linear(a + "in_proj_z");
             lay.la_in_a    = linear(a + "in_proj_a");
@@ -421,7 +550,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             lay.la_norm    = get(a + "norm.weight");
             lay.la_out     = linear(a + "out_proj");
         } else {
-            const std::string a = b + "self_attn.";
+            const std::string a = b + (cfg.is_agnes ? "global_attn." : "self_attn.");
             lay.q_proj = linear(a + "q_proj");
             lay.k_proj = linear(a + "k_proj");
             lay.v_proj = linear(a + "v_proj");

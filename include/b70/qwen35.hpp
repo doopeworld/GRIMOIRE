@@ -60,6 +60,19 @@ struct Qwen35Config {
     float partial_rope  = 1.0f;   // fraction of head_dim that gets RoPE
     bool  attn_out_gate = false;
     bool  is_muse       = false;   // Muse Glimmer: sandwich norms, scaleless qk/embed norm
+    // ---- Agnes ------------------------------------------------------
+    // Agnes-3.0-Flash (model_type "agnes"): a Qwen3.5-shaped hybrid --
+    // gated DeltaNet 3:1 against gated full attention, head_dim 256,
+    // partial RoPE 0.25, one MTP head -- with a vision tower and ONE
+    // architectural addition this engine does not have: a second, narrow
+    // SwiGLU per layer (parallel_ffn_inter wide) whose output is summed
+    // with the main MLP's.  Its checkpoint ships custom modeling code
+    // (auto_map -> modeling_agnes.py), so it is not any stock
+    // architecture and nothing in vLLM's registry covers it.
+    bool  is_agnes      = false;
+    int   parallel_ffn_inter = 0;  // parallel_ffn_intermediate_size, 0 == none
+    bool  mrope         = false;   // rope_parameters.mrope_section present
+    std::vector<int> mrope_section;
     float query_prescale = 1.0f;   // Muse scale_query_by (post qk-norm)
     bool  tie_embeddings= false;
 

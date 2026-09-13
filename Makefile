@@ -86,11 +86,15 @@ bin/test_dflash_config: tests/test_dflash_config.cpp include/b70/dflash_config.h
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+bin/test_agnes_config: tests/test_agnes_config.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
 bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
@@ -103,6 +107,7 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/
 	@echo ""; echo "=========== k2-config ==========="; ./bin/test_k2_config
 	@echo ""; echo "=========== dflash2-selector ==========="; ./bin/test_dflash2_selector
 	@echo ""; echo "=========== dflash-config ==========="; ./bin/test_dflash_config
+	@echo ""; echo "=========== agnes-config ==========="; ./bin/test_agnes_config
 
 clean:
 	rm -rf bin
