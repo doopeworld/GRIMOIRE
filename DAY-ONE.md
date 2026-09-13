@@ -95,9 +95,19 @@ is replicated and every rank drafts identically. Verified token-for-token
 against single-process plain decode — speculation is exact, so if it ever
 changes the output that is a bug, not a trade.
 
-DFlash is still single-GPU only: its drafter needs aux hidden states from
-target layers that PP puts on different ranks. So DFlash on one card, MTP
-on two. The load banner prints which is live — read it.
+DFlash now runs on dual GPU as well, under both TP and PP. Add
+`GRIMOIRE_DFLASH_MODEL=/models/<drafter>` to either launcher — every rank
+needs the same value, and the stages check that they agree.
+
+Under TP the drafter is replicated on every rank. Under PP the LAST stage
+hosts it, and every earlier stage captures the target taps it owns and
+forwards them up the pipe. That forwarding costs `n_taps * hidden` floats
+per token per boundary on top of the hidden state — for an 8-tap drafter,
+8x the boundary traffic. **Nobody has measured that on OCuLink.** MTP
+sends nothing extra, so do not prefer DFlash on two cards until you have
+compared them on this box, same prompt, accepted-per-step and tok/s.
+
+The load banner prints which drafter is live — read it.
 
 **If you load a DFlash drafter, read its four banner lines before you read
 anything else:**
@@ -244,16 +254,20 @@ software recovery. The known causes, all avoidable:
 
 ## 6. What is still open
 
+- **Batched prefill under TENSOR parallel.** TP declines the batched path
+  outright, so a TP run processes its prompt a token at a time. The
+  capability matrix says so, and says not to benchmark it as prompt
+  processing. Making it real means all-gathering every projection over
+  the whole token batch, not just one row, and an expert-parallel
+  all-reduce for the routed MoE half. None of it can be executed off the
+  card: the batched path is XMX from end to end, and a device without
+  matrix hardware cannot run a single one of its kernels, so this is
+  work to do ON the Tower, not before it.
 - **F07**: single-process `GRIMOIRE_PIPELINE` puts every kernel on
-  device 0's queue. It is numerically correct but GPU1's weights cross
-  the link every token. Use the multiprocess launchers above instead.
-  Making it real means threading a per-layer queue through every
-  launcher — architectural, not a patch.
-- **DFlash** under TP/PP. Its drafter reads aux hidden states from
-  specific target layers, which PP puts on different ranks, and its
-  batched embed path is not TP-aware. MTP under TP/PP is DONE and
-  verified exact (section 2) -- this line used to say speculation as a
-  whole was open, which stopped being true on 2026-09-12.
-- MoVA's value projection reads its routing table back to the host once
-  per layer. Fine at M=1, useless at 4096 tokens. Pack the experts
-  expert-major before quoting a K2 prefill number.
+  device 0's queue. It is numerically correct, but GPU1's weights cross
+  the link every token. Making it real means threading a per-layer queue
+  through every launcher — architectural, not a patch. Use the
+  multiprocess launchers in section 2 instead.
+- **Single-process cross-device.** Rule 7: the original failure was
+  measured over USB4 and has not been retried on OCuLink. That is a
+  hardware experiment, not a code change.

@@ -221,10 +221,42 @@ greedy output, single process and across two processes, TP and PP, dense
 and MoE, BF16 and FP8. That is the right test because speculation is an
 exactness claim, not an approximation.
 
-**DFlash is still single-GPU only.** Its drafter reads aux hidden states
-from specific target layers, which under PP live on different ranks, and
-its batched embed path is not TP-aware. So: DFlash where it wins on one
-card, MTP for dual-GPU. The capability matrix says which one is live.
+**DFlash now runs under BOTH TP and PP too (2026-09-13).** The old note
+here said DFlash was single-GPU only. Both reasons it gave have been
+removed:
+
+- **TP**: the drafter is small, so it loads REPLICATED on every rank and
+  each rank drafts identically with no extra collective -- the same
+  argument that made the MTP head work. Two spots had to be fixed, and
+  both were silent: the block embed read the target's embedding table,
+  which TP shards over the VOCABULARY (so every rank embedded a plausible
+  WRONG token), and a drafter sharing the target's `lm_head` read a head
+  sharded the same way.
+- **PP**: the drafter consumes the residual stream tapped at several
+  TARGET layers, and a split puts those layers on different stages. Each
+  stage now captures the taps it owns and forwards the block to the next
+  one, which overwrites its copy, fills in its own, and forwards again --
+  so the last stage, which hosts the drafter exactly as it hosts the MTP
+  head, ends up with the whole concatenated row. The drafted block goes
+  backward on the same channel `argmax_token` already uses, so every
+  stage speculates on identical candidates and rolls back to the same
+  position. Stages agree on the tap count and the draft width through
+  two more hops in `pp_connect`, because a stage that disagreed would
+  read a different number of floats off the socket than the previous one
+  wrote and desynchronise every later message.
+
+The extra PP traffic is `n_taps * hidden` floats per token per boundary,
+on top of the hidden state -- for an 8-tap drafter that is 8x the
+boundary bytes. Nobody has measured what that costs on OCuLink. Do that
+before preferring DFlash to MTP on two cards.
+
+Verified by `bin/test_spec_e2e`, which now drives DFlash single-process,
+under TP and under PP, with a drafter forced to non-zero acceptance so
+both the accept and the rollback paths run. The mini drafter taps target
+layers 0 and 2 of a 4-layer target, so a 2/2 split lands one tap on each
+stage: drop the forwarding and the test fails.
+
+The capability matrix still says which one is live -- read it.
 
 **8. Never quote a benchmark number from a config that never generated text.**
 Multiple false leads in this project (BesTLA, DAG, several kernel "wins")
