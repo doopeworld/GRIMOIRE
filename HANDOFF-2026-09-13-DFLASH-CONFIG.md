@@ -173,16 +173,34 @@ test_model_matrix      ALL PASS, 28/28: dense / moe / hybrid / k2-horizon
                        x bf16 fp8_e4m3 fp8_e5m2 int8 int4 mxfp8 mxfp4
 test_parallel_e2e      ALL PASS, 7 cases: PP and TP token-identical to one
                        process, including DeltaNet state across a split
-test_spec_e2e          MTP identical at K=1,2,3,5 for dense and moe in
-                       bf16 and fp8, single process + TP + PP; hybrid
-                       REFUSES here as designed (no batched verify on a
-                       CPU device); DFlash identical at M=4, 8 and 16,
-                       both sharing the target's head and running the
-                       drafter's own reduced head + d2t; the
-                       forced-agreement case identical at 0.60
-                       accepted/step
 bin/grimoire, bin/grimoire-server   compile and link
 ```
+
+`test_spec_e2e`, ALL PASS, in full:
+
+```
+dense+mtp    bf16   identical at K=1,2,3,5   TP+MTP match   PP+MTP match
+dense+mtp    fp8    identical at K=1,2,3,5   TP+MTP match   PP+MTP match
+moe+mtp      bf16   identical at K=1,2,3,5   TP+MTP match   PP+MTP match
+moe+mtp      fp8    identical at K=1,2,3,5   TP+MTP match   PP+MTP match
+hybrid+mtp   bf16   speculation REFUSED here -- no batched verify on a CPU
+hybrid+mtp   fp8    speculation REFUSED here -- no batched verify on a CPU
+dflash       bf16   identical at M=4,16
+   accept path: identical, token 30 x6   0.60 accepted/step (6 of 64, 9.4%)
+dflash       fp8    identical at M=4,16
+   accept path: identical, token 30 x4   0.33 accepted/step (4 of 71, 5.6%)
+dflash+head  bf16   identical at M=4,16
+   accept path: identical, token 30 x6   0.60 accepted/step (6 of 64, 9.4%)
+dflash+head  fp8    identical at M=4,16
+   accept path: identical, token 30 x4   0.33 accepted/step (4 of 71, 5.6%)
+```
+
+The `dflash+head` rows are the drafter's own reduced lm_head with its
+d2t mapping; the load banner in those runs reads "the drafter's own
+lm_head, 64 rows + d2t mapping", so the new path is the one that ran.
+The four DFlash rows were additionally re-run against a binary built
+from the final tree (identical at M=4, 8 and 16, accept path 0.60), for
+the handful of commits that landed after this suite started.
 
 ## NOT verified — and be precise about this
 
