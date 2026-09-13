@@ -51,6 +51,16 @@ struct DFlashSettings {
     int   mask_token    = -1;  // -1: the config names none
     int   selector_top_k = 0;
     int   selector_rank  = 0;
+    // Page size of the DRAFT's own KV cache.  DFlash checkpoints declare
+    // it in dflash_config; it is NOT the target's page size, and a paged
+    // kernel given the wrong one silently reads a trailing partial page
+    // as zeros -- which for a 1+N query block means the draft rows never
+    // see the anchor token at all.
+    int   block_size = 16;
+    // The window the config names, whether or not any layer uses one.
+    // Kept separate from the per-layer answer so a caller comparing
+    // against an older assumption has the raw number to compare with.
+    int   config_window = 0;
     float rope_theta    = 1.0e6f;  // vLLM's set_default_rope_theta default
     float rms_eps       = 1.0e-6f;
     bool  attention_bias = false;
@@ -150,6 +160,8 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
     s.use_aux_hidden_state = sc.flag_or("use_aux_hidden_state", true);
     s.selector_top_k = sc.number_or("selector_top_k", 0);
     s.selector_rank  = sc.number_or("selector_rank", 0);
+    s.block_size     = sc.number_or("block_size", 16);
+    if (s.block_size <= 0) s.block_size = 16;
 
     if (s.n_layers <= 0)
         s.error = "draft config.json has no usable num_hidden_layers";
@@ -252,6 +264,7 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
         if (const Json* v = typed(top, "sliding_window", Kind::Number))
             window = int(v->number);
 
+    s.config_window = window;
     s.layers.resize(size_t(s.n_layers > 0 ? s.n_layers : 0));
     for (size_t i = 0; i < s.layers.size(); ++i) {
         const bool typed_sliding =
@@ -276,6 +289,18 @@ inline DFlashSettings parse_dflash_config(std::string_view text) {
                           "every layer is full attention and non-causal -- "
                           "which is what the reference computes for a silent "
                           "config, not an assumption made here");
+    // Two knobs the reference honours and this engine's draft path does
+    // not.  Neither is fatal and neither is visible: they change the
+    // drafter's numbers, so they change acceptance and nothing else.
+    if (dflash_cfg && (dflash_cfg->find("attention_sink_bias") ||
+                       top.find("add_swa_attention_sink_bias")))
+        s.notes.push_back("this drafter declares an attention sink bias; the "
+                          "draft attention here has no sink term");
+    if (const Json* ls = typed(top, "logit_scale", Kind::Number))
+        if (ls->number != 1.0)
+            s.notes.push_back("logit_scale is not 1; the draft argmax is "
+                              "unaffected but the DFlash2 selector's unary "
+                              "term is scored against it unscaled");
     if (s.attention_bias)
         s.notes.push_back("attention_bias is set: the reference gives qkv and "
                           "o_proj a bias, and this engine's draft path has no "

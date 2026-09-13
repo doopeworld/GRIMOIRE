@@ -123,17 +123,26 @@ def main():
 
     def project(context_states, num_ctx, L, nkv, hd):
         k, v = orig_project(context_states, num_ctx, L, nkv, hd)
-        ctx["04_ctxkv"] = torch.cat([k.reshape(L, num_ctx, -1),
-                                     v.reshape(L, num_ctx, -1)], dim=-1).detach()
-        ctx["06_ctxv"] = v.detach()
+        # 04 is all_kv_flat as the fused GEMM produced it, BEFORE the
+        # model's own permute to layer-major: [num_ctx, L, 2, nkv, hd].
+        # That is the layout GRIMOIRE dumps on both the fused (Muse) and
+        # the per-layer path, so undo the permute rather than invent a
+        # third layout.
+        kv = torch.stack([k, v], dim=0)          # [2, L, num_ctx, nkv, hd]
+        ctx["04_ctxkv"] = kv.permute(2, 1, 0, 3, 4).reshape(num_ctx, -1).detach()
+        ctx["06_ctxv"] = v.detach()              # [L, num_ctx, nkv, hd]
         return k, v
 
     def normk(all_k):
         out = orig_normk(all_k)
-        # NOTE: GRIMOIRE's 05_ctxk is AFTER RoPE; the reference applies
-        # RoPE in-place just after this returns, so capture there instead
-        # if the shapes line up but the values do not.
-        ctx["05_ctxk_prerope"] = out.detach()
+        # GRIMOIRE's 05_ctxk is AFTER k-norm AND RoPE.  The reference
+        # rotates all_k_flat -- a VIEW of what this returns -- in place
+        # right after this call, so holding the tensor WITHOUT cloning it
+        # yields the post-RoPE values by the time it is written out.  Do
+        # not .clone() here: a clone freezes the pre-RoPE values and there
+        # is nothing on GRIMOIRE's side to compare those against -- its
+        # K-norm and rotation are one fused kernel.
+        ctx["05_ctxk"] = out
         return out
 
     model._project_context_kv = project
@@ -146,11 +155,9 @@ def main():
     if taps:
         # token-major [tokens][n_taps * H]
         w(args.out, "01_aux_0", torch.cat([t for t in taps], dim=-1))
-    for name in ("02_fc", "03_ctxnorm", "04_ctxkv", "06_ctxv"):
+    for name in ("02_fc", "03_ctxnorm", "04_ctxkv", "05_ctxk", "06_ctxv"):
         if name in ctx:
             w(args.out, name + "_0", ctx[name])
-    if "05_ctxk_prerope" in ctx:
-        w(args.out, "05_ctxk_0", ctx["05_ctxk_prerope"])
 
     print(f"\nwrote reference tensors to {args.out}", file=sys.stderr)
     print(f"now: tools/dflash_compare.py {args.out}", file=sys.stderr)

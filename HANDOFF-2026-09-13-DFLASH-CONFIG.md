@@ -69,6 +69,32 @@ Each of these produced a running drafter with bad acceptance:
   DEVICE_LOST and a power cycle rather than an exception.
 - a reduced draft `lm_head` with no `d2t` to interpret its ids
 
+## A finding that was written down and never applied
+
+`DFlash2Head::block_size` had a twelve-line comment above it recording a
+measurement against the running Fusion reference — its draft context
+slots for positions 0–63 are 368–431 and its query slots 432–447, so base
+368 = block 23 x **16**; the drafter's own `config.json` declares
+`block_size: 16`; and at 64 the 80-key draft sequence is one whole page
+plus a 16-key partial page that the paged kernel **reads back as zeros**,
+so the query rows "see only the 64 context keys and never the bonus
+token".
+
+The field was still initialised to 64. The conclusion was recorded and
+the value was not changed, so the Muse draft ran with its anchor row
+invisible — which is a total acceptance killer, and exactly the class of
+silent failure the rest of this work is about.
+
+It now comes from `dflash_config.block_size` (16 when the config names
+none), is printed at load as `draft page N`, and `GRIMOIRE_DFLASH_BLOCK`
+overrides it so 16 vs 64 is an A/B on the card rather than an argument.
+`block_table` is shared with the target's own paged attention, which
+pages at 64 and reads only the first `(max_seq+63)/64` entries: a smaller
+draft page makes that table longer, never shorter, so this stays in
+bounds. **This is the one change here that touches a Muse path with real
+measurements behind it, and it is compile-checked only — no Muse
+checkpoint runs in this container.**
+
 ## What is new
 
 - **The drafter's own `lm_head`, `d2t` and `embed_tokens` are used when
@@ -112,6 +138,29 @@ output identical to plain decode
 
 That is the first non-zero speculative acceptance any test here has
 measured, and the output still has to match exactly.
+
+## Two bugs in the comparison harness itself
+
+`tools/dflash_compare.py` and `GRIMOIRE_DFLASH_DUMP` are what step 3
+below depends on. Running them for the first time found that neither
+half worked on the model they were written for:
+
+- **The draft stages were never dumped at all.** `generate_tokens()`
+  opens with a context-only `dflash_draft(..., context_only=true)` call,
+  and the dump used a single "first call" latch — which that call spent
+  entirely. The block embedding, per-layer intermediates, final norm,
+  logits and draft ids were never written. The two halves latch
+  independently now, each set only once its own work has happened.
+- **Stages 04–06 were dumped only on the Muse path.** The Ornith path
+  projects context K/V per layer instead of through one fused GEMM, and
+  dumped nothing. It now stacks the per-layer results into the
+  reference's own layouts (`04` = `all_kv_flat`, `[rows][L,2,nkv,hd]`;
+  `05`/`06` = `[L][rows][nkv*hd]`), and `tools/dflash_reference_dump.py`
+  was corrected to emit `04` in that layout rather than a third one.
+
+Verified end to end here: a miniature drafter writes all 17 tensors,
+both halves, and the comparator names the first divergence correctly on
+an injected one.
 
 ## Verified in a container (OpenCL CPU device, no XMX)
 

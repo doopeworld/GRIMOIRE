@@ -1796,7 +1796,16 @@ struct Grimoire {
         // bit-identical to the source K/V) but attention reads them as zero,
         // so the 16 draft rows see only the 64 context keys and never the
         // bonus token. At 16 the same 80 keys are exactly 5 whole pages.
-        int block_size=64, num_blocks=0;
+        //
+        // That investigation concluded 16 and the default stayed at 64, so
+        // the finding was written down and never applied: the Muse draft
+        // ran with its anchor invisible.  It is resolved from the draft
+        // config now (dflash_config.block_size), 16 when the config names
+        // none, and printed at load.  block_table is shared with the
+        // target's own paged attention, which pages at 64 and reads only
+        // the first (max_seq+63)/64 entries -- a SMALLER draft page makes
+        // that table longer, never shorter, so this stays in bounds.
+        int block_size=16, num_blocks=0;
         float rope_theta=0.0f;
         std::vector<Layer> layers;
         std::vector<int> target_layers;
@@ -3271,8 +3280,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // wrong -- the drafter runs, the output stays correct, and only
         // the acceptance rate moves -- so the rules live in one place
         // transcribed from ref/qwen3_dflash.py rather than guessed here.
-        // Muse deliberately does not consult it: its table below was
-        // measured against the running Fusion reference.
+        // Muse takes only the draft page size from it; the rest of its
+        // table below was measured against the running Fusion reference
+        // and stays as measured.
         DFlashSettings dcfg;
         {
             std::ifstream dcfg_in(std::string(dpath)+"/config.json");
@@ -3364,6 +3374,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.rope_theta=500000.0f;
             dflash2.sliding_window=2048;
             dflash2.rms_eps=1.0e-5f;
+            if(dcfg.error.empty())dflash2.block_size=dcfg.block_size;
             dflash2.shared_embed_f16=upload_f16_t(
                 q,ck,ck.embed,"dflash2.shared_embed",&dok);
             dflash2.shared_lm_head_f16=upload_f16_t(
@@ -3384,6 +3395,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.rms_eps=dcfg.rms_eps;
             dflash2.selector_top_k=dcfg.selector_top_k;
             dflash2.selector_rank=dcfg.selector_rank;
+            dflash2.block_size=dcfg.block_size;
             if(dcfg.mask_token>=0)dflash2.mask_token=dcfg.mask_token;
             else{
                 dflash2.mask_token=248077;
@@ -3402,6 +3414,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.sliding_window=0;
             for(const DFlashLayerAttn& la:dcfg.layers)
                 dflash2.sliding_window=std::max(dflash2.sliding_window,la.window);
+        }
+        // The draft page size decides whether the paged draft attention
+        // can see its own anchor row, and the value that was in this tree
+        // (64) contradicted the measurement recorded beside it (16).  It
+        // is resolved from the config now; this overrides it, so the two
+        // can be A/B'd on accepted-per-step rather than argued about.
+        if(const char* bs=std::getenv("GRIMOIRE_DFLASH_BLOCK")){
+            const int v=std::atoi(bs);
+            if(v>0)dflash2.block_size=v;
         }
         if(dflash2.q_heads<=0||dflash2.kv_heads<=0||dflash2.inter<=0)dok=false;
         // The Muse assistant checkpoint is BF16 and vLLM casts it to FP16 at
@@ -3482,12 +3503,6 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const char* hn_name=dr("encoder.output_norm_enc.weight").ok()?
                             "encoder.output_norm_enc.weight":"hidden_norm.weight";
         dflash2.fc=qload(fc_name,"dflash.fc");
-        // fc consumes exactly n_taps * target_hidden floats per row, and the
-        // engine hands it target_layers.size() * cfg.hidden.  The reference
-        // raises on this mismatch (combine_hidden_states) because it means
-        // the tap set does not belong to this drafter -- here it is worse
-        // than wrong numbers: too many taps reads past target_aux on DEVICE,
-        // which is a DEVICE_LOST and a power cycle, not an exception.
         // A tap is captured at ENTRY to layer id+1, so a tap naming the
         // last layer is never written at all and fc then reads whatever
         // that slice of target_aux was allocated with -- uninitialised
@@ -3500,6 +3515,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 "this draft/target pair does not match";
             return false;
         }
+        // fc consumes exactly n_taps * target_hidden floats per row, and the
+        // engine hands it target_layers.size() * cfg.hidden.  The reference
+        // raises on this mismatch (combine_hidden_states) because it means
+        // the tap set does not belong to this drafter -- here it is worse
+        // than wrong numbers: too many taps reads past target_aux on DEVICE,
+        // which is a DEVICE_LOST and a power cycle, not an exception.
         if(dflash2.fc.w.K>0&&cfg.hidden>0){
             const int want=dflash2.fc.w.K/cfg.hidden;
             if(dflash2.fc.w.K%cfg.hidden||
@@ -3706,12 +3727,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 std::getenv("GRIMOIRE_DFLASH_LEGACY_SLIDING")!=nullptr;
             if(cfg.is_muse||legacy_sliding){
                 const bool sliding=cfg.is_muse||dflash2.v2||i<5;
-                // The old code's own default window, not the resolved one:
-                // for a config that names no window the resolver leaves it
-                // at 0, and an escape hatch that silently means "full
-                // attention" would A/B nothing.
-                const int legacy_window=dflash2.sliding_window?
-                    dflash2.sliding_window:(cfg.is_muse?2048:4096);
+                // The old code's own window, not the resolved one.  It
+                // read a top-level "sliding_window" and fell back to 4096;
+                // the resolver leaves the per-layer window at 0 for a
+                // config that names none, and an escape hatch that
+                // silently means "full attention" would A/B nothing.
+                const int legacy_window=cfg.is_muse?2048:
+                    (dcfg.config_window?dcfg.config_window:4096);
                 d.window=sliding?legacy_window:0;
                 d.causal=false;
             }else{
@@ -4023,11 +4045,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             for(size_t i=0;i<dflash2.target_layers.size();++i)
                 taps+=(i?",":"")+std::to_string(dflash2.target_layers[i]);
             std::printf("  dflash config: %zu layers, taps [%s]%s%s, "
-                        "mask %d, rope_theta %g, eps %g, head_dim %d\n",
+                        "mask %d, rope_theta %g, eps %g, head_dim %d, "
+                        "draft page %d\n",
                         dflash2.layers.size(), taps.c_str(),
                         dcfg.tap_key.empty()?"":" from ", dcfg.tap_key.c_str(),
                         dflash2.mask_token, double(dflash2.rope_theta),
-                        double(dflash2.rms_eps), dflash2.head_dim);
+                        double(dflash2.rms_eps), dflash2.head_dim,
+                        dflash2.block_size);
             std::printf("  dflash attention: %d of %zu layers sliding"
                         " (window %d), %d causal\n",
                         sliding, dflash2.layers.size(),
@@ -6339,9 +6363,16 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         std::fprintf(stderr,"ok\n");
     };
     const char* dump_dir=std::getenv("GRIMOIRE_DFLASH_DUMP");
-    static int dflash_dump_call=0;
-    const bool dumping=dump_dir&&*dump_dir&&dflash_dump_call==0;
-    ++dflash_dump_call;
+    // Two latches, not one.  generate_tokens() opens with a context-only
+    // call, so a single "first call" latch was spent entirely on the
+    // context ingest and the draft stages (the block embedding, the final
+    // norm, the logits, the draft ids) were NEVER written -- the tensor
+    // comparison the 2026-08-28 handoff asks for could only ever see its
+    // first half.  Latch the two halves independently, and set each only
+    // once the work it describes has actually happened.
+    static bool dumped_ctx=false, dumped_draft=false;
+    const bool want_dump=dump_dir&&*dump_dir;
+    bool dumping=want_dump&&!dumped_ctx;
     auto dump_write=[&](const std::string& name,const std::vector<float>& h){
         std::string fn=std::string(dump_dir)+"/g_"+name+".f32";
         std::FILE* f=std::fopen(fn.c_str(),"wb");
@@ -6477,19 +6508,62 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                     rows,start,KVH,HD,dflash2.block_size,{});
             }
         }else{
-            for(auto& d:dflash2.layers){
+            // Stages 04-06 used to be dumped only on the Muse path, which
+            // left the comparison harness blind on exactly the model it
+            // was written for.  The per-layer projections here produce the
+            // same tensors the reference's fused one does, so stack them
+            // into the reference's layouts: 04 is all_kv_flat,
+            // [rows][L,2,nkv,hd]; 05 and 06 are [L][rows][nkv*hd].  Debug
+            // path, first draft call only.
+            const size_t LN=dflash2.layers.size();
+            std::vector<float> ctxkv, ctxk, ctxv, hk, hv;
+            if(dumping){
+                ctxkv.assign(size_t(rows)*LN*2*size_t(KVW),0.0f);
+                ctxk.assign(LN*size_t(rows)*size_t(KVW),0.0f);
+                ctxv.assign(LN*size_t(rows)*size_t(KVW),0.0f);
+                hk.resize(size_t(rows)*size_t(KVW));
+                hv.resize(size_t(rows)*size_t(KVW));
+            }
+            for(size_t li=0;li<LN;++li){
+                auto& d=dflash2.layers[li];
                 mm(d.k,dflash2.normed,dflash2.k,rows);
                 mm(d.v,dflash2.normed,dflash2.v,rows);
+                if(dumping){
+                    // Pre-norm, pre-RoPE: this is what the reference's
+                    // fused KV GEMM emits, before _normalize_context_k.
+                    q.memcpy(hk.data(),dflash2.k,hk.size()*sizeof(float)).wait();
+                    q.memcpy(hv.data(),dflash2.v,hv.size()*sizeof(float)).wait();
+                    for(int r=0;r<rows;++r)
+                        for(int c=0;c<KVW;++c){
+                            const size_t base=((size_t(r)*LN+li)*2)*size_t(KVW);
+                            ctxkv[base+size_t(c)]=hk[size_t(r)*KVW+c];
+                            ctxkv[base+size_t(KVW)+size_t(c)]=hv[size_t(r)*KVW+c];
+                        }
+                }
                 launch_qk_norm_rope_batched(q,dflash2.q,dflash2.k,
                     d.q_norm,d.k_norm,rows,QH,KVH,HD,start,theta,1.0f,eps,{},0.0f);
+                if(dumping){
+                    q.memcpy(ctxk.data()+li*size_t(rows)*KVW,dflash2.k,
+                             size_t(rows)*KVW*sizeof(float)).wait();
+                    q.memcpy(ctxv.data()+li*size_t(rows)*KVW,dflash2.v,
+                             size_t(rows)*KVW*sizeof(float)).wait();
+                }
                 launch_kv_append_batched(q,dflash2.k,dflash2.v,
                     d.k_cache,d.v_cache,rows,start,KVH,HD,max_seq);
+            }
+            if(dumping){
+                dump_write("04_ctxkv_"+std::to_string(start),ctxkv);
+                dump_write("05_ctxk_"+std::to_string(start),ctxk);
+                dump_write("06_ctxv_"+std::to_string(start),ctxv);
             }
         }
         checkpoint("context KV");
         dflash2.context_pos+=rows;
+        if(dumping)dumped_ctx=true;
     }
     draft_mark("context ingest");
+    // From here on the draft stages get their own first-call latch.
+    dumping=want_dump&&!context_only&&!dumped_draft;
     if(context_only){
         if(time_draft){
             std::fprintf(stderr,
@@ -6790,6 +6864,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         std::fprintf(stderr,"\n");
     }
     checkpoint("draft logits");
+    if(dumping)dumped_draft=true;
     if(time_draft){
         double total=0.0;
         for(const auto& kv:draft_times)total+=kv.second;
