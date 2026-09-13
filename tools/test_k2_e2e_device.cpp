@@ -121,6 +121,38 @@ int main() {
     }
 
     grimoire_delete(e);
+
+    // ---- MoVA: expert-major packing must not change the answer --------
+    // The routed value projection now packs its experts into one
+    // [E*N][K] weight so the routing table can stay on the device.  That
+    // is a LAYOUT change, so the tokens must be bit-identical to the
+    // per-expert path it replaces -- if they are not, the packed index
+    // (expert*N + row) is reading the wrong expert, and every value it
+    // produces would still be finite and plausible.
+    {
+        ::setenv("GRIMOIRE_MOVA_PER_EXPERT", "1", 1);
+        std::string err2;
+        Grimoire* e2 = grimoire_new();
+        std::vector<int32_t> d;
+        FinishReason rd{};
+        if (!e2 || !grimoire_load(*e2, dir.string(), Fmt::BF16, max_seq, err2)) {
+            std::printf("  FAIL per-expert reload: %s\n", err2.c_str());
+            ++g_fail;
+        } else {
+            try {
+                grimoire_serve_generate(*e2, prompt, want, -1, d, -1, {}, &rd);
+            } catch (const std::exception& ex) {
+                std::printf("  FAIL per-expert generate threw: %s\n", ex.what());
+                ++g_fail;
+            }
+            CHECK(d == a, "expert-major MoVA packing CHANGED the output");
+            std::printf("MoVA packed vs per-expert: %s\n",
+                        d == a ? "identical" : "DIFFERENT");
+        }
+        if (e2) grimoire_delete(e2);
+        ::unsetenv("GRIMOIRE_MOVA_PER_EXPERT");
+    }
+
     fs::remove_all(dir);
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;

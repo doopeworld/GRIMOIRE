@@ -1301,6 +1301,21 @@ sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     });
 }
 
+sycl::event launch_embed_batched_shard(sycl::queue& q, const bf16_t* table,
+    const int32_t* tokens, float* out, int count, int hidden,
+    int begin, int rows, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(count) * hidden), [=](sycl::id<1> id) {
+            const int t = int(id[0] / hidden), d = int(id[0] % hidden);
+            const int tok = tokens[t] - begin;
+            // Out of this rank's slice: contribute nothing.  The all-reduce
+            // that follows takes the row from whichever rank owns it.
+            out[int64_t(t) * hidden + d] = (tok >= 0 && tok < rows)
+                ? bf16_to_f32(table[int64_t(tok) * hidden + d]) : 0.0f;
+        });
+    });
+}
+
 sycl::event launch_embed_f16_batched(sycl::queue& q, const sycl::half* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps) {

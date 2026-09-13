@@ -115,6 +115,42 @@ static int spawn_run(const char* self, const std::string& dir, const std::string
     return WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
 }
 
+// Run one job across two ranks and return {writer rc, peer rc}.  The
+// WRITER is the rank that emits the tokens: rank 0 under TP (every rank
+// has the full model), the LAST stage under PP (only it owns the final
+// hidden state).  The peer's output goes to "-" and is discarded.
+static std::pair<int,int> spawn_two(const char* self, const std::string& dir,
+        const std::string& out, const char* fmt,
+        const std::vector<std::string>& common, const std::string& var,
+        int writer, const fs::path& logdir, const char* tag) {
+    const int peer_rank = writer == 0 ? 1 : 0;
+    auto envfor = [&](int r) {
+        auto v = common; v.push_back(var + "=" + std::to_string(r)); return v;
+    };
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        for (const auto& kv : envfor(peer_rank)) {
+            const size_t eq = kv.find('=');
+            ::setenv(kv.substr(0, eq).c_str(), kv.substr(eq+1).c_str(), 1);
+        }
+        // Named locals: a temporary's c_str() dangles at the end of the
+        // full expression, and execv would receive a freed pointer.
+        const std::string d = dir;
+        const std::string l =
+            (logdir/(std::string(tag)+std::to_string(peer_rank)+".log")).string();
+        std::freopen(l.c_str(), "w", stdout);
+        std::freopen(l.c_str(), "a", stderr);
+        const char* av[] = { self, d.c_str(), "-", fmt, nullptr };
+        ::execv(self, const_cast<char* const*>(av));
+        ::_exit(127);
+    }
+    const std::string wlog =
+        (logdir/(std::string(tag)+std::to_string(writer)+".log")).string();
+    const int rcw = spawn_run(self, dir, out, fmt, envfor(writer), wlog);
+    int st = 0; ::waitpid(pid, &st, 0);
+    return { rcw, WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st) };
+}
+
 // Pull the "spec:" line GRIMOIRE_SPEC_STATS prints, so a correct-but-
 // never-accepted drafter is visible rather than passing quietly.
 static std::string spec_line(const std::string& log) {
@@ -331,9 +367,23 @@ int main(int argc, char** argv) {
     // what that costs: four engine bugs in code that had been read many
     // times and never run, one of them a device heap overrun.
     //
-    // Single process only, by design: DFlash reads aux hidden states from
-    // target layers that PP puts on different ranks, and its batched embed
-    // is not TP-aware.  MTP is what covers dual GPU.
+    // TENSOR parallel is covered below: the drafter is small, so it loads
+    // replicated on every rank and each rank drafts identically.  Two spots
+    // had to be fixed for that -- the block embed reads the target's
+    // embedding table, which TP shards over the VOCABULARY, and a drafter
+    // that shares the target's lm_head reads a head sharded the same way.
+    // Both were silent: every rank produced a plausible embedding of the
+    // wrong token, drafted a different token from the next one, and the
+    // ranks' KV caches quietly stopped describing the same sequence.
+    //
+    // PIPELINE parallel is covered below too, and it is the harder half:
+    // the drafter reads the residual stream tapped at specific TARGET
+    // layers, and a split puts those layers on different stages.  Each
+    // stage now captures the taps it owns and forwards the block, so the
+    // last stage -- which hosts the drafter, as it hosts the MTP head --
+    // ends up with the whole concatenated row.  The mini drafter taps
+    // layers 0 and 2 of a 4-layer target, so a 2/2 split lands one tap on
+    // each stage and the test fails if the forwarding is dropped.
     for (bool own : {false, true}) {
         // own=false: the drafter ships no head or embedding, so it shares
         //            the target's -- what this loader always assumed.
@@ -457,6 +507,96 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("   accept path: identical, token %d x%d   [%s]\n",
                             best, best_n, fstats.c_str());
+            }
+
+            // ---- DFlash across two tensor-parallel ranks --------------
+            // Run the FORCED drafter, not the random one: at zero
+            // acceptance every rank rolls back every draft and the test
+            // would pass without either rank ever committing a drafted
+            // token.  What has to hold is that both ranks draft the SAME
+            // token from sharded weights and commit the same prefix --
+            // and that the result is still, exactly, the plain output.
+            if (rc == 0) {
+                const std::string tsock = (tdir/"df-tp.sock").string();
+                const std::string tout  = (tdir/"df-tp.txt").string();
+                const std::vector<std::string> common{
+                    "GRIMOIRE_TP_WORLD_SIZE=2", "GRIMOIRE_TP_SOCKET="+tsock,
+                    "GRIMOIRE_DFLASH_MODEL="+fdir.string(),
+                    "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_SPEC_STATS=1",
+                    "GRIMOIRE_DEVICE_ANY=1"};
+                const auto r = spawn_two(self, tdir.string(), tout, fmt,
+                                         common, "GRIMOIRE_TP_RANK", 0,
+                                         tdir, "df-tp");
+                const std::string tlog = (tdir/"df-tp0.log").string();
+                const std::string tstats = spec_line(tlog);
+                if (r.first != 0 || r.second != 0) {
+                    ++g_fail;
+                    std::printf("   TP+DFlash FAILED (rank0 %d, rank1 %d): %s\n",
+                                r.first, r.second, tstats.c_str());
+                } else if (read_tokens(tout) != plain) {
+                    ++g_fail;
+                    std::printf("   TP+DFlash CHANGED THE OUTPUT"
+                                "\n     plain:%s\n     tp   :%s\n",
+                                join(plain).c_str(),
+                                join(read_tokens(tout)).c_str());
+                } else if (tstats.empty() ||
+                           tstats.find("(0 of ") != std::string::npos) {
+                    // Same trap as the single-process forced case: an
+                    // identical answer is free if nothing was drafted, and
+                    // a drafter that failed to load under TP would pass.
+                    ++g_fail;
+                    std::printf("   TP+DFlash accepted NOTHING -- the drafter "
+                                "did not load or drafted nothing: %s\n",
+                                tstats.c_str());
+                } else {
+                    std::printf("   TP+DFlash: identical   [%s]\n",
+                                tstats.c_str());
+                }
+
+                // ---- DFlash across two PIPELINE stages ---------------
+                // The case the tap forwarding exists for.  The mini
+                // drafter taps target layers 0 and 2, which a 2/2 split
+                // puts on DIFFERENT stages: stage 0 captures the first,
+                // stage 1 the second, and only the forwarded block makes
+                // the concatenated row the drafter's fc consumes.  Drop
+                // the forwarding and the drafter still runs -- on a row
+                // that is half zeros -- so the failure this catches is a
+                // silent one.
+                const std::string psock = (tdir/"df-pp.sock").string();
+                const std::string pout  = (tdir/"df-pp.txt").string();
+                const std::vector<std::string> pcommon{
+                    "GRIMOIRE_PP_WORLD_SIZE=2", "GRIMOIRE_PP_SPLIT=2",
+                    "GRIMOIRE_PP_SOCKET="+psock,
+                    "GRIMOIRE_DFLASH_MODEL="+fdir.string(),
+                    "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_SPEC_STATS=1",
+                    "GRIMOIRE_DEVICE_ANY=1"};
+                // The LAST stage writes the tokens: it hosts the drafter
+                // and the lm_head, so it is the one that has them.
+                const auto pr = spawn_two(self, tdir.string(), pout, fmt,
+                                          pcommon, "GRIMOIRE_PP_RANK", 1,
+                                          tdir, "df-pp");
+                const std::string plog2 = (tdir/"df-pp1.log").string();
+                const std::string pstats = spec_line(plog2);
+                if (pr.first != 0 || pr.second != 0) {
+                    ++g_fail;
+                    std::printf("   PP+DFlash FAILED (last %d, first %d): %s\n",
+                                pr.first, pr.second, pstats.c_str());
+                } else if (read_tokens(pout) != plain) {
+                    ++g_fail;
+                    std::printf("   PP+DFlash CHANGED THE OUTPUT"
+                                "\n     plain:%s\n     pp   :%s\n",
+                                join(plain).c_str(),
+                                join(read_tokens(pout)).c_str());
+                } else if (pstats.empty() ||
+                           pstats.find("(0 of ") != std::string::npos) {
+                    ++g_fail;
+                    std::printf("   PP+DFlash accepted NOTHING -- the drafter "
+                                "did not load or drafted nothing: %s\n",
+                                pstats.c_str());
+                } else {
+                    std::printf("   PP+DFlash: identical   [%s]\n",
+                                pstats.c_str());
+                }
             }
         }
     }

@@ -346,6 +346,14 @@ sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h,
 sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
     const float* gate, float* out, int64_t n, float beta,
     const std::vector<sycl::event>& deps = {});
+// Fused MoVA value projection: routes stay on the device.  `w` is the E
+// experts packed expert-major as one [E*N][K] weight; rex/rwt are the
+// [M][top_k] routing table the K2 router wrote.  See ops.cpp.
+sycl::event launch_mova_value_packed(
+    sycl::queue& q, const QuantWeight& w, const float* x,
+    const int32_t* rex, const float* rwt, float* y,
+    int M, int N, int E, int top_k,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
     float w, int n, const std::vector<sycl::event>& deps = {});
 sycl::event launch_router_topk_k2(
@@ -459,6 +467,14 @@ sycl::event launch_dflash2_path_walk(
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});
+// Row-sharded counterpart of launch_embed_batched, for tensor parallel.
+// Each rank holds vocabulary rows [begin, begin+rows) of the table; a token
+// outside that range contributes ZERO from this rank, and the caller sums
+// the ranks with an all-reduce.  Writing zero (rather than skipping the
+// row) is what makes that sum exact.
+sycl::event launch_embed_batched_shard(sycl::queue& q, const bf16_t* table,
+    const int32_t* tokens, float* out, int count, int hidden,
+    int begin, int rows, const std::vector<sycl::event>& deps = {});
 sycl::event launch_embed_f16_batched(sycl::queue& q, const sycl::half* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});

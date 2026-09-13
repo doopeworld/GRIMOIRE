@@ -158,6 +158,12 @@ int main(int argc, char** argv) {
         { mini::dense(4), "fp8"  },   // the dual-GPU format
         { mini::moe(4),   "bf16" },
         { mini::moe(4),   "fp8"  },
+        // K2 also happens to A/B the MoVA value projection across
+        // processes for free: a single process packs its value experts
+        // expert-major and reads the routing table on the device, while
+        // TP keeps the per-expert weights and reads it back to the host.
+        // Two different code paths, so token-identical output here says
+        // the packing indexes the right expert.
         { mini::k2(),     "bf16" },
         // The hybrid carries DeltaNet layers: a recurrent state and a conv
         // ring that a pipeline split has to keep consistent across ranks.

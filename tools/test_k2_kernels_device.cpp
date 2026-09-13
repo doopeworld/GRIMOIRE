@@ -291,6 +291,108 @@ int main() {
         sycl::free(d_in,q); sycl::free(d_out,q);
     }
 
+    // ---- 4b. MoVA value projection, experts packed EXPERT-MAJOR ------
+    // The kernel that replaces the per-expert GEMV plus the host readback.
+    // It must produce EXACTLY what that path produced, so the reference
+    // here is the same one: dequantize through QuantWeight::at(), which is
+    // what every GRIMOIRE kernel is required to agree with, then
+    // k2::mova_combine over the routed expert outputs.
+    //
+    // Every format, because the expert-major index (expert*N + row) walks
+    // the scale array differently per format -- a per-channel scale is one
+    // value per packed row, a group scale is a row of them, and getting
+    // that wrong reads another expert's scales while still producing
+    // finite, plausible values.
+    for (Fmt fmt : {Fmt::BF16, Fmt::FP8_E4M3, Fmt::FP8_E5M2, Fmt::INT8,
+                    Fmt::INT4, Fmt::MXFP8, Fmt::MXFP4}) {
+        const int E = 6, N = 32, K = 128, M = 3, top_k = 3;
+        std::vector<float> host(size_t(E) * N * K);
+        for (auto& v : host) v = nd(rng) * 0.5f;
+        PackedWeight pw = quantize(host.data(), E * N, K, fmt);
+
+        // Upload the packed weight as the engine does.
+        uint8_t* d_pay = sycl::malloc_device<uint8_t>(pw.payload.size(), q);
+        q.memcpy(d_pay, pw.payload.data(), pw.payload.size()).wait();
+        uint8_t* d_sc = nullptr;
+        if (!pw.scales_raw.empty()) {
+            d_sc = sycl::malloc_device<uint8_t>(pw.scales_raw.size(), q);
+            q.memcpy(d_sc, pw.scales_raw.data(), pw.scales_raw.size()).wait();
+        }
+        uint8_t* d_zr = nullptr;
+        if (!pw.zeros.empty()) {
+            d_zr = sycl::malloc_device<uint8_t>(pw.zeros.size(), q);
+            q.memcpy(d_zr, pw.zeros.data(), pw.zeros.size()).wait();
+        }
+        QuantWeight dw = pw.view();
+        dw.payload = d_pay; dw.scales = d_sc; dw.zeros = d_zr;
+
+        std::vector<float> x(size_t(M) * K);
+        for (auto& v : x) v = nd(rng);
+        // A deliberate out-of-range route in the last slot of row 1: the
+        // router emits -1 when it fills fewer than top_k slots, and the
+        // kernel must skip it rather than index past the experts.
+        std::vector<int32_t> rex(size_t(M) * top_k);
+        std::vector<float>   rwt(size_t(M) * top_k);
+        for (int m = 0; m < M; ++m)
+            for (int j = 0; j < top_k; ++j) {
+                rex[size_t(m)*top_k+j] = (m * 2 + j * 3) % E;
+                rwt[size_t(m)*top_k+j] = 0.15f + 0.2f * float(j);
+            }
+        rex[size_t(1)*top_k + top_k - 1] = -1;
+
+        float*   d_x   = sycl::malloc_device<float>(x.size(), q);
+        int32_t* d_rex = sycl::malloc_device<int32_t>(rex.size(), q);
+        float*   d_rwt = sycl::malloc_device<float>(rwt.size(), q);
+        float*   d_y   = sycl::malloc_device<float>(size_t(M) * N, q);
+        q.memcpy(d_x, x.data(), x.size()*4).wait();
+        q.memcpy(d_rex, rex.data(), rex.size()*sizeof(int32_t)).wait();
+        q.memcpy(d_rwt, rwt.data(), rwt.size()*sizeof(float)).wait();
+        q.memset(d_y, 0, size_t(M)*N*4).wait();
+
+        launch_mova_value_packed(q, dw, d_x, d_rex, d_rwt, d_y,
+                                 M, N, E, top_k).wait();
+        std::vector<float> got(size_t(M) * N);
+        q.memcpy(got.data(), d_y, size_t(M)*N*4).wait();
+
+        // Reference: dequantize on the host through the SAME accessor the
+        // kernel is required to match, project, then combine.
+        const QuantWeight hw = pw.view();
+        std::vector<float> want(size_t(M) * N, 0.0f);
+        for (int m = 0; m < M; ++m) {
+            std::vector<std::vector<float>> outs;
+            std::vector<float> ws;
+            for (int j = 0; j < top_k; ++j) {
+                const int e = rex[size_t(m)*top_k+j];
+                if (e < 0 || e >= E) continue;
+                std::vector<float> o(size_t(N), 0.0f);
+                for (int n2 = 0; n2 < N; ++n2) {
+                    double a = 0.0;
+                    for (int k = 0; k < K; ++k)
+                        a += double(hw.at(e * N + n2, k)) * double(x[size_t(m)*K+k]);
+                    o[size_t(n2)] = float(a);
+                }
+                outs.push_back(std::move(o));
+                ws.push_back(rwt[size_t(m)*top_k+j]);
+            }
+            std::vector<const float*> ptr(outs.size());
+            for (size_t i = 0; i < outs.size(); ++i) ptr[i] = outs[i].data();
+            k2::mova_combine(ptr.data(), ws.data(), int(outs.size()), N,
+                             want.data() + size_t(m)*N);
+        }
+        const double d = worst_abs(want, got);
+        std::printf("mova packed      %-9s E=%d N=%d K=%d top_k=%d      %.3e\n",
+                    fmt_name(fmt), E, N, K, top_k, d);
+        // The tolerance is on the ACCUMULATION order, not the dequant: the
+        // host sums in double and the kernel in float over K=128 terms.
+        CHECK(d < 2e-3, "packed MoVA differs from the per-expert reference (%s)",
+              fmt_name(fmt));
+        // The skipped route must actually be skipped: if the kernel read
+        // expert -1 it would still write finite numbers.
+        CHECK(std::isfinite(got[size_t(1)*N]), "packed MoVA produced a non-finite value");
+        sycl::free(d_pay,q); if(d_sc) sycl::free(d_sc,q); if(d_zr) sycl::free(d_zr,q);
+        sycl::free(d_x,q); sycl::free(d_rex,q); sycl::free(d_rwt,q); sycl::free(d_y,q);
+    }
+
     // ---- 5. DFlash2 candidate selector -------------------------------
     // The whole chain, on device: top-16 per row over a PADDED logit
     // stride, edge scores, then the greedy walk.

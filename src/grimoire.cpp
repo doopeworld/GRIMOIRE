@@ -1706,6 +1706,26 @@ struct Grimoire {
     // loop and deadlock on the next collective.  The last stage publishes
     // one answer at connect time and everyone uses it.
     int  pp_spec = 0;
+    // Taps forwarded along the pipeline for a DFlash drafter, or 0.
+    //
+    // DFlash's drafter consumes the residual stream tapped at several
+    // TARGET layers, concatenated into one row per token.  Under PP those
+    // layers live on different stages, so no stage can build that row from
+    // what it computes alone.  Each stage therefore captures the taps it
+    // owns and forwards the whole block to the next one, which overwrites
+    // its copy, fills in its own taps, and forwards again -- by the last
+    // stage every tap is present.  The last stage is the one that hosts
+    // the drafter, same as the MTP head.
+    //
+    // Zero unless a drafter is configured, and every send below is guarded
+    // on it, so a pipeline without DFlash moves exactly the bytes it
+    // always did.
+    int  pp_taps = 0;
+    // Draft block width the LAST stage will propose, or 0 when no DFlash
+    // drafter is loaded there.  Earlier stages have no drafter and cannot
+    // ask their own copy, so they take the width from the handshake and
+    // use it to size the backward hop that carries the drafted block.
+    int  pp_dflash = 0;
     bool spec_active() const {
         if (pp_enabled()) return pp_spec != 0;
         return mtp_enabled() && mtp.ok;
@@ -1745,6 +1765,8 @@ struct Grimoire {
     bool pp_sync_tokens(std::vector<int32_t>& toks);
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
+    bool pp_send_taps(int first,int rows);
+    bool pp_recv_taps(int first,int rows);
     int  pp_sync_token(int token);
     bool tp_allgather(float* dev, int elems, int begin, int count);
     bool tp_allreduce_sum(float* dev, int elems);
@@ -1797,6 +1819,18 @@ struct Grimoire {
         bool moe_layer = false;
         DevQuant v_router;
         bf16_t*  v_router_bias = nullptr;
+        // Exactly ONE of these is populated, never both -- they hold the
+        // same weights and holding both would double a K2 layer's value
+        // parameters on the card.
+        //   v_experts_packed : the E experts concatenated along N as one
+        //     [E*N][K] weight, so a single kernel can index them from the
+        //     device-resident routing table.  The default.
+        //   v_experts        : the separate per-expert weights, kept for
+        //     TENSOR PARALLEL, which shards each expert's rows across
+        //     ranks -- a shard of the concatenated matrix would cut across
+        //     expert boundaries instead.
+        DevQuant v_experts_packed;
+        int      v_experts_n = 0;          // rows per expert in the packed form
         std::vector<DevQuant> v_experts;
         bf16_t*  router_bias = nullptr;      // mlp.gate.bias
 
@@ -2107,6 +2141,22 @@ struct Grimoire {
     // grouped GEMV can index them with no sync at all.
     sycl::event mova_value_m1(LayerDev& d, const float* x, float* y,
                               const std::vector<sycl::event>& deps) {
+        // Packed form: no readback at all, and one kernel instead of
+        // 1 + top_k.  Decode pays the same two stalls per sparse layer
+        // that prefill did, just fewer of them, so it takes this path too.
+        if (d.v_experts_packed.w.N > 0 && d.v_experts_n > 0) {
+            const int E = cfg.mova_experts;
+            const int K = std::min(cfg.mova_top_k, E);
+            if (E <= 0 || K <= 0) return q.submit([&](sycl::handler& h){
+                h.depends_on(deps); h.single_task([=](){}); });
+            sycl::event ev = gemv_any(d.v_router, x, mova_logits, deps);
+            ev = launch_router_topk_k2(q, mova_logits, d.v_router_bias,
+                                       1, E, K, mova_rex, mova_rwt,
+                                       /*normalize=*/K > 1, cfg.router_scale, {ev});
+            return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+                                            mova_rex, mova_rwt, y,
+                                            1, d.v_experts_n, E, K, {ev});
+        }
         const int E = int(d.v_experts.size());
         const int K = std::min(cfg.mova_top_k, E);
         // output_rows(), NOT w.N.  Under TP w.N is this rank's SHARD, while
@@ -2168,10 +2218,28 @@ struct Grimoire {
                                    float* logits, int32_t* rex, float* rwt,
                                    std::vector<int32_t>& idx_host,
                                    std::vector<float>& wt_host) {
+        const int H = cfg.hidden;
+        // Packed form: the routing table never leaves the device, so the
+        // one remaining stall goes away with it.
+        if (d.v_experts_packed.w.N > 0 && d.v_experts_n > 0) {
+            const int E = cfg.mova_experts;
+            const int K = std::min(cfg.mova_top_k, E);
+            if (E <= 0 || K <= 0 || M <= 0)
+                return q.submit([&](sycl::handler& h){ h.single_task([=](){}); });
+            for (int m = 0; m < M; ++m)
+                gemv_any(d.v_router, x + size_t(m) * H,
+                         logits + size_t(m) * E, {});
+            sycl::event ev = launch_router_topk_k2(q, logits, d.v_router_bias,
+                                                   M, E, K, rex, rwt,
+                                                   /*normalize=*/K > 1,
+                                                   cfg.router_scale, {});
+            return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+                                            rex, rwt, y, M, d.v_experts_n,
+                                            E, K, {ev});
+        }
         const int E = int(d.v_experts.size());
         const int K = std::min(cfg.mova_top_k, E);
         const int N = d.v_experts.empty() ? 0 : d.v_experts[0].output_rows();
-        const int H = cfg.hidden;
         if (E <= 0 || K <= 0 || N <= 0 || M <= 0)
             return q.submit([&](sycl::handler& h){ h.single_task([=](){}); });
 
@@ -2358,6 +2426,29 @@ struct Grimoire {
         return tp_allreduce_sum(out,cfg.hidden);
     }
 
+    // Batched embed that is correct under tensor parallel.  The table is
+    // row-sharded over the VOCABULARY, so launch_embed_batched -- which
+    // indexes it by absolute token id -- reads whatever row happens to sit
+    // at that offset in this rank's slice.  Nothing errors: every rank
+    // produces a plausible embedding of the WRONG token, and the only
+    // symptom is that the drafter proposes badly.  That is precisely the
+    // failure mode this project keeps paying for, so route every batched
+    // embed through here rather than calling the kernel directly.
+    bool embed_rows(const bf16_t* table,const int32_t* tokens,float* out,
+                    int count) {
+        const std::vector<sycl::event> none{};
+        if(count<=0)return true;
+        // Only the TARGET's table is sharded.  A drafter that ships its own
+        // embed_tokens loaded it whole, so it must NOT be offset.
+        if(!tp_enabled()||table!=embed){
+            launch_embed_batched(q,table,tokens,out,count,cfg.hidden,none);
+            return true;
+        }
+        launch_embed_batched_shard(q,table,tokens,out,count,cfg.hidden,
+                                   embed_begin,embed_count,none);
+        return tp_allreduce_sum(out,count*cfg.hidden);
+    }
+
     bool build_graph();
     const float* step();          // one token: graph replay if available
 
@@ -2493,6 +2584,28 @@ bool Grimoire::pp_connect(std::string& err) {
         // while rank 1 did not.
         pp_spec = pp_sync_token(mtp.ok ? 1 : 0);
         if (pp_spec < 0) { err = "PP speculation handshake failed"; return false; }
+        // Second hop, same shape, for the DFlash tap block.  Every stage
+        // resolved the tap count from the drafter's own config, so they
+        // SHOULD already agree -- but a stage that disagreed would read a
+        // different number of floats off the socket than the previous one
+        // wrote, desynchronising the stream for every later message
+        // (hidden states included) with no error at the point of failure.
+        // Check it once here, where it is one comparison.
+        // Third hop: the DFlash draft width.  Same reason pp_spec exists --
+        // if one stage ran the speculative loop and another the plain one
+        // they would deadlock on the next collective, so the LAST stage
+        // (the only one with a drafter) decides for everybody.
+        pp_dflash = pp_sync_token(dflash2.ok ? dflash_block_rows() : 0);
+        if (pp_dflash < 0) { err = "PP DFlash handshake failed"; return false; }
+        const int want_taps = pp_sync_token(pp_taps);
+        if (want_taps < 0) { err = "PP tap handshake failed"; return false; }
+        if (want_taps != pp_taps) {
+            err = "PP stages disagree about the DFlash tap count (this "
+                  "stage " + std::to_string(pp_taps) + ", the last stage " +
+                  std::to_string(want_taps) + ") -- every stage must be "
+                  "given the same GRIMOIRE_DFLASH_MODEL";
+            return false;
+        }
     }
     std::printf("  %s rank %d/%d: connected%s\n",tp_enabled()?"TP":"PP",
                 comm_rank(),(tp_enabled()?tp_world:pp_world),
@@ -2515,6 +2628,28 @@ bool Grimoire::pp_sync_tokens(std::vector<int32_t>& toks) {
         if (pp_rank > 0 && !fd_write_all(pp_prev_fd, toks.data(), bytes)) return false;
     }
     return true;
+}
+
+// Forward this stage's view of the DFlash tap block for `rows` positions
+// starting at `first`.  The receiver overwrites its own copy with it and
+// then fills in the taps it owns, so the union grows along the pipe and
+// the last stage ends up with every tap.
+//
+// Sent as ONE contiguous message because target_aux is token-major
+// [max_seq][taps][hidden]: the rows for a span of positions are already
+// adjacent, so no gather is needed.
+bool Grimoire::pp_send_taps(int first, int rows) {
+    if (!pp_taps || rows <= 0) return true;
+    const size_t elems = size_t(rows) * size_t(pp_taps) * size_t(cfg.hidden);
+    return pp_send_hidden(dflash2.target_aux +
+                          int64_t(first) * pp_taps * cfg.hidden, elems);
+}
+
+bool Grimoire::pp_recv_taps(int first, int rows) {
+    if (!pp_taps || rows <= 0) return true;
+    const size_t elems = size_t(rows) * size_t(pp_taps) * size_t(cfg.hidden);
+    return pp_recv_hidden(dflash2.target_aux +
+                          int64_t(first) * pp_taps * cfg.hidden, elems);
 }
 
 bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
@@ -2920,14 +3055,52 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     if (src.v_router_bias.ok())
                         d.v_router_bias = dev_copy_t<bf16_t>(lq, ck, src.v_router_bias,
                             "self_attn.v_router.bias", &ok);
-                    d.v_experts.resize(size_t(cfg.mova_experts));
-                    for (int e = 0; e < cfg.mova_experts && ok; ++e) {
-                        const std::string vn =
-                            "self_attn.v_experts." + std::to_string(e);
-                        d.v_experts[size_t(e)] = quantize_upload_t(
-                            lq, ck, src.v_experts[size_t(e)], PF, vn.c_str(), &ok);
-                        shard(d.v_experts[size_t(e)], lq);
-                        acct(d.v_experts[size_t(e)].w.bytes());
+                    // GRIMOIRE_MOVA_PER_EXPERT=1 keeps the old per-expert
+                    // path so the two can be run against each other -- on
+                    // output first (they must be identical; bin/test_k2_e2e
+                    // checks that) and then, on the card, on time.  Read
+                    // through getenv on every load, not a function-local
+                    // static, so a single process can load both ways.
+                    const char* per_ex = std::getenv("GRIMOIRE_MOVA_PER_EXPERT");
+                    if (!tp_enabled() && !(per_ex && *per_ex && *per_ex != '0')) {
+                        // Expert-major: one [E*N][K] weight, so the routed
+                        // value projection reads the routing table on the
+                        // DEVICE instead of stalling on it once per layer.
+                        // Same bytes as the E separate weights -- this is a
+                        // different layout, not a second copy.
+                        std::vector<TensorRef> refs;
+                        refs.reserve(size_t(cfg.mova_experts));
+                        for (int e = 0; e < cfg.mova_experts; ++e)
+                            refs.push_back(src.v_experts[size_t(e)]);
+                        d.v_experts_packed = concat_rows_f32_t(
+                            lq, ck, refs, PF, "self_attn.v_experts.packed", &ok);
+                        if (ok) {
+                            const int rows = d.v_experts_packed.w.N;
+                            if (cfg.mova_experts <= 0 || rows % cfg.mova_experts) {
+                                // Refuse rather than divide wrongly: every
+                                // index below is expert*N + row, so a bad N
+                                // reads another expert's weights and the
+                                // output stays plausible.
+                                err = "MoVA packed experts have " +
+                                      std::to_string(rows) + " rows, not a "
+                                      "multiple of " +
+                                      std::to_string(cfg.mova_experts) +
+                                      " experts";
+                                return false;
+                            }
+                            d.v_experts_n = rows / cfg.mova_experts;
+                            acct(d.v_experts_packed.w.bytes());
+                        }
+                    } else {
+                        d.v_experts.resize(size_t(cfg.mova_experts));
+                        for (int e = 0; e < cfg.mova_experts && ok; ++e) {
+                            const std::string vn =
+                                "self_attn.v_experts." + std::to_string(e);
+                            d.v_experts[size_t(e)] = quantize_upload_t(
+                                lq, ck, src.v_experts[size_t(e)], PF, vn.c_str(), &ok);
+                            shard(d.v_experts[size_t(e)], lq);
+                            acct(d.v_experts[size_t(e)].w.bytes());
+                        }
                     }
                 }
             }
@@ -3473,7 +3646,69 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // ---- DFlash sidecar weights -------------------------------------
     const char* dpath=std::getenv("GRIMOIRE_DFLASH_MODEL");
     if(!dpath||!*dpath)dpath=std::getenv("GRIMOIRE_DFLASH2_MODEL");
-    if(dpath&&*dpath&&!tp_enabled()&&!pp_enabled()) {
+    // TENSOR parallel is fine: the drafter is small and is loaded WHOLE on
+    // every rank (nothing in this block calls the `shard` lambda), so each
+    // rank drafts identically with no extra collective -- the same argument
+    // that makes the MTP head work under TP.  The two places that did read
+    // sharded target state are fixed: the block embed goes through
+    // embed_rows(), and a shared lm_head goes through gemv_any().
+    //
+    // PIPELINE parallel: the LAST stage hosts the drafter, exactly as it
+    // hosts the MTP head, because it is the stage that owns the final
+    // hidden state.  The taps the drafter consumes are captured on
+    // whichever stage owns the layer they name and forwarded along the
+    // pipe (see pp_taps), so by the time the last stage drafts, the
+    // concatenated tap row is complete.
+    //
+    // An EARLIER stage takes the short branch below instead: it resolves
+    // the same tap set from the same config and allocates the same tap
+    // buffer, but loads no draft weights -- it never drafts, it only
+    // captures and forwards.  Resolving the tap set from the drafter's own
+    // config on every stage is what keeps the stages from disagreeing
+    // about which layers to tap, which would be silent.
+    if(dpath&&*dpath&&pp_enabled()&&pp_rank!=pp_world-1) {
+        DFlashSettings dcfg;
+        std::ifstream dcfg_in(std::string(dpath)+"/config.json");
+        if(!dcfg_in){
+            err="DFlash: no config.json in "+std::string(dpath);return false;
+        }
+        const std::string text((std::istreambuf_iterator<char>(dcfg_in)),
+                                std::istreambuf_iterator<char>());
+        dcfg=parse_dflash_config(text);
+        if(!dcfg.error.empty()){
+            err="DFlash draft config: "+dcfg.error; return false;
+        }
+        dflash2.target_layers=dcfg.target_layers;
+        if(dflash2.target_layers.empty())
+            dflash2.target_layers={1,6,11,16,22,27,32,37};
+        // Same refusal the owning stage makes: a tap naming the last layer
+        // has no capture point, and fc would then read whatever that slice
+        // of target_aux was allocated with.
+        for(int id:dflash2.target_layers){
+            if(id>=0&&id+1<cfg.n_layers)continue;
+            err="DFlash target layer id "+std::to_string(id)+
+                " has no capture point in a "+std::to_string(cfg.n_layers)+
+                "-layer target";
+            return false;
+        }
+        const size_t NTAP=dflash2.target_layers.size();
+        dflash2.target_aux=sycl::malloc_device<float>(
+            size_t(max_seq)*NTAP*cfg.hidden,q);
+        if(!dflash2.target_aux){
+            err="DFlash tap buffer allocation failed on PP stage "+
+                std::to_string(pp_rank);
+            return false;
+        }
+        // Uninitialised device memory would otherwise reach fc for any
+        // position a stage forwards before capturing anything into it.
+        q.memset(dflash2.target_aux,0,
+                 size_t(max_seq)*NTAP*cfg.hidden*sizeof(float)).wait();
+        pp_taps=int(NTAP);
+        std::printf("  dflash taps: %d, captured here and forwarded "
+                    "(stage %d of %d hosts no drafter)\n",
+                    pp_taps,pp_rank,pp_world);
+    }
+    if(dpath&&*dpath&&(!pp_enabled()||pp_rank==pp_world-1)) {
         std::printf("\n  dflash       ");
         std::fflush(stdout);
         Qwen35Model dc;
@@ -4257,6 +4492,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
         dflash2.ok=dok;
         if(!dok){err="DFlash weight upload failed";return false;}
+        // The last stage receives taps from every stage before it, so it
+        // must expect the same block width they send.  Every stage derived
+        // this from the SAME draft config; pp_connect checks that they
+        // agree rather than trusting it.
+        if(pp_enabled())pp_taps=int(dflash2.target_layers.size());
         acct(db);
         std::printf("ok (%s, %.2f GiB device, target taps + draft KV ready)\n",
                     dflash2.v2?"DFlash2DraftModel":"DFlashDraftModel",
@@ -4490,7 +4730,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
         const bool par = tp_enabled() || pp_enabled();
         if (!spec_verify_available() && (mtp.ok || dflash2.ok ||
-                                         (pp_enabled() && pp_spec)))
+                                         (pp_enabled() && (pp_spec || pp_dflash))))
             std::printf("    speculation   DISABLED -- recurrent "
                         "(linear-attention) model and no batched verify here, "
                         "so a rejected draft could not be rolled back exactly\n");
@@ -4499,14 +4739,22 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         else if (pp_enabled() && pp_spec)
             std::printf("    speculation   MTP (head on the last stage; this "
                         "stage drafts in lockstep with it)\n");
-        else if (dflash2.ok)   std::printf("    speculation   DFlash%s%s\n",
+        else if (dflash2.ok)   std::printf("    speculation   DFlash%s%s%s\n",
                                    dflash2.v2 ? "2" : "",
                                    dflash2.selector_ok ? " + candidate selector"
-                                                       : " (argmax draft, no selector)");
+                                                       : " (argmax draft, no selector)",
+                                   tp_enabled() ? " (drafter replicated on every rank)"
+                                 : pp_enabled() ? " (drafter on this, the last stage;"
+                                                  " taps forwarded from every stage)"
+                                                : "");
+        else if (pp_enabled() && pp_dflash > 0)
+            std::printf("    speculation   DFlash (drafter on the last stage; "
+                        "this stage captures %d target tap%s and forwards "
+                        "them, and drafts in lockstep)\n",
+                        pp_taps, pp_taps == 1 ? "" : "s");
         else if (par && std::getenv("GRIMOIRE_DFLASH_MODEL"))
-            std::printf("    speculation   DISABLED -- DFlash is not supported "
-                        "with %s (MTP is)\n", tp_enabled() ? "tensor parallel"
-                                                            : "pipeline parallel");
+            std::printf("    speculation   DISABLED -- a DFlash drafter was "
+                        "given but did not load\n");
         else if (par && mtp_enabled())
             std::printf("    speculation   DISABLED -- MTP requested but the "
                         "head did not load\n");
@@ -5790,13 +6038,25 @@ const float* Grimoire::forward_muse(int token) {
             std::fprintf(stderr, "PP rank %d: Muse hidden receive failed\n", pp_rank);
             return nullptr;
         }
+        // Same order on both sides of every boundary: hidden, then taps.
+        // The socket is a byte stream, so a mismatch here would not fail
+        // where it happened -- it would misalign every later message.
+        if (!pp_recv_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: Muse tap receive failed\n", pp_rank);
+            return nullptr;
+        }
     }
 
     const int layer_begin = pp_enabled() ? pp_begin : 0;
     const int layer_end   = pp_enabled() ? pp_end   : cfg.n_layers;
     for (int i = layer_begin; i < layer_end; ++i) {
         LayerDev& d = L[i];
-        if (dflash2.ok) {
+        // target_aux, not dflash2.ok.  Under PP an earlier stage owns the
+        // tap buffer and the tap set but hosts no drafter, and it is
+        // exactly that stage's taps the last stage cannot compute for
+        // itself -- gating on .ok would leave them zero and the drafter
+        // would run on a tap row that is mostly zeros, silently.
+        if (dflash2.target_aux) {
             for (size_t tap = 0; tap < dflash2.target_layers.size(); ++tap) {
                 // vLLM requests aux layer target_layer_id + 1 and Muse emits
                 // it after completing target_layer_id.  This loop observes
@@ -5866,6 +6126,10 @@ const float* Grimoire::forward_muse(int token) {
             std::fprintf(stderr, "PP rank %d: Muse hidden send failed\n", pp_rank);
             return nullptr;
         }
+        if (!pp_send_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: Muse tap send failed\n", pp_rank);
+            return nullptr;
+        }
         launch_incr_pos(q, s.d_pos, none);
         launch_incr_pos(q, s.d_seq_len, none);
         ++pos;
@@ -5907,6 +6171,10 @@ const float* Grimoire::forward(int token) {
     if (pp_enabled() && pp_rank > 0) {
         if (!pp_recv_hidden(s.h, size_t(H))) {
             std::fprintf(stderr, "PP rank 1: hidden receive failed\n");
+            return nullptr;
+        }
+        if (!pp_recv_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: tap receive failed\n", pp_rank);
             return nullptr;
         }
     } else if (tp_enabled()) {
@@ -5952,7 +6220,7 @@ const float* Grimoire::forward(int token) {
         // vLLM turns target_layer_id n into aux layer n+1.  At entry to layer
         // n+1 Grimoire has folded layer n's output into s.h, matching Muse's
         // post-layer aux hidden state exactly.
-        if (dflash2.ok) {
+        if (dflash2.target_aux) {
             for (size_t tap = 0; tap < dflash2.target_layers.size(); ++tap) {
                 if (dflash2.target_layers[tap] + 1 == i) {
                     launch_dflash_store_tap_dev(q,s.h,dflash2.target_aux,H,
@@ -6232,6 +6500,10 @@ const float* Grimoire::forward(int token) {
         }
         if (!pp_send_hidden(s.h, size_t(H))) {
             std::fprintf(stderr, "PP rank %d: hidden send failed\n",pp_rank);
+            return nullptr;
+        }
+        if (!pp_send_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: tap send failed\n",pp_rank);
             return nullptr;
         }
         if (fusion_mask & 8) launch_incr_pos2(q, s.d_pos, s.d_seq_len, none);
@@ -6548,6 +6820,23 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                             std::vector<int32_t>& draft_tokens,
                             bool context_only) {
     constexpr int MMAX=16;   // the host_tokens array below is this wide
+    // Under PP only the LAST stage owns the final hidden state, so only it
+    // can run the drafter.  Earlier stages take the drafted block from the
+    // same backward hop mtp_draft uses, so every rank ends up with the
+    // identical candidate list and therefore the identical acceptance
+    // count -- which is what lets them all roll back to the same position
+    // without a second round trip.
+    if(pp_enabled()&&pp_rank<pp_world-1){
+        draft_tokens.clear();
+        if(context_only)return true;     // nothing to ingest without a drafter
+        if(pp_dflash<2)return false;
+        draft_tokens.assign(size_t(pp_dflash-1),0);
+        if(!pp_sync_tokens(draft_tokens)){
+            std::fprintf(stderr,"PP rank %d: draft block receive failed\n",pp_rank);
+            return false;
+        }
+        return true;
+    }
     const int M=dflash_block_rows();
     if(!dflash2.ok||position<0||position+M>max_seq){
         static bool once2=false;
@@ -6820,9 +7109,11 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     if(cfg.is_muse)
         launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
                                  dflash2.resid,M,H);
-    else
-        launch_embed_batched(q,dflash2.draft_embed?dflash2.draft_embed:embed,
-                             dflash2.tokens,dflash2.resid,M,H);
+    else if(!embed_rows(dflash2.draft_embed?dflash2.draft_embed:embed,
+                        dflash2.tokens,dflash2.resid,M)) {
+        std::fprintf(stderr,"  DFlash: block embed all-reduce failed\n");
+        return false;
+    }
     checkpoint("block embedding");
     draft_mark("embed + setup");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
@@ -7015,6 +7306,19 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else if(cfg.is_muse){
         mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
            dflash2.logits,M-1);
+    }else if(tp_enabled()&&lm_head.tp_sharded()){
+        // Under TP the target's lm_head is row-sharded over the vocabulary,
+        // so lm_head.w.N is THIS rank's slice.  Both wide paths below write
+        // a full-width logits row from it and would silently emit one rank's
+        // fraction of the vocabulary -- every rank then drafts a different
+        // token, the ranks' KV caches stop describing the same sequence, and
+        // nothing reports an error.  gemv_any is the one path that knows to
+        // compute the local rows and all-gather them, so take it.  It costs
+        // M-1 <= 15 row projections per step; correctness first, and the
+        // batched sharded head is a measurement to make on the card.
+        for(int r=1;r<M;++r)
+            gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
+                     dflash2.logits+int64_t(r-1)*cfg.vocab,{});
     }else if(lm_head.has_i4()&&w4){
         launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
                                   M-1,H,{});
@@ -7100,6 +7404,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         std::fprintf(stderr,"\n");
     }
     checkpoint("draft logits");
+    // Push the block backward so every earlier stage speculates on the
+    // SAME candidates.  Sizes already agree: pp_dflash carries this M.
+    if(pp_enabled()&&!pp_sync_tokens(draft_tokens)){
+        std::fprintf(stderr,"PP rank %d: draft block send failed\n",pp_rank);
+        return false;
+    }
     if(dumping)dumped_draft=true;
     if(time_draft){
         double total=0.0;
@@ -7335,7 +7645,7 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         mt_cur=li;
         if(mt_on&&(mt_all||li==mt_layer))mt_prev=std::chrono::high_resolution_clock::now();
         LayerDev& d=L[size_t(li)];
-        if(dflash2.ok){
+        if(dflash2.target_aux){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
                 // vLLM converts DFlash target IDs with i+1, producing Muse
                 // auxiliary layers (2,14,26,38,50).
@@ -7700,6 +8010,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (pp_enabled() && pp_rank > 0) {
         if (!pp_recv_hidden(bh, size_t(M) * H)) {
             std::fprintf(stderr,"PP rank %d: batched hidden receive failed\n",pp_rank);
+            for(void* z:mem) if(z) sycl::free(z,q);
+            return false;
+        }
+        if (!pp_recv_taps(start_pos, M)) {
+            std::fprintf(stderr,"PP rank %d: batched tap receive failed\n",pp_rank);
             for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
@@ -8243,7 +8558,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // Match vLLM's target_layer_id + 1 convention.  bh is the completed
         // residual stream after the previous layer. Preserve every row, not
         // just the final token, because context K/V covers the accepted span.
-        if(dflash2.ok){
+        if(dflash2.target_aux){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
                 if(dflash2.target_layers[tap]+1==li){
                     launch_dflash_store_tap(q,bh,dflash2.target_aux,M,H,
@@ -8791,6 +9106,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
+        if (!pp_send_taps(start_pos, M)) {
+            std::fprintf(stderr,"PP rank %d: batched tap send failed\n",pp_rank);
+            for(void* z:mem) if(z) sycl::free(z,q);
+            return false;
+        }
     } else {
       if(defer_moe_gather)
           launch_rmsnorm_moe_residual_batched(q,bh,moe_res,pinv,rwt,r1,fnorm,bn,
@@ -9060,7 +9380,13 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                              FinishReason* finish) {
     GenerationOptions o;
     o.max_tokens=n_predict; o.eos=eos_id; o.eot=eot_id;
-    o.dflash=e.dflash2.ok && e.spec_verify_available();
+    // Under PP the drafter lives on the LAST stage only, so an earlier
+    // stage cannot answer this from its own state -- it takes the answer
+    // from the connect-time handshake.  Every stage must agree or one
+    // would run the speculative loop while another ran the plain one, and
+    // they would deadlock on the next collective.
+    o.dflash=(e.pp_enabled()?e.pp_dflash>0:e.dflash2.ok) &&
+             e.spec_verify_available();
     const char* depth=std::getenv("GRIMOIRE_MTP_K");
     o.draft_depth=o.dflash?e.dflash_block_rows()-1
                           :std::clamp(depth?std::atoi(depth):3,0,15);

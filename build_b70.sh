@@ -188,6 +188,7 @@ icpx -fsycl -fsycl-targets=spir64 \
      -fsycl-device-code-split=per_kernel \
      -I include -I src \
      tools/test_k2_kernels_device.cpp src/ops.cpp src/prefill.cpp \
+     src/quantize.cpp \
      -o bin/test_k2_kernels \
   && echo "built  : bin/test_k2_kernels" || echo "warn: k2 kernel test failed"
 

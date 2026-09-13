@@ -1452,6 +1452,114 @@ sycl::event launch_router_topk_k2(
 // MoVA accumulate: out += w * silu(in).  The SiLU is on the EXPERT
 // OUTPUT and applies before the router weight scales it, per
 // combine_routed_experts(activation=F.silu).
+// ---------------------------------------------------------------------
+// MoVA value projection over experts packed EXPERT-MAJOR.
+//
+// The bring-up path issued one GEMV per (token, route) and brought the
+// routing table back to the HOST to decide which expert each one needed:
+// two synchronisations per layer at M=1, and one per layer plus a stall
+// at prefill.  At 4096 tokens over 45 sparse layers the readback is what
+// makes K2 prefill unusable -- not the arithmetic, which is unchanged.
+//
+// Packing the E experts into a single [E*N][K] weight removes it.  Expert
+// e's output row n is global row e*N + n, so QuantWeight's own indexing
+// resolves payload and scales with NO new decode logic -- the packed
+// weight is simply a taller matrix of the same format, and `at()` on it
+// is the same reference these kernels have always had to match.  The
+// routing table can then stay on the device: this kernel reads rex/rwt
+// directly and never tells the host what it found.
+//
+// One work-item owns one (token, output row) pair and walks its own top-k
+// routes, so the accumulation is private -- no atomics, and the summation
+// order is fixed by j, which keeps the result reproducible run to run.
+//
+// NOT used under tensor parallel: TP shards each expert's rows across
+// ranks, and row-sharding a matrix that has been concatenated along N
+// would cut across expert boundaries.  The per-expert path stays for
+// that case.
+// ---------------------------------------------------------------------
+template <Fmt F>
+static sycl::event mova_value_packed_impl(
+        sycl::queue& q, const QuantWeight& w, const float* x,
+        const int32_t* rex, const float* rwt, float* y,
+        int M, int N, int E, int top_k,
+        const std::vector<sycl::event>& deps) {
+    const int K = w.K;
+    constexpr int WG = 128;
+    const size_t total  = size_t(M) * size_t(N);
+    const size_t groups = (total + WG - 1) / WG;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const QuantWeight wc = w;          // POD: pointers and strides only
+        h.parallel_for(
+            sycl::nd_range<1>(groups * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const size_t g = it.get_global_id(0);
+                if (g >= total) return;
+                const int m = int(g / size_t(N));
+                const int n = int(g % size_t(N));
+                const float* xr = x + size_t(m) * K;
+                float sum = 0.0f;
+                for (int j = 0; j < top_k; ++j) {
+                    const int e = rex[size_t(m) * top_k + j];
+                    if (e < 0 || e >= E) continue;   // router produced no route
+                    const int64_t row = int64_t(e) * N + n;
+                    const uint8_t* rp = wc.payload + row * wc.row_bytes;
+                    float a = 0.0f;
+                    for (int k = 0; k < K; ++k) {
+                        float sc;
+                        if constexpr (F == Fmt::BF16) {
+                            sc = 1.0f;
+                        } else if constexpr (F == Fmt::FP8_E4M3 ||
+                                             F == Fmt::FP8_E5M2 ||
+                                             F == Fmt::INT8) {
+                            sc = static_cast<const float*>(wc.scales)[row];
+                        } else if constexpr (F == Fmt::INT4) {
+                            sc = bf16_to_f32(static_cast<const bf16_t*>(wc.scales)
+                                     [row * wc.row_scales + k / kInt4Group]);
+                        } else {
+                            sc = e8m0_to_f32(static_cast<const uint8_t*>(wc.scales)
+                                     [row * wc.row_scales + k / kMXBlock]);
+                        }
+                        float wv;
+                        if constexpr (F == Fmt::INT4) {
+                            const uint8_t z = wc.zeros
+                                ? wc.zeros[row * wc.row_scales + k / kInt4Group]
+                                : uint8_t(0);
+                            wv = decode_int4(rp, k, sc, z);
+                        } else {
+                            wv = decode_elem<F>(rp, k, sc);
+                        }
+                        a = sycl::fma(wv, xr[k], a);
+                    }
+                    // silu THEN weight, matching launch_silu_scale_accum:
+                    // the router weight scales the activated expert output,
+                    // it does not enter the activation.
+                    const float sl = a / (1.0f + sycl::exp(-a));
+                    sum = sycl::fma(rwt[size_t(m) * top_k + j], sl, sum);
+                }
+                y[size_t(m) * N + n] = sum;
+            });
+    });
+}
+
+sycl::event launch_mova_value_packed(
+        sycl::queue& q, const QuantWeight& w, const float* x,
+        const int32_t* rex, const float* rwt, float* y,
+        int M, int N, int E, int top_k,
+        const std::vector<sycl::event>& deps) {
+    switch (w.fmt) {
+        case Fmt::BF16:     return mova_value_packed_impl<Fmt::BF16>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::FP8_E4M3: return mova_value_packed_impl<Fmt::FP8_E4M3>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::FP8_E5M2: return mova_value_packed_impl<Fmt::FP8_E5M2>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::INT8:     return mova_value_packed_impl<Fmt::INT8>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::INT4:     return mova_value_packed_impl<Fmt::INT4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::MXFP8:    return mova_value_packed_impl<Fmt::MXFP8>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::MXFP4:    return mova_value_packed_impl<Fmt::MXFP4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+    }
+    return {};
+}
+
 sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
                                     float w, int n,
                                     const std::vector<sycl::event>& deps) {
