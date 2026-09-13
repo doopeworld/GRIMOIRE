@@ -182,8 +182,15 @@ enumeration order, and each rank prints the card it got:
   rank 2 -> GPU 2/3: Intel(R) Arc(TM) B580 Graphics
 ```
 
-Read that line. On a mixed box the layer split depends on which rank
-landed where. `GRIMOIRE_DEVICES=0,2,1` remaps rank to device index when
+Read that line **before believing any multi-GPU number**. It carries the
+card's PCI address where the driver exposes one, and which physical card
+a rank gets was changed on 2026-09-13 (audit finding F5) and has been
+reasoned about, not run. A rank whose device does not exist now FAILS
+rather than quietly falling back to the default selector -- which used to
+put every rank on the same card while the collectives still connected,
+i.e. a run that looked like it worked.
+
+On a mixed box the layer split depends on which rank landed where. `GRIMOIRE_DEVICES=0,2,1` remaps rank to device index when
 the driver's order is not the one you want.
 
 **N cards, uneven split.** `tools/nrun.sh` replaces the two-card
