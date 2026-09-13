@@ -39,6 +39,7 @@ order, and stops at the first required failure:
 | `bin/test_model_matrix` | 3 architectures × 7 projection formats |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
 | `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU, MTP and DFlash |
+| generate | real model, real prompt — **you read the output** |
 
 **Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say
 REFUSED (no batched verify there, and the engine will not speculate
@@ -46,7 +47,6 @@ without one). On your B70 they run for real and must say `identical at
 K=1,2,3,5`. If either says `CHANGED THE OUTPUT`, stop: that is
 speculation on a Qwen3.5/Ornith-shaped model not reproducing the model's
 own output, which is the path the verified 49.8 TG MTP recipe uses.
-| generate | real model, real prompt — **you read the output** |
 
 Green preflight means the box is sane. It does not mean anything is
 fast: no stage above produces a number, deliberately.
@@ -59,6 +59,53 @@ actually uses, so treat the first `-n 64` on a long prompt as the real
 first run: if something is going to be wrong, it is most likely there.
 `test_k2_e2e` prints which prefill path it took, by name, so you can see
 on the card that the batched one was finally exercised.
+
+## 1b. Single GPU
+
+Once preflight is green, this is the whole thing:
+
+```bash
+GPU=gpu0 LIM=600 tools/tune.sh run \
+  /grimoire/bin/grimoire -m /models/<dir> --proj int4 \
+  -p "Explain in two sentences why the sky is blue." -n 64
+```
+
+Always through `tools/tune.sh` — never `timeout ... docker run` (rule 6:
+that orphans the container and wedges the card).
+
+Read the `capabilities:` block it prints before you read the tokens. It
+names what is actually live — parallel mode, which drafter, whether
+prefill is batched or fell back — because every one of those degrades
+SILENTLY and a lost feature looks like a slow model.
+
+**Engine switches do NOT pass through your shell.** `tune.sh` builds the
+container's environment itself, so `GRIMOIRE_MTP=1 tools/tune.sh ...`
+sets the variable on the HOST and the container never sees it. Use
+`EXTRA_ENV`, newline-separated `K=V`, which `tune.sh` appends to the env
+it hands the container.
+
+Speculation on one card, if the checkpoint has an MTP head:
+
+```bash
+EXTRA_ENV="GRIMOIRE_MTP=1
+GRIMOIRE_MTP_K=3
+GRIMOIRE_SPEC_STATS=1" GPU=gpu0 LIM=600 tools/tune.sh run \
+  /grimoire/bin/grimoire -m /models/<dir> --proj int4 -p "..." -n 64
+```
+
+With a separate DFlash drafter instead:
+
+```bash
+EXTRA_ENV="GRIMOIRE_DFLASH_MODEL=/models/<drafter>
+GRIMOIRE_SPEC_STATS=1" GPU=gpu0 LIM=600 tools/tune.sh run \
+  /grimoire/bin/grimoire -m /models/<dir> --proj int4 -p "..." -n 64
+```
+
+Always set `GRIMOIRE_SPEC_STATS=1`: it prints accepted-per-step, and a
+drafter that is correct but never accepted is a silent 1.0x -- it looks
+like a working feature and buys nothing. It also tells you the switch
+ARRIVED: if it did not, the capability matrix says `speculation none` and
+there is no `spec:` line at all.
 
 ## 2. Dual GPU
 
@@ -88,8 +135,19 @@ dense model, a routed-MoE model and K2, in BF16 and FP8. What was NOT
 verified there is the link itself — that is what these two commands
 measure and nothing else can.
 
-**Speculation now works on dual GPU.** Add `GRIMOIRE_MTP=1` (and
-`GRIMOIRE_MTP_K=3`) to either launcher. Under PP the last stage hosts the
+**Speculation now works on dual GPU.** The two-rank launchers take the
+same newline-separated form but through `GRIM_ENV`, not `EXTRA_ENV` --
+they call `b70run.sh`'s env path directly:
+
+```bash
+GRIM_ENV="GRIMOIRE_MTP=1
+GRIMOIRE_MTP_K=3
+GRIMOIRE_SPEC_STATS=1" GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh \
+  renderD129 renderD130 1800 pp \
+  /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p "..." -n 64
+```
+
+Under PP the last stage hosts the
 MTP head and drives the drafting for the whole pipeline; under TP the head
 is replicated and every rank drafts identically. Verified token-for-token
 against single-process plain decode — speculation is exact, so if it ever
