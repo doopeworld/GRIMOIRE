@@ -249,7 +249,11 @@ software recovery. The known causes, all avoidable:
   the link every token. Use the multiprocess launchers above instead.
   Making it real means threading a per-layer queue through every
   launcher — architectural, not a patch.
-- Speculation under TP/PP (section 2).
+- **DFlash** under TP/PP. Its drafter reads aux hidden states from
+  specific target layers, which PP puts on different ranks, and its
+  batched embed path is not TP-aware. MTP under TP/PP is DONE and
+  verified exact (section 2) -- this line used to say speculation as a
+  whole was open, which stopped being true on 2026-09-12.
 - MoVA's value projection reads its routing table back to the host once
   per layer. Fine at M=1, useless at 4096 tokens. Pack the experts
   expert-major before quoting a K2 prefill number.
