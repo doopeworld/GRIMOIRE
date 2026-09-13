@@ -63,6 +63,21 @@ repo holds no valid measurement either way, because the only DFlash2
 numbers on record are from the selector-less build. Re-measure both on the
 same prompt before trusting any ranking, and read the output (rule 8).
 
+**DFlash config fidelity (2026-09-13).** The drafter's `config.json` was
+read with a substring search and `strtol`, and everything else was
+hardcoded -- rope_theta defaulting to 1e7 where the reference defaults to
+1e6, a fixed head_dim and norm epsilon, "layers 0-4 slide at 4096", and
+always the TARGET's lm_head and embedding even for a drafter that ships
+its own. All of it now resolves from the draft config the way
+`ref/qwen3_dflash.py` resolves it
+(`include/b70/dflash_config.hpp`, pinned by `tests/test_dflash_config.cpp`),
+and the loader PRINTS what it resolved. Read those `dflash` banner lines
+first: every value in them is silent when wrong -- the drafter still runs
+and the output stays correct, only acceptance moves. Whether any of them
+actually differed for the z-lab checkpoint is still unknown; huggingface
+was unreachable from the work container, so one load on the Tower is what
+settles it. Details: `HANDOFF-2026-09-13-DFLASH-CONFIG.md`.
+
 This supersedes the Muse Glimmer prefill work mentioned later in this file
 and in HANDOFF-2026-08-27-PP-TP-COMPLETE.md, which is real but lower
 priority right now. If you are unsure which task is current, ASK IAN rather

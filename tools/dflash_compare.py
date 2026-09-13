@@ -25,6 +25,14 @@ mismatch at stage 3 makes every later stage meaningless, so reporting
     tools/dflash_compare.py /tmp/dfl
 
 Exit status is 0 when every paired tensor agrees.
+
+BEFORE YOU RUN ANY OF THIS: load the pair once and read the four `dflash`
+lines the loader now prints -- the resolved taps, mask token, rope theta,
+norm epsilon, head_dim, per-layer attention shape, and which lm_head and
+embedding table the draft actually used.  Those are config-level
+divergences, they are every bit as silent as a wrong tensor, and finding
+one costs a single load instead of two dumps and a container.  See
+HANDOFF-2026-09-13-DFLASH-CONFIG.md.
 """
 import argparse
 import os

@@ -26,6 +26,7 @@
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
 #include "b70/qwen35.hpp"
+#include "b70/dflash_config.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -1692,7 +1693,12 @@ struct Grimoire {
             bf16_t *attn_conv_base=nullptr, *mlp_conv_base=nullptr;
             uint8_t *k_cache=nullptr, *v_cache=nullptr;
             sycl::half *k_cache_f16=nullptr, *v_cache_f16=nullptr;
-            bool sliding=true;
+            // Attention shape, resolved per layer the way the reference
+            // does (see include/b70/dflash_config.hpp).  window == 0 is
+            // full attention; causal is a property of the LAYER, not of
+            // the drafter.
+            int  window=0;
+            bool causal=false;
         };
         bool ok=false, v2=false;
         DevQuant fc, selector_hidden;
@@ -1739,6 +1745,18 @@ struct Grimoire {
         float *draft_head_i4s=nullptr;
         int32_t *draft_head_token_ids=nullptr;
         int draft_head_rows=0;
+        // The DRAFT's own output head and embedding table, when the
+        // checkpoint ships them.  vLLM shares the TARGET's lm_head and
+        // embed_tokens ONLY with a drafter that has none of its own
+        // (_should_share, ref/dflash_speculator.py).  A head trained over a
+        // reduced draft vocabulary, decoded instead through the target's
+        // head, is a different model -- and, like everything else about a
+        // drafter, it fails only as an acceptance rate: the tokens still
+        // look like words and the verified output is still correct.
+        DevQuant draft_lm_head;
+        bf16_t  *draft_embed=nullptr;
+        int32_t *draft_vocab_map=nullptr;  // draft id -> target id (from d2t)
+        int      draft_vocab_rows=0;
         int32_t *block_table=nullptr, *cu_q=nullptr, *cu_k=nullptr;
         int32_t *seqused_k=nullptr;
         // DFlash2 dynamic grouped convolution.  Geometry is derived from the
@@ -1763,6 +1781,10 @@ struct Grimoire {
         int context_pos=0;
         int hidden=0, inter=0, q_heads=0, kv_heads=0, head_dim=0;
         int mask_token=0, sliding_window=0;
+        // The DRAFT's rms_norm_eps, not the target's.  Hardcoding 1e-6
+        // here silently changed every norm in the draft forward for any
+        // checkpoint that ships a different one.
+        float rms_eps=1.0e-6f;
         // Fusion pages the DRAFT KV cache at 16, not at the target's 64.
         // Verified against the running reference: its context slots for
         // positions 0..63 are 368..431 and its query slots for 64..79 are
@@ -3243,6 +3265,51 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         dflash2.v2=dr("candidate_selector.hidden_projection.weight").ok();
         dflash2.hidden=cfg.hidden;
         dflash2.head_dim=128;
+        // ---- draft config, resolved like the reference ---------------
+        // Read it BEFORE the geometry below, because head_dim is one of
+        // the things it decides.  Every field it carries is silent when
+        // wrong -- the drafter runs, the output stays correct, and only
+        // the acceptance rate moves -- so the rules live in one place
+        // transcribed from ref/qwen3_dflash.py rather than guessed here.
+        // Muse deliberately does not consult it: its table below was
+        // measured against the running Fusion reference.
+        DFlashSettings dcfg;
+        {
+            std::ifstream dcfg_in(std::string(dpath)+"/config.json");
+            if(dcfg_in){
+                const std::string text((std::istreambuf_iterator<char>(dcfg_in)),
+                                        std::istreambuf_iterator<char>());
+                dcfg=parse_dflash_config(text);
+            }else dcfg.error="no config.json in the draft directory "+
+                             std::string(dpath);
+        }
+        if(!cfg.is_muse){
+            if(!dcfg.error.empty()){
+                err="DFlash draft config: "+dcfg.error; return false;
+            }
+            // A draft whose hidden width differs from the target's is a
+            // feature (target_hidden_size), not a number to plug in: fc,
+            // the shared embedding and the shared lm_head all assume the
+            // two are equal here.  Refuse rather than run a drafter whose
+            // every tensor is the wrong width.
+            if(dcfg.hidden>0&&dcfg.hidden!=cfg.hidden){
+                err="DFlash draft hidden_size "+std::to_string(dcfg.hidden)+
+                    " != target hidden_size "+std::to_string(cfg.hidden)+
+                    "; a draft of a different width is not implemented";
+                return false;
+            }
+            if(dcfg.head_dim>0)dflash2.head_dim=dcfg.head_dim;
+            // With use_aux_hidden_state off the reference feeds the draft
+            // the target's LAST hidden state and has no fc at all; this
+            // engine's context path is fc-over-taps only.  Refuse rather
+            // than run the taps through an fc the drafter never had.
+            if(!dcfg.use_aux_hidden_state){
+                err="this DFlash drafter sets use_aux_hidden_state=false "
+                    "(it consumes the target's last hidden state, not the "
+                    "layer taps); that path is not implemented";
+                return false;
+            }
+        }
         // ---- draft architecture validation ---------------------------
         // dr() returns an EMPTY TensorRef for a name the checkpoint does not
         // have, and .t.shape is then empty -- so reading shape[0] straight
@@ -3296,6 +3363,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.mask_token=201818;
             dflash2.rope_theta=500000.0f;
             dflash2.sliding_window=2048;
+            dflash2.rms_eps=1.0e-5f;
             dflash2.shared_embed_f16=upload_f16_t(
                 q,ck,ck.embed,"dflash2.shared_embed",&dok);
             dflash2.shared_lm_head_f16=upload_f16_t(
@@ -3303,69 +3371,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             db+=dflash2.shared_embed_f16.w.bytes();
             db+=dflash2.shared_lm_head_f16.w.bytes();
         }else{
-            // Non-Muse DFlash/DFlash2 geometry (layer count, target-layer
-            // taps, mask token, rope theta, sliding window) is specific to
-            // the DRAFT checkpoint, not the target model. Every published
-            // DFlash2 checkpoint (Ornith's, Qwen's) ships a config.json with
-            // this exact shape, so read it instead of hardcoding one
-            // model's numbers -- a fixed 6-layer/40-target-layer draft
-            // silently truncated Qwen's 5-layer/64-target-layer one to 6
-            // layers and read past its last real layer.
-            dflash2.layers.resize(6);
-            dflash2.target_layers={1,6,11,16,22,27,32,37};
-            dflash2.mask_token=248077;
-            dflash2.rope_theta=10000000.0f;
-            dflash2.sliding_window=4096;
-            const std::string dcfg_path=std::string(dpath)+"/config.json";
-            std::ifstream dcfg_f(dcfg_path);
-            if(dcfg_f){
-                std::string dcfg((std::istreambuf_iterator<char>(dcfg_f)),
-                                 std::istreambuf_iterator<char>());
-                auto find_int=[&](const char* key,long dflt)->long{
-                    const std::string pat=std::string("\"")+key+"\":";
-                    const size_t p0=dcfg.find(pat);
-                    if(p0==std::string::npos)return dflt;
-                    size_t p1=p0+pat.size();
-                    while(p1<dcfg.size()&&(dcfg[p1]==' '||dcfg[p1]=='\n'))++p1;
-                    if(p1>=dcfg.size()||dcfg[p1]=='n')return dflt;
-                    return std::strtol(dcfg.c_str()+p1,nullptr,10);
-                };
-                auto find_int_arr=[&](const char* key)->std::vector<int>{
-                    std::vector<int> out;
-                    const std::string pat=std::string("\"")+key+"\":";
-                    size_t p0=dcfg.find(pat);
-                    if(p0==std::string::npos)return out;
-                    p0=dcfg.find('[',p0);
-                    if(p0==std::string::npos)return out;
-                    const size_t p1=dcfg.find(']',p0);
-                    if(p1==std::string::npos)return out;
-                    const char* c=dcfg.c_str()+p0+1;
-                    const char* end=dcfg.c_str()+p1;
-                    while(c<end){
-                        char* nx=nullptr;
-                        const long v=std::strtol(c,&nx,10);
-                        if(nx==c)break;
-                        out.push_back(int(v));c=nx;
-                        while(c<end&&(*c==','||*c==' '||*c=='\n'))++c;
-                    }
-                    return out;
-                };
-                const long nl=find_int("num_hidden_layers",6);
-                if(nl>0)dflash2.layers.resize(size_t(nl));
-                const std::vector<int> tl=find_int_arr("target_layer_ids");
-                if(!tl.empty())dflash2.target_layers=tl;
-                else if(!find_int_arr("aux_hidden_state_layer_ids").empty())
-                    std::printf("\n  dflash2: draft config uses "
-                        "aux_hidden_state_layer_ids (DaoCloud layout); this "
-                        "loader reads target_layer_ids -- taps NOT applied\n");
-                dflash2.mask_token=int(find_int("mask_token_id",dflash2.mask_token));
-                dflash2.rope_theta=float(find_int("rope_theta",
-                    long(dflash2.rope_theta)));
-                dflash2.sliding_window=int(find_int("sliding_window",
-                    dflash2.sliding_window));
-                dflash2.selector_top_k=int(find_int("selector_top_k",0));
-                dflash2.selector_rank=int(find_int("selector_rank",0));
+            // Non-Muse DFlash/DFlash2 geometry (layer count, taps, mask
+            // token, rope theta, per-layer attention shape, norm epsilon)
+            // is specific to the DRAFT checkpoint, not the target model,
+            // and dcfg above resolved all of it the way the reference
+            // does.  What is left here is only the fallbacks for keys a
+            // checkpoint may genuinely omit -- each one printed, because a
+            // guessed value in this list costs acceptance and nothing else
+            // ever says so.
+            dflash2.layers.resize(size_t(dcfg.n_layers));
+            dflash2.rope_theta=dcfg.rope_theta;
+            dflash2.rms_eps=dcfg.rms_eps;
+            dflash2.selector_top_k=dcfg.selector_top_k;
+            dflash2.selector_rank=dcfg.selector_rank;
+            if(dcfg.mask_token>=0)dflash2.mask_token=dcfg.mask_token;
+            else{
+                dflash2.mask_token=248077;
+                dcfg.notes.push_back("falling back to mask token 248077 "
+                    "(z-lab Qwen3.5 DFlash); the mask rows carry the whole "
+                    "draft, so a wrong id here is most of the acceptance");
             }
+            if(!dcfg.target_layers.empty())dflash2.target_layers=dcfg.target_layers;
+            else{
+                dflash2.target_layers={1,6,11,16,22,27,32,37};
+                dcfg.notes.push_back("falling back to the z-lab Qwen3.5 tap "
+                    "set {1,6,11,16,22,27,32,37}; checked against fc below");
+            }
+            // The window is per layer now; keep the scalar for the Muse
+            // paged kernel's sake and report the widest one in use.
+            dflash2.sliding_window=0;
+            for(const DFlashLayerAttn& la:dcfg.layers)
+                dflash2.sliding_window=std::max(dflash2.sliding_window,la.window);
         }
         if(dflash2.q_heads<=0||dflash2.kv_heads<=0||dflash2.inter<=0)dok=false;
         // The Muse assistant checkpoint is BF16 and vLLM casts it to FP16 at
@@ -3446,12 +3482,103 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const char* hn_name=dr("encoder.output_norm_enc.weight").ok()?
                             "encoder.output_norm_enc.weight":"hidden_norm.weight";
         dflash2.fc=qload(fc_name,"dflash.fc");
+        // fc consumes exactly n_taps * target_hidden floats per row, and the
+        // engine hands it target_layers.size() * cfg.hidden.  The reference
+        // raises on this mismatch (combine_hidden_states) because it means
+        // the tap set does not belong to this drafter -- here it is worse
+        // than wrong numbers: too many taps reads past target_aux on DEVICE,
+        // which is a DEVICE_LOST and a power cycle, not an exception.
+        // A tap is captured at ENTRY to layer id+1, so a tap naming the
+        // last layer is never written at all and fc then reads whatever
+        // that slice of target_aux was allocated with -- uninitialised
+        // DEVICE memory, straight into the context projection.
+        for(int id:dflash2.target_layers){
+            if(id>=0&&id+1<cfg.n_layers)continue;
+            err="DFlash target layer id "+std::to_string(id)+
+                " has no capture point in a "+std::to_string(cfg.n_layers)+
+                "-layer target (the tap is taken at entry to layer id+1); "
+                "this draft/target pair does not match";
+            return false;
+        }
+        if(dflash2.fc.w.K>0&&cfg.hidden>0){
+            const int want=dflash2.fc.w.K/cfg.hidden;
+            if(dflash2.fc.w.K%cfg.hidden||
+               want!=int(dflash2.target_layers.size())){
+                err="DFlash fc expects "+std::to_string(dflash2.fc.w.K)+
+                    " concatenated target features ("+std::to_string(want)+
+                    " x hidden "+std::to_string(cfg.hidden)+") but the tap set "
+                    "has "+std::to_string(dflash2.target_layers.size())+
+                    " entries -- this draft/target pair does not match";
+                return false;
+            }
+        }
         if(cfg.is_muse){
             dflash2.hidden_norm_f16=hload(hn_name,"dflash.hidden_norm");
             dflash2.norm_f16=hload("norm.weight","dflash2.norm");
         }else{
             dflash2.hidden_norm=bload(hn_name,"dflash.hidden_norm");
             dflash2.norm=bload("norm.weight","dflash2.norm");
+            // A drafter that ships its own lm_head / embed_tokens must be
+            // run with them.  Until now every non-Muse drafter was decoded
+            // through the TARGET's lm_head and embedded from the TARGET's
+            // table, which is right only for a checkpoint that ships
+            // neither -- and wrong invisibly for one that does.
+            const char* head_name=dr("lm_head.weight").ok()?"lm_head.weight":
+                (dr("model.lm_head.weight").ok()?"model.lm_head.weight":nullptr);
+            if(head_name){
+                dflash2.draft_lm_head=qload(head_name,"dflash.lm_head");
+                dflash2.draft_vocab_rows=dflash2.draft_lm_head.w.N;
+                TensorRef d2t=dr("d2t");
+                if(!d2t.ok())d2t=dr("model.d2t");
+                if(!d2t.ok())d2t=dr("draft_id_to_target_id");
+                if(d2t.ok()){
+                    // d2t is a DELTA per draft id, not an absolute id:
+                    // the reference computes arange(draft_vocab) + d2t.
+                    const int64_t n=d2t.t.numel();
+                    if(n!=int64_t(dflash2.draft_vocab_rows)){
+                        err="DFlash d2t has "+std::to_string(n)+" entries for "+
+                            std::to_string(dflash2.draft_vocab_rows)+
+                            " draft lm_head rows";
+                        return false;
+                    }
+                    std::vector<float> delta(size_t(n),0.0f);
+                    std::string rerr;
+                    if(!dc.shards[d2t.shard]->read_f32(d2t.t,delta.data(),rerr)){
+                        err="DFlash d2t: "+rerr; return false;
+                    }
+                    std::vector<int32_t> ids(size_t(n),0);
+                    for(int64_t i=0;i<n;++i){
+                        const long v=long(i)+long(delta[size_t(i)]);
+                        if(v<0||v>=long(cfg.vocab)){
+                            err="DFlash d2t maps draft id "+std::to_string(i)+
+                                " to "+std::to_string(v)+", outside the "
+                                "target vocabulary";
+                            return false;
+                        }
+                        ids[size_t(i)]=int32_t(v);
+                    }
+                    dflash2.draft_vocab_map=
+                        sycl::malloc_device<int32_t>(size_t(n),q);
+                    if(!dflash2.draft_vocab_map)dok=false;
+                    else{
+                        q.memcpy(dflash2.draft_vocab_map,ids.data(),
+                                 size_t(n)*sizeof(int32_t)).wait();
+                        db+=size_t(n)*sizeof(int32_t);
+                    }
+                }else if(dflash2.draft_vocab_rows!=cfg.vocab){
+                    err="the DFlash drafter has an lm_head of "+
+                        std::to_string(dflash2.draft_vocab_rows)+" rows over a "
+                        "target vocabulary of "+std::to_string(cfg.vocab)+
+                        " but ships no d2t mapping; its token ids cannot be "
+                        "interpreted";
+                    return false;
+                }
+            }
+            const char* emb_name=dr("embed_tokens.weight").ok()?
+                "embed_tokens.weight":
+                (dr("model.embed_tokens.weight").ok()?
+                     "model.embed_tokens.weight":nullptr);
+            if(emb_name)dflash2.draft_embed=bload(emb_name,"dflash.embed_tokens");
         }
         if(dflash2.v2){
             dflash2.selector_hidden=qload(
@@ -3562,9 +3689,41 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 d.mlp_conv_base=bload(p+"mlp_conv.base_kernel",
                                       "dflash2.mlp_conv_base");
             }
-            // Original DFlash uses sliding attention for layers 0..4 and
-            // full attention for layer 5. DFlash2's six layers are sliding.
-            d.sliding=cfg.is_muse||dflash2.v2||i<5;
+            // Attention shape.  Muse keeps the table measured against the
+            // running Fusion reference.  Everything else takes what the
+            // draft config says, resolved exactly as the reference resolves
+            // it -- which for a config that describes no attention shape is
+            // FULL, NON-CAUSAL attention on every layer.
+            //
+            // This replaces "layers 0..4 slide at 4096, DFlash2 slides
+            // everywhere", which was an assumption, not a checkpoint fact,
+            // and which no self-check could ever have contradicted: a
+            // wrongly-windowed draft layer still produces fluent tokens and
+            // still leaves the output correct.  GRIMOIRE_DFLASH_LEGACY_SLIDING=1
+            // restores it so the two can be A/B'd on accepted-tokens-per-step
+            // on the card, which is the only measurement that settles it.
+            static const bool legacy_sliding=
+                std::getenv("GRIMOIRE_DFLASH_LEGACY_SLIDING")!=nullptr;
+            if(cfg.is_muse||legacy_sliding){
+                const bool sliding=cfg.is_muse||dflash2.v2||i<5;
+                // The old code's own default window, not the resolved one:
+                // for a config that names no window the resolver leaves it
+                // at 0, and an escape hatch that silently means "full
+                // attention" would A/B nothing.
+                const int legacy_window=dflash2.sliding_window?
+                    dflash2.sliding_window:(cfg.is_muse?2048:4096);
+                d.window=sliding?legacy_window:0;
+                d.causal=false;
+            }else{
+                if(size_t(i)>=dcfg.layers.size()){
+                    err="DFlash draft config resolved "+
+                        std::to_string(dcfg.layers.size())+" layers but the "
+                        "checkpoint has more"; return false;
+                }
+                const DFlashLayerAttn la=dcfg.layers[size_t(i)];
+                d.window=la.window;
+                d.causal=la.causal;
+            }
             if(cfg.is_muse){
                 const size_t cache_elems=size_t(dflash2.num_blocks)*dflash2.block_size*
                     dflash2.kv_heads*dflash2.head_dim;
@@ -3748,8 +3907,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             }
             const int draft_vocab=dflash2.draft_head_rows?
                 dflash2.draft_head_rows:
-                (dflash2.draft_lm_head_i4.has_i4()?
-                    dflash2.draft_lm_head_i4.w.N:cfg.vocab);
+                (dflash2.draft_vocab_rows?dflash2.draft_vocab_rows:
+                 (dflash2.draft_lm_head_i4.has_i4()?
+                     dflash2.draft_lm_head_i4.w.N:cfg.vocab));
             dflash2.draft_logits_stride=draft_vocab;
             dflash2.logits=dfd(size_t(DM-1)*dflash2.draft_logits_stride);
             if(cfg.is_muse){
@@ -3848,6 +4008,47 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         std::printf("ok (%s, %.2f GiB device, target taps + draft KV ready)\n",
                     dflash2.v2?"DFlash2DraftModel":"DFlashDraftModel",
                     double(db)/1073741824.0);
+        // Print what the drafter actually resolved to.  None of these values
+        // can be inferred from the output -- a drafter running on the wrong
+        // rope theta, mask token or attention shape still writes fluent text
+        // and still leaves the answer correct; only acceptance moves.  So the
+        // one place they can be checked is here, before the first token.
+        {
+            int sliding=0,causal=0;
+            for(const auto& d:dflash2.layers){
+                if(d.window)++sliding;
+                if(d.causal)++causal;
+            }
+            std::string taps;
+            for(size_t i=0;i<dflash2.target_layers.size();++i)
+                taps+=(i?",":"")+std::to_string(dflash2.target_layers[i]);
+            std::printf("  dflash config: %zu layers, taps [%s]%s%s, "
+                        "mask %d, rope_theta %g, eps %g, head_dim %d\n",
+                        dflash2.layers.size(), taps.c_str(),
+                        dcfg.tap_key.empty()?"":" from ", dcfg.tap_key.c_str(),
+                        dflash2.mask_token, double(dflash2.rope_theta),
+                        double(dflash2.rms_eps), dflash2.head_dim);
+            std::printf("  dflash attention: %d of %zu layers sliding"
+                        " (window %d), %d causal\n",
+                        sliding, dflash2.layers.size(),
+                        dflash2.sliding_window, causal);
+            // Which head and which embedding table the draft actually used.
+            // A drafter silently decoded through the TARGET's head is the
+            // single largest divergence this loader can have, and nothing
+            // downstream of it ever says so.
+            std::printf("  dflash head: %s", dflash2.draft_head_rows
+                ? "NInfer reduced extract"
+                : dflash2.draft_lm_head.w.N ? "the drafter's own lm_head"
+                : "the TARGET's lm_head (the drafter ships none)");
+            if(dflash2.draft_vocab_rows)
+                std::printf(", %d rows%s", dflash2.draft_vocab_rows,
+                    dflash2.draft_vocab_map ? " + d2t mapping" : "");
+            std::printf("\n  dflash embed: %s\n", dflash2.draft_embed
+                ? "the drafter's own embed_tokens"
+                : "the TARGET's embed_tokens (the drafter ships none)");
+            for(const std::string& n:dcfg.notes)
+                std::printf("  dflash note: %s\n", n.c_str());
+        }
     }
 
     if (mtp.ok) {
@@ -4368,6 +4569,11 @@ void Grimoire::release() {
     dflash2.shared_embed_f16.release(q);
     dflash2.shared_lm_head_f16.release(q);
     dflash2.draft_lm_head_i4.release(q);
+    dflash2.draft_lm_head.release(q);
+    if(dflash2.draft_embed)sycl::free(dflash2.draft_embed,q);
+    if(dflash2.draft_vocab_map)sycl::free(dflash2.draft_vocab_map,q);
+    dflash2.draft_embed=nullptr;
+    dflash2.draft_vocab_map=nullptr;
     for (auto& d : dflash2.layers) {
         d.q.release(q); d.k.release(q); d.v.release(q); d.qkv.release(q);
         d.o.release(q);
@@ -6103,7 +6309,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     const int HD=dflash2.head_dim,QW=QH*HD,KVW=KVH*HD,I=dflash2.inter;
     const int MASK=dflash2.mask_token;
     const int NT=int(dflash2.target_layers.size());
-    const float eps=cfg.is_muse?1.0e-5f:1.0e-6f;
+    const float eps=dflash2.rms_eps;
     const float theta=dflash2.rope_theta;
     const auto fa2_paged=cfg.is_muse?load_xe2_dflash_paged_f16():nullptr;
     if(cfg.is_muse&&!fa2_paged)return false;
@@ -6186,10 +6392,25 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             dflash2.linear_out_f16,it->scratch);
         return dflash2.linear_out_f16;
     };
+    // Same predicate the batched prefill uses: a device with no matrix
+    // hardware cannot run a joint_matrix kernel at all -- the runtime
+    // throws on submission -- so the whole draft forward was unreachable
+    // anywhere but a B70, which is why none of it had ever executed off
+    // the card.  A B70 is a GPU, so on the card this is false and the
+    // behaviour is exactly as before.  The row loop is the same math the
+    // single-token decode path already runs.
+    static const bool no_matrix =
+        !q.get_device().is_gpu() &&
+        !q.get_device().has(sycl::aspect::ext_intel_matrix);
     auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
         if(cfg.is_muse&&w.fp16){
             const sycl::half* out=mm_f16_raw(w,x,rows);
             launch_f16_to_f32(q,out,y,size_t(rows)*w.w.N,{});
+            return;
+        }
+        if(no_matrix){
+            for(int r=0;r<rows;++r)
+                gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
         }
         launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
@@ -6290,7 +6511,8 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         launch_embed_f16_batched(q,dflash2.shared_embed_f16.fp16,dflash2.tokens,
                                  dflash2.resid,M,H);
     else
-        launch_embed_batched(q,embed,dflash2.tokens,dflash2.resid,M,H);
+        launch_embed_batched(q,dflash2.draft_embed?dflash2.draft_embed:embed,
+                             dflash2.tokens,dflash2.resid,M,H);
     checkpoint("block embedding");
     draft_mark("embed + setup");
     dump_f32("07_blockembed",dflash2.resid,size_t(M)*H);
@@ -6376,7 +6598,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 d.k_cache_f16,d.v_cache_f16,M,position,KVH,HD,
                 dflash2.block_size,{});
             const int32_t used=position+M;
-            const int window=d.sliding?dflash2.sliding_window-1:-1;
+            const int window=d.window?d.window-1:-1;
             if(dumping&&li==0){
                 // Read the KV cache back through the same linear indexing the
                 // append uses, for the 64 context slots and the 16 query slots.
@@ -6398,9 +6620,9 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 std::fprintf(stderr,
                     "  dflash probe: position=%d M=%d used=%d | device "
                     "seqused_k=%d cu_q=[%d,%d] cu_k=[%d,%d] | block_size=%d "
-                    "num_blocks=%d window=%d causal=0\n",
+                    "num_blocks=%d window=%d causal=%d\n",
                     position,M,used,sk,cq[0],cq[1],ck2[0],ck2[1],
-                    dflash2.block_size,dflash2.num_blocks,window);
+                    dflash2.block_size,dflash2.num_blocks,window,int(d.causal));
                 std::fflush(stderr);
             }
             const int rc=fa2_paged(&q,dflash2.q_f16,d.k_cache_f16,
@@ -6419,7 +6641,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                                      M,position,KVH,HD,max_seq);
             launch_dflash2_block_attention(q,dflash2.q,d.k_cache,d.v_cache,
                 dflash2.attn,M,position,QH,KVH,HD,max_seq,
-                d.sliding?dflash2.sliding_window:0,false,
+                d.window,d.causal,
                 1.0f/std::sqrt(float(HD)));
         }
         checkpoint("block attention");
@@ -6470,6 +6692,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         head_w4(&q,dflash2.a8,dflash2.draft_head_i4,
                 dflash2.draft_head_i4s,dflash2.a8s,dflash2.logits,
                 M-1,dflash2.draft_head_rows,H);
+    }else if(dflash2.draft_lm_head.w.N){
+        // The drafter's OWN head.  Row 0 is the anchor, which is a verified
+        // token and never sampled, so only rows 1..M-1 are projected.
+        mm(dflash2.draft_lm_head,dflash2.normed+H,dflash2.logits,M-1);
     }else if(cfg.is_muse&&dflash2.draft_lm_head_i4.has_i4()&&w4){
         const auto& head=dflash2.draft_lm_head_i4;
         launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
@@ -6492,10 +6718,17 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                  dflash2.logits+int64_t(r-1)*cfg.vocab,{});
     draft_mark("lm head");
-    const int draft_vocab=dflash2.draft_head_rows?
-        dflash2.draft_head_rows:cfg.vocab;
+    const int draft_vocab=dflash2.draft_head_rows?dflash2.draft_head_rows:
+        (dflash2.draft_vocab_rows?dflash2.draft_vocab_rows:cfg.vocab);
     const int draft_stride=dflash2.draft_logits_stride?
         dflash2.draft_logits_stride:draft_vocab;
+    // Either head can emit ids in its own reduced vocabulary: the NInfer
+    // extract carries absolute target ids, the checkpoint's d2t a delta
+    // already folded into absolute ids at load.  Everything downstream --
+    // the selector codebooks, the verifier, the caller -- speaks target
+    // ids, so map exactly once, here.
+    const int32_t* vocab_map=dflash2.draft_head_rows?
+        dflash2.draft_head_token_ids:dflash2.draft_vocab_map;
     // ---- candidate selection -------------------------------------
     // DFlash2 does NOT take a bare argmax per position.  It keeps the
     // top-k candidates at each draft position and scores the EDGE from
@@ -6518,10 +6751,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
             launch_topk16_rows(q,dflash2.logits+int64_t(r)*draft_stride,1,
                                draft_vocab,dflash2.sel_ids+int64_t(r)*K,
                                dflash2.sel_unary+int64_t(r)*K,{});
-        if(dflash2.draft_head_rows){
+        if(vocab_map){
             // candidates are rows of the REDUCED head; the codebooks are
             // indexed by real vocabulary id, so map before scoring.
-            const int32_t* map=dflash2.draft_head_token_ids;
+            const int32_t* map=vocab_map;
             int32_t* ids=dflash2.sel_ids;
             const int64_t n=int64_t(steps)*K;
             q.parallel_for(sycl::range<1>(size_t(n)),[=](sycl::id<1> i){
@@ -6538,8 +6771,8 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else for(int r=0;r<M-1;++r){
         launch_argmax(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
                       s.d_tok,s.d_val,{});
-        if(dflash2.draft_head_rows){
-            const int32_t* map=dflash2.draft_head_token_ids;
+        if(vocab_map){
+            const int32_t* map=vocab_map;
             int32_t* src=s.d_tok;
             int32_t* dst=dflash2.draft_ids+r;
             q.single_task([=](){*dst=map[*src];});

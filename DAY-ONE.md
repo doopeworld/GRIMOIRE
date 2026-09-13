@@ -38,7 +38,7 @@ order, and stops at the first required failure:
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
 | `bin/test_model_matrix` | 3 architectures × 7 projection formats |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
-| `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU |
+| `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU, MTP and DFlash |
 
 **Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say
 REFUSED (no batched verify there, and the engine will not speculate
@@ -98,6 +98,25 @@ changes the output that is a bug, not a trade.
 DFlash is still single-GPU only: its drafter needs aux hidden states from
 target layers that PP puts on different ranks. So DFlash on one card, MTP
 on two. The load banner prints which is live — read it.
+
+**If you load a DFlash drafter, read its four banner lines before you read
+anything else:**
+
+```
+  dflash config: 6 layers, taps [...] from target_layer_ids, mask N,
+                 rope_theta ..., eps ..., head_dim ...
+  dflash attention: K of 6 layers sliding (window W), C causal
+  dflash head:  the drafter's own lm_head / the TARGET's lm_head
+  dflash embed: the drafter's own embed_tokens / the TARGET's
+```
+
+Every one of those is silent when wrong: the drafter still runs, still
+proposes real tokens, and the verified output is still correct — only
+acceptance moves. Check each against the drafter's own `config.json`.
+That is the cheapest possible first step on the 2.21-accepted-per-step
+blocker, and it costs one load.
+`GRIMOIRE_DFLASH_LEGACY_SLIDING=1` restores the old "layers 0-4 slide at
+4096" assumption if you want to A/B it — on accepted-per-step, not tok/s.
 
 One rule the engine now enforces for you: a model with linear-attention
 (DeltaNet) layers — Qwen3.5, Ornith — can only speculate when the BATCHED

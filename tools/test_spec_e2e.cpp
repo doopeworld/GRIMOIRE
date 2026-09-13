@@ -321,6 +321,145 @@ int main(int argc, char** argv) {
         std::printf("   PP+MTP match\n");
     }
 
+    // ---- DFlash: the other drafter, and the one never executed here ---
+    // MTP is a head inside the target checkpoint; DFlash is a SEPARATE
+    // model in its own directory, and its entire forward -- the target
+    // layer taps, fc, the hidden norm, the context K/V inserted into the
+    // draft's own cache, the 1+15 non-causal query block -- runs only when
+    // such a directory is present.  No test ever provided one, so none of
+    // that had executed anywhere except on the Tower.  The K2 path taught
+    // what that costs: four engine bugs in code that had been read many
+    // times and never run, one of them a device heap overrun.
+    //
+    // Single process only, by design: DFlash reads aux hidden states from
+    // target layers that PP puts on different ranks, and its batched embed
+    // is not TP-aware.  MTP is what covers dual GPU.
+    for (bool own : {false, true}) {
+        // own=false: the drafter ships no head or embedding, so it shares
+        //            the target's -- what this loader always assumed.
+        // own=true : the drafter ships its own reduced-vocabulary lm_head
+        //            and a d2t map, the EAGLE3-derived layout.  Ignoring
+        //            either is silent: the draft still emits real token
+        //            ids, they are just the wrong ones.
+        const mini::Arch target = mini::dense(4, false);
+        const mini::Arch draft  = mini::dflash_draft(2, own, own);
+        for (const char* fmt : {"bf16", "fp8"}) {
+            const std::string tag = std::string(draft.name) + "-" + fmt;
+            const fs::path tdir = root / tag;
+            const fs::path ddir = root / (tag + "-drafter");
+            mini::write_model(tdir, target);
+            mini::write_model(ddir, draft, 20260913);   // not the target's seed
+            std::printf("%-12s %-5s  ", draft.name, fmt);
+
+            const std::string plain_out = (tdir/"plain.txt").string();
+            const std::string plain_log = (tdir/"plain.log").string();
+            int rc = spawn_run(self, tdir.string(), plain_out, fmt,
+                               {"GRIMOIRE_DEVICE_ANY=1"}, plain_log);
+            if (rc != 0) {
+                ++g_fail;
+                std::printf("plain decode FAILED (%d)\n", rc);
+                continue;
+            }
+            const auto plain = read_tokens(plain_out);
+            if (int(plain.size()) != kWant) {
+                ++g_fail;
+                std::printf("plain decode gave %zu tokens, wanted %d\n",
+                            plain.size(), kWant);
+                continue;
+            }
+
+            // Two block widths.  M is the query block INCLUDING the anchor
+            // row, so M=4 verifies 3 drafts and M=16 verifies 15; an
+            // off-by-one in the accept loop or the rollback usually
+            // survives one of them and not the other.
+            bool all_ok = true, drafted = false;
+            std::string last_stats;
+            for (const char* m : {"4", "16"}) {
+                const std::string out = (tdir/(std::string("df")+m+".txt")).string();
+                const std::string log = (tdir/(std::string("df")+m+".log")).string();
+                rc = spawn_run(self, tdir.string(), out, fmt,
+                               {"GRIMOIRE_DFLASH_MODEL="+ddir.string(),
+                                std::string("GRIMOIRE_DFLASH_M=")+m,
+                                "GRIMOIRE_SPEC_STATS=1", "GRIMOIRE_DEVICE_ANY=1"},
+                               log);
+                if (rc != 0) {
+                    ++g_fail; all_ok = false;
+                    std::printf("\n   DFlash M=%s FAILED (%d): %s", m, rc,
+                                spec_line(log).c_str());
+                    continue;
+                }
+                const auto spec = read_tokens(out);
+                if (spec != plain) {
+                    ++g_fail; all_ok = false;
+                    std::printf("\n   DFlash M=%s CHANGED THE OUTPUT"
+                                "\n     plain:%s\n     spec :%s",
+                                m, join(plain).c_str(), join(spec).c_str());
+                    continue;
+                }
+                last_stats = spec_line(log);
+                if (!last_stats.empty()) drafted = true;
+            }
+            if (!all_ok) { std::printf("\n"); continue; }
+            if (!drafted) {
+                // "identical" is free when nothing was ever drafted, and a
+                // drafter that silently failed to load would pass that way.
+                ++g_fail;
+                std::printf("NOTHING WAS DRAFTED -- the drafter did not load "
+                            "or speculation was refused\n");
+                continue;
+            }
+            std::printf("identical at M=4,16   [%s]\n", last_stats.c_str());
+
+            // ---- the same, with a drafter that IS accepted ------------
+            // Everything above ran at 0% acceptance -- random weights make
+            // a drafter that agrees with a random target about once in
+            // `vocab` -- so the engine's accept-then-continue path had
+            // never run here, only its rollback.  Point a drafter at the
+            // token this target repeats most and it is accepted wherever
+            // the target emits it and rejected everywhere else, which
+            // drives both halves in one generation.  The output must still
+            // be the same output.
+            int best = -1, best_n = 0;
+            for (int32_t t : plain) {
+                int n = 0;
+                for (int32_t u : plain) if (u == t) ++n;
+                if (n > best_n) { best_n = n; best = t; }
+            }
+            const fs::path fdir = root / (tag + "-forced");
+            mini::write_model(fdir, mini::dflash_draft(2, own, own, best), 20260913);
+            const std::string fout = (tdir/"forced.txt").string();
+            const std::string flog = (tdir/"forced.log").string();
+            rc = spawn_run(self, tdir.string(), fout, fmt,
+                           {"GRIMOIRE_DFLASH_MODEL="+fdir.string(),
+                            "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_SPEC_STATS=1",
+                            "GRIMOIRE_DEVICE_ANY=1"}, flog);
+            const auto forced = read_tokens(fout);
+            const std::string fstats = spec_line(flog);
+            if (rc != 0) {
+                ++g_fail;
+                std::printf("   forced-agreement drafter FAILED (%d): %s\n",
+                            rc, fstats.c_str());
+            } else if (forced != plain) {
+                ++g_fail;
+                std::printf("   forced-agreement drafter CHANGED THE OUTPUT"
+                            "\n     plain:%s\n     spec :%s\n",
+                            join(plain).c_str(), join(forced).c_str());
+            } else if (fstats.find(" 0 of ") != std::string::npos ||
+                       fstats.find("0.0%") != std::string::npos) {
+                // The whole point of this case is a non-zero acceptance.
+                // If it lands at zero the case proves nothing and must
+                // not pass quietly.
+                ++g_fail;
+                std::printf("   forced-agreement drafter accepted NOTHING "
+                            "(token %d appears %d times): %s\n",
+                            best, best_n, fstats.c_str());
+            } else {
+                std::printf("   accept path: identical, token %d x%d   [%s]\n",
+                            best, best_n, fstats.c_str());
+            }
+        }
+    }
+
     if (!g_fail) fs::remove_all(root);
     else std::printf("\nlogs kept in %s\n", root.c_str());
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

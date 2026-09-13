@@ -34,7 +34,14 @@ namespace mini {
 
 namespace fs = std::filesystem;
 
-struct Tn { std::string name; std::vector<int64_t> shape; };
+// `fill`, when non-empty, gives the tensor its exact values instead of
+// random ones.  Needed for index tables (a DFlash d2t map) where random
+// noise is not a weaker test, it is a different tensor.
+struct Tn {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::vector<float> fill = {};
+};
 
 // A named architecture and the tensors it needs.
 struct Arch {
@@ -67,6 +74,15 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
     std::normal_distribution<float> nd(0.f, 0.05f);
     std::vector<bf16_t> data(off/2);
     for (auto& v : data) v = f32_to_bf16(nd(rng));
+    {   // exact values where a tensor asked for them
+        size_t at = 0;
+        for (const Tn& t : a.tensors) {
+            size_t n = 1; for (auto d : t.shape) n *= size_t(d);
+            for (size_t i = 0; i < t.fill.size() && i < n; ++i)
+                data[at+i] = f32_to_bf16(t.fill[i]);
+            at += n;
+        }
+    }
 
     std::ofstream f(dir/"model.safetensors", std::ios::binary);
     const uint64_t n = hs.size();
@@ -329,6 +345,84 @@ inline Arch moe(int L = 4, bool mtp = false) {
         t.push_back({m+"shared_expert_gate.weight",      {1,H}});
     }
     if (mtp) add_mtp(t, H, Q, KV, 16, 0, E, MI);
+    return a;
+}
+
+// ---- a DFlash drafter for the dense target above -----------------------
+// The drafter is a separate checkpoint in its own directory, selected with
+// GRIMOIRE_DFLASH_MODEL.  Its shape has to agree with the TARGET it drafts
+// for: same hidden width, and taps that name layers the target actually
+// runs.  fc consumes n_taps * target_hidden and the engine feeds it exactly
+// target_layers.size() * hidden, so those two must match or the context
+// projection reads the wrong amount of memory.
+//
+// `own_head` gives the drafter its own reduced-vocabulary lm_head plus the
+// d2t map that turns its ids back into target ids -- the layout every
+// EAGLE3-derived drafter ships and the one that is silent when ignored:
+// decoded through the TARGET's head instead, the draft still yields real
+// token ids and the verifier simply rejects them.
+//
+// `forced_target`, when >= 0, collapses the draft head's whole vocabulary
+// onto that one target id (d2t[i] = forced_target - i, so every row maps
+// there).  Random weights make a drafter that agrees with a random target
+// about one time in `vocab`, so every speculative test so far ran at 0%
+// acceptance and never once exercised accept-then-continue in the real
+// engine.  A drafter that always proposes a token the target actually
+// emits does: it is accepted wherever the target repeats that token,
+// rejected everywhere else, and both have to come out identical.
+inline Arch dflash_draft(int L = 2, bool own_head = false, bool own_embed = false,
+                         int forced_target = -1) {
+    const int H=64, Q=64, KV=32, HD=16, I=128, V=128, DV=64;
+    const int taps[] = {0, 2};                 // target layers 0 and 2
+    const int NT = int(sizeof(taps)/sizeof(taps[0]));
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen3_dflash", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "rms_norm_eps": 1e-06,
+  "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"},
+  "target_layer_ids": [)JSON" << taps[0] << ',' << taps[1] << R"JSON(],
+  "dflash_config": {"mask_token_id": 7, "block_size": 16})JSON";
+    if (own_head || forced_target >= 0)
+        c << ",\n  \"draft_vocab_size\": "
+          << (forced_target >= 0 ? 16 : DV);
+    c << "\n}";
+
+    Arch a{forced_target >= 0 ? "dflash+forced"
+           : own_head ? "dflash+head" : "dflash", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    t = { {"fc.weight", {H, int64_t(NT)*H}}, {"hidden_norm.weight", {H}},
+          {"norm.weight", {H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "layers." + std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        t.push_back({s+"v_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"q_norm.weight", {HD}});
+        t.push_back({s+"k_norm.weight", {HD}});
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+    }
+    if (own_embed) t.push_back({"embed_tokens.weight", {V,H}});
+    if (own_head || forced_target >= 0) {
+        const int rows = forced_target >= 0 ? 16 : DV;
+        t.push_back({"lm_head.weight", {rows,H}});
+        // d2t is a DELTA per draft id: target = i + d2t[i].  Delta i maps
+        // draft id i to target id 2i, which is inside the target vocabulary
+        // and is emphatically NOT the identity, so a build that drops the
+        // mapping proposes different tokens rather than the same ones.
+        std::vector<float> d2t(size_t(rows), 0.0f);
+        for (int i = 0; i < rows; ++i)
+            d2t[size_t(i)] = float(forced_target >= 0 ? forced_target - i : i);
+        t.push_back({"d2t", {rows}, d2t});
+    }
     return a;
 }
 

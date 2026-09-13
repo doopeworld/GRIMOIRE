@@ -82,11 +82,15 @@ bin/test_dflash2_selector: tests/test_dflash2_selector.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+bin/test_dflash_config: tests/test_dflash_config.cpp include/b70/dflash_config.hpp include/b70/json.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
@@ -98,6 +102,7 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/
 	@echo ""; echo "=========== k2-horizon ==========="; ./bin/test_k2_horizon
 	@echo ""; echo "=========== k2-config ==========="; ./bin/test_k2_config
 	@echo ""; echo "=========== dflash2-selector ==========="; ./bin/test_dflash2_selector
+	@echo ""; echo "=========== dflash-config ==========="; ./bin/test_dflash_config
 
 clean:
 	rm -rf bin
