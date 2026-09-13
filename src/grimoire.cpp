@@ -3655,17 +3655,27 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         double(mb) / 1073741824.0);
         }
     }
-    // The last pipeline stage loaded the embedding table only so the MTP
-    // head could embed the tokens it drafts.  If no head is live here,
-    // give it back -- on a big model that is over a gigabyte on the card
-    // that is short of VRAM, which is the reason PP is being used at all.
-    if (pp_enabled() && pp_rank == pp_world - 1 && pp_rank != 0 &&
-        !mtp.ok && embed) {
+    // The last pipeline stage loaded the embedding table only so a drafter
+    // could embed the tokens it proposes.  If no drafter needs it, give it
+    // back -- on a big model that is over a gigabyte on the card that is
+    // short of VRAM, which is the reason PP is being used at all.
+    //
+    // A DFlash drafter has not been loaded yet at this point, so the
+    // release for that case happens AFTER its block below, where whether
+    // it ships its own embed_tokens is finally known.  Releasing here on
+    // !mtp.ok alone is what took the table away from a DFlash drafter
+    // that shares the target's -- MEASURED, as a failed draft on the last
+    // stage under PP and nowhere else.
+    const bool dflash_configured = dflash_env && *dflash_env;
+    auto release_last_stage_embed = [&]() {
+        if (!(pp_enabled() && pp_rank == pp_world - 1 && pp_rank != 0) ||
+            mtp.ok || !embed) return;
         const size_t freed = size_t(embed_count) * H * sizeof(bf16_t);
         sycl::free(embed, q);
         embed = nullptr;
         bytes -= std::min(bytes, freed);
-    }
+    };
+    if (!dflash_configured) release_last_stage_embed();
 
     // ---- DFlash sidecar weights -------------------------------------
     const char* dpath=std::getenv("GRIMOIRE_DFLASH_MODEL");
@@ -4614,6 +4624,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
               spec_conv_input_elems * kSpecBatch + size_t(kSpecBatch) * cfg.hidden) *
              sizeof(float));
     }
+
+    // Now the drafter is loaded, so it is known whether it brought its own
+    // embedding table.  One that did never touches the target's, so the
+    // copy this stage holds can go back.  One that did NOT embeds every
+    // token it drafts from it, and must keep it.
+    if (dflash_configured && (!dflash2.ok || dflash2.draft_embed))
+        release_last_stage_embed();
 
     std::printf("\n  scratch buffers ... ");
     std::fflush(stdout);
