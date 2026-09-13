@@ -1054,6 +1054,8 @@ bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
     return true;
 }
 
+static DevQuant upload_packed(sycl::queue& q, const PackedWeight& p);
+
 DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
                            const TensorRef& r, Fmt fmt, const char* what,
                            bool* ok) {
@@ -1152,6 +1154,17 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         }
         p = quantize(f32.data(), N, K, use);
     }
+    return upload_packed(q, p);
+}
+
+// Move a host-packed weight onto the device.  Split out of
+// quantize_upload_t so the Agnes FFN fold can build its merged matrix in
+// f32, quantize it with the ordinary packer, and upload it exactly the
+// way every other weight is uploaded -- including the int4 scale
+// transpose below, which the W4A8 tiles depend on.
+static DevQuant upload_packed(sycl::queue& q, const PackedWeight& p) {
+    DevQuant d;
+    const int N = p.view().N;
     d.payload = dev_copy<uint8_t>(q, p.payload.data(), p.payload.size());
     if (!p.scales_raw.empty())
         d.scales = dev_copy<uint8_t>(q, p.scales_raw.data(), p.scales_raw.size());
@@ -1175,6 +1188,102 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         d.od_w4=d.od_scales!=nullptr;
     }
     return d;
+}
+
+// ---------------------------------------------------------------------
+//  Agnes parallel_ffn, folded into the main FFN.
+//
+//  Agnes puts a second, narrow SwiGLU inside every mlp:
+//
+//      mlp(x) = down(silu(gate(x)) * up(x))
+//             + pdown(silu(pgate(x)) * pup(x))
+//
+//  (mlp.parallel_ffn.{gate,up,down}_proj is a submodule of mlp, sibling
+//  to gate/up/down, with no norm of its own -- so it consumes the same
+//  post_attention_layernorm output, and both results land in the same
+//  residual.)
+//
+//  Two SwiGLUs summed are ONE SwiGLU over the concatenated intermediate:
+//  a matmul over a concatenated contraction dimension IS the sum of the
+//  two partial products.  So no kernel changes and no second FFN pass --
+//  the whole feature is a load-time concatenation:
+//
+//      gate' = [gate ; pgate]      rows,  I' = I + pI
+//      up'   = [up   ; pup  ]      rows
+//      down' = [down | pdown]      COLUMNS -- along K, per row
+//
+//  gate_up' keeps the [all gate rows][all up rows] order the SwiGLU
+//  kernel expects, so it is a four-way row concatenation in the order
+//  gate, pgate, up, pup.
+//
+//  down' is the one that is not an append: for row-major [N][K], row n of
+//  the result is row n of down followed by row n of pdown, so the two
+//  sources interleave per row.  Appending the bytes would silently
+//  produce a different matrix.
+//
+//  Both are built in f32 and handed to the ordinary quantizer, so every
+//  projection format works with no per-format special case.
+static DevQuant concat_rows_f32_t(sycl::queue& q, const Qwen35Model& ck,
+                                  const std::vector<TensorRef>& refs,
+                                  Fmt fmt, const char* what, bool* ok) {
+    DevQuant d;
+    if (refs.empty()) { *ok = false; return d; }
+    const int K = int(refs[0].t.shape.size() == 2 ? refs[0].t.shape[1] : 0);
+    int N = 0;
+    for (const auto& r : refs) {
+        if (!r.ok() || r.t.shape.size() != 2 || int(r.t.shape[1]) != K) {
+            std::printf("\n  cannot row-concatenate %s (shape mismatch)\n", what);
+            *ok = false; return d;
+        }
+        N += int(r.t.shape[0]);
+    }
+    std::vector<float> m(size_t(N) * K);
+    size_t at = 0;
+    std::string err;
+    for (const auto& r : refs) {
+        if (!read_matrix_f32(ck, r, m.data() + at, err)) {
+            std::printf("\n  %s: %s\n", what, err.c_str()); *ok = false; return d;
+        }
+        at += size_t(r.t.shape[0]) * K;
+    }
+    Fmt use = fmt;
+    const int blk = (fmt == Fmt::INT4) ? kInt4Group
+                  : (fmt == Fmt::MXFP4 || fmt == Fmt::MXFP8) ? kMXBlock : 1;
+    if (blk > 1 && (K % blk) != 0) use = Fmt::BF16;
+    return upload_packed(q, quantize(m.data(), N, K, use));
+}
+
+// down' = [a | b] along K: row n is a's row n followed by b's row n.
+static DevQuant concat_cols_f32_t(sycl::queue& q, const Qwen35Model& ck,
+                                  const TensorRef& ra, const TensorRef& rb,
+                                  Fmt fmt, const char* what, bool* ok) {
+    DevQuant d;
+    if (!ra.ok() || !rb.ok() || ra.t.shape.size() != 2 || rb.t.shape.size() != 2 ||
+        ra.t.shape[0] != rb.t.shape[0]) {
+        std::printf("\n  cannot column-concatenate %s (shape mismatch)\n", what);
+        *ok = false; return d;
+    }
+    const int N  = int(ra.t.shape[0]);
+    const int Ka = int(ra.t.shape[1]), Kb = int(rb.t.shape[1]);
+    const int K  = Ka + Kb;
+    std::vector<float> a(size_t(N) * Ka), b(size_t(N) * Kb);
+    std::string err;
+    if (!read_matrix_f32(ck, ra, a.data(), err) ||
+        !read_matrix_f32(ck, rb, b.data(), err)) {
+        std::printf("\n  %s: %s\n", what, err.c_str()); *ok = false; return d;
+    }
+    std::vector<float> m(size_t(N) * K);
+    for (int n = 0; n < N; ++n) {
+        std::memcpy(m.data() + size_t(n) * K,      a.data() + size_t(n) * Ka,
+                    size_t(Ka) * sizeof(float));
+        std::memcpy(m.data() + size_t(n) * K + Ka, b.data() + size_t(n) * Kb,
+                    size_t(Kb) * sizeof(float));
+    }
+    Fmt use = fmt;
+    const int blk = (fmt == Fmt::INT4) ? kInt4Group
+                  : (fmt == Fmt::MXFP4 || fmt == Fmt::MXFP8) ? kMXBlock : 1;
+    if (blk > 1 && (K % blk) != 0) use = Fmt::BF16;
+    return upload_packed(q, quantize(m.data(), N, K, use));
 }
 
 DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
@@ -3012,6 +3121,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 shard(d.sh_gate_q,lq);
                 d.has_sh_gate = true;
             }
+            acct(size_t(d.sh_gu.w.bytes() + d.sh_down.w.bytes()));
+        } else if (src.pf_gate.ok() && src.pf_up.ok() && src.pf_down.ok()) {
+            // Agnes: fold the parallel SwiGLU into the main one.  The
+            // SwiGLU kernel reads gate_up as [all gate rows][all up rows]
+            // and takes the intermediate width from d.sh_gu, so the row
+            // order is gate, pgate, up, pup -- NOT gate, up, pgate, pup.
+            // down is concatenated along K, per row, because row-major
+            // rows interleave; appending the bytes would build a
+            // different matrix that still has the right shape.
+            d.sh_gu   = concat_rows_f32_t(lq, ck,
+                {src.sh_gate, src.pf_gate, src.sh_up, src.pf_up}, PF,
+                "mlp.gate_up+parallel_ffn", &ok);
+            d.sh_down = concat_cols_f32_t(lq, ck, src.sh_down, src.pf_down, PF,
+                                          "mlp.down_proj+parallel_ffn", &ok);
+            shard(d.sh_gu,lq);shard(d.sh_down,lq);
             acct(size_t(d.sh_gu.w.bytes() + d.sh_down.w.bytes()));
         } else {
             d.sh_gu   = concat_upload_t(lq, ck, src.sh_gate, src.sh_up, PF,

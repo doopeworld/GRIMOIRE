@@ -165,6 +165,10 @@ struct Qwen35Layer {
     // --- FFN ------------------------------------------------------
     TensorRef router;                       // MoE only
     TensorRef sh_gate, sh_up, sh_down;      // shared expert / dense FFN
+    // Agnes: mlp.parallel_ffn.{gate,up,down}_proj -- a second, narrower
+    // SwiGLU inside the same mlp, summed with the main one.  Empty on
+    // every other architecture.
+    TensorRef pf_gate, pf_up, pf_down;
     TensorRef sh_gate_w;                    // shared_expert_gate
     // experts[e] -> {packed, scale} for each projection
     std::vector<TensorRef> e_gate_p, e_gate_s;

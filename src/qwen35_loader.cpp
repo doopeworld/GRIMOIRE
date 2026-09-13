@@ -303,37 +303,27 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         // still generates fluent text, and is not this model.  That is
         // the failure mode this tree spent a whole session removing, so
         // refuse until it is implemented rather than quietly approximate.
-        if (cfg.parallel_ffn_inter > 0) {
-            err = "Agnes declares parallel_ffn_intermediate_size " +
-                  std::to_string(cfg.parallel_ffn_inter) + ": a second SwiGLU "
-                  "per layer whose output is summed with the main MLP's. "
-                  "That is not implemented here, and running without it "
-                  "silently drops ~" +
-                  std::to_string(100 * cfg.parallel_ffn_inter /
-                                 std::max(1, cfg.dense_inter + cfg.parallel_ffn_inter)) +
-                  "% of every feed-forward block";
-            return false;
-        }
         if (cfg.lin_k_heads <= 0 || cfg.lin_v_heads <= 0) {
             err = "Agnes: no gated-DeltaNet geometry in the config"; return false;
         }
-        // The second thing this engine does not have.  attn_output_gate
-        // is parsed everywhere but only ever CONSUMED by Muse, which
-        // loads a separate self_attn.gate_proj into o_gate.  Agnes ships
-        // no such tensor -- its global_attn has exactly k_norm, k_proj,
-        // o_proj, q_norm, q_proj, v_proj -- so the gate is folded into a
-        // double-width q_proj, which means loading it here would both
-        // misread q_proj AND drop the gate.  Refuse: an ignored output
-        // gate is invisible in the output and shows up only as a model
-        // that is subtly worse than it should be.
-        if (cfg.attn_out_gate) {
-            err = "Agnes sets attn_output_gate, and this engine has no "
-                  "output-gate path for the Qwen3.5 attention shape (only "
-                  "Muse, which loads a separate gate_proj). Agnes ships no "
-                  "gate tensor, so the gate lives in a double-width q_proj "
-                  "and would be both misread and ignored";
-            return false;
-        }
+        // parallel_ffn is folded into the main FFN at upload, so after
+        // loading the feed-forward intermediate really IS this wide.  Say
+        // so once, here, rather than leave every consumer of dense_inter
+        // to remember the exception: the widths the engine derives from
+        // the uploaded tensor (sh_gu.output_rows()/2) already come out at
+        // the folded size, and this makes the config-derived bounds --
+        // the verifier staging buffers among them -- agree with them
+        // instead of under-allocating by parallel_ffn_inter.
+        cfg.dense_inter += cfg.parallel_ffn_inter;
+        // attn_output_gate needs nothing here.  Agnes ships no gate
+        // tensor because the gate rides in a double-width q_proj, and the
+        // engine detects exactly that from the tensor's own width --
+        // `gated = (QD == 2 * n_heads * head_dim)` in both the decode and
+        // the batched-prefill attention -- then splits it per head
+        // (launch_split_qgate: q at [head*2*hd + d], gate at
+        // [head*2*hd + hd + d]) and applies sigmoid before o_proj.  That
+        // is the same layout the reference produces with
+        // `view(heads, 2*head_dim)` followed by `chunk(2, dim=-1)`.
     }
     if (cfg.is_k2) {
         if (cfg.rope_head_dim && cfg.head_dim && cfg.rope_head_dim != cfg.head_dim) {
@@ -598,6 +588,15 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
 
         const std::string m = b + "mlp.";
+        // Agnes' second SwiGLU.  Resolved for every layer that has one;
+        // the uploader folds it into the main FFN, so nothing downstream
+        // needs to know it existed.
+        if (cfg.parallel_ffn_inter > 0) {
+            const std::string pf = m + "parallel_ffn.";
+            lay.pf_gate = linear(pf + "gate_proj");
+            lay.pf_up   = linear(pf + "up_proj");
+            lay.pf_down = linear(pf + "down_proj");
+        }
         // K2: a DENSE layer has no router and no experts -- its FFN is one
         // intermediate_size MLP under mlp.{gate,up,down}_proj.  cfg.is_moe()
         // is true for the model as a whole, so without this the three dense

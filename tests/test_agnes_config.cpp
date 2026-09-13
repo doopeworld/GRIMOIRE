@@ -161,36 +161,35 @@ int main() {
     if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
     const fs::path root = tmpl;
 
-    // ---- the real config: must REFUSE, and say why --------------------
+    // ---- the real config, exactly as the checkpoint ships it ----------
     {
         const fs::path d = root / "real";
         write_stub(d, config(true, true));
         Qwen35Model ld; std::string err;
         const bool ok = ld.load(d.string(), err, /*skip_vision=*/true, /*index_only=*/true);
-        std::printf("parallel_ffn is refused, not approximated\n");
-        CHECK(!ok, "the checkpoint declares parallel_ffn and the loader accepted it");
-        CHECK(err.find("parallel_ffn") != std::string::npos,
-              "the refusal must name parallel_ffn: %s", err.c_str());
-        // 2048 / (17408 + 2048) = 10.5%.  The message quotes the share of
-        // every FFN that would go missing, because "some of the model" is
-        // not an actionable thing to read at 3am.
-        CHECK(err.find("10%") != std::string::npos,
-              "the refusal should quantify what would be dropped: %s", err.c_str());
-        std::printf("  %s\n\n", err.c_str());
+        std::printf("the real config loads\n");
+        CHECK(ok, "the checkpoint's own config was rejected: %s", err.c_str());
+        if (ok) {
+            // parallel_ffn is FOLDED into the main FFN at upload -- two
+            // SwiGLUs summed are one SwiGLU over the concatenated
+            // intermediate -- so after loading the feed-forward width is
+            // the sum, and every buffer sized from it has to agree.
+            EQ(ld.cfg.parallel_ffn_inter, 2048, "parallel_ffn_intermediate_size");
+            EQ(ld.cfg.dense_inter, 17408 + 2048, "folded FFN intermediate width");
+        }
     }
 
     // ---- everything else, with that one key removed -------------------
-    {   // attn_output_gate is the OTHER refusal: parsed everywhere,
-        // consumed only by Muse, and Agnes ships no gate tensor because
-        // the gate rides in a double-width q_proj.  Ignoring it is
-        // invisible -- the model just comes out subtly worse.
+    {   // attn_output_gate needs no special handling and must NOT refuse:
+        // the gate rides in a double-width q_proj, and the engine detects
+        // that from the tensor width and splits it per head already.
         const fs::path d = root / "gate";
         write_stub(d, config(false, true));
         Qwen35Model l; std::string e;
         const bool ok = l.load(d.string(), e, true, true);
-        CHECK(!ok, "attn_output_gate must refuse while there is no gate path");
-        CHECK(e.find("attn_output_gate") != std::string::npos,
-              "the refusal must name it: %s", e.c_str());
+        CHECK(ok, "attn_output_gate must load: the gate is in q_proj and the "
+                  "engine detects it by width (%s)", e.c_str());
+        CHECK(l.cfg.attn_out_gate, "attn_output_gate parsed");
     }
 
     const fs::path d = root / "nopffn";
@@ -215,7 +214,9 @@ int main() {
     EQ(c.n_heads, 24, "n_heads");
     EQ(c.n_kv_heads, 4, "n_kv_heads");
     EQ(c.head_dim, 256, "head_dim");
+    // No parallel_ffn in this variant, so nothing is folded in.
     EQ(c.dense_inter, 17408, "intermediate_size (NOT the vision tower's 4304)");
+    EQ(c.parallel_ffn_inter, 0, "no parallel_ffn in this variant");
     CHECK(!c.is_moe(), "Agnes-3.0-Flash is dense, not MoE");
     CHECK(!c.tie_embeddings, "tie_word_embeddings");
 
@@ -278,6 +279,98 @@ int main() {
         CHECK(!ok, "an unknown layer_types entry must refuse, not default to full");
         CHECK(e2.find("agnes_mystery") != std::string::npos,
               "the refusal must name the value it did not understand: %s", e2.c_str());
+    }
+
+    // ---- the fold identity, in arithmetic ------------------------------
+    // Everything above is names and numbers.  This is the claim the whole
+    // parallel_ffn implementation rests on:
+    //
+    //   down(silu(gate x) * up x) + pdown(silu(pgate x) * pup x)
+    //     == down'(silu(gate' x) * up' x)
+    //
+    // with gate' = [gate;pgate] and up' = [up;pup] stacked by ROW, and
+    // down' = [down|pdown] joined by COLUMN.  It is true because a matmul
+    // over a concatenated contraction dimension is the sum of the two
+    // partial products -- but the layouts are easy to get backwards, and
+    // getting them backwards yields a matrix of exactly the right shape
+    // that computes something else.  So compute it both ways.
+    {
+        std::printf("parallel_ffn fold\n");
+        const int H = 6, I = 4, PI = 3, IF = I + PI;
+        auto rnd = [](int n, unsigned seed) {
+            std::vector<float> v(size_t(n), 0.0f);
+            unsigned s2 = seed;
+            for (auto& x : v) { s2 = s2 * 1664525u + 1013904223u;
+                                x = float(int(s2 >> 16) % 200 - 100) / 100.0f; }
+            return v;
+        };
+        const auto x     = rnd(H, 1);
+        const auto gate  = rnd(I  * H, 2),  up   = rnd(I  * H, 3);
+        const auto pgate = rnd(PI * H, 4),  pup  = rnd(PI * H, 5);
+        const auto down  = rnd(H  * I, 6),  pdown= rnd(H  * PI, 7);
+        auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
+        auto matvec = [](const std::vector<float>& m, const std::vector<float>& v,
+                         int n, int k) {
+            std::vector<float> o(size_t(n), 0.0f);
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < k; ++j) o[size_t(i)] += m[size_t(i)*k+j] * v[size_t(j)];
+            return o;
+        };
+        // reference: two independent SwiGLUs, summed
+        std::vector<float> ref(size_t(H), 0.0f);
+        {
+            auto g = matvec(gate, x, I, H), u = matvec(up, x, I, H);
+            std::vector<float> h(size_t(I), 0.0f);
+            for (int i = 0; i < I; ++i) h[size_t(i)] = silu(g[size_t(i)]) * u[size_t(i)];
+            auto a = matvec(down, h, H, I);
+            auto pg = matvec(pgate, x, PI, H), pu = matvec(pup, x, PI, H);
+            std::vector<float> ph(size_t(PI), 0.0f);
+            for (int i = 0; i < PI; ++i) ph[size_t(i)] = silu(pg[size_t(i)]) * pu[size_t(i)];
+            auto b = matvec(pdown, ph, H, PI);
+            for (int i = 0; i < H; ++i) ref[size_t(i)] = a[size_t(i)] + b[size_t(i)];
+        }
+        // folded: gate_up rows in the order gate, pgate, up, pup -- which
+        // is what the SwiGLU kernel's [all gate][all up] split needs --
+        // and down joined per row along K.
+        std::vector<float> gu;
+        gu.insert(gu.end(), gate.begin(),  gate.end());
+        gu.insert(gu.end(), pgate.begin(), pgate.end());
+        gu.insert(gu.end(), up.begin(),    up.end());
+        gu.insert(gu.end(), pup.begin(),   pup.end());
+        std::vector<float> dn(size_t(H) * IF);
+        for (int n = 0; n < H; ++n) {
+            std::copy(down.begin()  + size_t(n)*I,  down.begin()  + size_t(n+1)*I,
+                      dn.begin() + size_t(n)*IF);
+            std::copy(pdown.begin() + size_t(n)*PI, pdown.begin() + size_t(n+1)*PI,
+                      dn.begin() + size_t(n)*IF + I);
+        }
+        auto gv = matvec(gu, x, 2*IF, H);
+        std::vector<float> h(size_t(IF), 0.0f);
+        for (int i = 0; i < IF; ++i)
+            h[size_t(i)] = silu(gv[size_t(i)]) * gv[size_t(IF + i)];
+        const auto got = matvec(dn, h, H, IF);
+        double worst = 0.0;
+        for (int i = 0; i < H; ++i)
+            worst = std::max(worst, double(std::fabs(got[size_t(i)] - ref[size_t(i)])));
+        CHECK(worst < 1e-5, "folded FFN != two SwiGLUs summed: max|d| %.3e", worst);
+        std::printf("  two SwiGLUs summed == one folded SwiGLU, max|d| %.2e\n", worst);
+
+        // And prove the layout matters: the obvious-looking row order
+        // gate, up, pgate, pup has the right SHAPE and the wrong answer.
+        std::vector<float> wrong;
+        wrong.insert(wrong.end(), gate.begin(),  gate.end());
+        wrong.insert(wrong.end(), up.begin(),    up.end());
+        wrong.insert(wrong.end(), pgate.begin(), pgate.end());
+        wrong.insert(wrong.end(), pup.begin(),   pup.end());
+        auto wv = matvec(wrong, x, 2*IF, H);
+        std::vector<float> wh(size_t(IF), 0.0f);
+        for (int i = 0; i < IF; ++i)
+            wh[size_t(i)] = silu(wv[size_t(i)]) * wv[size_t(IF + i)];
+        const auto bad = matvec(dn, wh, H, IF);
+        double diff = 0.0;
+        for (int i = 0; i < H; ++i)
+            diff = std::max(diff, double(std::fabs(bad[size_t(i)] - ref[size_t(i)])));
+        CHECK(diff > 1e-3, "the wrong row order should NOT agree, but did");
     }
 
     std::error_code ec; fs::remove_all(root, ec);
