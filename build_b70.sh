@@ -44,6 +44,26 @@ fi
 
 command -v icpx >/dev/null || { echo "icpx not found; install the oneAPI DPC++ compiler"; exit 1; }
 command -v ocloc >/dev/null || echo "warning: ocloc not on PATH, AOT will fail"
+# ...and a PRESENT ocloc is not the same as a USABLE one.  MEASURED
+# 2026-09-13: Ubuntu 24.04 ships intel-ocloc 23.43, which predates
+# Battlemage entirely -- its device list stops at pvc/mtl/xe-lpg, and
+# `ocloc compile -device bmg_g31` answers "Cannot get HW Info".  Checking
+# only that the binary exists would let that build get all the way to the
+# device compile before failing, with an error that names the die rather
+# than the toolchain.  Battlemage wants compute-runtime 24.35 or newer,
+# from Intel's own repo, not the distro's.
+#
+# `ocloc ids` exits 0 either way, so the OUTPUT is what decides -- and an
+# ocloc too old to have the subcommand at all must not be read as a
+# refusal, so only the explicit "Unknown acronym" counts.
+ocloc_probe() {   # $1 = intel_gpu_<die>
+    local die="${1#intel_gpu_}"
+    local out; out="$(ocloc ids "$die" 2>&1)" || true
+    case "$out" in
+        *"Unknown acronym"*) echo "$die" ;;   # this ocloc cannot target it
+        *) ;;                                 # matched, or too old to know
+    esac
+}
 
 # Every Battlemage die, in one image.  AOT code compiled for g31 does NOT
 # run on a g21: the binary has no device image for it and the card is
@@ -66,6 +86,20 @@ for _t in "${TARGET_LIST[@]}"; do
     BACKEND_OPTS+=( -Xsycl-target-backend="$_t" "-options -cl-intel-256-GRF-per-thread" )
 done
 
+if command -v ocloc >/dev/null; then
+    UNKNOWN=""
+    for _t in "${TARGET_LIST[@]}"; do
+        _bad="$(ocloc_probe "$_t")"
+        [ -n "$_bad" ] && UNKNOWN="$UNKNOWN $_bad"
+    done
+    if [ -n "$UNKNOWN" ]; then
+        echo "ERROR: this ocloc does not know:$UNKNOWN" >&2
+        echo "       It is too old for Battlemage.  Install Intel's" >&2
+        echo "       compute-runtime (24.35+); the distro package is not it." >&2
+        echo "       B70_TARGET=... narrows the dies if that is what you want." >&2
+        exit 1
+    fi
+fi
 echo "target : $TARGET"
 icpx --version | head -1
 

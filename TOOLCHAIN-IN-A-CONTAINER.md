@@ -23,7 +23,9 @@ minutes and needs no GPU.
 - No XMX/DPAS. Anything using `joint_matrix` — `gemm_xmx`, the whole
   batched prefill path — cannot execute. `Grimoire::prefill` detects the
   missing `ext_intel_matrix` aspect and falls back to sequential.
-- No AOT image for `intel_gpu_bmg_g31` (that needs `ocloc`), no
+- No AOT image for `intel_gpu_bmg_g31` (that needs `ocloc`, and see the
+  note below -- an `ocloc` that INSTALLS is not necessarily one that can
+  target Battlemage), no
   bandwidth, no timing, no B70 driver behaviour.
 - Therefore: **no benchmark number from here means anything.** Rule 8 is
   unchanged. This is a correctness floor, not a substitute for the card.
@@ -119,3 +121,28 @@ intend to RUN here. `off` is correct for the B70 and is what
 A change to `src/*.cpp` is not finished until `icpx` has accepted it and,
 where a test exists, the kernels have run. "Written but never compiled"
 is not a state to hand off in.
+
+## `ocloc`: present is not the same as usable (MEASURED 2026-09-13)
+
+`apt-get install intel-ocloc` succeeds on Ubuntu 24.04 and puts a working
+`ocloc` on PATH. It is version 23.43, which predates Battlemage: its
+device list stops at `pvc` / `mtl-*` / `xe-lpg`, and
+
+```
+$ ocloc compile -device bmg_g31 -file x.cl
+Could not determine device target: bmg_g31.
+Error: Cannot get HW Info for device bmg_g31.
+```
+
+So "install ocloc and build the AOT image" does not work from the distro
+package. Battlemage needs Intel's own compute-runtime, 24.35 or newer,
+and `repositories.intel.com` was NOT reachable from this work container
+(403 through the egress proxy). The AOT image is therefore Tower work,
+for a specific reason rather than a vague one.
+
+`build_b70.sh` now probes each die with `ocloc ids` before it compiles
+anything and refuses with that explanation, instead of letting the build
+run to the device compile and fail with an error that names the die. Note
+that `ocloc ids` exits 0 whether or not it recognises the acronym, so the
+check reads its OUTPUT; an `ocloc` too old to have the subcommand at all
+is not treated as a refusal.
