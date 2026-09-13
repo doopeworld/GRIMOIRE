@@ -43,3 +43,7 @@ work-*/
 src/test_xe2_gdn_bridge
 src/test_xe2_bridge
 src/test_xe2_attention_bridge
+
+# Python bytecode from the tools/ scripts -- generated, never source.
+__pycache__/
+*.pyc
