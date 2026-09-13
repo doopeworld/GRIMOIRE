@@ -169,11 +169,19 @@ make test              13 host suites, incl. the new dflash-config
 make test-correctness  2 suites
 test_k2_kernels        ALL PASS
 test_k2_e2e            ALL PASS
-test_model_matrix      (see the run log)
-test_parallel_e2e      (see the run log)
-test_spec_e2e          DFlash identical at M=4,8,16, shared head and own
-                       head + d2t; accept path identical at 9.4%
-src/grimoire.cpp       compiles clean
+test_model_matrix      ALL PASS, 28/28: dense / moe / hybrid / k2-horizon
+                       x bf16 fp8_e4m3 fp8_e5m2 int8 int4 mxfp8 mxfp4
+test_parallel_e2e      ALL PASS, 7 cases: PP and TP token-identical to one
+                       process, including DeltaNet state across a split
+test_spec_e2e          MTP identical at K=1,2,3,5 for dense and moe in
+                       bf16 and fp8, single process + TP + PP; hybrid
+                       REFUSES here as designed (no batched verify on a
+                       CPU device); DFlash identical at M=4, 8 and 16,
+                       both sharing the target's head and running the
+                       drafter's own reduced head + d2t; the
+                       forced-agreement case identical at 0.60
+                       accepted/step
+bin/grimoire, bin/grimoire-server   compile and link
 ```
 
 ## NOT verified — and be precise about this
