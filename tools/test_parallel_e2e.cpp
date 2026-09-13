@@ -186,51 +186,91 @@ int main(int argc, char** argv) {
         }
         std::printf("single%s", join(ref).c_str());
 
-        // ---- pipeline parallel, 2 ranks, 2+2 layers -----------------
-        const std::string sock = (dir/"pp.sock").string();
-        const std::string pp_out = (dir/"pp.txt").string();
-        std::vector<pid_t> pids;
-        // Rank 1 listens, so start it first; rank 0 retries the connect
-        // for 10 minutes anyway, but starting the listener first keeps
-        // the log readable when something does go wrong.
-        pids.push_back(spawn(self, dir.string(), pp_out, c.fmt,
-            {"GRIMOIRE_PP_RANK=1","GRIMOIRE_PP_WORLD_SIZE=2",
-             "GRIMOIRE_PP_SPLIT=2","GRIMOIRE_PP_SOCKET="+sock,
-             "GRIMOIRE_DEVICE_ANY=1"}));
-        pids.push_back(spawn(self, dir.string(), "-", c.fmt,
-            {"GRIMOIRE_PP_RANK=0","GRIMOIRE_PP_WORLD_SIZE=2",
-             "GRIMOIRE_PP_SPLIT=2","GRIMOIRE_PP_SOCKET="+sock,
-             "GRIMOIRE_DEVICE_ANY=1"}));
-        if (!wait_ok(pids, "pp")) {
-            ++g_fail; std::printf("   PP run FAILED\n"); continue;
-        }
-        const auto pp = read_tokens(pp_out);
-        const bool pp_match = (pp == ref);
-        std::printf("   PP %s", pp_match ? "match" : "DIFFERS");
-        if (!pp_match) std::printf("%s", join(pp).c_str());
-        CHECK(pp_match, "%s/%s: pipeline parallel changed the output",
-              c.arch.name, c.fmt);
+        // ---- pipeline parallel, N ranks -----------------------------
+        // The chain, the collectives and the layer split are all written
+        // for N stages, but only TWO had ever been run -- and a 2-rank
+        // chain never exercises a MIDDLE stage, the one that both
+        // receives and forwards.  GRIMOIRE must work on any number of
+        // Battlemage cards, so drive 2, 3 and 4.
+        //
+        // The mini models have 4 layers, so the splits are 2+2, 2+1+1 and
+        // 1+1+1+1 -- the last giving every stage exactly one layer, which
+        // is the tightest the boundary code ever gets.
+        auto run_pp = [&](int world, const char* layers) {
+            const std::string sock = (dir/("pp"+std::to_string(world)+".sock")).string();
+            const std::string out  = (dir/("pp"+std::to_string(world)+".txt")).string();
+            std::vector<pid_t> pids;
+            // Later ranks listen, so start from the back: rank 0 retries
+            // the connect for 10 minutes anyway, but starting listeners
+            // first keeps the log readable when something goes wrong.
+            for (int r = world - 1; r >= 0; --r) {
+                std::vector<std::string> env{
+                    "GRIMOIRE_PP_RANK=" + std::to_string(r),
+                    "GRIMOIRE_PP_WORLD_SIZE=" + std::to_string(world),
+                    "GRIMOIRE_PP_LAYERS=" + std::string(layers),
+                    "GRIMOIRE_PP_SOCKET=" + sock,
+                    "GRIMOIRE_DEVICE_ANY=1"};
+                // Only the LAST stage has the head, so only it has tokens.
+                pids.push_back(spawn(self, dir.string(),
+                                     r == world - 1 ? out : "-", c.fmt, env));
+            }
+            const std::string what = "pp" + std::to_string(world);
+            if (!wait_ok(pids, what.c_str())) {
+                ++g_fail; std::printf("   PP%d FAILED", world); return;
+            }
+            const auto got = read_tokens(out);
+            const bool match = (got == ref);
+            std::printf("   PP%d %s", world, match ? "match" : "DIFFERS");
+            if (!match) std::printf("%s", join(got).c_str());
+            CHECK(match, "%s/%s: pipeline parallel over %d ranks changed the output",
+                  c.arch.name, c.fmt, world);
+        };
 
-        // ---- tensor parallel, 2 ranks -------------------------------
-        // Every rank runs the head, so rank 0's tokens are the answer.
-        const std::string tsock = (dir/"tp.sock").string();
-        const std::string tp_out = (dir/"tp.txt").string();
-        pids.clear();
-        pids.push_back(spawn(self, dir.string(), tp_out, c.fmt,
-            {"GRIMOIRE_TP_RANK=0","GRIMOIRE_TP_WORLD_SIZE=2",
-             "GRIMOIRE_TP_SOCKET="+tsock,"GRIMOIRE_DEVICE_ANY=1"}));
-        pids.push_back(spawn(self, dir.string(), "-", c.fmt,
-            {"GRIMOIRE_TP_RANK=1","GRIMOIRE_TP_WORLD_SIZE=2",
-             "GRIMOIRE_TP_SOCKET="+tsock,"GRIMOIRE_DEVICE_ANY=1"}));
-        if (!wait_ok(pids, "tp")) {
-            ++g_fail; std::printf("   TP run FAILED\n"); continue;
+        // Every rank runs the head under TP, so rank 0's tokens are the
+        // answer.  Uneven shards are the point at 3: 4 query heads over 3
+        // ranks is 2/1/1, which no 2-rank run ever produces.
+        auto run_tp = [&](int world) {
+            const std::string sock = (dir/("tp"+std::to_string(world)+".sock")).string();
+            const std::string out  = (dir/("tp"+std::to_string(world)+".txt")).string();
+            std::vector<pid_t> pids;
+            for (int r = 0; r < world; ++r) {
+                std::vector<std::string> env{
+                    "GRIMOIRE_TP_RANK=" + std::to_string(r),
+                    "GRIMOIRE_TP_WORLD_SIZE=" + std::to_string(world),
+                    "GRIMOIRE_TP_SOCKET=" + sock,
+                    "GRIMOIRE_DEVICE_ANY=1"};
+                pids.push_back(spawn(self, dir.string(),
+                                     r == 0 ? out : "-", c.fmt, env));
+            }
+            const std::string what = "tp" + std::to_string(world);
+            if (!wait_ok(pids, what.c_str())) {
+                ++g_fail; std::printf("   TP%d FAILED", world); return;
+            }
+            const auto got = read_tokens(out);
+            const bool match = (got == ref);
+            std::printf("   TP%d %s", world, match ? "match" : "DIFFERS");
+            if (!match) std::printf("%s", join(got).c_str());
+            CHECK(match, "%s/%s: tensor parallel over %d ranks changed the output",
+                  c.arch.name, c.fmt, world);
+        };
+
+        run_pp(2, "2,2");
+        run_tp(2);
+        // 3 and 4 ranks on every architecture would triple a run that
+        // already takes twenty minutes on a CPU device, and the rank
+        // COUNT is what is under test here, not the architecture -- the
+        // architectures are covered at 2.  Drive the widest counts on the
+        // two shapes that stress the boundary most: a plain dense model,
+        // and the hybrid, whose DeltaNet layers carry a recurrent state
+        // and a conv ring across every split.
+        const bool wide = c.arch.name == std::string("dense") ||
+                          c.arch.name == std::string("hybrid");
+        if (wide) {
+            run_pp(3, "2,1,1");
+            run_pp(4, "1,1,1,1");
+            run_tp(3);
+            run_tp(4);
         }
-        const auto tp = read_tokens(tp_out);
-        const bool tp_match = (tp == ref);
-        std::printf("   TP %s", tp_match ? "match" : "DIFFERS");
-        if (!tp_match) std::printf("%s", join(tp).c_str());
-        CHECK(tp_match, "%s/%s: tensor parallel changed the output",
-              c.arch.name, c.fmt);
         std::printf("\n");
     }
 

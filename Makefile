@@ -115,9 +115,13 @@ clean:
 # Standalone C++/SYCL profile: external bridges (including Torch/vLLM)
 # are disabled at compile time. The default image is AOT for Battlemage G31.
 # For compilation on a host without ocloc, use SYCL_TARGET=spir64.
+# Both Battlemage dies by default: g31 is B70/B65, g21 is B580/B60/B50,
+# and an image built for one will not run on the other.  A machine can
+# hold a mix, so the default binary carries device code for both.
 SYCL_CXX ?= icpx
-SYCL_TARGET ?= intel_gpu_bmg_g31
-NATIVE_DIR = bin/native-$(SYCL_TARGET)
+SYCL_TARGET ?= intel_gpu_bmg_g31,intel_gpu_bmg_g21
+COMMA := ,
+NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
 NATIVE_SRC = grimoire qwen35_loader native_model safetensors quantize gptq \

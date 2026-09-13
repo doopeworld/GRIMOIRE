@@ -12,7 +12,9 @@
 #    RIGHT   -fsycl-targets=intel_gpu_bmg_g31     <- Battlemage G31 = Arc Pro B70/B65
 #
 #  intel_gpu_bmg_g21 is the SMALLER Battlemage die (B580, Arc Pro B50/B60).
-#  Building for g21 and running on a B70 works, but you lose the tuning.
+#  Both are built by default now: an AOT image for one die does not run on
+#  the other at all, and a box can hold a mix (two B70s plus a B580).  A
+#  single-die image is still one env var away -- see B70_TARGET below.
 # =====================================================================
 set -eo pipefail
 
@@ -43,8 +45,26 @@ fi
 command -v icpx >/dev/null || { echo "icpx not found; install the oneAPI DPC++ compiler"; exit 1; }
 command -v ocloc >/dev/null || echo "warning: ocloc not on PATH, AOT will fail"
 
-TARGET="${B70_TARGET:-intel_gpu_bmg_g31}"
+# Every Battlemage die, in one image.  AOT code compiled for g31 does NOT
+# run on a g21: the binary has no device image for it and the card is
+# simply not usable.  GRIMOIRE has to work on any Battlemage card --
+# B70/B65 are g31, B580/B60/B50 are g21 -- and a machine can now hold a
+# mix of both at once, so the default builds for both dies and the
+# runtime picks the matching image per device.
+#
+# The cost is compile time: every kernel is compiled once per die.
+# B70_TARGET=intel_gpu_bmg_g31 builds a single die when iterating.
+TARGET="${B70_TARGET:-intel_gpu_bmg_g31,intel_gpu_bmg_g21}"
 OUT="${B70_OUT:-b70_native_inference}"
+
+# -Xsycl-target-backend takes ONE target, so a multi-die build needs the
+# flag repeated per die.  Passing the comma list to it builds a binary
+# that silently has the option on NEITHER.
+IFS=',' read -r -a TARGET_LIST <<< "$TARGET"
+BACKEND_OPTS=()
+for _t in "${TARGET_LIST[@]}"; do
+    BACKEND_OPTS+=( -Xsycl-target-backend="$_t" "-options -cl-intel-256-GRF-per-thread" )
+done
 
 echo "target : $TARGET"
 icpx --version | head -1
@@ -68,7 +88,7 @@ icpx -fsycl \
      -ffp-contract=fast \
      -fno-math-errno \
      -fsycl-device-code-split=off \
-     -Xsycl-target-backend="$TARGET" "-options -cl-intel-256-GRF-per-thread" \
+     "${BACKEND_OPTS[@]}" \
      -I include -I src \
      src/main.cpp src/quantize.cpp src/gemv_decode.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \

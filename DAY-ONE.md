@@ -161,6 +161,50 @@ slice — it is routed through the full all-gathered projection instead.
 Correct, but the draft-vocab speedup is not available there. Another
 reason PP is the default choice for two cards.
 
+## 2c. More than two cards, or cards that are not the same
+
+GRIMOIRE runs on any Battlemage part, and a box can mix them. Two things
+make that work:
+
+**One binary covers both dies.** B70/B65 are `bmg_g31`; B580/B60/B50 are
+`bmg_g21`. An AOT image built for one die does not run on the other at
+all. `build_b70.sh` now builds both by default, so the same binary drives
+every card. `B70_TARGET=intel_gpu_bmg_g31` builds a single die when you
+are iterating and want the compile to be quick.
+
+**Device selection is no longer by product name.** It used to match the
+literal string "B70", which made a B580 invisible: on a mixed box the
+extra rank fell through to the default selector, and on a B580-only box
+nothing was selectable. Ranks now take the discrete Arc GPUs in
+enumeration order, and each rank prints the card it got:
+
+```
+  rank 2 -> GPU 2/3: Intel(R) Arc(TM) B580 Graphics
+```
+
+Read that line. On a mixed box the layer split depends on which rank
+landed where. `GRIMOIRE_DEVICES=0,2,1` remaps rank to device index when
+the driver's order is not the one you want.
+
+**N cards, uneven split.** `tools/nrun.sh` replaces the two-card
+launchers for anything other than exactly two:
+
+```bash
+GRIMOIRE_PP_LAYERS=30,30,12 tools/nrun.sh pp   renderD128,renderD129,renderD130 1800 pp3   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
+```
+
+`GRIMOIRE_PP_LAYERS` is one positive count per GPU, summing to the
+model's layer count, and it is REQUIRED beyond two cards — the engine
+refuses to guess. **Give a smaller card fewer layers**: pipeline
+throughput is set by the slowest stage, so an equal split makes the
+small card the ceiling for everything.
+
+Tensor parallel across unequal cards is the wrong tool: TP shards evenly
+and synchronises every layer, so the smallest card throttles all of them.
+Use PP when the cards differ, TP when they match.
+
+`tools/nrun.sh tp <nodes> ...` exists for the matched case.
+
 ## 3. Which format
 
 One card, model fits: `--proj int4` (the W4A8 path, int8 XMX, ~367 TOPS).

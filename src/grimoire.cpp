@@ -1398,14 +1398,61 @@ struct Grimoire {
     // Match vLLM's XPU worker model: ZE_AFFINITY_MASK keeps the full 0,1
     // visibility list, while each child process selects device local_rank.
     static sycl::device rank_device() {
-        std::vector<sycl::device> b70;
-        for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("B70") != std::string::npos)
-                b70.push_back(d);
+        // This used to select devices whose NAME contains "B70", which
+        // made every other Battlemage card invisible: a B580, a B60 or a
+        // B50 simply was not in the list, so on a mixed box the third
+        // rank fell through to the default selector and on a B580-only
+        // box nothing was selectable at all.  GRIMOIRE has to run on
+        // every Battlemage part, so take all GPUs and merely PREFER the
+        // discrete Arc ones -- which keeps an integrated display GPU from
+        // being picked when a real card is present, without hardcoding
+        // one product name.
+        const auto all = sycl::device::get_devices(sycl::info::device_type::gpu);
+        std::vector<sycl::device> pick;
+        for (const auto& d : all) {
+            const std::string n = d.get_info<sycl::info::device::name>();
+            // Arc discrete parts: "Intel(R) Arc(TM) B580 Graphics",
+            // "Intel(R) Arc(TM) Pro B70 Graphics", and the Battlemage
+            // codename as the driver sometimes reports it.
+            if (n.find("Arc") != std::string::npos ||
+                n.find("Battlemage") != std::string::npos ||
+                n.find("BMG") != std::string::npos)
+                pick.push_back(d);
+        }
+        if (pick.empty()) pick = all;
+        // GRIMOIRE_DEVICES remaps rank -> device index, for a box whose
+        // cards are not all the same: with two B70s and a B580 the small
+        // card should be a specific pipeline stage, not whichever one the
+        // driver happens to enumerate third.
+        if (const char* order = std::getenv("GRIMOIRE_DEVICES");
+            order && *order && !pick.empty()) {
+            std::vector<sycl::device> remap;
+            for (const char* p = order; *p; ) {
+                char* end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (v >= 0 && v < long(pick.size())) remap.push_back(pick[size_t(v)]);
+                p = end;
+                while (*p == ',' || *p == ' ') ++p;
+            }
+            if (!remap.empty()) pick.swap(remap);
+        }
         const char* e = std::getenv("GRIMOIRE_PP_RANK");
         if (!e || !*e) e = std::getenv("GRIMOIRE_TP_RANK");
         const int rank = e && *e ? std::atoi(e) : 0;
-        if (rank >= 0 && rank < int(b70.size())) return b70[size_t(rank)];
+        if (rank >= 0 && rank < int(pick.size())) {
+            // Say which card this rank got.  On a mixed box the layer
+            // split depends on it, and "it was slow" is not debuggable
+            // without knowing which rank ran where.
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "  rank %d -> GPU %d/%zu: %s\n", rank, rank,
+                             pick.size(),
+                             pick[size_t(rank)].get_info<sycl::info::device::name>().c_str());
+            }
+            return pick[size_t(rank)];
+        }
         // GRIMOIRE_DEVICE_ANY: run on whatever SYCL device exists when
         // there is no GPU at all.  This is a CORRECTNESS harness, not a
         // fallback -- it is what lets tools/test_k2_e2e_device.cpp drive
