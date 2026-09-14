@@ -276,6 +276,47 @@ Two lessons, both cheap:
   first time anyone reads it" -- which is what made the A/B that proved
   the fix possible at all.
 
+**7c. UNDER PP, THE LAST STAGE ALWAYS OWES A REPLY -- AND ITS SHAPE
+DEPENDS ON THE PHASE (learned 2026-09-14).** Earlier stages are never
+idle after calling into the drafter. During DRAFTING they sit in
+`pp_sync_tokens()` waiting for M-1 integers. After a CONTEXT-ONLY call
+they return at once and go straight to `argmax_token()`, which waits for
+exactly ONE. So:
+
+    drafting, failed      -> M-1 negative tokens
+    context-only, failed  -> ONE negative token
+    context-only, ok      -> nothing; argmax_token sends the scalar
+
+Both wrong answers have been shipped here and both were silent. Sending a
+block during a context-only call put the first -1 where the scalar was
+expected and left the rest for the NEXT message to misread -- fatal to a
+resident server, harmless to a CLI that exits. Sending nothing left the
+peers blocked forever on a scalar.
+
+The notifier is an RAII destructor, not a lambda called at each exit,
+because the paths that need it most have no exit to annotate: a bridge, an
+allocation, a kernel submission or a wait can throw straight out of the
+function. It uses a fixed, clamped buffer so the failure path allocates
+nothing even after a `bad_alloc`.
+
+`bin/test_spec_e2e` proves it end to end rather than with a mock: capacity
+32, a valid 25-token prompt and M=8, so the drafter cannot prepare; both
+ranks must fail and then the SAME engine and SAME sockets must serve a
+normal request identically. Tearing the model down after the refusal would
+hide both a blocked peer and a dirty wire.
+
+**7d. ASK THE COMPILER (learned 2026-09-14).** The fix for 7b was itself
+broken by a braceless `if`:
+
+    if (capture_spec)
+        q.memcpy(spec_hidden_steps, ...);   // conditional
+        spec_hidden_valid = true;           // NOT conditional
+
+so a verify batch wider than `kSpecBatch` marked a buffer valid that
+nothing had written -- reachable ON THE CARD, where batched prefill works.
+`build_b70.sh` now passes `-Wmisleading-indentation`. Keep it. A warning
+costs nothing and this cost three audits.
+
 **8. Never quote a benchmark number from a config that never generated text.**
 Multiple false leads in this project (BesTLA, DAG, several kernel "wins")
 were caught only because someone bothered to run `-p "prompt" -n N` and read

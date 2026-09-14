@@ -224,3 +224,44 @@ heisenbug precisely because stale memory is usually finite.
 
 **This would have reached the B70.** The same fallback is taken on the
 card whenever a speculative scratch allocation fails.
+
+## Final state, 2026-09-14
+
+Head `102ecea`. Three external audits, 14 defects fixed. All seven gates
+green on the final build, run SERIALLY on an idle machine (running them
+concurrently on 4 cores produced contention failures that are not bugs):
+
+```
+make test / make test-correctness   rc=0
+test_k2_kernels                     rc=0
+test_k2_e2e                         rc=0
+test_model_matrix                   rc=0   28/28
+test_parallel_e2e                   rc=0   PP+TP at 2, 3 and 4 ranks
+test_spec_e2e                       rc=0   ALL PASS
+```
+
+Inside the speculation gate, the four checks the audits were about:
+
+| check | passed |
+| --- | --- |
+| `PP+MTP match` | 4/4 |
+| `PP+DFlash: identical` | 4/4 |
+| `PP taps: byte-identical to one process` | 4/4 |
+| `PP refusal: both ranks recovered` | 1 (new) |
+
+**Two of the fixed defects would have fired on the B70 and not here**, so
+do not read "the CPU gates pass" as "the card is fine":
+
+- the hidden-state restore, whenever a speculative scratch allocation
+  fails;
+- the braceless `if` in its fix, on any verify batch wider than
+  `kSpecBatch` -- which only happens where batched prefill actually works.
+
+**What is still untouched by any of this.** No XMX tile, no cutlass
+bridge, no AOT image, no OCuLink, no real checkpoint, no generated text
+read by a human, and not one throughput number. Agnes has never been
+loaded against its real weights. The DFlash acceptance figure on record is
+still void. Rule 8 stands: none of the above is verification.
+
+**Run the gates more than once on the card.** Two of the three audits
+turned on a failure that appeared in some runs and not others.
