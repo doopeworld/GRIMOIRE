@@ -1900,6 +1900,10 @@ struct Grimoire {
         float rope_theta = 0.0f;
         float partial_rope = 1.0f;
         bool  rope_proportional = false;
+        // gemma-4: hidden_states *= layer_scalar as the LAST act of the
+        // layer, after the residual add.  1.0 is the identity everywhere
+        // else, so the multiply is unconditional and costs nothing.
+        float layer_scalar = 1.0f;
         bool k2_sparse = false;
         // Routed FFN is decided PER LAYER, not per model: a K2 layer in
         // mlp_only_layers has a plain MLP while the model as a whole is
@@ -2877,6 +2881,26 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
+    // head_dim per lane.  Every flash kernel in attention.cpp and
+    // prefill.cpp accumulates its head into a PRIVATE array of MAX_DPL
+    // floats, with dpl = head_dim / SG_SIZE and SG_SIZE 16 -- so head_dim
+    // above 256 writes past the end of a device stack array.  That is a
+    // DEVICE_LOST, not a wrong number, and no supported model has ever
+    // exceeded it (Qwen 128, K2/Muse 256).  gemma-4's full-attention
+    // layers are 512.  Raising MAX_DPL is a register-pressure change to
+    // the hot decode kernel and has to be measured on the card, so bound
+    // it here rather than guess.
+    const int max_hd = cfg.max_head_dim();
+    if (max_hd > MAX_HEAD_DIM)
+        return "head_dim " + std::to_string(max_hd) +
+               " exceeds what the flash-attention kernels can hold "
+               "(MAX_DPL " + std::to_string(MAX_DPL) + " x SG_SIZE " +
+               std::to_string(SG_SIZE) + " = " +
+               std::to_string(MAX_HEAD_DIM) + ").  Every head accumulates "
+               "into a private array of that size, so a wider head writes "
+               "past the end of device stack memory -- a DEVICE_LOST, not a "
+               "wrong answer.  Refusing.";
+
     // GeGLU.  Every FFN dispatch in this engine -- decode GEMV, batched
     // prefill, the MoE path, speculative verify -- is swiglu.  The kernels
     // exist (launch_geglu, pinned by bin/test_k2_kernels) but nothing calls
@@ -3328,6 +3352,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 d.q_norm = dev_copy_t<bf16_t>(lq, ck, src.q_norm, "self_attn.q_norm", &ok);
             if (src.k_norm.ok())
                 d.k_norm = dev_copy_t<bf16_t>(lq, ck, src.k_norm, "self_attn.k_norm", &ok);
+            if (cfg.is_gemma4) {
+                // Same sandwich shape as Muse, without the f16 companions:
+                // gemma-4 has no Fusion FlashAttention path, so nothing
+                // reads the half-precision copies.
+                d.pre_ff_norm  = dev_copy_t<bf16_t>(lq, ck, src.pre_ff_norm,  "mlp.pre_ff_norm",  &ok);
+                d.post_ff_norm = dev_copy_t<bf16_t>(lq, ck, src.post_ff_norm, "mlp.post_ff_norm", &ok);
+                // hidden_states *= layer_scalar, AFTER the residual add, as
+                // the last act of the layer.  A [1] tensor, read to the host
+                // once here: it is a per-layer constant, so keeping it on the
+                // device would cost a kernel launch per layer to apply.
+                float ls = 1.0f;
+                if (!read_matrix_f32(ck, src.layer_scalar, &ls, err)) ok = false;
+                d.layer_scalar = ls;
+            }
             if (cfg.is_muse) {
                 d.pre_ff_norm  = dev_copy_t<bf16_t>(lq, ck, src.pre_ff_norm,  "mlp.pre_ff_norm",  &ok);
                 d.post_ff_norm = dev_copy_t<bf16_t>(lq, ck, src.post_ff_norm, "mlp.post_ff_norm", &ok);

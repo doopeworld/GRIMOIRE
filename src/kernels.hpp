@@ -26,6 +26,13 @@ inline sycl_bf16 to_sycl_bf16(float f) { return sycl_bf16(f); }
 // bf16 and K == 32 for int8.
 // ---------------------------------------------------------------------
 constexpr int SG_SIZE = 16;
+// Widest head the flash kernels can hold.  Each accumulates a head into a
+// PRIVATE array of MAX_DPL floats per lane (dpl = head_dim / SG_SIZE), so a
+// wider head writes past the end of device stack memory -- a DEVICE_LOST,
+// not a wrong number.  Declared here so attention.cpp, prefill.cpp and the
+// engine's capability check cannot drift apart.
+constexpr int MAX_DPL      = 16;
+constexpr int MAX_HEAD_DIM = MAX_DPL * SG_SIZE;
 
 // Upper bound on FlashDecoding split-K chunks for single-token decode.
 // GRAPH_SPLITS (8) sizes the graph-recorded path and never scaled with

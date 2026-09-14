@@ -127,7 +127,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                 // 8-slot array silently computes only the first half of
                 // every head and leaves dims 128..255 holding whatever
                 // the previous token left there.
-                constexpr int MAX_DPL = 16;
+                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
                 const int dpl = HD / SG_SIZE;
                 float m   = -std::numeric_limits<float>::infinity();
                 float l   = 0.0f;
@@ -328,7 +328,7 @@ sycl::event launch_flash_decode_batched(
                 float* vsl = vs.template get_multi_ptr<
                     sycl::access::decorated::no>().get();
 
-                constexpr int MAX_DPL = 16;
+                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
                 const int dpl = head_dim / SG_SIZE;
                 float m = -std::numeric_limits<float>::infinity();
                 float l = 0.0f;

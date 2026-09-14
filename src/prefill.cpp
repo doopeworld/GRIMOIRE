@@ -1217,7 +1217,7 @@ sycl::event launch_flash_prefill(
                 const uint8_t* vh = v_cache + int64_t(kvh) * seq_cap * head_dim;
                 float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* vsl=vs.template get_multi_ptr<sycl::access::decorated::no>().get();
-                constexpr int MAX_DPL = 16;
+                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
                 const int dpl = head_dim / SG_SIZE;
                 float acc[MAX_DPL];
                 #pragma unroll
@@ -1300,7 +1300,7 @@ sycl::event launch_dflash2_block_attention(
                 const uint8_t* vh=v_cache+int64_t(kvh)*seq_cap*head_dim;
                 float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* vsl=vs.template get_multi_ptr<sycl::access::decorated::no>().get();
-                constexpr int MAX_DPL=16;
+                static_assert(MAX_DPL==16,"kernels.hpp owns this bound");
                 const int dpl=head_dim/SG_SIZE;
                 float acc[MAX_DPL];
                 #pragma unroll
