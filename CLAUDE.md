@@ -374,6 +374,27 @@ that the message contains the architecture's name passes on the loader's
 own shape refusals — so a malformed fixture would look like a working
 capability check. Match the engine's sentence.
 
+**11. GEMMA-4 DOES NOT USE `(1 + w)` IN ITS NORMS. Gemma-2 and Gemma-3
+DO (learned 2026-09-14, from an external audit).**
+`Gemma4RMSNorm.forward` is `normed * self.weight` — no offset
+(`ref/gemma4.py:211`). The whole family used the zero-centered convention
+until this one, so the wrong answer is exactly what the family name leads
+you to. Applying `(1 + w)` shifts every normalised activation in the
+model and leaves the output fluent. This engine now sets the convention
+per model in one place (`set_norm_convention`, called once in `build()`):
+Qwen/Muse whole-row `(1 + w)`, K2 grouped `w`, gemma-4 whole-row `w`.
+
+The knock-on is worth stating because it is not obvious: a SCALELESS norm
+(gemma-4's `v_norm`, `with_scale=False`) is reproduced by a weight vector
+of ZEROS under `(1 + w)` and by a vector of ONES under `w`. Get the
+convention right and the placeholder wrong and the model multiplies its
+values by zero. Name such a buffer after the norm it serves, not after
+its contents — `gemma_zero` was a name that had to be wrong half the time.
+
+More generally: when reading a reference for a new family member, read
+the norm's `forward`, do not infer it from the sibling you already
+implemented.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the

@@ -169,6 +169,16 @@ int main(int argc, char** argv) {
         // ring that a pipeline split has to keep consistent across ranks.
         { mini::hybrid(4), "bf16" },
         { mini::hybrid(4), "fp8"  },
+        // gemma-4 is the only architecture with TWO attention geometries
+        // in one model, which is exactly what PP and TP shard on.  A
+        // 6-layer model splits 3/3, 2/2/2 and 2/2/1/1, so every split
+        // lands a boundary between a sliding layer and a full-attention
+        // one -- different head_dim, different KV head count and a
+        // different rotation on either side.  It also has no batched
+        // prefill, so this is the only gate that drives its sequential
+        // fallback across ranks.
+        { mini::gemma4(6), "bf16" },
+        { mini::gemma4(6), "fp8"  },
     };
 
     for (size_t ci = 0; ci < cases.size(); ++ci) {
@@ -260,7 +270,21 @@ int main(int argc, char** argv) {
                   c.arch.name, c.fmt, world);
         };
 
-        run_pp(2, "2,2");
+        // The layer counts a split needs depend on the MODEL, not on a
+        // constant: gemma-4 is 6 layers where every other case here is 4,
+        // and a "2,2" split of a 6-layer model is rejected outright (the
+        // counts must sum to n_layers).  Derive them.
+        auto split = [&](int world) {
+            const int n = c.arch.layers;
+            std::string out;
+            for (int r = 0; r < world; ++r) {
+                const int beg = (n * r) / world, end = (n * (r + 1)) / world;
+                out += (r ? "," : "") + std::to_string(end - beg);
+            }
+            return out;
+        };
+
+        run_pp(2, split(2).c_str());
         run_tp(2);
         // 3 and 4 ranks on every architecture would triple a run that
         // already takes twenty minutes on a CPU device, and the rank
@@ -269,11 +293,20 @@ int main(int argc, char** argv) {
         // two shapes that stress the boundary most: a plain dense model,
         // and the hybrid, whose DeltaNet layers carry a recurrent state
         // and a conv ring across every split.
+        // gemma-4 joins them: it is the only architecture with two
+        // attention geometries, so where a boundary FALLS decides whether
+        // a stage sees a head_dim change, and 2 ranks only ever produce
+        // one boundary.
         const bool wide = c.arch.name == std::string("dense") ||
-                          c.arch.name == std::string("hybrid");
+                          c.arch.name == std::string("hybrid") ||
+                          c.arch.name == std::string("gemma4");
         if (wide) {
-            run_pp(3, "2,1,1");
-            run_pp(4, "1,1,1,1");
+            // At 3 ranks the derived split is uneven on every model here
+            // (4 layers -> 1,1,2; 6 -> 2,2,2 with 4 ranks giving 1,2,1,2),
+            // and any count above 2 exercises a MIDDLE stage -- one that
+            // both receives and forwards -- which a 2-rank chain never has.
+            run_pp(3, split(3).c_str());
+            run_pp(4, split(4).c_str());
             run_tp(3);
             run_tp(4);
         }

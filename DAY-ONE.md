@@ -36,7 +36,7 @@ order, and stops at the first required failure:
 | `make test`, `make test-correctness` | 13 host suites |
 | `bin/test_k2_kernels` | every new kernel matches its host reference |
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
-| `bin/test_model_matrix` | 3 architectures × 7 projection formats |
+| `bin/test_model_matrix` | 5 architectures × 7 projection formats, plus the refusals |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
 | `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU, MTP and DFlash |
 | generate | real model, real prompt — **you read the output** |
@@ -340,3 +340,30 @@ software recovery. The known causes, all avoidable:
 - **Single-process cross-device.** Rule 7: the original failure was
   measured over USB4 and has not been retried on OCuLink. That is a
   hardware experiment, not a code change.
+- **gemma-4 at its real head_dim.** `google/gemma-4-31B-it` loads,
+  resolves and is implemented end to end — sandwich residual graph,
+  `k_eq_v` value, GeGLU, proportional RoPE, sliding window, per-layer
+  geometry, `layer_scalar`, embedding scale, logit softcap — and a
+  scaled-down fixture runs it in `bin/test_model_matrix` and
+  `bin/test_parallel_e2e`. The REAL checkpoint still refuses, for one
+  reason: its full-attention layers are **head_dim 512** and every flash
+  kernel accumulates a head into a private array of `MAX_DPL`(16) floats
+  per lane at `SG_SIZE` 16, i.e. 256 wide. Going past that writes off the
+  end of device stack memory — a DEVICE_LOST and a power cycle, so
+  `Grimoire::unsupported_reason()` refuses it rather than let it reach the
+  card.
+
+  Raising the bound is a Tower job and not a one-line change:
+  `attention.cpp`'s accumulator loops run to `MAX_DPL` UNCONDITIONALLY,
+  unlike `prefill.cpp` which guards each slot with `if (j < dpl)`. So
+  doubling the constant doubles the accumulator work for every model,
+  head_dim 128 included. Bound those loops by `dpl` first, then measure
+  register pressure at `dpl` 32 on a real B70. Rule 8: no claim about it
+  from a container. Details and the full item list:
+  `GEMMA4-2026-09-14.md`.
+- **gemma-4 batched prefill.** Not written. `prefill()` returns false for
+  gemma-4 and falls back to sequential decode, which is correct and slow.
+  The batched loop is the Qwen residual graph, so running a gemma-4 prompt
+  through it would contradict `forward_gemma4()` token for token while
+  still producing fluent text. Batching it needs the sandwich graph, the
+  `k_eq_v` value and both rotations in batched form.
