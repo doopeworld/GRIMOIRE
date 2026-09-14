@@ -354,6 +354,18 @@ sycl::event launch_mova_value_packed(
     const int32_t* rex, const float* rwt, float* y,
     int M, int N, int E, int top_k,
     const std::vector<sycl::event>& deps = {});
+// GeGLU -- gelu_pytorch_tanh(gate) * up.  Gemma asks for this and NOT
+// silu; substituting one for the other is silent.  See ops.cpp.
+sycl::event launch_geglu(sycl::queue& q, const float* gate, const float* up,
+    float* out, int n, const std::vector<sycl::event>& deps = {});
+sycl::event launch_geglu_batched(sycl::queue& q, const float* gu, float* out,
+    int rows, int inter, const std::vector<sycl::event>& deps = {});
+// Proportional RoPE -- gemma-4 full-attention layers.  NOT partial_rope:
+// the exponent divides by the full head_dim and the pairing is over
+// head_dim/2.  See ops.cpp and ref/gemma4_proportional_rope.py.
+sycl::event launch_rope_proportional(sycl::queue& q, float* x, int n_heads,
+    int head_dim, const int32_t* d_pos, float theta, float partial_factor,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
     float w, int n, const std::vector<sycl::event>& deps = {});
 sycl::event launch_router_topk_k2(

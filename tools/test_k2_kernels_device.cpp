@@ -291,6 +291,117 @@ int main() {
         sycl::free(d_in,q); sycl::free(d_out,q);
     }
 
+    // ---- 3b. GeGLU, and that it is NOT SwiGLU ------------------------
+    // Gemma asks for gelu_pytorch_tanh.  Running silu in its place loads
+    // cleanly and produces the wrong model's output, so this checks both
+    // that GeGLU matches its reference AND that it visibly differs from
+    // the kernel it would be confused with.
+    {
+        const int rows = 5, inter = 96;
+        std::vector<float> gu(size_t(rows) * 2 * inter);
+        for (auto& v : gu) v = nd(rng) * 1.5f;
+
+        float* d_gu  = sycl::malloc_device<float>(gu.size(), q);
+        float* d_out = sycl::malloc_device<float>(size_t(rows) * inter, q);
+        q.memcpy(d_gu, gu.data(), gu.size() * 4).wait();
+        launch_geglu_batched(q, d_gu, d_out, rows, inter).wait();
+        std::vector<float> got(size_t(rows) * inter);
+        q.memcpy(got.data(), d_out, got.size() * 4).wait();
+
+        // Host reference, written from the formula the reference uses.
+        auto gelu = [](double x) {
+            const double a = 0.7978845608028654, b = 0.044715;
+            return 0.5 * x * (1.0 + std::tanh(a * (x + b * x * x * x)));
+        };
+        std::vector<float> want(got.size()), silu(got.size());
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < inter; ++c) {
+                const double g = gu[size_t(r) * 2 * inter + c];
+                const double u = gu[size_t(r) * 2 * inter + inter + c];
+                want[size_t(r) * inter + c] = float(gelu(g) * u);
+                silu[size_t(r) * inter + c] = float(g / (1.0 + std::exp(-g)) * u);
+            }
+        const double d_ref  = worst_abs(want, got);
+        const double d_silu = worst_abs(silu, got);
+        std::printf("geglu            %d x %d   vs reference %.3e   vs swiglu %.3e\n",
+                    rows, inter, d_ref, d_silu);
+        CHECK(d_ref < 1e-5, "GeGLU does not match gelu_pytorch_tanh(gate)*up");
+        // If this ever passes, the kernel is silu and the check above is
+        // measuring nothing.
+        CHECK(d_silu > 1e-2, "GeGLU is indistinguishable from SwiGLU here, so "
+                             "the reference comparison proves nothing");
+        sycl::free(d_gu, q); sycl::free(d_out, q);
+    }
+
+    // ---- 3c. proportional RoPE, and that it is NOT partial_rope -------
+    // gemma-4 full-attention layers.  The exponent divides by the FULL
+    // head_dim and dim i pairs with i + head_dim/2; partial_rope divides
+    // by the rotated width and pairs j with j + rot/2.  Both differences
+    // are invisible in the output.
+    {
+        const int heads = 3, head_dim = 64, pos = 7;
+        const float theta = 1000000.0f, factor = 0.25f;
+        std::vector<float> x0(size_t(heads) * head_dim);
+        for (auto& v : x0) v = nd(rng);
+
+        float* d_x = sycl::malloc_device<float>(x0.size(), q);
+        int32_t* d_p = sycl::malloc_device<int32_t>(1, q);
+        q.memcpy(d_p, &pos, sizeof(int)).wait();
+        q.memcpy(d_x, x0.data(), x0.size() * 4).wait();
+        launch_rope_proportional(q, d_x, heads, head_dim, d_p, theta, factor).wait();
+        std::vector<float> got(x0.size());
+        q.memcpy(got.data(), d_x, got.size() * 4).wait();
+
+        // Host reference, straight from ref/gemma4_proportional_rope.py.
+        const int half = head_dim / 2;
+        const int angles = int(double(factor) * head_dim / 2.0);
+        std::vector<float> want = x0;
+        for (int h2 = 0; h2 < heads; ++h2)
+            for (int i = 0; i < angles; ++i) {
+                const double inv = std::pow(double(theta),
+                                            -double(2 * i) / double(head_dim));
+                const double ang = pos * inv;
+                const double c = std::cos(ang), sn = std::sin(ang);
+                const double a = x0[size_t(h2) * head_dim + i];
+                const double b = x0[size_t(h2) * head_dim + i + half];
+                want[size_t(h2) * head_dim + i]        = float(a * c - b * sn);
+                want[size_t(h2) * head_dim + i + half] = float(a * sn + b * c);
+            }
+        const double d_ref = worst_abs(want, got);
+
+        // What GRIMOIRE's partial_rope would have produced instead.
+        const int rot = int(head_dim * factor) & ~1;
+        std::vector<float> partial = x0;
+        for (int h2 = 0; h2 < heads; ++h2)
+            for (int j = 0; j < rot / 2; ++j) {
+                const double inv = std::pow(double(theta),
+                                            -double(2 * j) / double(rot));
+                const double ang = pos * inv;
+                const double c = std::cos(ang), sn = std::sin(ang);
+                const double a = x0[size_t(h2) * head_dim + j];
+                const double b = x0[size_t(h2) * head_dim + j + rot / 2];
+                partial[size_t(h2) * head_dim + j]           = float(a * c - b * sn);
+                partial[size_t(h2) * head_dim + j + rot / 2] = float(a * sn + b * c);
+            }
+        const double d_partial = worst_abs(partial, got);
+        std::printf("rope proportional %d heads hd=%d f=%.2f  vs reference %.3e"
+                    "   vs partial_rope %.3e\n",
+                    heads, head_dim, double(factor), d_ref, d_partial);
+        CHECK(d_ref < 1e-5, "proportional RoPE does not match the reference");
+        CHECK(d_partial > 1e-2, "proportional RoPE is indistinguishable from "
+                                "partial_rope here, so the comparison proves "
+                                "nothing");
+        // Dimensions past the rotated band must be untouched, not scaled.
+        int touched = 0;
+        for (int h2 = 0; h2 < heads; ++h2)
+            for (int i = angles; i < half; ++i)
+                if (got[size_t(h2)*head_dim+i] != x0[size_t(h2)*head_dim+i] ||
+                    got[size_t(h2)*head_dim+i+half] != x0[size_t(h2)*head_dim+i+half])
+                    ++touched;
+        CHECK(touched == 0, "%d unrotated dims were modified", touched);
+        sycl::free(d_x, q); sycl::free(d_p, q);
+    }
+
     // ---- 4a. quantize-then-append == append-then-quantize -------------
     // The expert-major pack quantizes each expert on its own and appends,
     // so the host never holds 64 of them as f32 at once.  That is only

@@ -382,6 +382,105 @@ sycl::event launch_swiglu(sycl::queue& q, const float* gate, const float* up,
 }
 
 // ---------------------------------------------------------------------
+// GeGLU: gelu(gate) * up, the tanh approximation.
+//
+// Gemma asks for "gelu_pytorch_tanh", which is NOT the error-function
+// gelu and NOT silu.  Substituting silu -- which is what this engine did
+// until the loader learned to read hidden_act -- loads cleanly and
+// produces fluent text from the wrong model.
+//
+//   gelu_tanh(x) = 0.5x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) ))
+//
+// The two constants are PyTorch's, kept as literals so this reads the
+// same as the reference rather than being rederived.
+// ---------------------------------------------------------------------
+inline float gelu_tanh(float x) {
+    constexpr float kA = 0.7978845608028654f;   // sqrt(2/pi)
+    constexpr float kB = 0.044715f;
+    return 0.5f * x * (1.0f + sycl::tanh(kA * (x + kB * x * x * x)));
+}
+
+sycl::event launch_geglu(sycl::queue& q, const float* gate, const float* up,
+                         float* out, int n,
+                         const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+            const int i = int(id[0]);
+            out[i] = gelu_tanh(gate[i]) * up[i];
+        });
+    });
+}
+
+// Batched form over a [rows][2*inter] gate|up block, matching
+// launch_swiglu_batched's layout so the two are interchangeable at the
+// call site and only the activation differs.
+sycl::event launch_geglu_batched(sycl::queue& q, const float* gu, float* out,
+                                 int rows, int inter,
+                                 const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * size_t(inter)),
+            [=](sycl::id<1> id) {
+                const int r = int(id[0] / inter), c = int(id[0] % inter);
+                const float* row = gu + int64_t(r) * 2 * inter;
+                out[int64_t(r) * inter + c] = gelu_tanh(row[c]) * row[inter + c];
+            });
+    });
+}
+
+// ---------------------------------------------------------------------
+// Proportional RoPE -- gemma-4 full-attention layers.
+//
+// This is NOT this engine's partial_rope, and the difference is silent.
+// From ref/gemma4_proportional_rope.py:
+//
+//   rope_angles = int(factor * head_dim / 2)
+//   inv_freq[i] = base ** -(2i / HEAD_DIM)   for i < rope_angles
+//   inv_freq[i] = 0                          for the rest
+//
+// Two things follow.  The exponent divides by the FULL head_dim, not by
+// the rotated width -- so at head_dim 512 and factor 0.25 the
+// frequencies are base^-(2i/512), where partial_rope would give
+// base^-(2i/128).  And the cos/sin table stays head_dim/2 wide, so the
+// pairing is dim i with dim i + head_dim/2 (i + 256), where partial_rope
+// pairs j with j + rot/2 (j + 64).  Different frequencies AND a
+// different pairing; either alone changes every number.
+//
+// Dimensions past rope_angles have inv_freq 0, which is cos 1 / sin 0 --
+// the identity.  They are left untouched rather than multiplied by one.
+// ---------------------------------------------------------------------
+sycl::event launch_rope_proportional(sycl::queue& q, float* x, int n_heads,
+                                     int head_dim, const int32_t* d_pos,
+                                     float theta, float partial_factor,
+                                     const std::vector<sycl::event>& deps) {
+    const int half   = head_dim / 2;
+    const int angles = int(partial_factor * float(head_dim) / 2.0f);
+    const int rot    = angles < half ? angles : half;
+    if (rot <= 0) return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps); h.single_task([=](){}); });
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n_heads) * size_t(rot)),
+            [=](sycl::id<1> id) {
+                const int t    = int(id[0]);
+                const int head = t / rot;
+                const int i    = t % rot;
+                const int pos  = d_pos[0];
+                // exponent over head_dim, NOT over the rotated width
+                const float inv = sycl::exp(-float(2 * i) / float(head_dim)
+                                            * sycl::log(theta));
+                const float ang = float(pos) * inv;
+                const float c = sycl::cos(ang), s = sycl::sin(ang);
+                float* p = x + int64_t(head) * head_dim;
+                const float a = p[i], b = p[i + half];   // pairing over half
+                p[i]        = a * c - b * s;
+                p[i + half] = a * s + b * c;
+            });
+    });
+}
+
+// ---------------------------------------------------------------------
 // L2 normalization per head. Gated DeltaNet requires q and k normalized;
 // without it the delta rule is not contractive and the recurrent state
 // diverges over a long context.
