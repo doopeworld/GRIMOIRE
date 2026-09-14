@@ -598,6 +598,10 @@ sycl::event launch_qk_norm_rope(sycl::queue&, float*, float*, const bf16_t*,
                                 float, float, float, const std::vector<sycl::event>&);
 sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
                                  float, bool, const std::vector<sycl::event>&);
+sycl::event launch_scale(sycl::queue&, float*, float, int,
+                         const std::vector<sycl::event>&);
+sycl::event launch_logit_softcap(sycl::queue&, float*, float, int,
+                                 const std::vector<sycl::event>&);
 sycl::event launch_add(sycl::queue&, float*, const float*, int,
                        const std::vector<sycl::event>&);
 sycl::event launch_add_f16_round(sycl::queue&, float*, const float*, int,
@@ -2585,7 +2589,13 @@ struct Grimoire {
     }
     const float* forward(int token);      // returns device logits
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
+    const float* forward_gemma4(int token); // gemma-4 sandwich + per-layer-type
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
+    // Same trick, head-width: gemma-4's v_norm is
+    // Gemma4RMSNorm(head_dim, eps, with_scale=False), a norm with no weight
+    // at all, which a zero weight under the (1+w) convention reproduces
+    // exactly.  Sized from max_head_dim so either layer type can use it.
+    bf16_t* gemma_zero = nullptr;
     sycl::half* muse_zero_f16 = nullptr;   // same, for the FP16 activation path
     const float* forward_dag(int token);  // out-of-order queue + true dependencies
     bool prefill(const std::vector<int32_t>& tokens,
@@ -2901,29 +2911,15 @@ std::string Grimoire::unsupported_reason() const {
                "past the end of device stack memory -- a DEVICE_LOST, not a "
                "wrong answer.  Refusing.";
 
-    // GeGLU.  Every FFN dispatch in this engine -- decode GEMV, batched
-    // prefill, the MoE path, speculative verify -- is swiglu.  The kernels
-    // exist (launch_geglu, pinned by bin/test_k2_kernels) but nothing calls
-    // them, so a gelu checkpoint would run silu in gelu's place and emit
-    // fluent text that is not the model's output.
-    if (cfg.geglu)
-        return "this checkpoint's hidden activation is gelu, and no forward "
-               "path in this engine dispatches GeGLU yet (the kernels exist "
-               "but are not wired in).  silu would silently run in its "
-               "place, so refuse.";
-    // Gemma-4.  The config resolves in full and tests/test_gemma4_config
-    // pins it, but the engine has no path with the Gemma sandwich residual
-    // graph, the k_eq_v value, the per-layer scalar, the embedding scale,
-    // logit softcapping or a sliding-attention window.  Running it on the
-    // generic Qwen path produces fluent, wrong output.  Lift this when a
-    // gemma-4 fixture passes bin/test_model_matrix.
-    if (cfg.is_gemma4)
-        return "gemma-4 is recognised and its config fully resolved, but "
-               "there is no gemma-4 forward path in this engine yet "
-               "(sandwich residual graph, k_eq_v value, layer_scalar, "
-               "embedding scale, logit softcapping, sliding window).  "
-               "Refusing rather than running the generic path, which would "
-               "be fluent and wrong.";
+    // GeGLU.  forward_gemma4() is the ONLY path that dispatches it; every
+    // other FFN dispatch here -- decode GEMV, batched prefill, the MoE
+    // path, speculative verify -- is swiglu.  A gelu checkpoint of any
+    // other architecture would run silu in gelu's place and emit fluent
+    // text that is not the model's output.
+    if (cfg.geglu && !cfg.is_gemma4)
+        return "this checkpoint's hidden activation is gelu, and the only "
+               "path that dispatches GeGLU is gemma-4's.  silu would "
+               "silently run in its place, so refuse.";
     return {};
 }
 
@@ -3142,6 +3138,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::fflush(stdout);
 
     // ---- layers
+    if (cfg.is_gemma4) {
+        gemma_zero = sycl::malloc_device<bf16_t>(size_t(cfg.max_head_dim()), q);
+        if (!gemma_zero) { err = "gemma-4 scaleless-norm weight allocation failed"; return false; }
+        q.memset(gemma_zero, 0, size_t(cfg.max_head_dim()) * sizeof(bf16_t)).wait();
+    }
     if (cfg.is_muse) {
         muse_zero = sycl::malloc_device<bf16_t>(cfg.hidden, q);
         q.memset(muse_zero, 0, size_t(cfg.hidden) * sizeof(bf16_t)).wait();
@@ -6502,6 +6503,182 @@ const float* Grimoire::forward_muse(int token) {
     return s.logits;
 }
 
+
+// ---------------------------------------------------------------------
+//  gemma-4.  A dense Gemma-sandwich transformer, which is NOT forward()'s
+//  residual graph:
+//
+//      h   = x + post_attention_layernorm(attn(input_layernorm(x)))
+//      out = h + post_feedforward_layernorm(mlp(pre_feedforward_layernorm(h)))
+//      out *= layer_scalar
+//
+//  forward() adds the attention output raw and normalises on the way INTO
+//  the FFN; running gemma-4 there loads cleanly and emits fluent text that
+//  is not this model's output.  It IS forward_muse()'s graph, but
+//  forward_muse carries query_prescale, a scaleless embedding norm, f16 KV
+//  caches and NoPE layers -- making those conditional would put a working,
+//  tested Muse path at risk for no gain.
+//
+//  Everything gemma-4-specific beyond the graph comes from LayerDev, which
+//  resolved it once at load: head_dim and KV heads differ per layer type,
+//  and so do the RoPE base, the rotated fraction and the rotation itself.
+// ---------------------------------------------------------------------
+const float* Grimoire::forward_gemma4(int token) {
+    check_token(token);
+    const int H = cfg.hidden;
+    const std::vector<sycl::event> none{};
+    const float eps = cfg.rms_eps;
+
+    const bool pp_first = !pp_enabled() || pp_rank == 0;
+    const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
+
+    if (pp_first) {
+        // Gemma4TextScaledWordEmbedding: the lookup is multiplied by
+        // sqrt(hidden) BEFORE the first norm.  Omitting it changes the
+        // scale every later RMSNorm sees.
+        if (!embed_one(token, s.h)) return nullptr;
+        if (cfg.embed_scale != 1.0f)
+            launch_scale(q, s.h, cfg.embed_scale, H, none);
+    } else {
+        if (!pp_recv_hidden(s.h, size_t(H))) {
+            std::fprintf(stderr, "PP rank %d: gemma-4 hidden receive failed\n", pp_rank);
+            return nullptr;
+        }
+        if (!pp_recv_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: gemma-4 tap receive failed\n", pp_rank);
+            return nullptr;
+        }
+    }
+
+    const int layer_begin = pp_enabled() ? pp_begin : 0;
+    const int layer_end   = pp_enabled() ? pp_end   : cfg.n_layers;
+    for (int i = layer_begin; i < layer_end; ++i) {
+        LayerDev& d = L[i];
+        // target_aux, not dflash2.ok -- see forward_muse: under PP an
+        // earlier stage owns taps it cannot draft with, and gating on .ok
+        // would leave them zero and the drafter would run on a mostly
+        // zero row, silently.
+        if (dflash2.target_aux) {
+            for (size_t tap = 0; tap < dflash2.target_layers.size(); ++tap)
+                if (dflash2.target_layers[tap] + 1 == i) {
+                    launch_dflash_store_tap_dev(q, s.h, dflash2.target_aux, H,
+                        int(dflash2.target_layers.size()), s.d_pos, int(tap),
+                        none, true);
+                    break;
+                }
+        }
+
+        const int HD = d.head_dim, KVH = d.kv_heads;
+        const int QH = cfg.n_heads, QW = QH * HD;
+
+        // ---- attention (residual added AFTER post_attention_layernorm) --
+        launch_rmsnorm_residual(q, s.h, nullptr, d.in_norm, s.h2, H, eps, none);
+        gemv_any(d.q_proj, s.h2, s.qkv, none);
+        gemv_any(d.k_proj, s.h2, s.zbuf, none);
+
+        // attention_k_eq_v: a full-attention layer ships NO v_proj, and V
+        // is the k_proj output taken BEFORE k_norm and BEFORE RoPE, then
+        // put through a scaleless RMSNorm of its own.  Copying it after
+        // either step is the mistake this comment exists to prevent --
+        // both produce fluent text.
+        // A DevQuant that was never uploaded keeps w.N == 0.  Rule 1
+        // applies to the PAYLOAD, not the format, so test the shape here
+        // and let gemv_any decide how to read it.
+        const bool k_is_v = d.v_proj.w.N <= 0;
+        if (k_is_v) q.memcpy(s.bbuf, s.zbuf, size_t(KVH) * HD * sizeof(float)).wait();
+        else        gemv_any(d.v_proj, s.h2, s.bbuf, none);
+
+        if (d.q_norm)
+            launch_rmsnorm_heads(q, s.qkv, d.q_norm, QH, HD, eps, true, none);
+        if (d.k_norm)
+            launch_rmsnorm_heads(q, s.zbuf, d.k_norm, KVH, HD, eps, true, none);
+        // Gemma4RMSNorm(head_dim, eps, with_scale=False): no weight at all,
+        // which a zero weight under the (1+w) convention reproduces exactly.
+        if (k_is_v)
+            launch_rmsnorm_heads(q, s.bbuf, gemma_zero, KVH, HD, eps, true, none);
+
+        if (d.rope_proportional) {
+            launch_rope_proportional(q, s.qkv,  QH,  HD, s.d_pos,
+                                     d.rope_theta, d.partial_rope, none);
+            launch_rope_proportional(q, s.zbuf, KVH, HD, s.d_pos,
+                                     d.rope_theta, d.partial_rope, none);
+        } else {
+            launch_rope_dev(q, s.qkv,  QH,  HD, s.d_pos,
+                            d.rope_theta, d.partial_rope, none);
+            launch_rope_dev(q, s.zbuf, KVH, HD, s.d_pos,
+                            d.rope_theta, d.partial_rope, none);
+        }
+        launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
+                             s.d_pos, KVH, HD, max_seq, none);
+
+        AttnParams ap{};
+        ap.q = s.qkv; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
+        ap.out = s.attn_out; ap.seq_len = pos + 1; ap.seq_cap = max_seq;
+        ap.head_dim = HD; ap.num_heads = QH; ap.num_kv_heads = KVH;
+        // scaling = 1.0 in the reference, NOT 1/sqrt(head_dim).
+        ap.softmax_scale = cfg.attn_softmax_scale(HD);
+        ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
+        ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
+        // Only the SLIDING layers have a window; the full-attention ones
+        // see the whole history.  Identical until the context passes the
+        // window, then quietly wrong -- which is why a short-prompt smoke
+        // test cannot find it.
+        ap.window_left = cfg.layer_global(i) ? 0 : cfg.sliding_window;
+        launch_flash_decode(q, ap, none);
+        launch_flash_merge(q, ap, none);
+
+        gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+        launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
+            d.post_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
+        launch_add(q, s.h, s.sh_out, H, none);
+
+        // ---- feed-forward (sandwich: pre_ff -> GeGLU mlp -> post_ff) ----
+        launch_rmsnorm_residual(q, s.h, nullptr, d.pre_ff_norm, s.h2, H, eps, none);
+        const int I = d.sh_gu.output_rows() / 2;
+        gemv_any(d.sh_gu, s.h2, s.sh_g, none);
+        // gelu_pytorch_tanh, not silu.  The two differ by up to 0.77 on
+        // the same input (bin/test_k2_kernels measures it), and nothing
+        // downstream would notice the substitution.
+        launch_geglu(q, s.sh_g, s.sh_g + I, s.sh_g, I, none);
+        gemv_any(d.sh_down, s.sh_g, s.moe_y, none);
+        launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
+            d.post_ff_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
+        launch_add(q, s.h, s.sh_out, H, none);
+
+        // hidden_states *= layer_scalar, the LAST act of the layer.  A
+        // nn.Buffer of ones in the reference source, and NOT ones in the
+        // checkpoint -- which is why it is read rather than assumed.
+        if (d.layer_scalar != 1.0f)
+            launch_scale(q, s.h, d.layer_scalar, H, none);
+    }
+
+    if (!pp_last) {
+        if (!pp_send_hidden(s.h, size_t(H))) {
+            std::fprintf(stderr, "PP rank %d: gemma-4 hidden send failed\n", pp_rank);
+            return nullptr;
+        }
+        if (!pp_send_taps(pos, 1)) {
+            std::fprintf(stderr, "PP rank %d: gemma-4 tap send failed\n", pp_rank);
+            return nullptr;
+        }
+        launch_incr_pos(q, s.d_pos, none);
+        launch_incr_pos(q, s.d_seq_len, none);
+        ++pos;
+        return s.logits;
+    }
+    launch_rmsnorm_residual_batched(q, s.h, nullptr, nullptr, fnorm, s.h2,
+                                    1, H, eps, nullptr, none, 0.0f);
+    gemv_any(lm_head, s.h2, s.logits, none);
+    // final_logit_softcapping.  Monotonic, so greedy picks the same token
+    // either way -- but not a no-op for sampling.
+    if (cfg.logit_softcap > 0.0f)
+        launch_logit_softcap(q, s.logits, cfg.logit_softcap, cfg.vocab, none);
+    launch_incr_pos(q, s.d_pos, none);
+    launch_incr_pos(q, s.d_seq_len, none);
+    ++pos;
+    return s.logits;
+}
+
 const float* Grimoire::forward(int token) {
     check_token(token);
     if(mtp.ok && pos>0 && !recording) {
@@ -6509,6 +6686,7 @@ const float* Grimoire::forward(int token) {
         set_cursor(pos);
     }
     if (cfg.is_muse) return forward_muse(token);
+    if (cfg.is_gemma4) return forward_gemma4(token);
     if (dag && !tp_enabled()) return forward_dag(token);
     const int H  = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
@@ -8218,6 +8396,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
         return prefill_muse(tokens,next_tokens);
     }
+    // gemma-4 has no batched prefill yet.  The loop below is the Qwen
+    // residual graph -- attention output added raw, normalised on the way
+    // INTO the FFN -- and gemma-4 is a sandwich, so running the prompt
+    // through it would contradict forward_gemma4() token for token while
+    // still producing fluent text.  Returning false falls back to
+    // sequential decode through forward_gemma4(), which is slower and
+    // correct.  Batching it is a real task, not a flag: it needs the
+    // sandwich graph, the k_eq_v value and both rotations in batched form.
+    if (cfg.is_gemma4) return false;
     const int M = int(tokens.size());
     if (M <= 0 || pos + M > max_seq) return false;
     const int start_pos = pos;

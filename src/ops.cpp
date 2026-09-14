@@ -783,6 +783,35 @@ sycl::event launch_add(sycl::queue& q, float* dst, const float* src, int n,
     });
 }
 
+// x *= k, in place.  gemma-4 needs it twice: the embedding is scaled by
+// sqrt(hidden) on lookup (Gemma4TextScaledWordEmbedding), and each decoder
+// layer multiplies the residual stream by its own layer_scalar after the
+// residual add.  Both are silent when omitted -- the model stays fluent and
+// drifts.
+sycl::event launch_scale(sycl::queue& q, float* x, float k, int n,
+                         const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n)),
+                       [=](sycl::id<1> id) { x[id[0]] *= k; });
+    });
+}
+
+// logits = tanh(logits / cap) * cap.  gemma-4's final_logit_softcapping is
+// 30.0.  Monotonic, so greedy decoding picks the same token -- but it is
+// not a no-op for sampling, and it is exactly the kind of omission that
+// leaves output plausible.
+sycl::event launch_logit_softcap(sycl::queue& q, float* logits, float cap,
+                                 int n, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const float inv = 1.0f / cap;
+        h.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+            logits[id[0]] = sycl::tanh(logits[id[0]] * inv) * cap;
+        });
+    });
+}
+
 sycl::event launch_add_f16_round(sycl::queue& q,float* dst,const float* src,
     int n,const std::vector<sycl::event>& deps){
     return q.submit([&](sycl::handler& h){

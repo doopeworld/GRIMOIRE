@@ -105,7 +105,8 @@ int main(int argc, char** argv) {
     const char* self = argv[0];
 
     std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
-                                      mini::hybrid(), mini::k2() };
+                                      mini::hybrid(), mini::k2(),
+                                      mini::gemma4() };
 
     std::printf("%-12s", "");
     for (const auto& f : kFormats) std::printf("%-10s", f.name);
@@ -171,39 +172,54 @@ int main(int argc, char** argv) {
     // ---- architectures the engine must REFUSE, by name ---------------
     // A model this engine cannot execute has exactly two acceptable
     // behaviours: run it correctly, or say so.  The third -- load it on a
-    // path with the wrong residual graph and emit fluent text -- is the
-    // failure this whole file exists to catch, and it cannot be caught by
-    // the table above because that cell would read "ok".
+    // path with the wrong residual graph and emit fluent text -- cannot be
+    // caught by the table above, because that cell would read "ok".
     //
-    // gemma-4's config resolves in full (tests/test_gemma4_config pins it)
-    // but nothing here implements its forward pass yet.  When that lands,
-    // MOVE this fixture into `archs` above; do not just delete the case.
+    // gemma-4 itself now RUNS (the row above), but only below head_dim
+    // 256: every flash kernel accumulates a head into a private array of
+    // MAX_DPL floats per lane, and the real 31B checkpoint's
+    // full-attention layers are 512 wide.  Going past that is a
+    // DEVICE_LOST, so it must refuse rather than reach the card.  The
+    // fixture here is the same model with ONE value changed, which is what
+    // makes this a test of the bound and not of gemma-4.
     {
         std::printf("\nmust be refused, not silently run:\n");
-        const mini::Arch g4 = mini::gemma4();
-        const fs::path dir = root / "refuse-gemma4";
-        mini::write_model(dir, g4);
-        std::string err;
-        Grimoire* e = grimoire_new();
-        bool loaded = false;
-        if (e) {
-            loaded = grimoire_load(*e, dir.string(), Fmt::BF16, 128, err);
-            grimoire_delete(e);
-        }
-        if (loaded) {
+        mini::Arch wide = mini::gemma4();
+        const std::string from = "\"global_head_dim\": 32";
+        const std::string to   = "\"global_head_dim\": 512";
+        const size_t at = wide.config.find(from);
+        if (at == std::string::npos) {
             ++fails;
-            std::printf("  %-14s LOADED -- the engine has no gemma-4 forward "
-                        "path, so this is fluent wrong output\n", g4.name);
-        } else if (err.find("no gemma-4 forward path") == std::string::npos) {
-            // Matching the word "gemma-4" alone would pass on the LOADER's
-            // own shape refusals ("gemma-4 layer 3 has no v_proj ..."), so
-            // a fixture that does not match its config would look like a
-            // working capability check.  Require the engine's sentence.
-            ++fails;
-            std::printf("  %-14s refused, but for the wrong reason: %s\n",
-                        g4.name, err.c_str());
+            std::printf("  %-14s fixture no longer declares global_head_dim; "
+                        "this case proves nothing\n", "head_dim 512");
         } else {
-            std::printf("  %-14s refused by name\n", g4.name);
+            wide.config.replace(at, from.size(), to);
+            const fs::path dir = root / "refuse-wide-head";
+            mini::write_model(dir, wide);
+            std::string err;
+            Grimoire* e = grimoire_new();
+            bool loaded = false;
+            if (e) {
+                loaded = grimoire_load(*e, dir.string(), Fmt::BF16, 128, err);
+                grimoire_delete(e);
+            }
+            if (loaded) {
+                ++fails;
+                std::printf("  %-14s LOADED -- a 512-wide head overruns a "
+                            "device stack array, which is a DEVICE_LOST\n",
+                            "head_dim 512");
+            } else if (err.find("exceeds what the flash-attention kernels")
+                       == std::string::npos) {
+                // The fixture is deliberately inconsistent in other ways
+                // once the width changes, so require the bound's OWN
+                // sentence: any other refusal would pass for the wrong
+                // reason and leave the bound untested.
+                ++fails;
+                std::printf("  %-14s refused, but for the wrong reason: %s\n",
+                            "head_dim 512", err.c_str());
+            } else {
+                std::printf("  %-14s refused by name\n", "head_dim 512");
+            }
         }
     }
 

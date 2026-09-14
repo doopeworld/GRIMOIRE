@@ -106,8 +106,14 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                 // This chunk's slice. seq_len comes from device memory
                 // when the kernel is running inside a recorded graph.
                 const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
-                const int per   = (seq + splits - 1) / splits;
-                const int s_beg = part * per;
+                // Sliding attention: everything before the window is
+                // masked to -inf, which contributes nothing, so drop it
+                // from the scan instead of scoring and discarding it.
+                const int lo    = pp.window_left > 0
+                                ? sycl::max(0, seq - pp.window_left) : 0;
+                const int span  = seq - lo;
+                const int per   = (span + splits - 1) / splits;
+                const int s_beg = lo + part * per;
                 const int s_end = sycl::min(s_beg + per, seq);
 
                 // Grouped-query attention: several query heads share one

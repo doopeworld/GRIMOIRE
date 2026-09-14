@@ -205,6 +205,15 @@ struct AttnParams {
     // the merge skips -- so a constant launch shape stays correct at
     // every context length.
     const int32_t* d_seq_len = nullptr;   // if set, overrides seq_len
+
+    // Sliding-attention window, in keys, counting the current position.
+    // <= 0 means the whole history, which is every model here except
+    // gemma-4's sliding layers.  Applied by NARROWING the scanned range
+    // rather than by masking scores: a key outside the window contributes
+    // nothing, so skipping it is both exact and cheaper.  Attending to the
+    // full history where a window was meant is completely silent -- it is
+    // identical until the context passes the window, then quietly wrong.
+    int window_left = 0;
 };
 
 // Pick enough chunks to fill the machine without shredding the sequence.
