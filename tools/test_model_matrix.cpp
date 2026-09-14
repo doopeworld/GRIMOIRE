@@ -72,11 +72,13 @@ static int run_cell(const std::string& dir, const std::string& fname, int vocab)
         std::fprintf(stderr, "load: %s\n", err.c_str());
         grimoire_delete(e); return 3;
     }
-    std::vector<int32_t> a, b;
+    std::vector<int32_t> a, b, c;
+    static const std::vector<int32_t> kOther{99, 4, 77, 12, 60, 31, 8, 120};
     FinishReason r{};
     try {
         grimoire_serve_generate(*e, kPrompt, kWant, -1, a, -1, {}, &r);
         grimoire_serve_generate(*e, kPrompt, kWant, -1, b, -1, {}, &r);
+        grimoire_serve_generate(*e, kOther,  kWant, -1, c, -1, {}, &r);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "generate: %s\n", ex.what());
         grimoire_delete(e); return 4;
@@ -87,6 +89,24 @@ static int run_cell(const std::string& dir, const std::string& fname, int vocab)
         std::fprintf(stderr, "token %d outside vocabulary\n", t); return 6;
     }
     if (a != b) { std::fprintf(stderr, "not reproducible across requests\n"); return 7; }
+    // Does the output depend on the INPUT at all?
+    //
+    // Every check above passes on a model whose logits never change: the
+    // same token is in vocabulary, is the right length, and is perfectly
+    // reproducible.  That is exactly how a tied-embedding checkpoint
+    // behaved for a whole session -- lm_head was never uploaded, gemv
+    // wrote nothing, and argmax read stale device memory.  The table said
+    // "ok".
+    //
+    // Two different prompts must not give the same continuation.  With
+    // random weights a collision is vanishingly unlikely over 8 tokens,
+    // and if it ever does happen it is worth looking at.
+    if (a == c) {
+        std::fprintf(stderr,
+            "output does not depend on the input: two different prompts "
+            "gave the same %d tokens\n", kWant);
+        return 8;
+    }
     return 0;
 }
 
@@ -146,6 +166,7 @@ int main(int argc, char** argv) {
                             : code == 3 ? "load"
                             : code == 4 ? "threw"
                             : code == 7 ? "nondet"
+                            : code == 8 ? "no-input"
                             : code == 6 ? "vocab"
                                         : "fail";
             std::printf("%-10s", tag);

@@ -283,19 +283,30 @@ inline Arch gemma4(int L = 6) {
     c << "]\n}";
     Arch a{"gemma4", c.str(), {}, V, L};
     auto& t = a.tensors;
+    // Norm weights near ONE, not the file-wide N(0, 0.05).
+    //
+    // gemma-4 applies the stored weight DIRECTLY (normed * w), where every
+    // other architecture here is zero-centered (normed * (1 + w)).  Under
+    // (1 + w) a random 0.05 weight is a 5% perturbation; under plain w it
+    // is a 20x ATTENUATION, and this model puts four norms in every layer.
+    // Over 6 layers that is 0.05^24 -- the residual stream underflows to
+    // zero and the logits stop depending on the input at all, which shows
+    // up as a constant output token and makes any A/B against it
+    // meaningless.  A real checkpoint's norm weights sit near 1.
+    auto ones = [](int n) { return std::vector<float>(size_t(n), 1.0f); };
     // tie_word_embeddings: no lm_head tensor, exactly as the real index.
     t = { {"model.language_model.embed_tokens.weight", {V,H}},
-          {"model.language_model.norm.weight", {H}} };
+          {"model.language_model.norm.weight", {H}, ones(H)} };
     for (int l = 0; l < L; ++l) {
         const int HD = sliding(l) ? SHD : GHD;
         const int KV = (sliding(l) ? SKV : GKV) * HD;
         const int Q  = qwidth(l);
         const std::string b = "model.language_model.layers." +
                               std::to_string(l) + ".";
-        t.push_back({b+"input_layernorm.weight", {H}});
-        t.push_back({b+"post_attention_layernorm.weight", {H}});
-        t.push_back({b+"pre_feedforward_layernorm.weight", {H}});
-        t.push_back({b+"post_feedforward_layernorm.weight", {H}});
+        t.push_back({b+"input_layernorm.weight", {H}, ones(H)});
+        t.push_back({b+"post_attention_layernorm.weight", {H}, ones(H)});
+        t.push_back({b+"pre_feedforward_layernorm.weight", {H}, ones(H)});
+        t.push_back({b+"post_feedforward_layernorm.weight", {H}, ones(H)});
         // nn.Buffer initialised to ones in the reference -- and NOT ones in
         // a real checkpoint, which is the whole reason it must be read.
         t.push_back({b+"layer_scalar", {1}, {1.0f}});
@@ -307,8 +318,8 @@ inline Arch gemma4(int L = 6) {
         // fixture disagree with the config it ships.
         if (sliding(l)) t.push_back({s+"v_proj.weight", {KV,H}});
         t.push_back({s+"o_proj.weight", {H,Q}});
-        t.push_back({s+"q_norm.weight", {HD}});
-        t.push_back({s+"k_norm.weight", {HD}});
+        t.push_back({s+"q_norm.weight", {HD}, ones(HD)});
+        t.push_back({s+"k_norm.weight", {HD}, ones(HD)});
         const std::string m = b + "mlp.";
         t.push_back({m+"gate_proj.weight", {I,H}});
         t.push_back({m+"up_proj.weight",   {I,H}});

@@ -395,6 +395,32 @@ More generally: when reading a reference for a new family member, read
 the norm's `forward`, do not infer it from the sibling you already
 implemented.
 
+**12. A CONSTANT OUTPUT PASSES EVERY CHECK A GENERATION TEST MAKES
+(learned 2026-09-14).** `tie_word_embeddings` was parsed into
+`cfg.tie_embeddings` and then read by NOTHING. A tied checkpoint ships no
+`lm_head` tensor, so the upload block was skipped, the loader printed
+`ok`, and `lm_head` stayed a default `DevQuant` with `N == 0`. `gemv_any`
+wrote nothing into `s.logits` and argmax read stale device memory.
+
+The result: the same token every step, for every prompt. In vocabulary.
+Correct length. Byte-identical across requests. `bin/test_model_matrix`
+passed it seven times out of seven, because every property it checked was
+TRUE of a model whose logits never change.
+
+So a generation gate must assert that the output DEPENDS ON THE INPUT --
+two different prompts, two different continuations. `test_model_matrix`
+does that now, and it is the only check in it that a dead output
+projection cannot satisfy. If you add a generation test, add that line.
+
+The second lesson is about the banner again (rule 10): printing `ok` was
+unconditional, outside the `if` that did the work. A status line that
+cannot say "no" is not a status line.
+
+Qwen, Ornith, K2 and Muse all ship an explicit `lm_head`, which is why a
+missing feature survived this long. The first model that needed it was
+gemma-4, and it was found by asking one question the test suite never
+asked.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the

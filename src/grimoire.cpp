@@ -1981,6 +1981,9 @@ struct Grimoire {
     bf16_t*  fnorm = nullptr;
     sycl::half* fnorm_f16 = nullptr;
     DevQuant lm_head;
+    // lm_head aliases the embedding table (tie_word_embeddings).  It must
+    // not be freed twice, and it must not be quantized in place.
+    bool     tied_lm_head = false;
 
     // ---- MTP (multi-token prediction) head ------------------------
     // The checkpoint already carries it: mtp.fc [H][2H], three norms, and a
@@ -3148,8 +3151,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         if(!ok){if(err.empty())err="lm_head TP sharding failed";return false;}
         acct(size_t(lm_head.w.bytes()));
     }
+    // tie_word_embeddings.  cfg.tie_embeddings was PARSED and never used:
+    // a tied checkpoint ships no lm_head tensor at all, so the block above
+    // was skipped, "ok" was printed anyway, and lm_head stayed a default
+    // DevQuant with N == 0.  gemv_any then wrote NOTHING into s.logits, so
+    // argmax read stale device memory -- the same token every step, for
+    // every prompt, in vocabulary and perfectly reproducible.  Nothing in
+    // the engine said a word.
+    //
+    // No architecture here had needed it before (Qwen, Ornith, K2 and Muse
+    // all ship an explicit lm_head); gemma-4 is the first that is tied.
+    //
+    // The output projection IS the embedding table, so alias it rather
+    // than copy a second gigabyte onto the card.  Under TP that is already
+    // the right sharding: the table is row-sharded over the VOCABULARY and
+    // an lm_head shards over its output rows, which are the vocabulary.
+    // tied_lm_head records the alias so release() frees the buffer once.
+    if (!lm_head.payload && !ck.lm_head.ok() && cfg.tie_embeddings && embed &&
+        (!pp_enabled() || pp_rank == pp_world - 1)) {
+        lm_head.payload = reinterpret_cast<uint8_t*>(embed);
+        lm_head.w = QuantWeight{Fmt::BF16, embed_count, H, lm_head.payload,
+                                nullptr, nullptr, int64_t(H) * 2, 0};
+        if (tp_enabled()) { lm_head.full_N = cfg.vocab; lm_head.row_begin = embed_begin; }
+        tied_lm_head = true;
+    }
+    if (!lm_head.payload && (!pp_enabled() || pp_rank == pp_world - 1)) {
+        err = "no lm_head: the checkpoint ships none and tie_word_embeddings "
+              "is not set, so there is no output projection to run";
+        return false;
+    }
 
-    std::printf("ok\n");
+    std::printf("%s\n", tied_lm_head ? "tied to embed_tokens" : "ok");
     std::fflush(stdout);
 
     // ---- layers
@@ -5529,6 +5561,8 @@ void Grimoire::release() {
                     (void*)dflash2.verify_ids, (void*)dflash2.fc_scratch})
         if (p) sycl::free(p, q);
     dflash2 = {};
+    // A tied lm_head points AT embed; freeing both would double-free.
+    if (tied_lm_head) { lm_head.payload = nullptr; lm_head.w.payload = nullptr; }
     lm_head.release(q);
     if (embed) sycl::free(embed, q);
     if (fnorm) sycl::free(fnorm, q);
@@ -6637,6 +6671,7 @@ const float* Grimoire::forward_gemma4(int token) {
         const int QH = cfg.n_heads, QW = QH * HD;
 
         // ---- attention (residual added AFTER post_attention_layernorm) --
+        if (i == probe_layer) probe("G4 embed", s.h, H);
         launch_rmsnorm_residual(q, s.h, nullptr, d.in_norm, s.h2, H, eps, none);
         gemv_any(d.q_proj, s.h2, s.qkv, none);
         gemv_any(d.k_proj, s.h2, s.zbuf, none);
@@ -6654,15 +6689,15 @@ const float* Grimoire::forward_gemma4(int token) {
         else        gemv_any(d.v_proj, s.h2, s.bbuf, none);
 
         if (d.q_norm)
-            launch_rmsnorm_heads(q, s.qkv, d.q_norm, QH, HD, eps, true, none);
+            launch_rmsnorm_heads(q, s.qkv, d.q_norm, QH, HD, eps, false, none);
         if (d.k_norm)
-            launch_rmsnorm_heads(q, s.zbuf, d.k_norm, KVH, HD, eps, true, none);
+            launch_rmsnorm_heads(q, s.zbuf, d.k_norm, KVH, HD, eps, false, none);
         // v_norm runs on EVERY non-kv-shared layer, not only the ones
         // where V came from k_proj.  ref/gemma4.py:1249 applies it
         // unconditionally after the branch that chose the value source --
         // reading it as "the replacement for the missing v_proj" is the
         // natural misreading, and it leaves 50 of 60 layers unnormalised.
-        launch_rmsnorm_heads(q, s.bbuf, gemma_vnorm, KVH, HD, eps, true, none);
+        launch_rmsnorm_heads(q, s.bbuf, gemma_vnorm, KVH, HD, eps, false, none);
 
         if (d.rope_proportional) {
             launch_rope_proportional(q, s.qkv,  QH,  HD, s.d_pos,
@@ -6694,10 +6729,12 @@ const float* Grimoire::forward_gemma4(int token) {
         launch_flash_decode(q, ap, none);
         launch_flash_merge(q, ap, none);
 
+        if (i == probe_layer) probe("G4 attn_core", s.attn_out, QH * HD);
         gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, s.h, s.sh_out, H, none);
+        if (i == probe_layer) probe("G4 after attn", s.h, H);
 
         // ---- feed-forward (sandwich: pre_ff -> GeGLU mlp -> post_ff) ----
         launch_rmsnorm_residual(q, s.h, nullptr, d.pre_ff_norm, s.h2, H, eps, none);
@@ -6711,6 +6748,7 @@ const float* Grimoire::forward_gemma4(int token) {
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_ff_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, s.h, s.sh_out, H, none);
+        if (i == probe_layer) probe("G4 after ffn", s.h, H);
 
         // hidden_states *= layer_scalar, the LAST act of the layer.  A
         // nn.Buffer of ones in the reference source, and NOT ones in the
@@ -6735,7 +6773,9 @@ const float* Grimoire::forward_gemma4(int token) {
     }
     launch_rmsnorm_residual_batched(q, s.h, nullptr, nullptr, fnorm, s.h2,
                                     1, H, eps, nullptr, none, 0.0f);
+    probe("G4 final h2", s.h2, H);
     gemv_any(lm_head, s.h2, s.logits, none);
+    probe("G4 logits", s.logits, cfg.vocab);
     // final_logit_softcapping.  Monotonic, so greedy picks the same token
     // either way -- but not a no-op for sampling.
     if (cfg.logit_softcap > 0.0f)
