@@ -109,6 +109,12 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                    || j.find("muse_glimmer_text") != std::string::npos;
     const bool agnes = model_type == "agnes" || model_type.rfind("agnes", 0) == 0
                     || j.find("\"agnes_text\"") != std::string::npos;
+    // gemma4 / gemma4_text.  Deliberately NOT a prefix match on "gemma":
+    // gemma, gemma2 and gemma3 are different architectures this engine
+    // does not implement, and claiming them would be the silent-wrong
+    // default the layer_types check above exists to remove.
+    const bool gemma4 = model_type == "gemma4" || model_type == "gemma4_text"
+                     || j.find("\"gemma4_text\"") != std::string::npos;
     // Any multimodal config nests the language model under "text_config".
     // This used to be extracted for Muse alone, so every other nested
     // config was read by scanning the WHOLE file -- which finds whichever
@@ -161,6 +167,94 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.partial_rope  = tcfg_f("partial_rotary_factor", 1.0f);
     cfg.attn_out_gate = tcfg_b("attn_output_gate", false);
     cfg.tie_embeddings= cfg_b(j, "tie_word_embeddings", false);
+    cfg.is_gemma4     = gemma4;
+    if (gemma4) {
+        // Per-LAYER-TYPE geometry.  Sliding layers use head_dim /
+        // num_key_value_heads; full-attention layers use global_head_dim /
+        // num_global_key_value_heads.  Nothing else in this engine has
+        // two geometries in one model, so cfg.layer_head_dim(i) and
+        // cfg.layer_kv_heads(i) exist for exactly this.
+        cfg.global_head_dim   = tcfg_i("global_head_dim", 0);
+        cfg.n_global_kv_heads = tcfg_i("num_global_key_value_heads", 0);
+        cfg.sliding_window    = tcfg_i("sliding_window", 0);
+        cfg.logit_softcap     = tcfg_f("final_logit_softcapping", 0.0f);
+        cfg.k_eq_v            = tcfg_b("attention_k_eq_v", false);
+        // ref/gemma4.py: `self.scaling = 1.0`, NOT 1/sqrt(head_dim).
+        cfg.attn_scale        = 1.0f;
+        // Gemma4TextScaledWordEmbedding(embed_scale = hidden_size ** 0.5)
+        cfg.embed_scale       = cfg.hidden > 0
+                              ? std::sqrt(float(cfg.hidden)) : 1.0f;
+        // Sandwich FFN norms, as Muse has.
+        cfg.is_muse           = false;   // NOT Muse; only the norm shape rhymes
+
+        // rope_parameters is keyed BY LAYER TYPE here, which no other
+        // checkpoint in this loader does:
+        //   "sliding_attention": {rope_theta 1e4, rope_type "default"}
+        //   "full_attention":    {rope_theta 1e6, rope_type "proportional",
+        //                         partial_rotary_factor 0.25}
+        // cfg.rope_theta keeps the SLIDING value because that is what the
+        // majority of layers use and what the generic path reads;
+        // global_* carries the full-attention pair.
+        auto block = [&](const std::string& src, const char* key,
+                         std::string& out) {
+            const size_t p0 = src.find(std::string("\"") + key + "\"");
+            if (p0 == std::string::npos) return false;
+            const size_t b0 = src.find('{', p0);
+            if (b0 == std::string::npos) return false;
+            int depth = 0; size_t e0 = b0;
+            for (; e0 < src.size(); ++e0) {
+                if (src[e0]=='{') ++depth;
+                else if (src[e0]=='}') { if(--depth==0){++e0;break;} }
+            }
+            if (depth != 0) return false;
+            out = src.substr(b0, e0 - b0);
+            return true;
+        };
+        std::string rp_all, rp_slide, rp_full;
+        if (block(cj, "rope_parameters", rp_all)) {
+            if (block(rp_all, "sliding_attention", rp_slide)) {
+                cfg.rope_theta   = cfg_f(rp_slide, "rope_theta", cfg.rope_theta);
+                cfg.partial_rope = cfg_f(rp_slide, "partial_rotary_factor", 1.0f);
+            }
+            if (block(rp_all, "full_attention", rp_full)) {
+                cfg.global_rope_theta   = cfg_f(rp_full, "rope_theta", 0.0f);
+                cfg.global_partial_rope = cfg_f(rp_full, "partial_rotary_factor", 1.0f);
+                std::string rt;
+                find_scalar(rp_full, "rope_type", rt);
+                cfg.global_rope_proportional = (rt == "proportional");
+                // Refuse a rope_type this engine does not implement rather
+                // than silently running the default one: the frequencies
+                // and the dimension pairing both differ, and the output
+                // would stay fluent.  See ref/gemma4_proportional_rope.py.
+                if (!rt.empty() && rt != "proportional" && rt != "default") {
+                    err = "gemma-4 full_attention rope_type \"" + rt +
+                          "\" is not implemented (only default and "
+                          "proportional are)";
+                    return false;
+                }
+            }
+        }
+        // Features this engine does not have.  Refuse by name; every one
+        // of them loads cleanly and produces the wrong model's output.
+        if (tcfg_b("enable_moe_block", false) || tcfg_i("num_experts", 0) > 0) {
+            err = "gemma-4 with enable_moe_block is not implemented";
+            return false;
+        }
+        if (tcfg_i("num_kv_shared_layers", 0) > 0) {
+            err = "gemma-4 num_kv_shared_layers > 0 (cross-layer KV sharing) "
+                  "is not implemented";
+            return false;
+        }
+        if (tcfg_i("hidden_size_per_layer_input", 0) > 0) {
+            err = "gemma-4 per-layer input embeddings "
+                  "(hidden_size_per_layer_input) are not implemented";
+            return false;
+        }
+        if (tcfg_b("use_double_wide_mlp", false)) {
+            err = "gemma-4 use_double_wide_mlp is not implemented";
+            return false;
+        }
+    }
 
     cfg.lin_k_heads   = tcfg_i("linear_num_key_heads", 0);
     cfg.lin_v_heads   = tcfg_i("linear_num_value_heads", 0);
@@ -201,8 +295,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if (!find_scalar(j, "hidden_activation", act))
                 find_scalar(j, "hidden_act", act);
         }
+        cfg.geglu = act == "gelu_pytorch_tanh" || act == "gelu_tanh" ||
+                    act == "gelu";
         if (!act.empty() && act != "silu" && act != "swish" &&
-            act != "silu_and_mul") {
+            act != "silu_and_mul" && !cfg.geglu) {
             err = "config.json asks for hidden activation \"" + act +
                   "\", and this engine implements only swiglu "
                   "(silu(gate) * up).  Running silu in its place would load "
@@ -605,6 +701,48 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 lay.attn_gate    = linear(a + "gate_proj");
                 lay.pre_ff_norm  = get(b + "pre_feedforward_layernorm.weight");
                 lay.post_ff_norm = get(b + "post_feedforward_layernorm.weight");
+            }
+            if (cfg.is_gemma4) {
+                lay.pre_ff_norm  = get(b + "pre_feedforward_layernorm.weight");
+                lay.post_ff_norm = get(b + "post_feedforward_layernorm.weight");
+                lay.layer_scalar = get(b + "layer_scalar");
+                // attention_k_eq_v: a FULL-attention layer ships no
+                // v_proj at all, and V is the pre-norm pre-RoPE k_proj
+                // output.  Verified against the real weight map: layers
+                // 5, 11, ... 59 have no v_proj and every sliding layer
+                // does.  Check both directions -- a missing v_proj where
+                // one is expected, or a present one where the config says
+                // there should be none, means this is not the checkpoint
+                // the config describes.
+                const bool sliding = !cfg.muse_sliding_attention.empty() &&
+                                     cfg.muse_sliding_attention[size_t(L)];
+                const bool want_v = !(cfg.k_eq_v && !sliding);
+                if (want_v && !lay.v_proj.ok()) {
+                    err = "gemma-4 layer " + std::to_string(L) +
+                          " has no v_proj, but it is a " +
+                          (sliding ? "sliding" : "full-attention") +
+                          " layer that should have one";
+                    return false;
+                }
+                if (!want_v && lay.v_proj.ok()) {
+                    err = "gemma-4 layer " + std::to_string(L) +
+                          " is full-attention with attention_k_eq_v set, so "
+                          "it should have NO v_proj, but the checkpoint has "
+                          "one";
+                    return false;
+                }
+                if (!lay.pre_ff_norm.ok() || !lay.post_ff_norm.ok()) {
+                    err = "gemma-4 layer " + std::to_string(L) +
+                          " is missing a sandwich feed-forward norm";
+                    return false;
+                }
+                if (!lay.layer_scalar.ok()) {
+                    err = "gemma-4 layer " + std::to_string(L) +
+                          " has no layer_scalar; the reference multiplies "
+                          "the residual stream by it at the end of every "
+                          "layer, so running without it is a different model";
+                    return false;
+                }
             }
             if (cfg.is_k2) {
                 // Every K2 layer has the attention output gate; only the

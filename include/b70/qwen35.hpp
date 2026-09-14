@@ -33,6 +33,7 @@
 #include "weights.hpp"
 #include "native_model.hpp"
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <map>
 #include <memory>
@@ -110,6 +111,55 @@ struct Qwen35Config {
     std::vector<int>  mlp_only_layers;
     std::vector<bool> k2_sparse;    // per layer: MoVA attention + routed MoE
 
+    // ---- Gemma-4 ----------------------------------------------------
+    // google/gemma-4-31B-it (model_type "gemma4"/"gemma4_text").  A dense
+    // Gemma-sandwich transformer, but with per-LAYER-TYPE geometry that
+    // nothing else here has: sliding layers are head_dim 256 over 16 KV
+    // heads, full-attention layers head_dim 512 over 4.  See
+    // GEMMA4-2026-09-14.md and ref/gemma4.py -- every item below is
+    // silent if implemented wrongly.
+    bool  is_gemma4       = false;
+    int   global_head_dim = 0;      // full-attention head_dim (0 == same)
+    int   n_global_kv_heads = 0;    // full-attention KV heads (0 == same)
+    // Gemma-4 keys RoPE by layer type: sliding uses plain RoPE at 1e4,
+    // full uses "proportional" RoPE at 1e6 with partial_rotary_factor
+    // 0.25.  `rope_theta` above stays the SLIDING value; these two carry
+    // the full-attention pair.
+    float global_rope_theta = 0.0f;     // 0 == no per-type override
+    float global_partial_rope = 1.0f;
+    bool  global_rope_proportional = false;
+    // hidden_states *= layer_scalar as the LAST act of each decoder
+    // layer, after the residual add.  Per layer, from the checkpoint.
+    bool  layer_scalar    = false;
+    // GeGLU instead of SwiGLU: gelu(gate) * up, tanh approximation.
+    bool  geglu           = false;
+    // attention_k_eq_v: full-attention layers have NO v_proj; V is the
+    // PRE-norm, PRE-RoPE k_proj output through a scaleless RMSNorm.
+    bool  k_eq_v          = false;
+    float logit_softcap   = 0.0f;   // final_logit_softcapping (0 == none)
+    float attn_scale      = 0.0f;   // 0 == the usual 1/sqrt(head_dim)
+    float embed_scale     = 1.0f;   // embeddings multiplied on lookup
+    int   sliding_window  = 0;
+
+    // head_dim / KV heads for one layer, which differ per layer type on
+    // Gemma-4 and are uniform everywhere else.  Never read cfg.head_dim
+    // directly in a per-layer context.
+    int layer_head_dim(int i) const {
+        if (global_head_dim > 0 && i >= 0 && i < int(layer_types.size()) &&
+            !muse_sliding_attention.empty() && !muse_sliding_attention[size_t(i)])
+            return global_head_dim;
+        return head_dim;
+    }
+    int layer_kv_heads(int i) const {
+        if (n_global_kv_heads > 0 && i >= 0 && i < int(layer_types.size()) &&
+            !muse_sliding_attention.empty() && !muse_sliding_attention[size_t(i)])
+            return n_global_kv_heads;
+        return n_kv_heads;
+    }
+    // The widest of either, for anything sized once for all layers.
+    int max_head_dim() const { return std::max(head_dim, global_head_dim); }
+    int max_kv_heads() const { return std::max(n_kv_heads, n_global_kv_heads); }
+
     std::vector<LayerKind> layer_types;
     // Muse uses sliding RoPE attention for three layers followed by one
     // full NoPE layer. Keep the checkpoint distinction; both map to the
@@ -160,7 +210,8 @@ struct Qwen35Layer {
     // --- full attention -------------------------------------------
     TensorRef q_proj, k_proj, v_proj, o_proj, q_norm, k_norm;
     TensorRef attn_gate;                    // Muse: self_attn.gate_proj (output gate)
-    TensorRef pre_ff_norm, post_ff_norm;    // Muse: sandwich feed-forward norms
+    TensorRef pre_ff_norm, post_ff_norm;    // Muse/Gemma-4: sandwich FFN norms
+    TensorRef layer_scalar;                 // Gemma-4: per-layer residual scale
 
     // --- FFN ------------------------------------------------------
     TensorRef router;                       // MoE only
