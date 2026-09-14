@@ -127,10 +127,17 @@ icpx --version | head -1
 #  a way that looks like a model quality problem rather than a compiler
 #  flag. Use the targeted relaxations instead.
 # ---------------------------------------------------------------------
+# -Wmisleading-indentation is here for a specific reason: a braceless
+# `if` whose body LOOKED like two statements set a validity flag
+# unconditionally while the write it described stayed conditional, and the
+# result was a drafter reading a buffer nothing had filled.  The compiler
+# could see that and was not asked.  It is a warning, not an error, so it
+# cannot break a build that is otherwise fine.
 icpx -fsycl \
      -fsycl-targets="$TARGET" \
      -O3 \
      -ferror-limit=0 \
+     -Wmisleading-indentation \
      -std=c++20 \
      -fno-fast-math \
      -ffp-contract=fast \

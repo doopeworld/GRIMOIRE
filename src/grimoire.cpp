@@ -4961,6 +4961,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 // no error and no obvious symptom.
 // ---------------------------------------------------------------------
 void Grimoire::reset() {
+    // A new sequence inherits nothing, this flag included: the buffer
+    // still holds the previous request's states, and they describe a
+    // different sequence.
+    spec_hidden_valid = false;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const int qkv_ch = 2 * cfg.lin_k_heads * cfg.lin_k_dim + Hv * Dv;
     for (auto& d : L) {
@@ -7062,26 +7066,45 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // A block of -1 is the failure marker; it is not a legal token id, and
     // the receiver turns it back into `return false` so every stage fails
     // the same round the same way.
-    // PHASE MATTERS.  Earlier stages only enter pp_sync_tokens() for a
-    // DRAFTING call; on a context_only call they return immediately and
-    // the next thing they read is argmax_token()'s single int32.  Sending
-    // a block there is worse than sending nothing: the first -1 is read as
-    // the scalar, fails token validation, and the remaining integers stay
-    // in the stream for the next message to misread.  On a surviving
-    // server that corrupts every later request.
+    // THE LAST STAGE OWES A REPLY, AND ITS SHAPE DEPENDS ON THE PHASE.
     //
-    // So: send only when a receive is actually posted, and send at most
-    // once -- after the real block has gone out, or after the transport
-    // itself failed, another sentinel helps nobody.
-    bool block_sent=false;
-    auto refuse=[&]()->bool{
-        if(!context_only&&!block_sent&&
-           pp_enabled()&&pp_rank==pp_world-1&&pp_world>1){
-            std::vector<int32_t> dead(size_t(std::max(0,pp_dflash-1)),-1);
-            if(!dead.empty()){block_sent=true;pp_sync_tokens(dead);}
+    // Earlier stages are never idle after calling in here.  On a DRAFTING
+    // call they are inside pp_sync_tokens() waiting for M-1 integers.  On
+    // a CONTEXT-ONLY call they return immediately and go straight to
+    // argmax_token(), which waits for exactly ONE.  So:
+    //
+    //   drafting, failed   -> M-1 negative tokens
+    //   context-only, failed -> ONE negative token
+    //   context-only, ok   -> nothing; argmax_token sends the scalar next
+    //
+    // Both wrong answers have been made here.  Sending a block during a
+    // context-only call put the first -1 where the scalar was expected and
+    // left the rest in the stream for the next message to misread; sending
+    // NOTHING left the peers blocked on a scalar that never came.  Neither
+    // fails where it happens.
+    //
+    // A destructor, not a lambda at each exit: it covers every `return
+    // false` AND every exception out of a bridge, an allocation, a kernel
+    // submission or a wait -- paths that have no explicit exit to annotate.
+    // A fixed buffer, so the failure path allocates nothing even after a
+    // bad_alloc; clamped, so the count can never outrun it.
+    struct Owed {
+        Grimoire* g; bool active; bool context_only; int count; bool owed = true;
+        ~Owed() {
+            if (!active || !owed) return;
+            owed = false;
+            constexpr int kMax = 16;          // MMAX; pp_dflash cannot exceed it
+            int32_t dead[kMax];
+            const int n = context_only ? 1 : std::min(std::max(count, 0), kMax);
+            if (n <= 0) return;
+            for (int i = 0; i < n; ++i) dead[i] = -1;
+            // Best effort, and never throw out of a destructor: if the
+            // transport is already broken there is nothing left to say.
+            fd_write_all(g->pp_prev_fd, dead, size_t(n) * sizeof(int32_t));
         }
-        return false;
-    };
+    } reply{this, pp_enabled() && pp_rank == pp_world - 1 && pp_world > 1,
+            context_only, pp_dflash - 1};
+    auto refuse=[&]()->bool{ return false; };   // ~Owed does the notifying
     if(!dflash2.ok||position<0||position+M>max_seq){
         static bool once2=false;
         if(!once2){once2=true;std::fprintf(stderr,
@@ -7334,6 +7357,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // From here on the draft stages get their own first-call latch.
     dumping=want_dump&&!context_only&&!dumped_draft;
     if(context_only){
+        reply.owed=false;      // argmax_token sends the scalar next
         if(time_draft){
             std::fprintf(stderr,
                 "  DFlash context preparation call %d: %.3f ms\n",
@@ -7651,7 +7675,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // Push the block backward so every earlier stage speculates on the
     // SAME candidates.  Sizes already agree: pp_dflash carries this M.
     if(pp_enabled()){
-        block_sent=true;          // the real block; never send a sentinel after it
+        reply.owed=false;         // the real block; never a sentinel after it
         if(!pp_sync_tokens(draft_tokens)){
             std::fprintf(stderr,"PP rank %d: draft block send failed\n",pp_rank);
             return false;         // transport is already broken -- do not resend
@@ -9419,9 +9443,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // mtp_draft consumes the unnormalised hidden state of the last processed
     // token. Sequential forward() leaves it in s.h; the batched path must do
     // the same so speculation can chain across verify steps.
-    if (capture_spec)
+    // BRACES.  Without them the memcpy was conditional and the flag was
+    // not, so a verify batch wider than kSpecBatch marked a buffer valid
+    // that nothing had written -- the exact bug the flag exists to stop,
+    // and on a B70 (where batched prefill works) it is reachable.
+    if (capture_spec) {
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
         spec_hidden_valid = true;
+    }
     q.memcpy(s.h, bh + int64_t(M-1) * H, size_t(H) * sizeof(float));
     pos+=M; set_cursor(pos);
     if (next_tokens) {

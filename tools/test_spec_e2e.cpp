@@ -51,14 +51,39 @@ static int run_one(const std::string& dir, const std::string& out, const std::st
                   : fname == "mxfp4" ? Fmt::MXFP4
                                      : Fmt::BF16;
     std::string err;
+    // A drafting refusal must leave the PIPELINE usable, not just fail
+    // cleanly on the stage that noticed.  With capacity 32, a valid
+    // 25-token prompt and M=8, the drafter cannot prepare (25+8 > 32) --
+    // so the last stage refuses, and every earlier stage is already
+    // waiting on a reply it will otherwise never get.  The engine and its
+    // sockets are then REUSED for a normal request below: closing the
+    // model here would hide both a blocked peer and any bytes left on the
+    // wire by a wrongly-shaped reply.
+    const bool refusal_case =
+        std::getenv("GRIMOIRE_TEST_DFLASH_CONTEXT_REFUSAL") != nullptr;
     Grimoire* e = grimoire_new();
     if (!e) return 2;
-    if (!grimoire_load(*e, dir, fmt, 256, err)) {
+    if (!grimoire_load(*e, dir, fmt, refusal_case ? 32 : 256, err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         grimoire_delete(e); return 3;
     }
     std::vector<int32_t> toks;
     FinishReason r{};
+    if (refusal_case) {
+        bool refused = false;
+        try {
+            grimoire_serve_generate(*e, std::vector<int32_t>(25, 7), 1,
+                                    -1, toks, -1, {}, &r);
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "expected refusal: %s\n", ex.what());
+            refused = true;
+        }
+        if (!refused) {
+            std::fprintf(stderr, "the refusal case did not refuse\n");
+            grimoire_delete(e); return 6;
+        }
+        toks.clear();
+    }
     try {
         grimoire_serve_generate(*e, kPrompt, kWant, -1, toks, -1, {}, &r);
     } catch (const std::exception& ex) {
@@ -644,6 +669,32 @@ int main(int argc, char** argv) {
                 } else {
                     std::printf("   PP+DFlash: identical, same acceptance   [%s]\n",
                                 pstats.c_str());
+                }
+
+                // ---- a refusal must leave the pipeline usable ---------
+                if (!own && std::strcmp(fmt, "bf16") == 0) {
+                    auto renv = pcommon;
+                    renv.push_back("GRIMOIRE_TEST_DFLASH_CONTEXT_REFUSAL=1");
+                    renv.push_back("GRIMOIRE_PP_SOCKET="+(tdir/"df-rec.sock").string());
+                    const std::string rout = (tdir/"df-rec.txt").string();
+                    const auto rr = spawn_two(self, tdir.string(), rout, fmt,
+                                              renv, "GRIMOIRE_PP_RANK", 1,
+                                              tdir, "df-rec");
+                    if (rr.first != 0 || rr.second != 0) {
+                        ++g_fail;
+                        std::printf("   PP refusal/reuse FAILED (last %d, first %d)"
+                                    " -- a peer was left blocked, or the wire was"
+                                    " left dirty\n", rr.first, rr.second);
+                    } else if (read_tokens(rout) != plain) {
+                        ++g_fail;
+                        std::printf("   PP refusal/reuse CHANGED THE OUTPUT of the"
+                                    " request AFTER the refusal\n     plain:%s\n"
+                                    "     after:%s\n", join(plain).c_str(),
+                                    join(read_tokens(rout)).c_str());
+                    } else {
+                        std::printf("   PP refusal: both ranks recovered, next "
+                                    "request identical\n");
+                    }
                 }
 
                 // ---- the taps themselves, byte for byte ---------------
