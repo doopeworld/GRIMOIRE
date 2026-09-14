@@ -252,9 +252,15 @@ inline Arch dense(int L = 4, bool mtp = false) {
 //
 // 6 layers: 0,1 sliding, 2 full, 3,4 sliding, 5 full.
 inline Arch gemma4(int L = 6) {
-    const int H=64, Q=64, V=128;
+    const int H=64, V=128, QH=4;
     const int SHD=16, SKV=2, GHD=32, GKV=1, I=128;
     auto sliding = [](int l) { return (l % 3) != 2; };
+    // Query width is QH * that LAYER's head_dim, so it differs between the
+    // two layer types just as the KV width does -- 64 on a sliding layer,
+    // 128 on a full one.  A single fixed Q here would hand the engine a
+    // q_proj narrower than the geometry its config declares, and the
+    // per-head q_norm would run off the end of the projection output.
+    auto qwidth = [&](int l) { return QH * (sliding(l) ? SHD : GHD); };
     std::ostringstream c;
     c << R"JSON({
   "model_type": "gemma4_text", "hidden_size": 64, "num_hidden_layers": )JSON" << L
@@ -283,6 +289,7 @@ inline Arch gemma4(int L = 6) {
     for (int l = 0; l < L; ++l) {
         const int HD = sliding(l) ? SHD : GHD;
         const int KV = (sliding(l) ? SKV : GKV) * HD;
+        const int Q  = qwidth(l);
         const std::string b = "model.language_model.layers." +
                               std::to_string(l) + ".";
         t.push_back({b+"input_layernorm.weight", {H}});

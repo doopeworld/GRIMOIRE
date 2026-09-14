@@ -2591,11 +2591,13 @@ struct Grimoire {
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
     const float* forward_gemma4(int token); // gemma-4 sandwich + per-layer-type
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
-    // Same trick, head-width: gemma-4's v_norm is
-    // Gemma4RMSNorm(head_dim, eps, with_scale=False), a norm with no weight
-    // at all, which a zero weight under the (1+w) convention reproduces
-    // exactly.  Sized from max_head_dim so either layer type can use it.
-    bf16_t* gemma_zero = nullptr;
+    // gemma-4's v_norm is Gemma4RMSNorm(head_dim, eps, with_scale=False):
+    // a norm with NO weight parameter, i.e. scale 1.  gemma-4 runs on the
+    // plain-weight convention (offset 0), so reproducing "no weight" takes
+    // a vector of ONES -- a zero vector would multiply the value by zero
+    // and produce silence, not an identity.  Sized from max_head_dim so
+    // either layer type can use it.
+    bf16_t* gemma_vnorm = nullptr;
     sycl::half* muse_zero_f16 = nullptr;   // same, for the FP16 activation path
     const float* forward_dag(int token);  // out-of-order queue + true dependencies
     bool prefill(const std::vector<int32_t>& tokens,
@@ -2910,6 +2912,19 @@ std::string Grimoire::unsupported_reason() const {
                "into a private array of that size, so a wider head writes "
                "past the end of device stack memory -- a DEVICE_LOST, not a "
                "wrong answer.  Refusing.";
+    // The same kernels compute dims-per-lane as head_dim / SG_SIZE with
+    // INTEGER division, while the merge pass tiles ceil(head_dim/SG_SIZE).
+    // At head_dim 24 the split pass writes 16 dimensions and the merge
+    // reads 24, so the last 8 are whatever the previous token left there.
+    // No supported model has a ragged head, and nothing would report it.
+    if (max_hd % SG_SIZE != 0 || cfg.head_dim % SG_SIZE != 0)
+        return "head_dim must be a multiple of " + std::to_string(SG_SIZE) +
+               " (got " + std::to_string(cfg.head_dim) +
+               (cfg.global_head_dim > 0
+                    ? "/" + std::to_string(cfg.global_head_dim) : "") +
+               ").  The flash kernels split by integer division and merge "
+               "by ceiling, so a ragged head leaves its last dimensions "
+               "holding the previous token's values.  Refusing.";
 
     // GeGLU.  forward_gemma4() is the ONLY path that dispatches it; every
     // other FFN dispatch here -- decode GEMV, batched prefill, the MoE
@@ -3139,9 +3154,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
     // ---- layers
     if (cfg.is_gemma4) {
-        gemma_zero = sycl::malloc_device<bf16_t>(size_t(cfg.max_head_dim()), q);
-        if (!gemma_zero) { err = "gemma-4 scaleless-norm weight allocation failed"; return false; }
-        q.memset(gemma_zero, 0, size_t(cfg.max_head_dim()) * sizeof(bf16_t)).wait();
+        const size_t hd = size_t(cfg.max_head_dim());
+        gemma_vnorm = sycl::malloc_device<bf16_t>(hd, q);
+        if (!gemma_vnorm) { err = "gemma-4 v_norm weight allocation failed"; return false; }
+        std::vector<bf16_t> ones(hd, f32_to_bf16(1.0f));
+        q.memcpy(gemma_vnorm, ones.data(), hd * sizeof(bf16_t)).wait();
     }
     if (cfg.is_muse) {
         muse_zero = sycl::malloc_device<bf16_t>(cfg.hidden, q);
@@ -3239,10 +3256,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // replaces it entirely, so asking for it would report a missing
             // tensor for something the checkpoint correctly does not have.
             const bool k2_mova = cfg.is_k2 && src.k2_sparse && cfg.mova_experts > 0;
-            if (!k2_mova)
+            // gemma-4 attention_k_eq_v: a FULL-attention layer ships no
+            // v_proj either, and V is the k_proj output.  The loader has
+            // already checked that the checkpoint agrees with the config
+            // in both directions, so trust src here -- asking for a tensor
+            // the model correctly does not have fails the whole upload and
+            // the mixed-layer checkpoint could never load.
+            const bool g4_k_eq_v = cfg.is_gemma4 && !src.v_proj.ok();
+            const bool no_v = k2_mova || g4_k_eq_v;
+            if (!no_v)
                 d.v_proj = quantize_upload_t(lq, ck, src.v_proj, PF, "self_attn.v_proj", &ok);
             shard(d.q_proj,lq);shard(d.k_proj,lq);
-            if (!k2_mova) shard(d.v_proj,lq);
+            if (!no_v) shard(d.v_proj,lq);
             if (cfg.is_k2) {
                 d.k2_sparse = src.k2_sparse;
                 // Softplus output gate, present on EVERY K2 layer.
@@ -3684,10 +3709,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::printf("\n");
 
     // Fix the norm convention for this model once, before any forward
-    // pass: K2 is grouped with a plain weight, everything else is
-    // whole-row and zero-centered.
-    set_norm_convention(cfg.is_k2 ? cfg.norm_groups : 1,
-                        cfg.is_k2 ? 0.0f : 1.0f);
+    // pass.  Two independent choices: how many groups a row is split into,
+    // and what is added to the stored weight.
+    //
+    //   Qwen / Muse   whole row, (1 + w)   -- zero-centered
+    //   K2            grouped,    w
+    //   gemma-4       whole row,  w
+    //
+    // gemma-4 is the trap: Gemma-2 and Gemma-3 DID use (1 + w), so the
+    // convention is the one a reader would assume from the family name.
+    // ref/gemma4.py:211 is unambiguous -- `normed_output * self.weight`,
+    // no offset.  Applying (1 + w) instead leaves the model fluent and
+    // shifts every normalised activation.
+    const float norm_offset = (cfg.is_k2 || cfg.is_gemma4) ? 0.0f : 1.0f;
+    set_norm_convention(cfg.is_k2 ? cfg.norm_groups : 1, norm_offset);
 
     // MoVA scratch: router logits, the top-k table and one expert output
     // row, reused by every sparse layer.
@@ -5342,6 +5377,9 @@ void Grimoire::release() {
         if(od)od.destroy(dflash2.fc_plan);
         dflash2.fc_plan=nullptr;
     }
+    for (void** p : {(void**)&gemma_vnorm, (void**)&muse_zero,
+                     (void**)&muse_zero_f16})
+        if (*p) { sycl::free(*p, q); *p = nullptr; }
     if(pp_prev_fd>=0){::close(pp_prev_fd);pp_prev_fd=-1;}
     if(pp_next_fd>=0){::close(pp_next_fd);pp_next_fd=-1;}
     for(int& fd:tp_peer_fd)if(fd>=0){::close(fd);fd=-1;}
@@ -5366,6 +5404,11 @@ void Grimoire::release() {
         d.v_experts_packed.release(q);
         for (auto& ve : d.v_experts) ve.release(q);
         for (void* p : {(void*)d.in_norm, (void*)d.post_norm,
+                        // The bf16 sandwich norms were missing from this
+                        // list entirely -- leaked by Muse as well as by
+                        // gemma-4, since only their _f16 companions were
+                        // named.
+                        (void*)d.pre_ff_norm, (void*)d.post_ff_norm,
                         (void*)d.in_norm_f16, (void*)d.post_norm_f16,
                         (void*)d.pre_ff_norm_f16, (void*)d.post_ff_norm_f16,
                         (void*)d.la_conv, (void*)d.la_Alog, (void*)d.la_dtb,
@@ -6536,7 +6579,18 @@ const float* Grimoire::forward_gemma4(int token) {
         // Gemma4TextScaledWordEmbedding: the lookup is multiplied by
         // sqrt(hidden) BEFORE the first norm.  Omitting it changes the
         // scale every later RMSNorm sees.
-        if (!embed_one(token, s.h)) return nullptr;
+        if (tp_enabled()) {
+            if (!embed_one(token, s.h)) return nullptr;
+        } else if (recording) {
+            // Same reason forward() does this: a captured graph replays
+            // the kernels it recorded, so an embedding taken from the HOST
+            // token bakes that one token into every replay.  s.d_tok is
+            // the buffer argmax_token() writes, which makes one recorded
+            // graph valid for every token.
+            launch_embed_batched(q, embed, s.d_tok, s.h, 1, H, none);
+        } else {
+            launch_embed(q, embed, token, s.h, H, none);
+        }
         if (cfg.embed_scale != 1.0f)
             launch_scale(q, s.h, cfg.embed_scale, H, none);
     } else {
@@ -6592,10 +6646,12 @@ const float* Grimoire::forward_gemma4(int token) {
             launch_rmsnorm_heads(q, s.qkv, d.q_norm, QH, HD, eps, true, none);
         if (d.k_norm)
             launch_rmsnorm_heads(q, s.zbuf, d.k_norm, KVH, HD, eps, true, none);
-        // Gemma4RMSNorm(head_dim, eps, with_scale=False): no weight at all,
-        // which a zero weight under the (1+w) convention reproduces exactly.
-        if (k_is_v)
-            launch_rmsnorm_heads(q, s.bbuf, gemma_zero, KVH, HD, eps, true, none);
+        // v_norm runs on EVERY non-kv-shared layer, not only the ones
+        // where V came from k_proj.  ref/gemma4.py:1249 applies it
+        // unconditionally after the branch that chose the value source --
+        // reading it as "the replacement for the missing v_proj" is the
+        // natural misreading, and it leaves 50 of 60 layers unnormalised.
+        launch_rmsnorm_heads(q, s.bbuf, gemma_vnorm, KVH, HD, eps, true, none);
 
         if (d.rope_proportional) {
             launch_rope_proportional(q, s.qkv,  QH,  HD, s.d_pos,

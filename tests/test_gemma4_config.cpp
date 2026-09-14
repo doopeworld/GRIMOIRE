@@ -178,13 +178,19 @@ static void write_stub(const fs::path& dir, const std::string& cfg,
     h << "{";
     size_t off = 0;
     for (size_t i = 0; i < all.size(); ++i) {
-        const bool vec = all[i].size() > 7 &&
-                         (all[i].compare(all[i].size()-7, 7, "_scalar") == 0 ||
-                          all[i].find("norm.weight") != std::string::npos);
-        const size_t elems = vec ? 2 : 4;             // [2] or [2,2]
+        // layer_scalar is nn.Buffer(torch.ones(1)) in the reference
+        // (ref/gemma4.py:1367), i.e. exactly ONE element, and the uploader
+        // reads it into a single float.  Writing it as [2] here would make
+        // this fixture disagree with the checkpoint it stands for, and the
+        // loader's shape check -- correctly -- rejects it.
+        const bool scalar = all[i].size() > 7 &&
+                            all[i].compare(all[i].size()-7, 7, "_scalar") == 0;
+        const bool vec = scalar ||
+                         all[i].find("norm.weight") != std::string::npos;
+        const size_t elems = scalar ? 1 : (vec ? 2 : 4);   // [1], [2] or [2,2]
         if (i) h << ",";
         h << "\"" << all[i] << "\":{\"dtype\":\"BF16\",\"shape\":"
-          << (vec ? "[2]" : "[2,2]")
+          << (scalar ? "[1]" : vec ? "[2]" : "[2,2]")
           << ",\"data_offsets\":[" << off << "," << off + elems*2 << "]}";
         off += elems * 2;
     }

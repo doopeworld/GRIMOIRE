@@ -169,6 +169,13 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.tie_embeddings= cfg_b(j, "tie_word_embeddings", false);
     cfg.is_gemma4     = gemma4;
     if (gemma4) {
+        // Every projection in this engine is bias-free.  A checkpoint that
+        // declares biases would load and simply not apply them.
+        if (tcfg_b("attention_bias", false)) {
+            err = "gemma-4 attention_bias is set; this engine's projections "
+                  "carry no bias and would drop it silently";
+            return false;
+        }
         // Per-LAYER-TYPE geometry.  Sliding layers use head_dim /
         // num_key_value_heads; full-attention layers use global_head_dim /
         // num_global_key_value_heads.  Nothing else in this engine has
@@ -300,8 +307,13 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if (!find_scalar(j, "hidden_activation", act))
                 find_scalar(j, "hidden_act", act);
         }
-        cfg.geglu = act == "gelu_pytorch_tanh" || act == "gelu_tanh" ||
-                    act == "gelu";
+        // "gelu" and "gelu_new" are NOT the tanh approximation.  The one
+        // kernel here is gelu_pytorch_tanh, so accepting the exact-erf
+        // spellings under the same flag would run tanh in erf's place --
+        // the same substitution one line down refuses by name.  Recognise
+        // only the tanh spellings; anything else gelu-ish falls through to
+        // the refusal below.
+        cfg.geglu = act == "gelu_pytorch_tanh" || act == "gelu_tanh";
         if (!act.empty() && act != "silu" && act != "swish" &&
             act != "silu_and_mul" && !cfg.geglu) {
             err = "config.json asks for hidden activation \"" + act +
@@ -745,12 +757,40 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                           " is missing a sandwich feed-forward norm";
                     return false;
                 }
+                // Every gemma-4 layer has q_norm and k_norm
+                // (ref/gemma4.py:1192, 1196).  Elsewhere in this loader
+                // they are optional, so a missing one would simply not be
+                // applied -- fluent output from an unnormalised head.
+                if (!lay.q_norm.ok() || !lay.k_norm.ok()) {
+                    err = "gemma-4 layer " + std::to_string(L) +
+                          " is missing q_norm or k_norm; both are present on "
+                          "every layer of this architecture and skipping "
+                          "them is silent";
+                    return false;
+                }
                 if (!lay.layer_scalar.ok()) {
                     err = "gemma-4 layer " + std::to_string(L) +
                           " has no layer_scalar; the reference multiplies "
                           "the residual stream by it at the end of every "
                           "layer, so running without it is a different model";
                     return false;
+                }
+                // The uploader reads this into ONE float.  A tensor that
+                // is present but not scalar-shaped is a valid safetensors
+                // record, so nothing upstream rejects it -- and the read
+                // would run off the end of a single-float destination.
+                // Count elements rather than match a shape: [], [1] and
+                // [1,1] all mean the same number.
+                {
+                    int64_t n = 1;
+                    for (int64_t dim : lay.layer_scalar.t.shape) n *= dim;
+                    if (n != 1) {
+                        err = "gemma-4 layer " + std::to_string(L) +
+                              " has a layer_scalar with " +
+                              std::to_string(n) + " elements; it is a "
+                              "per-layer scalar and is read as one float";
+                        return false;
+                    }
                 }
             }
             if (cfg.is_k2) {
