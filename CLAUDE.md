@@ -258,6 +258,24 @@ stage: drop the forwarding and the test fails.
 
 The capability matrix still says which one is live -- read it.
 
+**7b. A POINTER CHECK IS NOT A WRITTEN CHECK (learned 2026-09-14).**
+`commit_spec_prefix` restored the drafter's hidden state from
+`spec_hidden_steps` under `if (spec_hidden_steps)`. That buffer is
+allocated the moment MTP loads and written ONLY by the batched verify, so
+on any sequential-verify fallback the drafter ran on uninitialised device
+memory. The comment above the line already said "skip rather than read a
+buffer that was never written" -- the condition just did not implement
+it. Symptom: `MTP draft failed`, intermittently, because stale memory is
+usually finite and occasionally is not.
+
+Two lessons, both cheap:
+
+- When a buffer has conditional writers, track WRITTEN, not ALLOCATED.
+- POISON such buffers with NaN at allocation. It converts this whole
+  class from "fails one run in three" to "fails every time, loudly, the
+  first time anyone reads it" -- which is what made the A/B that proved
+  the fix possible at all.
+
 **8. Never quote a benchmark number from a config that never generated text.**
 Multiple false leads in this project (BesTLA, DAG, several kernel "wins")
 were caught only because someone bothered to run `-p "prompt" -n N` and read

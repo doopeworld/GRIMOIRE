@@ -156,7 +156,7 @@ block. It now names the DFlash mode explicitly — replicated under TP, or
 "drafter on the last stage; taps forwarded from every stage" under PP —
 because a silently disabled drafter looks exactly like a slow model.
 
-## OPEN, and the first thing to watch on the box
+## RESOLVED 2026-09-14 -- it was not the simulator
 
 **`test_spec_e2e` has an intermittent failure in `moe+mtp fp8` under
 PIPELINE parallel.** It is not in anything this session built -- MTP
@@ -189,9 +189,38 @@ MoE/FP8 case shows it.
 
 It has NOT been shown to be the simulator. Do not assume it is.
 
-**What settles it:** `tools/preflight_b70.sh` runs this exact gate on the
-card. If `moe+mtp fp8` is clean there over a few runs, it was the CPU
-device. If it fails there, it is real and it is a correctness bug in
-speculation under PP -- which is an exactness claim, so it would matter
-more than a slow path. Run the gate more than once before believing
-either answer; a single green run cannot distinguish them.
+**The hypothesis above was WRONG, and it was found by the second audit.**
+The cause is an engine bug, on any device:
+
+`commit_spec_prefix()` restores `s.h` from `spec_hidden_steps`, a buffer
+ONLY the batched verify writes. The guard tested the POINTER, which is
+non-null the moment MTP loads, not whether anything had been written to
+it. When `prefill()` declines -- no matrix hardware, or a scratch
+allocation that fails on a GPU too -- generation falls back to a
+sequential verify, nothing fills the buffer, and the next `mtp_draft()`
+drafts from uninitialised device memory. Non-finite logits there make
+`launch_argmax` return `INT_MAX`, which is a CORRECT reduction over NaN,
+and generation rejects that as outside the vocabulary.
+
+The comment above that line already stated the right rule. The condition
+did not implement it.
+
+That explains every observation the sub-group theory did not: the
+intermittency (it depends on what the allocator last left behind), why a
+fresh re-run passes, and why only the pipelined case surfaced it.
+
+**Fixed**, and proved by A/B on the same fixture and prompt:
+
+| build | runs | result |
+| --- | --- | --- |
+| guard reverted to the pointer check | 3 | 3 failed, every time |
+| fixed | 5 | 5 passed |
+
+Two changes: a validity flag set by the two batched writers and cleared
+by `snapshot_recurrent()`, which opens every speculative round; and the
+buffer is POISONED with NaN at allocation. The poison is why the reverted
+build fails 3 of 3 rather than 1 of 3 -- a read-before-write here was a
+heisenbug precisely because stale memory is usually finite.
+
+**This would have reached the B70.** The same fallback is taken on the
+card whenever a speculative scratch allocation fails.

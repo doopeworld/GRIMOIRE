@@ -48,13 +48,16 @@ K=1,2,3,5`. If either says `CHANGED THE OUTPUT`, stop: that is
 speculation on a Qwen3.5/Ornith-shaped model not reproducing the model's
 own output, which is the path the verified 49.8 TG MTP recipe uses.
 
-**One known intermittent failure to watch for.** `test_spec_e2e` failed
-its `moe+mtp fp8` PIPELINE case in 2 of 6 runs off the card, always that
-case, with `MTP draft failed` on both ranks. It may be the CPU device
-emulating a 16-wide sub-group in `launch_argmax`, or it may be a real
-correctness bug in speculation under PP. **Run the gate more than once on
-this box** -- one green run cannot tell those apart. Details and the full
-evidence: `HANDOFF-2026-09-13-DFLASH-MULTIGPU.md`.
+**A failure that used to live here is fixed** (2026-09-14):
+`test_spec_e2e`'s `moe+mtp fp8` PIPELINE case failed intermittently
+because the drafter restored its hidden state from a buffer only the
+BATCHED verify writes. It is an engine bug, not a CPU-device artifact,
+and the same fallback is taken on the card whenever a speculative scratch
+allocation fails. Fixed and A/B-proved; see
+`HANDOFF-2026-09-13-DFLASH-MULTIGPU.md`.
+
+Still worth running the gates more than once here -- a single green run
+on new hardware is weak evidence either way.
 
 Green preflight means the box is sane. It does not mean anything is
 fast: no stage above produces a number, deliberately.
