@@ -5105,9 +5105,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
           : !batched_ok   ? "SEQUENTIAL fallback (not a GPU, no matrix hardware) -- "
                             "do not benchmark this as prompt-processing throughput"
                           : "batched");
-        std::printf("    norms         %s\n",
-            cfg.is_k2 ? "grouped, weight applied directly (K2)"
-                      : "whole-row, zero-centered (1 + w)");
+        {
+            // Report what set_norm_convention actually installed, not a
+            // second copy of the decision.  The old line was a ternary on
+            // cfg.is_k2 alone, so gemma-4 -- which runs plain w like K2
+            // but ungrouped -- printed "(1 + w)" while the kernels ran w.
+            int ng = 1; float noff = 1.0f;
+            get_norm_convention(&ng, &noff);
+            char nb[96];
+            std::snprintf(nb, sizeof nb, "%s, %s",
+                ng > 1 ? "grouped" : "whole-row",
+                noff == 0.0f ? "weight applied directly (w)"
+                             : "zero-centered (1 + w)");
+            std::printf("    norms         %s\n", nb);
+        }
         // An acceptance rate measured under the compatibility norm is not
         // comparable to one measured under the checkpoint's own weights.
         // Say which is live so the two never get averaged together.

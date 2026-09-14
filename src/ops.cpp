@@ -27,6 +27,16 @@ void set_norm_convention(int groups, float weight_offset) {
     g_norm_groups = groups > 0 ? groups : 1;
     g_norm_weight_offset = weight_offset;
 }
+// What set_norm_convention last installed.  The capability banner has to
+// report the convention that is actually LIVE: it used to re-derive it
+// from cfg with a second ternary that only knew about K2, so a gemma-4
+// load printed "(1 + w)" while the kernels ran plain w.  A banner line
+// that disagrees with the engine is worse than no banner -- the whole
+// point of printing it is that a reader can trust it.
+void get_norm_convention(int* groups, float* weight_offset) {
+    if (groups) *groups = g_norm_groups;
+    if (weight_offset) *weight_offset = g_norm_weight_offset;
+}
 bool norm_is_grouped(int hidden) {
     return (g_norm_groups > 1 || g_norm_weight_offset != 1.0f)
         && g_norm_groups > 0 && (hidden % g_norm_groups) == 0;

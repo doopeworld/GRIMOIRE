@@ -352,6 +352,8 @@ sycl::event launch_router_topk_batched(
 // directly.  set_norm_convention is called once by Grimoire::build so no
 // call site can keep the wrong convention.
 void set_norm_convention(int groups, float weight_offset);
+// Read back what is live, so a banner cannot drift from the kernels.
+void get_norm_convention(int* groups, float* weight_offset);
 bool norm_is_grouped(int hidden);
 extern int   g_norm_groups;
 extern float g_norm_weight_offset;
