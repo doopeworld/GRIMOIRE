@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <cstring>
+#include <cmath>
 
 namespace b70 {
 
@@ -145,20 +146,51 @@ struct Qwen35Config {
     // Gemma-4 and are uniform everywhere else.  Never read cfg.head_dim
     // directly in a per-layer context.
     int layer_head_dim(int i) const {
-        if (global_head_dim > 0 && i >= 0 && i < int(layer_types.size()) &&
-            !muse_sliding_attention.empty() && !muse_sliding_attention[size_t(i)])
-            return global_head_dim;
-        return head_dim;
+        return (global_head_dim > 0 && layer_global(i)) ? global_head_dim
+                                                        : head_dim;
     }
     int layer_kv_heads(int i) const {
-        if (n_global_kv_heads > 0 && i >= 0 && i < int(layer_types.size()) &&
-            !muse_sliding_attention.empty() && !muse_sliding_attention[size_t(i)])
-            return n_global_kv_heads;
-        return n_kv_heads;
+        return (n_global_kv_heads > 0 && layer_global(i)) ? n_global_kv_heads
+                                                          : n_kv_heads;
     }
     // The widest of either, for anything sized once for all layers.
     int max_head_dim() const { return std::max(head_dim, global_head_dim); }
     int max_kv_heads() const { return std::max(n_kv_heads, n_global_kv_heads); }
+
+    // True when layer i is a FULL-attention (global) layer on a model that
+    // gives the two layer types different parameters.  Every other
+    // architecture answers false for every layer, so each accessor below
+    // collapses to the model-wide value it always returned.
+    bool layer_global(int i) const {
+        return i >= 0 && i < int(layer_types.size()) &&
+               !muse_sliding_attention.empty() &&
+               !muse_sliding_attention[size_t(i)];
+    }
+    // RoPE base, rotated fraction and flavour for one layer.  Gemma-4
+    // keys rope_parameters by layer type: sliding layers get plain RoPE
+    // at 1e4 over the whole head, full-attention layers "proportional"
+    // RoPE at 1e6 over a quarter of it.  Picking the wrong one leaves the
+    // model fluent and wrong, which is why no forward path may read
+    // cfg.rope_theta / cfg.partial_rope in a per-layer context.
+    float layer_rope_theta(int i) const {
+        return (global_rope_theta > 0.0f && layer_global(i)) ? global_rope_theta
+                                                            : rope_theta;
+    }
+    float layer_partial_rope(int i) const {
+        return (global_rope_theta > 0.0f && layer_global(i)) ? global_partial_rope
+                                                            : partial_rope;
+    }
+    bool layer_rope_proportional(int i) const {
+        return global_rope_proportional && layer_global(i);
+    }
+    // Attention softmax scale for a layer of this head_dim.  Gemma-4 sets
+    // `self.scaling = 1.0` flat (ref/gemma4.py) instead of the usual
+    // 1/sqrt(head_dim); attn_scale is 0 for every other architecture,
+    // which keeps this exactly the expression it replaces.
+    float attn_softmax_scale(int hd) const {
+        return attn_scale > 0.0f ? attn_scale
+                                 : 1.0f / std::sqrt(float(hd));
+    }
 
     std::vector<LayerKind> layer_types;
     // Muse uses sliding RoPE attention for three layers followed by one

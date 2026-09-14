@@ -737,6 +737,69 @@ sycl::event launch_qk_norm_rope_batched(
     });
 }
 
+// ---------------------------------------------------------------------
+// Batched q/k norm + PROPORTIONAL RoPE -- gemma-4 full-attention layers.
+//
+// Identical to launch_qk_norm_rope_batched above except for the rotation,
+// which follows ref/gemma4_proportional_rope.py rather than this engine's
+// partial_rope:
+//
+//   rope_angles = int(factor * head_dim / 2)
+//   inv_freq[i] = base ** -(2i / head_dim)   for i < rope_angles, else 0
+//
+// The exponent divides by the FULL head_dim, not by the rotated width, and
+// the pairing is i with i + head_dim/2 rather than j with j + rot/2.  Both
+// differ from the kernel above, and both are silent: the model stays
+// fluent and every number is wrong.  Kept as a separate entry point so a
+// caller cannot pick the wrong rotation by passing a different float.
+// ---------------------------------------------------------------------
+sycl::event launch_qk_norm_rope_proportional_batched(
+    sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
+    int tokens, int q_heads, int k_heads, int dim, int start_pos,
+    float theta, float partial_factor, float eps,
+    const std::vector<sycl::event>& deps, float weight_offset) {
+    const int half = dim / 2;
+    const int ang_n = int(partial_factor * float(dim) / 2.0f);
+    const int rot = ang_n < half ? ang_n : half;
+    const int heads_per_token = q_heads + k_heads;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens) * heads_per_token * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int gh = int(it.get_group(0));
+                const int t = gh / heads_per_token;
+                const int h0 = gh % heads_per_token;
+                const bool isq = h0 < q_heads;
+                const int hi = isq ? h0 : h0 - q_heads;
+                float* p = isq ? qv + (int64_t(t) * q_heads + hi) * dim
+                               : kv + (int64_t(t) * k_heads + hi) * dim;
+                const bf16_t* w = isq ? qw : kw;
+                float ss = 0.0f;
+                for (int d = lane; d < dim; d += SG_SIZE)
+                    ss = sycl::fma(p[d], p[d], ss);
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                for (int d = lane; d < dim; d += SG_SIZE)
+                    p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                sycl::group_barrier(sg);
+                const int pos = start_pos + t;
+                for (int i = lane; i < rot; i += SG_SIZE) {
+                    // exponent over dim, NOT over the rotated width
+                    const float inv = sycl::exp(-float(2 * i) / float(dim)
+                                                * sycl::log(theta));
+                    const float ang = float(pos) * inv;
+                    const float cs = sycl::cos(ang), sn = sycl::sin(ang);
+                    const float a = p[i], b = p[i + half];   // pairing over half
+                    p[i]        = a * cs - b * sn;
+                    p[i + half] = a * sn + b * cs;
+                }
+            });
+    });
+}
+
 sycl::event launch_kv_append_batched(
     sycl::queue& q, const float* k, const float* v, uint8_t* k_cache,
     uint8_t* v_cache, int tokens, int start_pos, int n_kv_heads,

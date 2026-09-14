@@ -254,6 +254,11 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             err = "gemma-4 use_double_wide_mlp is not implemented";
             return false;
         }
+        // What this loader does NOT do here is decide whether the engine
+        // can RUN the model it just described.  That is a property of the
+        // forward paths, not of the file, and it lives in
+        // Grimoire::unsupported_reason() so this stays a pure reader and
+        // tests/test_gemma4_config can pin the parse either way.
     }
 
     cfg.lin_k_heads   = tcfg_i("linear_num_key_heads", 0);
@@ -305,6 +310,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                   "cleanly and produce the wrong model's output, so refuse.";
             return false;
         }
+        // Recognising gelu is not the same as running it.  Whether any
+        // forward path dispatches GeGLU is an ENGINE question, refused in
+        // Grimoire::unsupported_reason(); recording the activation here is
+        // all a reader of the checkpoint can honestly do.
     }
 
     // ---- Agnes -------------------------------------------------------

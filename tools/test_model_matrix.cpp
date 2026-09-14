@@ -168,6 +168,45 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
+    // ---- architectures the engine must REFUSE, by name ---------------
+    // A model this engine cannot execute has exactly two acceptable
+    // behaviours: run it correctly, or say so.  The third -- load it on a
+    // path with the wrong residual graph and emit fluent text -- is the
+    // failure this whole file exists to catch, and it cannot be caught by
+    // the table above because that cell would read "ok".
+    //
+    // gemma-4's config resolves in full (tests/test_gemma4_config pins it)
+    // but nothing here implements its forward pass yet.  When that lands,
+    // MOVE this fixture into `archs` above; do not just delete the case.
+    {
+        std::printf("\nmust be refused, not silently run:\n");
+        const mini::Arch g4 = mini::gemma4();
+        const fs::path dir = root / "refuse-gemma4";
+        mini::write_model(dir, g4);
+        std::string err;
+        Grimoire* e = grimoire_new();
+        bool loaded = false;
+        if (e) {
+            loaded = grimoire_load(*e, dir.string(), Fmt::BF16, 128, err);
+            grimoire_delete(e);
+        }
+        if (loaded) {
+            ++fails;
+            std::printf("  %-14s LOADED -- the engine has no gemma-4 forward "
+                        "path, so this is fluent wrong output\n", g4.name);
+        } else if (err.find("no gemma-4 forward path") == std::string::npos) {
+            // Matching the word "gemma-4" alone would pass on the LOADER's
+            // own shape refusals ("gemma-4 layer 3 has no v_proj ..."), so
+            // a fixture that does not match its config would look like a
+            // working capability check.  Require the engine's sentence.
+            ++fails;
+            std::printf("  %-14s refused, but for the wrong reason: %s\n",
+                        g4.name, err.c_str());
+        } else {
+            std::printf("  %-14s refused by name\n", g4.name);
+        }
+    }
+
     if (!notes.empty()) {
         std::printf("\ndetail:\n");
         for (const auto& n : notes) std::printf("  %s\n", n.c_str());

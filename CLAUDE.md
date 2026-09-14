@@ -350,6 +350,30 @@ runtime dies on the `joint_matrix` ones even when nothing calls them.
 This does NOT weaken rule 8. Nothing here produces a number, and a CPU
 device is not a B70. It is the floor, not the ceiling.
 
+**10. The loader says what the file IS. The engine says what it can RUN.
+Keep those in different places.**
+`src/qwen35_loader.cpp` is a reader: it resolves a checkpoint's config and
+refuses only things it cannot PARSE or that contradict the weight map. It
+must not refuse a model because no forward path implements it — those two
+facts go out of date independently, and the config tests
+(`tests/test_gemma4_config.cpp` and friends) need the parse to SUCCEED in
+order to pin anything at all. Put "this engine cannot execute that" in
+`Grimoire::unsupported_reason()`, which `build()` calls before uploading a
+single byte, and name the missing feature in the message.
+
+Recognising a feature is not implementing it. Reading `hidden_act` and
+setting `cfg.geglu` made a gelu checkpoint LOAD where it used to be
+refused — while every FFN dispatch in the engine was still swiglu. Adding
+a config field without a path that consumes it converts a clean refusal
+into silent wrong output, which is strictly worse than not supporting the
+model. When you add a flag, either wire it the same day or refuse on it
+the same day.
+
+A refusal deserves a test, and the test has to be specific. Requiring only
+that the message contains the architecture's name passes on the loader's
+own shape refusals — so a malformed fixture would look like a working
+capability check. Match the engine's sentence.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the

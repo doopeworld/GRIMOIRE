@@ -236,6 +236,80 @@ inline Arch dense(int L = 4, bool mtp = false) {
     return a;
 }
 
+// ---- gemma-4: per-layer-type geometry, sandwich norms, k_eq_v ---------
+// Scaled down from google/gemma-4-31B-it but keeping every shape that
+// matters, because each of them is silent if implemented wrongly:
+//
+//   * layer_types alternate 2 sliding : 1 full, so ONE model carries both
+//     geometries and the boundary between them.
+//   * sliding layers are head_dim 16 over 2 KV heads; full layers are
+//     head_dim 32 over 1.  Nothing else in this file has two geometries.
+//   * attention_k_eq_v: the FULL layers ship NO v_proj at all.
+//   * rope_parameters keyed BY LAYER TYPE: default 1e4 on sliding,
+//     proportional 1e6 with partial_rotary_factor 0.25 on full.
+//   * gelu_pytorch_tanh, sandwich feed-forward norms, per-layer
+//     layer_scalar, tied embeddings.
+//
+// 6 layers: 0,1 sliding, 2 full, 3,4 sliding, 5 full.
+inline Arch gemma4(int L = 6) {
+    const int H=64, Q=64, V=128;
+    const int SHD=16, SKV=2, GHD=32, GKV=1, I=128;
+    auto sliding = [](int l) { return (l % 3) != 2; };
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "gemma4_text", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "global_head_dim": 32, "num_global_key_value_heads": 1,
+  "intermediate_size": 128, "rms_norm_eps": 1e-06,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "attention_k_eq_v": true, "final_logit_softcapping": 30.0,
+  "sliding_window": 8, "tie_word_embeddings": true,
+  "rope_parameters": {
+    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+    "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0,
+                       "partial_rotary_factor": 0.25}
+  },
+  "layer_types": [)JSON";
+    for (int l = 0; l < L; ++l)
+        c << (l ? ", " : "")
+          << (sliding(l) ? "\"sliding_attention\"" : "\"full_attention\"");
+    c << "]\n}";
+    Arch a{"gemma4", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    // tie_word_embeddings: no lm_head tensor, exactly as the real index.
+    t = { {"model.language_model.embed_tokens.weight", {V,H}},
+          {"model.language_model.norm.weight", {H}} };
+    for (int l = 0; l < L; ++l) {
+        const int HD = sliding(l) ? SHD : GHD;
+        const int KV = (sliding(l) ? SKV : GKV) * HD;
+        const std::string b = "model.language_model.layers." +
+                              std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        t.push_back({b+"pre_feedforward_layernorm.weight", {H}});
+        t.push_back({b+"post_feedforward_layernorm.weight", {H}});
+        // nn.Buffer initialised to ones in the reference -- and NOT ones in
+        // a real checkpoint, which is the whole reason it must be read.
+        t.push_back({b+"layer_scalar", {1}, {1.0f}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        // A full-attention layer has no v_proj: V is the pre-norm,
+        // pre-RoPE k_proj output.  Emitting one here would make the
+        // fixture disagree with the config it ships.
+        if (sliding(l)) t.push_back({s+"v_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"q_norm.weight", {HD}});
+        t.push_back({s+"k_norm.weight", {HD}});
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+    }
+    return a;
+}
+
 // ---- hybrid: DeltaNet linear attention + full attention ---------------
 // This is the Qwen3.5 / Ornith shape, and it was the one architecture with
 // no end-to-end coverage at all -- which matters, because the linear

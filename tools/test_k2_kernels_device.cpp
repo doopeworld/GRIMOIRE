@@ -37,6 +37,8 @@ using namespace b70;
 namespace b70 {
 sycl::event launch_rmsnorm_residual(sycl::queue&, float*, const float*, const bf16_t*,
                                     float*, int, float, const std::vector<sycl::event>&);
+sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
+                                 float, bool, const std::vector<sycl::event>&);
 }
 
 static int g_fail = 0;
@@ -400,6 +402,86 @@ int main() {
                     ++touched;
         CHECK(touched == 0, "%d unrotated dims were modified", touched);
         sycl::free(d_x, q); sycl::free(d_p, q);
+    }
+
+    // ---- 3d. batched proportional RoPE == the single-token one --------
+    // Prefill and decode must apply the SAME rotation.  They are separate
+    // kernels in separate files (ops.cpp, prefill.cpp), which is exactly
+    // how a prefill/decode divergence gets in: nothing downstream notices,
+    // the KV cache simply holds keys rotated one way and the queries
+    // another.  Drive both over several positions and require agreement,
+    // and require that the batched kernel is still distinguishable from
+    // the ordinary partial_rope one on the same input.
+    {
+        const int QH = 2, KVH = 1, HD = 64, M = 5, start = 3;
+        const float theta = 1000000.0f, factor = 0.25f, eps = 1e-6f;
+        std::vector<float> q0(size_t(M) * QH * HD), k0(size_t(M) * KVH * HD);
+        for (auto& v : q0) v = nd(rng);
+        for (auto& v : k0) v = nd(rng);
+        // Scaleless norms on both sides, so any difference is the rotation.
+        std::vector<bf16_t> ones_q(HD), ones_k(HD);
+        for (int i = 0; i < HD; ++i) ones_q[size_t(i)] = ones_k[size_t(i)] = f32_to_bf16(0.0f);
+
+        auto up = [&](const std::vector<float>& h) {
+            float* d = sycl::malloc_device<float>(h.size(), q);
+            q.memcpy(d, h.data(), h.size() * 4).wait(); return d;
+        };
+        bf16_t* d_wq = sycl::malloc_device<bf16_t>(size_t(HD), q);
+        bf16_t* d_wk = sycl::malloc_device<bf16_t>(size_t(HD), q);
+        q.memcpy(d_wq, ones_q.data(), size_t(HD) * sizeof(bf16_t)).wait();
+        q.memcpy(d_wk, ones_k.data(), size_t(HD) * sizeof(bf16_t)).wait();
+
+        float* bq = up(q0); float* bk = up(k0);
+        launch_qk_norm_rope_proportional_batched(q, bq, bk, d_wq, d_wk, M, QH,
+            KVH, HD, start, theta, factor, eps).wait();
+        std::vector<float> gotq(q0.size()), gotk(k0.size());
+        q.memcpy(gotq.data(), bq, gotq.size() * 4).wait();
+        q.memcpy(gotk.data(), bk, gotk.size() * 4).wait();
+
+        // Row by row through the DECODE kernels: norm, then the single-token
+        // proportional rotation at that row's own position.
+        std::vector<float> wantq(q0.size()), wantk(k0.size());
+        int32_t* d_pos = sycl::malloc_device<int32_t>(1, q);
+        for (int m = 0; m < M; ++m) {
+            const int p = start + m;
+            q.memcpy(d_pos, &p, sizeof(int)).wait();
+            float* rq = up(std::vector<float>(
+                q0.begin() + size_t(m) * QH * HD,
+                q0.begin() + size_t(m + 1) * QH * HD));
+            float* rk = up(std::vector<float>(
+                k0.begin() + size_t(m) * KVH * HD,
+                k0.begin() + size_t(m + 1) * KVH * HD));
+            launch_rmsnorm_heads(q, rq, d_wq, QH,  HD, eps, true, {}).wait();
+            launch_rmsnorm_heads(q, rk, d_wk, KVH, HD, eps, true, {}).wait();
+            launch_rope_proportional(q, rq, QH,  HD, d_pos, theta, factor).wait();
+            launch_rope_proportional(q, rk, KVH, HD, d_pos, theta, factor).wait();
+            q.memcpy(wantq.data() + size_t(m) * QH * HD, rq,
+                     size_t(QH) * HD * 4).wait();
+            q.memcpy(wantk.data() + size_t(m) * KVH * HD, rk,
+                     size_t(KVH) * HD * 4).wait();
+            sycl::free(rq, q); sycl::free(rk, q);
+        }
+        const double dq = worst_abs(wantq, gotq), dk = worst_abs(wantk, gotk);
+
+        // And the ordinary batched kernel on the same input, to prove the
+        // agreement above is not the trivial "both did nothing".
+        float* pq = up(q0); float* pk = up(k0);
+        launch_qk_norm_rope_batched(q, pq, pk, d_wq, d_wk, M, QH, KVH, HD,
+                                    start, theta, factor, eps).wait();
+        std::vector<float> partq(q0.size());
+        q.memcpy(partq.data(), pq, partq.size() * 4).wait();
+        const double d_partial = worst_abs(partq, gotq);
+
+        std::printf("rope proportional batched M=%d  vs decode q %.3e k %.3e"
+                    "   vs partial_rope %.3e\n", M, dq, dk, d_partial);
+        CHECK(dq < 1e-5 && dk < 1e-5,
+              "batched proportional RoPE disagrees with the decode kernel");
+        CHECK(d_partial > 1e-2,
+              "batched proportional RoPE is indistinguishable from "
+              "partial_rope here, so the comparison proves nothing");
+        sycl::free(bq, q); sycl::free(bk, q);
+        sycl::free(pq, q); sycl::free(pk, q);
+        sycl::free(d_wq, q); sycl::free(d_wk, q); sycl::free(d_pos, q);
     }
 
     // ---- 4a. quantize-then-append == append-then-quantize -------------

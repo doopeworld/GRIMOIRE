@@ -383,6 +383,14 @@ sycl::event launch_qk_norm_rope_batched(
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
     const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
+// gemma-4 full-attention layers.  Same norm, a DIFFERENT rotation --
+// see the definition in prefill.cpp; not interchangeable with the call
+// above by passing a different partial_factor.
+sycl::event launch_qk_norm_rope_proportional_batched(
+    sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
+    int tokens, int q_heads, int k_heads, int dim, int start_pos,
+    float theta, float partial_factor, float eps,
+    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
 sycl::event launch_kv_append_batched(
     sycl::queue& q, const float* k, const float* v, uint8_t* k_cache,
     uint8_t* v_cache, int tokens, int start_pos, int n_kv_heads,

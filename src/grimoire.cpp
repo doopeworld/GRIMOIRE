@@ -611,6 +611,15 @@ sycl::event launch_scale_by_sigmoid(sycl::queue&, float*, const float*, int,
                                     const std::vector<sycl::event>&);
 sycl::event launch_rope_dev(sycl::queue&, float*, int, int, const int32_t*,
                             float, float, const std::vector<sycl::event>&);
+// gemma-4 full-attention layers.  NOT interchangeable with launch_rope_dev's
+// partial_rope: different frequencies and a different dimension pairing.
+sycl::event launch_rope_proportional(sycl::queue&, float*, int, int,
+                                     const int32_t*, float, float,
+                                     const std::vector<sycl::event>&);
+sycl::event launch_geglu(sycl::queue&, const float*, const float*, float*, int,
+                         const std::vector<sycl::event>&);
+sycl::event launch_geglu_batched(sycl::queue&, const float*, float*, int, int,
+                                 const std::vector<sycl::event>&);
 sycl::event launch_kv_append_dev(sycl::queue&, const float*, const float*,
                                  uint8_t*, uint8_t*, const int32_t*, int, int, int,
                                  const std::vector<sycl::event>&);
@@ -1879,6 +1888,18 @@ struct Grimoire {
         // v_experts[], each [kv_heads*head_dim, hidden].  v_router is
         // [mova_experts, hidden] -- N=64 does not divide 256, so it stays
         // BF16 and must never reach a W4A8 tile (rule 4).
+        // This layer's attention geometry.  Equal to cfg.head_dim /
+        // cfg.n_kv_heads for every architecture except gemma-4, which
+        // gives sliding and full-attention layers different shapes.
+        // Resolved once at upload so no forward path has to re-derive it.
+        int  kv_heads = 0;
+        int  head_dim = 0;
+        // This layer's RoPE.  Gemma-4 keys rope_parameters by layer type;
+        // everywhere else these are cfg.rope_theta / cfg.partial_rope and
+        // rope_proportional is false.
+        float rope_theta = 0.0f;
+        float partial_rope = 1.0f;
+        bool  rope_proportional = false;
         bool k2_sparse = false;
         // Routed FFN is decided PER LAYER, not per model: a K2 layer in
         // mlp_only_layers has a plain MLP while the model as a whole is
@@ -2541,6 +2562,12 @@ struct Grimoire {
     const float* step();          // one token: graph replay if available
 
     bool build(const std::string& dir, const UploadOptions& opt, std::string& err);
+    // Empty when every feature this checkpoint declares has a forward path
+    // in this engine; otherwise the reason, named, for build() to refuse
+    // with.  Kept apart from the loader on purpose: the loader describes
+    // the file, this describes the engine, and the two go out of date
+    // independently.
+    std::string unsupported_reason() const;
     void reset();
     // At the next decode step K/V is appended at p and attention reads [0,p+1).
     // Capture values into a device command: never copy from a temporary host int.
@@ -2849,6 +2876,33 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 }
 
 // ---------------------------------------------------------------------
+std::string Grimoire::unsupported_reason() const {
+    // GeGLU.  Every FFN dispatch in this engine -- decode GEMV, batched
+    // prefill, the MoE path, speculative verify -- is swiglu.  The kernels
+    // exist (launch_geglu, pinned by bin/test_k2_kernels) but nothing calls
+    // them, so a gelu checkpoint would run silu in gelu's place and emit
+    // fluent text that is not the model's output.
+    if (cfg.geglu)
+        return "this checkpoint's hidden activation is gelu, and no forward "
+               "path in this engine dispatches GeGLU yet (the kernels exist "
+               "but are not wired in).  silu would silently run in its "
+               "place, so refuse.";
+    // Gemma-4.  The config resolves in full and tests/test_gemma4_config
+    // pins it, but the engine has no path with the Gemma sandwich residual
+    // graph, the k_eq_v value, the per-layer scalar, the embedding scale,
+    // logit softcapping or a sliding-attention window.  Running it on the
+    // generic Qwen path produces fluent, wrong output.  Lift this when a
+    // gemma-4 fixture passes bin/test_model_matrix.
+    if (cfg.is_gemma4)
+        return "gemma-4 is recognised and its config fully resolved, but "
+               "there is no gemma-4 forward path in this engine yet "
+               "(sandwich residual graph, k_eq_v value, layer_scalar, "
+               "embedding scale, logit softcapping, sliding window).  "
+               "Refusing rather than running the generic path, which would "
+               "be fluent and wrong.";
+    return {};
+}
+
 bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::string& err) {
     const auto t0 = std::chrono::high_resolution_clock::now();
     // ---- pipeline setup FIRST: both queues on ONE shared context -----
@@ -2912,6 +2966,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     if (!ck.load(dir, err)) return false;
     cfg = ck.cfg;
+    // The loader is a pure reader: it says what the checkpoint IS.  Whether
+    // a forward path in this engine can execute it is a separate question,
+    // and answering it wrongly is the silent-output class this project
+    // keeps paying for.  Ask here, once, before a single byte is uploaded.
+    if (const std::string why = unsupported_reason(); !why.empty()) {
+        err = why;
+        return false;
+    }
     max_seq = opt.max_seq;
     if(max_seq<2 || max_seq==INT32_MAX){err="invalid context capacity";return false;}
 
@@ -3070,6 +3132,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     pipe_split, pipe_split, cfg.n_layers);
     }
     L.resize(cfg.n_layers);
+    // Resolve every layer's geometry up front, for ALL n_layers -- not only
+    // the ones this rank uploads.  Under PP a stage owns [pp_begin, pp_end)
+    // and leaves the rest untouched; anything that walks the whole vector
+    // afterwards (the prefix cache, prefill's staging sizing) would then
+    // read a zero head_dim as a fact rather than as "not mine".
+    for (int i = 0; i < cfg.n_layers; ++i) {
+        LayerDev& g = L[size_t(i)];
+        g.kv_heads          = cfg.layer_kv_heads(i);
+        g.head_dim          = cfg.layer_head_dim(i);
+        g.rope_theta        = cfg.layer_rope_theta(i);
+        g.partial_rope      = cfg.layer_partial_rope(i);
+        g.rope_proportional = cfg.layer_rope_proportional(i);
+    }
     // Muse decoder projections remain checkpoint INT4-W4A16 while its
     // excluded lm_head stays BF16; these formats are intentionally distinct.
     const Fmt PF = cfg.is_muse ? Fmt::INT4 : opt.lm_head_fmt;
@@ -3269,15 +3344,24 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                       + d.o_proj.w.bytes()));
 
             // FP8 E4M3 KV: K is D-major for coalesced scoring, V is D-minor.
-            d.k_cache = sycl::malloc_device<uint8_t>(size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq, lq);
-            d.v_cache = sycl::malloc_device<uint8_t>(size_t(cfg.n_kv_heads) * max_seq * cfg.head_dim, lq);
-            acct(2 * size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq);
+            //
+            // Sized from THIS LAYER's geometry, not the model's.  On
+            // gemma-4 a full-attention layer is 4 KV heads of 512 where a
+            // sliding one is 16 of 256, so a single model-wide size is
+            // either too small for one kind or wasteful for the other.
+            // For every other architecture layer_* returns the model-wide
+            // value and this expression is exactly what it was.
+            // Geometry was resolved for every layer right after L.resize().
+            const size_t kv_elems = size_t(d.kv_heads) * d.head_dim * max_seq;
+            d.k_cache = sycl::malloc_device<uint8_t>(kv_elems, lq);
+            d.v_cache = sycl::malloc_device<uint8_t>(kv_elems, lq);
+            acct(2 * kv_elems);
             if(cfg.is_muse){
                 // Match Fusion's XPU FlashAttention KV-cache group.
                 constexpr int block_size=64;
                 const int blocks=(max_seq+block_size-1)/block_size;
-                const size_t elems=size_t(blocks)*block_size*cfg.n_kv_heads*
-                    cfg.head_dim;
+                const size_t elems=size_t(blocks)*block_size*d.kv_heads*
+                    d.head_dim;
                 d.k_cache_f16=sycl::malloc_device<sycl::half>(elems,lq);
                 d.v_cache_f16=sycl::malloc_device<sycl::half>(elems,lq);
                 if(!d.k_cache_f16||!d.v_cache_f16)ok=false;
@@ -3569,7 +3653,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // MoVA scratch: router logits, the top-k table and one expert output
     // row, reused by every sparse layer.
     if (cfg.is_k2 && cfg.mova_experts > 0) {
-        const int NV = cfg.n_kv_heads * cfg.head_dim;
+        const int NV = cfg.max_kv_heads() * cfg.max_head_dim();
         mova_logits     = sycl::malloc_device<float>(size_t(cfg.mova_experts), q);
         mova_rex        = sycl::malloc_device<int32_t>(size_t(cfg.mova_top_k), q);
         mova_rwt        = sycl::malloc_device<float>(size_t(cfg.mova_top_k), q);
@@ -3671,6 +3755,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             mtp.norm    = dev_copy_t<bf16_t>(q, ck, t_nrm,  "mtp.norm",  &mok);
             LayerDev& m = mtp.L;
             m.kind      = LayerKind::FULL_ATTN;
+            // The MTP head is one extra layer appended to the model, so it
+            // carries the model-wide attention geometry, not a layer type's.
+            // Set explicitly: every forward path reads LayerDev now, and a
+            // zero here would be a zero-width head rather than a wrong one.
+            m.kv_heads    = cfg.n_kv_heads;
+            m.head_dim    = cfg.head_dim;
+            m.rope_theta  = cfg.rope_theta;
+            m.partial_rope = cfg.partial_rope;
             m.in_norm   = dev_copy_t<bf16_t>(q, ck, t_in,  "mtp.in_norm",   &mok);
             m.post_norm = dev_copy_t<bf16_t>(q, ck, t_pon, "mtp.post_norm", &mok);
             m.q_proj    = quantize_upload_t(q, ck, t_q, mtp_fmt(t_q), "mtp.q_proj", &mok);
@@ -3754,13 +3846,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 mtp_ffn_bytes = m.sh_gu.w.bytes() + m.sh_down.w.bytes();
             }
             m.k_cache   = sycl::malloc_device<uint8_t>(
-                              size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq, q);
+                              size_t(m.kv_heads) * m.head_dim * max_seq, q);
             m.v_cache   = sycl::malloc_device<uint8_t>(
-                              size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq, q);
+                              size_t(m.kv_heads) * m.head_dim * max_seq, q);
             const size_t mb = mtp.fc.w.bytes() + m.q_proj.w.bytes() + m.k_proj.w.bytes()
                             + m.v_proj.w.bytes() + m.o_proj.w.bytes()
                             + mtp_ffn_bytes
-                            + size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq * 2;
+                            + size_t(m.kv_heads) * m.head_dim * max_seq * 2;
             acct(mb);
             if(!mok || !m.k_cache || !m.v_cache){err="MTP head loading failed";return false;}
             mtp.ok = true;
@@ -4601,8 +4693,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 // ~5x (16*202048 halves into 16*39936) and smashes megabytes
                 // of device memory past it, which corrupts the target's own
                 // decode whenever the drafter is loaded.
-                const int VW=std::max({cfg.hidden,cfg.n_heads*cfg.head_dim,
-                    cfg.n_kv_heads*cfg.head_dim,2*cfg.dense_inter,cfg.vocab});
+                const int VW=std::max({cfg.hidden,cfg.n_heads*cfg.max_head_dim(),
+                    cfg.max_kv_heads()*cfg.max_head_dim(),2*cfg.dense_inter,
+                    cfg.vocab});
                 dflash2.verify_logits=dfd(size_t(DM)*cfg.vocab);
                 dflash2.verify_bf=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
                 dflash2.verify_bf_out=sycl::malloc_device<sycl_bf16>(size_t(DM)*VW,q);
@@ -4811,7 +4904,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // 4096, equal to the former only by coincidence -- size it from both.
     {
         int ao = std::max(H, Hv * Dv);
-        ao = std::max(ao, cfg.n_heads * cfg.head_dim);
+        ao = std::max(ao, cfg.n_heads * cfg.max_head_dim());
         s.attn_out = sycl::malloc_device<float>(ao, q);
     }
     s.moe_h   = sycl::malloc_device<float>(size_t(TK) * SI + SI, q);
@@ -4825,8 +4918,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         tp_weight=sycl::malloc_device<float>(TK,q);
         if(!tp_expert||!tp_weight){err="TP MoE route allocation failed";return false;}
     }
-    s.qsplit  = sycl::malloc_device<float>(size_t(cfg.n_heads) * cfg.head_dim, q);
-    s.gsplit  = sycl::malloc_device<float>(size_t(cfg.n_heads) * cfg.head_dim, q);
+    s.qsplit  = sycl::malloc_device<float>(size_t(cfg.n_heads) * cfg.max_head_dim(), q);
+    s.gsplit  = sycl::malloc_device<float>(size_t(cfg.n_heads) * cfg.max_head_dim(), q);
     probe_buf   = sycl::malloc_device<float>(4, q);
     debug       = std::getenv("GRIMOIRE_DEBUG") != nullptr;
     // Which layer to instrument. Layer 0 is linear_attention; the
@@ -4854,7 +4947,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // width from the live sequence length (see decode_splits in attention.cpp),
     // so the workspace must cover the widest split it can choose. The batched
     // verify path still uses GRAPH_SPLITS and simply occupies a prefix.
-    s.part    = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS * cfg.head_dim, q);
+    s.part    = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS * cfg.max_head_dim(), q);
     s.pm      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
     s.pl      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
     q.wait();
@@ -4993,7 +5086,7 @@ void Grimoire::reset() {
     // has in `bh`), which is what vLLM does and why it holds ~52 TG at 4.4k
     // context. No batched path exists for that layer today.
     if (mtp.ok && mtp.L.k_cache && mtp.L.v_cache) {
-        const size_t kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
+        const size_t kv_bytes = size_t(mtp.L.kv_heads) * mtp.L.head_dim * max_seq;
         q.memset(mtp.L.k_cache, 0, kv_bytes);
         q.memset(mtp.L.v_cache, 0, kv_bytes);
     }
@@ -5046,12 +5139,18 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
         Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
-    const size_t kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
+    // Sized PER LAYER: on gemma-4 a full-attention layer's cache is a
+    // different size from a sliding one, so one model-wide kv_bytes would
+    // under-allocate half the layers and copy past the end of the other half.
+    auto layer_kv_bytes = [&](size_t i) {
+        return size_t(L[i].kv_heads) * L[i].head_dim * max_seq;
+    };
     if (prefix_cache.layers.empty()) {
         prefix_cache.layers.resize(L.size());
         for (size_t i = 0; i < L.size(); ++i) {
             auto& c = prefix_cache.layers[i];
             const auto& d = L[i];
+            const size_t kv_bytes = layer_kv_bytes(i);
             if (d.dn_state) c.dn = sycl::malloc_device<float>(dn_bytes / sizeof(float), q);
             if (d.conv_ring) c.conv = sycl::malloc_device<float>(conv_bytes / sizeof(float), q);
             if (d.k_cache) c.k = sycl::malloc_device<uint8_t>(kv_bytes, q);
@@ -5068,6 +5167,7 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     }
     for (size_t i = 0; i < L.size(); ++i) {
         const auto& d = L[i]; auto& c = prefix_cache.layers[i];
+        const size_t kv_bytes = layer_kv_bytes(i);
         if (d.dn_state) q.memcpy(c.dn, d.dn_state, dn_bytes);
         if (d.conv_ring) q.memcpy(c.conv, d.conv_ring, conv_bytes);
         if (d.k_cache) q.memcpy(c.k, d.k_cache, kv_bytes);
@@ -5087,9 +5187,9 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
         Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
-    const size_t kv_bytes = size_t(cfg.n_kv_heads) * cfg.head_dim * max_seq;
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
+        const size_t kv_bytes = size_t(d.kv_heads) * d.head_dim * max_seq;
         if (d.dn_state) q.memcpy(d.dn_state, c.dn, dn_bytes);
         if (d.conv_ring) q.memcpy(d.conv_ring, c.conv, conv_bytes);
         if (d.k_cache) q.memcpy(d.k_cache, c.k, kv_bytes);
@@ -6123,12 +6223,12 @@ const float* Grimoire::forward_dag(int token) {
             e_attn = gemv_any(d.la_out, s.attn_out, s.moe_y, deps({e_gate}));
         } else {
             const int QD = d.q_proj.w.N;
-            const bool gated = QD == 2 * cfg.n_heads * cfg.head_dim;
+            const bool gated = QD == 2 * cfg.n_heads * d.head_dim;
             sycl::event e_qp = gemv_any(d.q_proj, s.h2, s.qkv, deps({e_in}));
             sycl::event e_qready = e_qp;
             if (gated)
                 e_qready = launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
-                    cfg.n_heads, cfg.head_dim, deps({e_qp}));
+                    cfg.n_heads, d.head_dim, deps({e_qp}));
             float* qvec = gated ? s.qsplit : s.qkv;
 
             sycl::event e_kp = gemv_any(d.k_proj, s.h2, s.zbuf,
@@ -6140,29 +6240,35 @@ const float* Grimoire::forward_dag(int token) {
             sycl::event e_qn = e_qready;
             if (d.q_norm)
                 e_qn = launch_rmsnorm_heads(q, qvec, d.q_norm, cfg.n_heads,
-                    cfg.head_dim, cfg.rms_eps, true,
+                    d.head_dim, cfg.rms_eps, true,
                     deps({(dag_mask & 2) ? e_qready : e_vp}));
             sycl::event e_kn = e_kp;
             if (d.k_norm)
-                e_kn = launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
-                    cfg.head_dim, cfg.rms_eps, true,
+                e_kn = launch_rmsnorm_heads(q, s.zbuf, d.k_norm, d.kv_heads,
+                    d.head_dim, cfg.rms_eps, true,
                     deps({(dag_mask & 2) ? e_kp : e_qn}));
-            sycl::event e_qr = launch_rope_dev(q, qvec, cfg.n_heads, cfg.head_dim,
-                s.d_pos, cfg.rope_theta, cfg.partial_rope,
+            // gemma-4 full-attention layers rotate with different
+            // frequencies and a different pairing (see
+            // launch_rope_proportional); calling the default kernel here
+            // would be silently wrong rather than an error.
+            auto rope = d.rope_proportional ? launch_rope_proportional
+                                            : launch_rope_dev;
+            sycl::event e_qr = rope(q, qvec, cfg.n_heads, d.head_dim,
+                s.d_pos, d.rope_theta, d.partial_rope,
                 deps({(dag_mask & 2) ? e_qn : e_kn}));
-            sycl::event e_kr = launch_rope_dev(q, s.zbuf, cfg.n_kv_heads, cfg.head_dim,
-                s.d_pos, cfg.rope_theta, cfg.partial_rope,
+            sycl::event e_kr = rope(q, s.zbuf, d.kv_heads, d.head_dim,
+                s.d_pos, d.rope_theta, d.partial_rope,
                 deps({(dag_mask & 2) ? e_kn : e_qr}));
             sycl::event e_kv = launch_kv_append_dev(q, s.zbuf, s.bbuf,
-                d.k_cache, d.v_cache, s.d_pos, cfg.n_kv_heads, cfg.head_dim,
+                d.k_cache, d.v_cache, s.d_pos, d.kv_heads, d.head_dim,
                 max_seq, deps({e_kr, e_vp}));
 
             AttnParams ap{};
             ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
             ap.out = s.attn_out; ap.seq_len = pos + 1; ap.seq_cap = max_seq;
-            ap.head_dim = cfg.head_dim; ap.num_heads = cfg.n_heads;
-            ap.num_kv_heads = cfg.n_kv_heads;
-            ap.softmax_scale = 1.0f / std::sqrt(float(cfg.head_dim));
+            ap.head_dim = d.head_dim; ap.num_heads = cfg.n_heads;
+            ap.num_kv_heads = d.kv_heads;
+            ap.softmax_scale = cfg.attn_softmax_scale(d.head_dim);
             ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
             ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
             sycl::event e_fd = launch_flash_decode(q, ap, deps({e_qr, e_kv}));
@@ -6170,7 +6276,7 @@ const float* Grimoire::forward_dag(int token) {
             sycl::event e_gate = e_fm;
             if (gated)
                 e_gate = launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit,
-                    cfg.n_heads * cfg.head_dim, deps({e_fm, e_qready}));
+                    cfg.n_heads * d.head_dim, deps({e_fm, e_qready}));
             e_attn = gemv_any(d.o_proj, s.attn_out, s.moe_y, deps({e_gate}));
         }
 
@@ -6518,11 +6624,11 @@ const float* Grimoire::forward(int token) {
             // With attn_output_gate the projection emits [q | gate] per
             // head, so only half its rows are queries. Feeding all of
             // them to attention treats gate values as queries.
-            const bool gated = (QD == 2 * cfg.n_heads * cfg.head_dim);
+            const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
             gemv_any(d.q_proj, s.h2, s.qkv, none);
             if (gated)
                 launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
-                                   cfg.n_heads, cfg.head_dim, none);
+                                   cfg.n_heads, d.head_dim, none);
             float* qvec = gated ? s.qsplit : s.qkv;
             MK("  q gemv + split");
             gemv_any(d.k_proj, s.h2, s.zbuf, none);
@@ -6536,25 +6642,36 @@ const float* Grimoire::forward(int token) {
             //   k = k_norm(k_proj(x).view(heads, head_dim))
             //   q, k = apply_rotary_pos_emb(q, k, cos, sin)
             // Both are Qwen3_5MoeRMSNorm, so zero-centered.
-            if ((fusion_mask & 2) && d.q_norm && d.k_norm) {
+            // The fused kernel bakes in launch_rope_dev's partial_rope.
+            // A layer that wants proportional RoPE must take the split
+            // path, or it silently gets the wrong frequencies.
+            if ((fusion_mask & 2) && d.q_norm && d.k_norm &&
+                !d.rope_proportional) {
                 launch_qk_norm_rope(q, qvec, s.zbuf, d.q_norm, d.k_norm,
-                    qheads, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
-                    cfg.rope_theta, cfg.partial_rope, cfg.rms_eps, none);
+                    qheads, d.kv_heads, d.head_dim, s.d_pos,
+                    d.rope_theta, d.partial_rope, cfg.rms_eps, none);
             } else {
                 if (d.q_norm)
-                    launch_rmsnorm_heads(q, qvec, d.q_norm, qheads, cfg.head_dim,
+                    launch_rmsnorm_heads(q, qvec, d.q_norm, qheads, d.head_dim,
                                          cfg.rms_eps, true, none);
                 if (d.k_norm)
-                    launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
-                                         cfg.head_dim, cfg.rms_eps, true, none);
-                launch_rope_dev(q, qvec, qheads, cfg.head_dim, s.d_pos,
-                                cfg.rope_theta, cfg.partial_rope, none);
-                launch_rope_dev(q, s.zbuf, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
-                                cfg.rope_theta, cfg.partial_rope, none);
+                    launch_rmsnorm_heads(q, s.zbuf, d.k_norm, d.kv_heads,
+                                         d.head_dim, cfg.rms_eps, true, none);
+                if (d.rope_proportional) {
+                    launch_rope_proportional(q, qvec, qheads, d.head_dim,
+                        s.d_pos, d.rope_theta, d.partial_rope, none);
+                    launch_rope_proportional(q, s.zbuf, d.kv_heads, d.head_dim,
+                        s.d_pos, d.rope_theta, d.partial_rope, none);
+                } else {
+                    launch_rope_dev(q, qvec, qheads, d.head_dim, s.d_pos,
+                                    d.rope_theta, d.partial_rope, none);
+                    launch_rope_dev(q, s.zbuf, d.kv_heads, d.head_dim, s.d_pos,
+                                    d.rope_theta, d.partial_rope, none);
+                }
             }
             MK("  q/k norm + rope");
             launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
-                                 s.d_pos, cfg.n_kv_heads, cfg.head_dim,
+                                 s.d_pos, d.kv_heads, d.head_dim,
                                  max_seq, none);
             MK("  kv_append");
 
@@ -6562,15 +6679,15 @@ const float* Grimoire::forward(int token) {
             ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
             ap.out = s.attn_out;
             ap.seq_len = pos + 1; ap.seq_cap = max_seq;
-            ap.head_dim = cfg.head_dim; ap.num_heads = qheads;
-            ap.num_kv_heads = cfg.n_kv_heads;
-            ap.softmax_scale = 1.0f / std::sqrt(float(cfg.head_dim));
+            ap.head_dim = d.head_dim; ap.num_heads = qheads;
+            ap.num_kv_heads = d.kv_heads;
+            ap.softmax_scale = cfg.attn_softmax_scale(d.head_dim);
             ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
             // FIXED split count so the launch geometry never changes and
             // the graph stays valid; the kernel reads the live length.
             ap.splits    = GRAPH_SPLITS;
             ap.d_seq_len = s.d_seq_len;
-            if (i == probe_layer) probe("FA v", s.bbuf, cfg.n_kv_heads * cfg.head_dim);
+            if (i == probe_layer) probe("FA v", s.bbuf, d.kv_heads * d.head_dim);
             // GQA redundancy: this model is 24 query heads over 4 KV heads, so
             // launch_flash_decode's one-subgroup-per-query-head mapping fetches
             // every KV byte 6 times. The batched kernel gives a workgroup one
@@ -6588,8 +6705,8 @@ const float* Grimoire::forward(int token) {
                     : std::min(MAX_SPLITS,
                         std::max(GRAPH_SPLITS, (pos + 1 + 127) / 128));
                 launch_flash_decode_batched(q, qvec, d.k_cache, d.v_cache,
-                    s.attn_out, 1, pos + 1 + bdelta, qheads, cfg.n_kv_heads,
-                    cfg.head_dim, max_seq, ap.softmax_scale,
+                    s.attn_out, 1, pos + 1 + bdelta, qheads, d.kv_heads,
+                    d.head_dim, max_seq, ap.softmax_scale,
                     s.part, s.pm, s.pl, vs, {});
                 MK("  flash_decode_batched");
             } else {
@@ -6598,18 +6715,18 @@ const float* Grimoire::forward(int token) {
             launch_flash_merge(q, ap, none);
             MK("  flash_merge");
             }
-            if (i == probe_layer) probe("FA attn core", s.attn_out, qheads * cfg.head_dim);
+            if (i == probe_layer) probe("FA attn core", s.attn_out, qheads * d.head_dim);
 
             // apply the output gate before projecting back
             if (gated) {
-                const int gn = cfg.n_heads * cfg.head_dim;
+                const int gn = cfg.n_heads * d.head_dim;
                 if (cfg.attn_gate == 2)
                     launch_softplus_gate(q, s.attn_out, s.gsplit, s.attn_out,
                                          gn, kK2GateBeta, none);
                 else
                     launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, gn, none);
             }
-            if (i == probe_layer) probe("FA after gate", s.attn_out, qheads * cfg.head_dim);
+            if (i == probe_layer) probe("FA after gate", s.attn_out, qheads * d.head_dim);
             MK("  attn out gate");
             gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
             if (i == probe_layer) probe("FA out", s.moe_y, H);
@@ -6814,12 +6931,12 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
     if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
     else gemv_any(d.v_proj, s.h2, s.bbuf, none);
     if (d.k_norm)
-        launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
-                             cfg.head_dim, cfg.rms_eps, true, none);
-    launch_rope_dev(q, s.zbuf, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
-                    cfg.rope_theta, cfg.partial_rope, none);
+        launch_rmsnorm_heads(q, s.zbuf, d.k_norm, d.kv_heads,
+                             d.head_dim, cfg.rms_eps, true, none);
+    launch_rope_dev(q, s.zbuf, d.kv_heads, d.head_dim, s.d_pos,
+                    d.rope_theta, d.partial_rope, none);
     launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
-                         s.d_pos, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
+                         s.d_pos, d.kv_heads, d.head_dim, max_seq, none);
 }
 
 int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
@@ -6876,11 +6993,11 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_rmsnorm_residual(q, mtp.x, nullptr, d.in_norm, s.h2, H, cfg.rms_eps, none);
 
     const int QD = d.q_proj.w.N;
-    const bool gated = (QD == 2 * cfg.n_heads * cfg.head_dim);
+    const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
     gemv_any(d.q_proj, s.h2, s.qkv, none);
     if (gated)
         launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
-                           cfg.n_heads, cfg.head_dim, none);
+                           cfg.n_heads, d.head_dim, none);
     float* qvec = gated ? s.qsplit : s.qkv;
     gemv_any(d.k_proj, s.h2, s.zbuf, none);
     if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
@@ -6888,37 +7005,37 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
 
     if ((fusion_mask & 2) && d.q_norm && d.k_norm) {
         launch_qk_norm_rope(q, qvec, s.zbuf, d.q_norm, d.k_norm,
-            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
-            cfg.rope_theta, cfg.partial_rope, cfg.rms_eps, none);
+            cfg.n_heads, d.kv_heads, d.head_dim, s.d_pos,
+            d.rope_theta, d.partial_rope, cfg.rms_eps, none);
     } else {
         if (d.q_norm)
-            launch_rmsnorm_heads(q, qvec, d.q_norm, cfg.n_heads, cfg.head_dim,
+            launch_rmsnorm_heads(q, qvec, d.q_norm, cfg.n_heads, d.head_dim,
                                  cfg.rms_eps, true, none);
         if (d.k_norm)
-            launch_rmsnorm_heads(q, s.zbuf, d.k_norm, cfg.n_kv_heads,
-                                 cfg.head_dim, cfg.rms_eps, true, none);
-        launch_rope_dev(q, qvec, cfg.n_heads, cfg.head_dim, s.d_pos,
-                        cfg.rope_theta, cfg.partial_rope, none);
-        launch_rope_dev(q, s.zbuf, cfg.n_kv_heads, cfg.head_dim, s.d_pos,
-                        cfg.rope_theta, cfg.partial_rope, none);
+            launch_rmsnorm_heads(q, s.zbuf, d.k_norm, d.kv_heads,
+                                 d.head_dim, cfg.rms_eps, true, none);
+        launch_rope_dev(q, qvec, cfg.n_heads, d.head_dim, s.d_pos,
+                        d.rope_theta, d.partial_rope, none);
+        launch_rope_dev(q, s.zbuf, d.kv_heads, d.head_dim, s.d_pos,
+                        d.rope_theta, d.partial_rope, none);
     }
     launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
-                         s.d_pos, cfg.n_kv_heads, cfg.head_dim, max_seq, none);
+                         s.d_pos, d.kv_heads, d.head_dim, max_seq, none);
 
     AttnParams ap{};
     ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
     ap.out = s.attn_out;
     ap.seq_len = position + 1; ap.seq_cap = max_seq;
-    ap.head_dim = cfg.head_dim; ap.num_heads = cfg.n_heads;
-    ap.num_kv_heads = cfg.n_kv_heads;
-    ap.softmax_scale = 1.0f / std::sqrt(float(cfg.head_dim));
+    ap.head_dim = d.head_dim; ap.num_heads = cfg.n_heads;
+    ap.num_kv_heads = d.kv_heads;
+    ap.softmax_scale = cfg.attn_softmax_scale(d.head_dim);
     ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
     ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
     launch_flash_decode(q, ap, none);
     launch_flash_merge(q, ap, none);
     if (gated)
         launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit,
-                                cfg.n_heads * cfg.head_dim, none);
+                                cfg.n_heads * d.head_dim, none);
     gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
 
     // ---- FFN ------------------------------------------------------------
@@ -8233,8 +8350,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // One tile of slack costs ~1 MB and removes the whole class of overrun.
     constexpr size_t kMoeTilePad = 128;   // >= tm of every grouped policy
     const size_t Rpad = size_t(R) + kMoeTilePad;
-    const size_t bridge_elems=std::max(std::max(Rpad*std::max(H,I),
-                                                size_t(M)*W),gdn_qkv_elems);
+    // The bf16 attention path packs q|k|v back to back into xperm:
+    // M*(n_heads*head_dim) + 2*M*(kv_heads*head_dim) elements.  W above is
+    // the widest SINGLE projection, so M*W bounds each of those three, not
+    // their SUM.  Size it from the sum directly, per layer -- on gemma-4 a
+    // sliding layer and a full-attention layer do not even have the same
+    // width.
+    size_t attn_stage_elems=0;
+    for(const auto& ld:L)
+        attn_stage_elems=std::max(attn_stage_elems,
+            size_t(M)*(size_t(cfg.n_heads)+2*size_t(ld.kv_heads))*
+            size_t(ld.head_dim));
+    const size_t bridge_elems=std::max(std::max(std::max(Rpad*std::max(H,I),
+                                                size_t(M)*W),gdn_qkv_elems),
+                                       attn_stage_elems);
     sycl_bf16* xperm=sycl::malloc_device<sycl_bf16>(bridge_elems,q);
     sycl_bf16* grouped_out=(xe2_grouped||xe2_grouped_mxfp4||xe2_dense_mxfp4||xe2_attention||xe2_gdn||od)
         ? sycl::malloc_device<sycl_bf16>(std::max(std::max(Rpad*std::max(H,2*I),
@@ -8980,32 +9109,37 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             pp_mark("DN norm + output projection");
         }else{
             const int QD=d.q_proj.w.N;
-            const bool gated=QD==2*cfg.n_heads*cfg.head_dim;
+            const bool gated=QD==2*cfg.n_heads*d.head_dim;
             const bool bfqkv=std::getenv("GRIMOIRE_BF16_QKV")&&xe2_attention&&
                 xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&pos==0&&M>=32&&
                 d.q_proj.w.fmt==Fmt::MXFP4&&d.k_proj.w.fmt==Fmt::MXFP4&&
                 d.v_proj.w.fmt==Fmt::MXFP4&&d.o_proj.w.fmt==Fmt::MXFP4&&
                 // a MoVA layer has no v_proj at all; it must take the
                 // routed path below, not this fused bf16 one.
-                !d.k2_sparse;
+                !d.k2_sparse &&
+                // launch_qk_norm_rope_bf16_batched only knows partial_rope.
+                // A proportional-RoPE layer taking this path would rotate
+                // with the wrong frequencies and the wrong pairing, and
+                // nothing downstream would notice.
+                !d.rope_proportional;
             if(bfqkv){
-                const size_t qe=size_t(M)*cfg.n_heads*cfg.head_dim;
-                const size_t ke=size_t(M)*cfg.n_kv_heads*cfg.head_dim;
+                const size_t qe=size_t(M)*cfg.n_heads*d.head_dim;
+                const size_t ke=size_t(M)*d.kv_heads*d.head_dim;
                 sycl_bf16*fq=xperm,*fk=fq+qe,*fv=fk+ke;
                 mmbb(d.q_proj,bn_bf,grouped_out);
                 if(gated)launch_split_qgate_bf16(q,grouped_out,fq,t2,M,
-                    cfg.n_heads,cfg.head_dim);
+                    cfg.n_heads,d.head_dim);
                 else q.memcpy(fq,grouped_out,qe*sizeof(sycl_bf16));
                 mmbb(d.k_proj,bn_bf,fk);
                 mmbb(d.v_proj,bn_bf,fv);
                 launch_qk_norm_rope_bf16_batched(q,fq,fk,d.q_norm,d.k_norm,M,
-                    cfg.n_heads,cfg.n_kv_heads,cfg.head_dim,pos,cfg.rope_theta,
-                    cfg.partial_rope,cfg.rms_eps);
+                    cfg.n_heads,d.kv_heads,d.head_dim,pos,d.rope_theta,
+                    d.partial_rope,cfg.rms_eps);
                 launch_kv_append_bf16_batched(q,fk,fv,d.k_cache,d.v_cache,M,pos,
-                    cfg.n_kv_heads,cfg.head_dim,max_seq);
+                    d.kv_heads,d.head_dim,max_seq);
                 xe2_attention(&q,fq,fk,fv,grouped_out,M,M,cfg.n_heads,
-                    cfg.n_kv_heads,cfg.head_dim,dtok,dtok,
-                    1.0f/std::sqrt(float(cfg.head_dim)),true);
+                    d.kv_heads,d.head_dim,dtok,dtok,
+                    cfg.attn_softmax_scale(d.head_dim),true);
                 const sycl_bf16*o_in=grouped_out;
                 if(gated){launch_gate_sigmoid_mul_bf16_io(q,grouped_out,t2,xb,qe);o_in=xb;}
                 mmb(d.o_proj,o_in,r0);
@@ -9013,7 +9147,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             mm(d.q_proj,bn,t0);
             pp_mark("attn q proj");
             float* qv=t0;
-            if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,cfg.head_dim);qv=t1;}
+            if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,d.head_dim);qv=t1;}
             mm(d.k_proj,bn,t3);
             if (d.k2_sparse) {
                 // One readback for the whole batch instead of two stalls
@@ -9022,7 +9156,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // before using it -- see mova_value_batched.  If that
                 // scratch is not wide enough for the MoVA expert count,
                 // fall back rather than overrun it.
-                const int NV = cfg.n_kv_heads * cfg.head_dim;
+                const int NV = d.kv_heads * d.head_dim;
                 if (cfg.mova_experts <= std::max(1, cfg.n_experts) &&
                     cfg.mova_top_k <= alloc_top_k) {
                     mova_value_batched(d, bn, t4, M, rlog, rex, rwt,
@@ -9035,22 +9169,27 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
             } else mm(d.v_proj,bn,t4);
             pp_mark("attn kv proj");
-            launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
-                cfg.n_kv_heads,cfg.head_dim,pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps);
-            launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,M,pos,cfg.n_kv_heads,
-                cfg.head_dim,max_seq);
+            if(d.rope_proportional)
+                launch_qk_norm_rope_proportional_batched(q,qv,t3,d.q_norm,
+                    d.k_norm,M,cfg.n_heads,d.kv_heads,d.head_dim,pos,
+                    d.rope_theta,d.partial_rope,cfg.rms_eps);
+            else
+                launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
+                    d.kv_heads,d.head_dim,pos,d.rope_theta,d.partial_rope,cfg.rms_eps);
+            launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,M,pos,d.kv_heads,
+                d.head_dim,max_seq);
             pp_mark("attn rope + kv append");
             const sycl_bf16* attention_bf=nullptr;
             if(xe2_attention && pos==0 && M>=32){
-                const size_t qe=size_t(M)*cfg.n_heads*cfg.head_dim;
-                const size_t ke=size_t(M)*cfg.n_kv_heads*cfg.head_dim;
+                const size_t qe=size_t(M)*cfg.n_heads*d.head_dim;
+                const size_t ke=size_t(M)*d.kv_heads*d.head_dim;
                 sycl_bf16* fq=xperm; sycl_bf16* fk=fq+qe; sycl_bf16* fv=fk+ke;
                 launch_f32_to_bf16(q,qv,fq,qe);
                 launch_f32_to_bf16(q,t3,fk,ke);
                 launch_f32_to_bf16(q,t4,fv,ke);
                 xe2_attention(&q,fq,fk,fv,grouped_out,M,M,cfg.n_heads,
-                    cfg.n_kv_heads,cfg.head_dim,dtok,dtok,
-                    1.0f/std::sqrt(float(cfg.head_dim)),true);
+                    d.kv_heads,d.head_dim,dtok,dtok,
+                    cfg.attn_softmax_scale(d.head_dim),true);
                 if(xe2_dense_mxfp4_f32&&d.o_proj.w.fmt==Fmt::MXFP4)
                     attention_bf=grouped_out;
                 else launch_bf16_to_f32(q,grouped_out,t3,qe);
@@ -9077,8 +9216,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     // split-K-bound.  Keep the proven floor.
                     const int vsplits = GRAPH_SPLITS;
                     launch_flash_decode_batched(q,qv,d.k_cache,d.v_cache,t3,
-                        M,pos,cfg.n_heads,cfg.n_kv_heads,cfg.head_dim,max_seq,
-                        1.0f/std::sqrt(float(cfg.head_dim)),s.part,s.pm,s.pl,
+                        M,pos,cfg.n_heads,d.kv_heads,d.head_dim,max_seq,
+                        cfg.attn_softmax_scale(d.head_dim),s.part,s.pm,s.pl,
                         vsplits,{});
                 }else if(exact_verify){
                         const int start=pos;
@@ -9093,13 +9232,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         });
                         for(int r=0;r<M;++r){
                             AttnParams ap{};
-                            ap.q=qv+int64_t(r)*cfg.n_heads*cfg.head_dim;
+                            ap.q=qv+int64_t(r)*cfg.n_heads*d.head_dim;
                             ap.k_cache=d.k_cache;ap.v_cache=d.v_cache;
-                            ap.out=t3+int64_t(r)*cfg.n_heads*cfg.head_dim;
+                            ap.out=t3+int64_t(r)*cfg.n_heads*d.head_dim;
                             ap.seq_len=pos+r+1;ap.seq_cap=max_seq;
-                            ap.head_dim=cfg.head_dim;ap.num_heads=cfg.n_heads;
-                            ap.num_kv_heads=cfg.n_kv_heads;
-                            ap.softmax_scale=1.0f/std::sqrt(float(cfg.head_dim));
+                            ap.head_dim=d.head_dim;ap.num_heads=cfg.n_heads;
+                            ap.num_kv_heads=d.kv_heads;
+                            ap.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
                             ap.partials=s.part;ap.part_m=s.pm;ap.part_l=s.pl;
                             ap.splits=GRAPH_SPLITS;ap.d_seq_len=dtok+r;
                             launch_flash_decode(q,ap,{});
@@ -9107,16 +9246,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         }
                 }else launch_flash_prefill(q,qv,d.k_cache,d.v_cache,t3,M,
                     next_tokens ? pos - 1 : pos,cfg.n_heads,
-                    cfg.n_kv_heads,cfg.head_dim,max_seq,1.0f/std::sqrt(float(cfg.head_dim)));
+                    d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
             }
             pp_mark("attn flash");
             if(attention_bf){
                 const sycl_bf16* o_in=attention_bf;
                 if(gated){launch_gate_sigmoid_mul_bf16_io(q,attention_bf,t2,xb,
-                    size_t(M)*cfg.n_heads*cfg.head_dim);o_in=xb;}
+                    size_t(M)*cfg.n_heads*d.head_dim);o_in=xb;}
                 mmb(d.o_proj,o_in,r0);
             }else{
-                if(gated) launch_gate_sigmoid_mul(q,t3,t2,M*cfg.n_heads*cfg.head_dim,{});
+                if(gated) launch_gate_sigmoid_mul(q,t3,t2,M*cfg.n_heads*d.head_dim,{});
                 mm(d.o_proj,t3,r0);
             }
             }
@@ -9489,9 +9628,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         launch_rmsnorm_residual_batched(q,t1,nullptr,nullptr,mtp.L.in_norm,r0,M,H,cfg.rms_eps);
         mm(mtp.L.k_proj,r0,t0);mm(mtp.L.v_proj,r0,t2);
         launch_qk_norm_rope_batched(q,nullptr,t0,nullptr,mtp.L.k_norm,M,0,
-            cfg.n_kv_heads,cfg.head_dim,start_pos,cfg.rope_theta,cfg.partial_rope,cfg.rms_eps);
+            mtp.L.kv_heads,mtp.L.head_dim,start_pos,mtp.L.rope_theta,
+            mtp.L.partial_rope,cfg.rms_eps);
         launch_kv_append_batched(q,t0,t2,mtp.L.k_cache,mtp.L.v_cache,M,start_pos,
-            cfg.n_kv_heads,cfg.head_dim,max_seq);
+            mtp.L.kv_heads,mtp.L.head_dim,max_seq);
         set_cursor(pos);q.wait_and_throw();
     }
 
