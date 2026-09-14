@@ -2122,6 +2122,17 @@ struct Grimoire {
     float* spec_dn_steps = nullptr;
     float* spec_conv_inputs = nullptr;
     float* spec_hidden_steps = nullptr;
+    // Whether spec_hidden_steps actually HOLDS this round's hidden states.
+    // Only the BATCHED verify writes it.  The pointer is allocated as soon
+    // as MTP loads, so testing the pointer says nothing about the contents:
+    // when prefill() declines and generation falls back to a sequential
+    // verify, commit_spec_prefix would copy an allocated-but-never-written
+    // buffer into s.h, and the next mtp_draft would draft from uninitialised
+    // device memory.  Non-finite logits there make argmax return INT_MAX --
+    // a correct reduction over garbage -- which surfaces as "MTP draft
+    // failed", intermittently, because it depends on what the allocator
+    // last left behind.
+    bool   spec_hidden_valid = false;
     size_t spec_dn_elems = 0, spec_conv_elems = 0;
     size_t spec_conv_input_elems = 0;
     static constexpr int kSpecBatch = 16;
@@ -4715,6 +4726,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         if (spec_conv_input_elems)
             spec_conv_inputs = sycl::malloc_device<float>(kSpecBatch * spec_conv_input_elems, q);
         spec_hidden_steps = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.hidden, q);
+        // POISON it.  This buffer is written only by the batched verify,
+        // and reading it unwritten is a heisenbug: whatever the allocator
+        // last left there is usually finite, so the drafter produces
+        // plausible-but-wrong tokens most of the time and nonsense
+        // occasionally.  Filling it with NaN turns that whole class into a
+        // deterministic, loud failure the first time anyone reads it --
+        // non-finite logits, argmax returns INT_MAX, and generation
+        // rejects the token by name instead of once in three runs.
+        if (spec_hidden_steps) {
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            q.fill(spec_hidden_steps, nan, size_t(kSpecBatch) * cfg.hidden).wait();
+        }
         if ((spec_dn_elems && !spec_dn_state) ||
             (spec_conv_elems && !spec_conv_ring) ||
             (spec_dn_elems && !spec_dn_steps) ||
@@ -4993,7 +5016,23 @@ void Grimoire::reset() {
 bool Grimoire::prefix_cache_usable() const {
     if (!prefix_cache_enabled() || cfg.is_muse) return false;
     if (mtp.ok || dflash2.ok) return false;
-    if (pp_enabled() && (pp_spec || pp_dflash > 0)) return false;
+    // Under PP, refuse outright.
+    //
+    // A cache HIT makes prefill() return before it sends the hidden state,
+    // so the stages only stay in step if every one of them hits.  Nothing
+    // guarantees that: GRIMOIRE_PREFIX_CACHE is read per process, each
+    // stage tests its OWN valid flag and token list, and save_prefix() can
+    // fail its allocation on one stage and succeed on another (its return
+    // value is not checked).  One stage skipping the transfer while
+    // another waits for it is the deadlock this predicate was written to
+    // remove, and the drafter was only the loudest way to reach it.
+    //
+    // Making this work needs a per-request hit/miss agreement -- a hop
+    // like pp_spec, but on every prefill rather than once at connect.
+    // Until that exists, single-process and TP keep the cache and PP does
+    // not.  Losing a prefix cache costs one prefill; a deadlocked pipeline
+    // costs the request and the process.
+    if (pp_enabled()) return false;
     return true;
 }
 
@@ -5061,6 +5100,10 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
 }
 
 void Grimoire::snapshot_recurrent() {
+    // Opens every speculative round, so it is where the hidden-step
+    // capture is invalidated: whatever the last round left in the buffer
+    // does not describe this one, and only a batched verify will refill it.
+    spec_hidden_valid = false;
     const size_t dn_n = size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
     const size_t cv_n = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
                                cfg.lin_v_heads * cfg.lin_v_dim) *
@@ -5143,7 +5186,7 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
     // (it has no batch to capture from), so skip rather than read a buffer
     // that was never written -- speculation stays exact there, the drafts
     // after a partial rejection are just worse.
-    if (spec_hidden_steps)
+    if (spec_hidden_steps && spec_hidden_valid)
         q.memcpy(s.h, spec_hidden_steps + size_t(step) * cfg.hidden,
                  size_t(cfg.hidden) * sizeof(float));
     pos = saved_pos + accepted;
@@ -7019,10 +7062,23 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // A block of -1 is the failure marker; it is not a legal token id, and
     // the receiver turns it back into `return false` so every stage fails
     // the same round the same way.
+    // PHASE MATTERS.  Earlier stages only enter pp_sync_tokens() for a
+    // DRAFTING call; on a context_only call they return immediately and
+    // the next thing they read is argmax_token()'s single int32.  Sending
+    // a block there is worse than sending nothing: the first -1 is read as
+    // the scalar, fails token validation, and the remaining integers stay
+    // in the stream for the next message to misread.  On a surviving
+    // server that corrupts every later request.
+    //
+    // So: send only when a receive is actually posted, and send at most
+    // once -- after the real block has gone out, or after the transport
+    // itself failed, another sentinel helps nobody.
+    bool block_sent=false;
     auto refuse=[&]()->bool{
-        if(pp_enabled()&&pp_rank==pp_world-1&&pp_world>1){
+        if(!context_only&&!block_sent&&
+           pp_enabled()&&pp_rank==pp_world-1&&pp_world>1){
             std::vector<int32_t> dead(size_t(std::max(0,pp_dflash-1)),-1);
-            if(!dead.empty())pp_sync_tokens(dead);
+            if(!dead.empty()){block_sent=true;pp_sync_tokens(dead);}
         }
         return false;
     };
@@ -7049,7 +7105,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     const float eps=dflash2.rms_eps;
     const float theta=dflash2.rope_theta;
     const auto fa2_paged=cfg.is_muse?load_xe2_dflash_paged_f16():nullptr;
-    if(cfg.is_muse&&!fa2_paged)return false;
+    if(cfg.is_muse&&!fa2_paged)return refuse();
     const bool time_draft=std::getenv("GRIMOIRE_DFLASH_TIME")!=nullptr;
     static int time_draft_call=0;
     const int timed_call=time_draft_call++;
@@ -7300,7 +7356,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     else if(!embed_rows(dflash2.draft_embed?dflash2.draft_embed:embed,
                         dflash2.tokens,dflash2.resid,M)) {
         std::fprintf(stderr,"  DFlash: block embed all-reduce failed\n");
-        return false;
+        return refuse();
     }
     checkpoint("block embedding");
     draft_mark("embed + setup");
@@ -7419,7 +7475,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 dflash2.block_size,dflash2.num_blocks,dflash2.block_table,
                 dflash2.cu_q,dflash2.cu_k,dflash2.seqused_k,
                 1.0f/std::sqrt(float(HD)),window,window,false);
-            if(rc)return false;
+            if(rc)return refuse();
             draft_mark("kv append + attention");
             launch_f16_to_f32(q,dflash2.attn_f16,dflash2.attn,
                 size_t(M)*QW,{});
@@ -7475,7 +7531,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     if(dflash2.draft_head_rows){
         auto head_w4=load_xe2_dense_w4a8(
             "grimoire_xe2_dense_w4a8_f32_m8g64");
-        if(!head_w4)return false;
+        if(!head_w4)return refuse();
         launch_quantize_rows_int8(q,dflash2.normed+H,dflash2.a8,dflash2.a8s,
                                   M-1,H,{});
         head_w4(&q,dflash2.a8,dflash2.draft_head_i4,
@@ -7594,9 +7650,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     checkpoint("draft logits");
     // Push the block backward so every earlier stage speculates on the
     // SAME candidates.  Sizes already agree: pp_dflash carries this M.
-    if(pp_enabled()&&!pp_sync_tokens(draft_tokens)){
-        std::fprintf(stderr,"PP rank %d: draft block send failed\n",pp_rank);
-        return false;
+    if(pp_enabled()){
+        block_sent=true;          // the real block; never send a sentinel after it
+        if(!pp_sync_tokens(draft_tokens)){
+            std::fprintf(stderr,"PP rank %d: draft block send failed\n",pp_rank);
+            return false;         // transport is already broken -- do not resend
+        }
     }
     if(dumping)dumped_draft=true;
     if(time_draft){
@@ -7919,8 +7978,10 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         launch_f16_to_f32(q,normed+int64_t(M-1)*H,lastrow,size_t(H),{});
         gemv_any(lm_head,lastrow,s.logits,{});
     }
-    if(next_tokens&&M<=kSpecBatch&&spec_hidden_steps)
+    if(next_tokens&&M<=kSpecBatch&&spec_hidden_steps){
         launch_f16_to_f32(q,hidden,spec_hidden_steps,size_t(M)*H,{});
+        spec_hidden_valid=true;
+    }
     launch_f16_to_f32(q,hidden+int64_t(M-1)*H,s.h,size_t(H),{});
     pos+=M;
     set_cursor(pos);
@@ -9360,6 +9421,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // the same so speculation can chain across verify steps.
     if (capture_spec)
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
+        spec_hidden_valid = true;
     q.memcpy(s.h, bh + int64_t(M-1) * H, size_t(H) * sizeof(float));
     pos+=M; set_cursor(pos);
     if (next_tokens) {

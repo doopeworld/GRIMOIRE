@@ -662,19 +662,30 @@ int main(int argc, char** argv) {
                     fs::create_directories(d1); fs::create_directories(d2);
                     const std::string s1 = (tdir/"dump1.txt").string();
                     const std::string s2 = (tdir/"dump2.txt").string();
-                    spawn_run(self, tdir.string(), s1, fmt,
+                    // Check these runs' exit codes.  Matching dump files
+                    // do not mean the runs SUCCEEDED -- the dump is written
+                    // during the first context ingest, long before
+                    // generation ends, so a later crash in either process
+                    // would leave two identical files and a silent pass.
+                    const int rc1 = spawn_run(self, tdir.string(), s1, fmt,
                         {"GRIMOIRE_DFLASH_MODEL="+fdir.string(),
                          "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_DEVICE_ANY=1",
                          "GRIMOIRE_DFLASH_DUMP="+d1.string()},
                         (tdir/"dump1.log").string());
                     const std::string psock2 = (tdir/"df-ppd.sock").string();
-                    spawn_two(self, tdir.string(), s2, fmt,
+                    const auto rc2 = spawn_two(self, tdir.string(), s2, fmt,
                         {"GRIMOIRE_PP_WORLD_SIZE=2", "GRIMOIRE_PP_SPLIT=2",
                          "GRIMOIRE_PP_SOCKET="+psock2,
                          "GRIMOIRE_DFLASH_MODEL="+fdir.string(),
                          "GRIMOIRE_DFLASH_M=8", "GRIMOIRE_DEVICE_ANY=1",
                          "GRIMOIRE_DFLASH_DUMP="+d2.string()},
                         "GRIMOIRE_PP_RANK", 1, tdir, "df-ppd");
+                    if (rc1 != 0 || rc2.first != 0 || rc2.second != 0) {
+                        ++g_fail;
+                        std::printf("   tap-dump runs FAILED (one %d, pp last "
+                                    "%d, pp first %d)\n",
+                                    rc1, rc2.first, rc2.second);
+                    }
                     const auto a = read_blob((d1/"g_01_aux_0.f32").string());
                     const auto b = read_blob((d2/"g_01_aux_0.f32").string());
                     if (a.empty() || b.empty()) {
