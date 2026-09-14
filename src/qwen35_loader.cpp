@@ -174,6 +174,43 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.shared_inter  = cfg_i(j, "shared_expert_intermediate_size", 0);
     cfg.dense_inter   = cfg_i(cj, "intermediate_size", 0);
 
+    // ---- activation --------------------------------------------------
+    // The engine implements ONE gated MLP: swiglu, silu(gate) * up.  It
+    // has no GeGLU kernel.  Until now `hidden_act` was never read at all,
+    // so a checkpoint asking for gelu -- every Gemma, among others --
+    // loaded cleanly, ran silu in its place, and produced fluent text that
+    // is not the model's output.  That is the silent-wrong-answer class
+    // this loader keeps having to close.
+    //
+    // Accept the spellings that mean silu/swish; refuse anything else by
+    // name, so adding a model is a deliberate act rather than a default.
+    // NO WHOLE-FILE FALLBACK for this key.  A multimodal checkpoint
+    // declares hidden_act in its VISION tower too, and Agnes's says
+    // "gelu_pytorch_tanh" while its text config says "silu".  Falling back
+    // would read the vision tower's activation and refuse a text model
+    // that is perfectly runnable -- the same whichever-copy-comes-first
+    // trap that made text_config extraction necessary in the first place.
+    // When there is a text block it is authoritative: if it does not name
+    // an activation, the engine's default stands.
+    {
+        std::string act;
+        if (nested) {
+            if (!find_scalar(tj, "hidden_activation", act))
+                find_scalar(tj, "hidden_act", act);
+        } else {
+            if (!find_scalar(j, "hidden_activation", act))
+                find_scalar(j, "hidden_act", act);
+        }
+        if (!act.empty() && act != "silu" && act != "swish" &&
+            act != "silu_and_mul") {
+            err = "config.json asks for hidden activation \"" + act +
+                  "\", and this engine implements only swiglu "
+                  "(silu(gate) * up).  Running silu in its place would load "
+                  "cleanly and produce the wrong model's output, so refuse.";
+            return false;
+        }
+    }
+
     // ---- Agnes -------------------------------------------------------
     if (agnes) {
         cfg.is_agnes = true;
