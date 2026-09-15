@@ -39,8 +39,9 @@
 namespace fs = std::filesystem;
 using namespace b70;
 
-// Defined in src/grimoire.cpp.
-extern long g_gemma4_batched_prefills;
+// Defined in src/grimoire.cpp, inside namespace b70.
+namespace b70 { extern long g_gemma4_batched_prefills; }
+using b70::g_gemma4_batched_prefills;
 
 static const std::vector<int32_t> kPrompt{7, 11, 3, 42, 5, 90, 1, 64, 33, 2};
 static const int kWant = 8;
