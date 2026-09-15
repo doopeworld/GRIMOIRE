@@ -3102,7 +3102,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     if (!dflash_env || !*dflash_env) dflash_env = std::getenv("GRIMOIRE_DFLASH2_MODEL");
     const bool last_stage_drafts =
         (mtp_enabled() || (dflash_env && *dflash_env)) && pp_rank == pp_world - 1;
-    const bool need_embed = !pp_enabled() || pp_rank == 0 || last_stage_drafts;
+    // A tied model has no lm_head tensor: its output projection IS the
+    // embedding table.  The LAST stage runs that projection, so it needs
+    // the table even when it embeds no token of its own -- otherwise it
+    // loads with nothing to produce logits with.
+    const bool tied_head = cfg.tie_embeddings && !ck.lm_head.ok();
+    const bool need_embed = !pp_enabled() || pp_rank == 0 || last_stage_drafts
+                         || (tied_head && pp_rank == pp_world - 1);
     if(need_embed)
         embed=dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
     if (!ok) { err = "embed upload failed"; return false; }
@@ -3176,7 +3182,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         tied_lm_head = true;
     }
     if (!lm_head.payload && (!pp_enabled() || pp_rank == pp_world - 1)) {
-        err = "no lm_head: the checkpoint ships none and tie_word_embeddings "
+        err = tied_head
+            ? "tie_word_embeddings is set but the embedding table is not on "
+              "this rank, so there is nothing to project through"
+            : "no lm_head: the checkpoint ships none and tie_word_embeddings "
               "is not set, so there is no output projection to run";
         return false;
     }
@@ -3979,8 +3988,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // stage under PP and nowhere else.
     const bool dflash_configured = dflash_env && *dflash_env;
     auto release_last_stage_embed = [&]() {
+        // Never give back a table the lm_head is aliasing: on a tied model
+        // freeing it here leaves the output projection pointing at freed
+        // device memory, which is rule 1's failure mode exactly.
         if (!(pp_enabled() && pp_rank == pp_world - 1 && pp_rank != 0) ||
-            mtp.ok || !embed) return;
+            mtp.ok || !embed || tied_lm_head) return;
         const size_t freed = size_t(embed_count) * H * sizeof(bf16_t);
         sycl::free(embed, q);
         embed = nullptr;
