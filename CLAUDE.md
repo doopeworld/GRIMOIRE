@@ -432,6 +432,10 @@ per session, most recent state and next-steps at the bottom of each file:
   ranked next-steps plan
 - `HANDOFF-2026-08-27-PP-TP-COMPLETE.md` — multiprocess PP/TP, prefix cache,
   Muse Glimmer integration, and the CURRENT next-steps (Muse batched prefill)
+- `HANDOFF-2026-09-15-GEMMA4.md` — **newest.** gemma-4 end to end, the three
+  pre-existing engine bugs it uncovered (tied embeddings, head_dim > 256,
+  graph-capture cleanup), two external audits, and exactly what is left.
+  Read this one first if you are picking the project up.
 
 `ref/` holds extracted vLLM reference implementations (DFlash2, Muse Glimmer
 modeling code) — pulled from the vLLM nightly image specifically so nobody
