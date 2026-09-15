@@ -8585,11 +8585,17 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     float* proj = df(size_t(M) * H);
     float* sh   = df(size_t(M) * H);
     float* ff   = df(size_t(M) * 2 * size_t(IX ? IX : 1));
+    // GeGLU needs its OWN output.  launch_geglu_batched writes
+    // out[r*I + c] while other work-items still read gu[r'*2I + ...];
+    // aliasing them is a race, not an in-place op.  Decode gets away with
+    // one buffer only because M is 1 and the write is at the same index
+    // as the read.
+    float* ffo  = df(size_t(M) * size_t(IX ? IX : 1));
     int32_t* dtok = sycl::malloc_device<int32_t>(size_t(M), q);
     sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
     std::vector<void*> mem = {(void*)h, (void*)h2, (void*)qv, (void*)kv,
         (void*)vv, (void*)attn, (void*)proj, (void*)sh, (void*)ff,
-        (void*)dtok, (void*)xb};
+        (void*)ffo, (void*)dtok, (void*)xb};
     auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
     for (void* p : mem) if (!p) { cleanup(); return false; }
 
@@ -8704,8 +8710,8 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
         if (!ok) break;
         // gelu_pytorch_tanh, not silu.  The two differ by up to 0.77 on the
         // same input and nothing downstream would notice the substitution.
-        launch_geglu_batched(q, ff, ff, M, I, none);
-        mmg(d.sh_down, ff, proj);
+        launch_geglu_batched(q, ff, ffo, M, I, none);
+        mmg(d.sh_down, ffo, proj);
         if (!ok) break;
         launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
             d.post_ff_norm, sh, M, H, cfg.post_norm_eps, nullptr, none);
@@ -8718,9 +8724,23 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
 
     if (!ok) { q.wait(); cleanup(); return false; }
 
-    // The caller's contract, matched to prefill(): the UNNORMALISED hidden
-    // state of the last processed token is left in s.h, the cursor moves by
-    // M, and a full prompt from position 0 populates the prefix cache.
+    // prefill()'s contract includes s.logits for the LAST row: the caller
+    // takes the first generated token from it and does NOT re-run the
+    // prompt's final token through forward().  Leaving it stale is silent
+    // -- the logits are in vocabulary and the length is right, and only a
+    // token-for-token diff against sequential decode shows it (rule 12).
+    // This is forward_gemma4()'s tail: final norm, head, then softcap.
+    launch_rmsnorm_residual_batched(q, h + int64_t(M - 1) * H, nullptr,
+        nullptr, fnorm, h2, 1, H, eps, nullptr, none);
+    gemv_any(lm_head, h2, s.logits, none);
+    // final_logit_softcapping.  Monotonic, so greedy picks the same token
+    // either way -- but not a no-op for sampling, and sequential applies it.
+    if (cfg.logit_softcap > 0.0f)
+        launch_logit_softcap(q, s.logits, cfg.logit_softcap, cfg.vocab, none);
+
+    // The UNNORMALISED hidden state of the last processed token is left in
+    // s.h, the cursor moves by M, and a full prompt from position 0
+    // populates the prefix cache.
     q.memcpy(s.h, h + int64_t(M - 1) * H, size_t(H) * sizeof(float));
     q.wait_and_throw();
     pos += M;
