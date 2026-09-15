@@ -8666,16 +8666,29 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
         if (!ok) break;
 
         // q_norm and k_norm, then RoPE -- fused, and in that order, which
-        // is forward_gemma4()'s order.  The norm convention is global
-        // (set_norm_convention in build()), so gemma-4's plain `w` applies
-        // here without being passed.
+        // is forward_gemma4()'s order.
+        //
+        // RULE 11, AND IT BIT HERE.  Unlike launch_rmsnorm_residual_batched,
+        // which reads the global set_norm_convention() installed, these two
+        // take the convention as a PARAMETER that DEFAULTS TO 1.0 -- i.e.
+        // (1 + w), Qwen's zero-centered norm.  gemma-4 applies the weight
+        // directly, and decode says so by passing zero_centered=false to
+        // launch_rmsnorm_heads.  Passing 1.0 here (or omitting it) shifts
+        // every normalised q and k in the model and leaves the output
+        // fluent -- it cost this path its first two gate runs.
+        //
+        // Read what build() actually installed rather than hardcoding 0.0,
+        // so the convention stays owned by one place.
+        int nconv_groups = 1; float nconv_offset = 1.0f;
+        get_norm_convention(&nconv_groups, &nconv_offset);
         if (d.rope_proportional)
             launch_qk_norm_rope_proportional_batched(q, qv, kv, d.q_norm,
                 d.k_norm, M, QH, KVH, HD, start_pos, d.rope_theta,
-                d.partial_rope, eps, none, 1.0f, d.rope_factor);
+                d.partial_rope, eps, none, nconv_offset, d.rope_factor);
         else
             launch_qk_norm_rope_batched(q, qv, kv, d.q_norm, d.k_norm, M,
-                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps);
+                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps,
+                none, nconv_offset);
 
         // v_norm on EVERY layer, scaleless, after the value source was
         // chosen -- not only where V came from k_proj.  The rows are
