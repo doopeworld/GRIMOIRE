@@ -2610,6 +2610,8 @@ struct Grimoire {
                  std::vector<int32_t>* next_tokens = nullptr);
     bool prefill_muse(const std::vector<int32_t>& tokens,
                       std::vector<int32_t>* next_tokens = nullptr);
+    bool prefill_gemma4(const std::vector<int32_t>& tokens,
+                        std::vector<int32_t>* next_tokens = nullptr);
     void snapshot_recurrent();
     void restore_recurrent(int saved_pos);
     void commit_spec_prefix(int saved_pos, int accepted);
@@ -8514,12 +8516,243 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 // state exactly as they were and the caller may redo the work
 // sequentially.  Keep it that way -- a late bail-out would silently
 // double-process tokens.
+// Counts SUCCESSFUL gemma-4 batched prefills.  A test that only compares
+// batched output against sequential output passes trivially when the
+// batched path quietly declined and fell back -- which is the same shape
+// of silence rule 12 was written about.  The gate reads this to prove the
+// path it is comparing actually ran.
+long g_gemma4_batched_prefills = 0;
+
+// ---------------------------------------------------------------------
+// gemma-4 batched prefill.
+//
+// forward_gemma4()'s graph, M tokens at a time.  It is NOT the generic
+// prefill() loop: that one is the Qwen residual graph (attention output
+// added raw, normalised on the way INTO the FFN) and gemma-4 is a
+// sandwich, so running a prompt through it would contradict
+// forward_gemma4() token for token while still emitting fluent text.
+//
+// Every stage below is the batched twin of the decode kernel on the same
+// line of forward_gemma4(), in the same order.  The three that are easy
+// to get wrong, and that produce fluent output when wrong:
+//
+//   * k_eq_v: V is the k_proj output taken BEFORE k_norm and BEFORE RoPE.
+//     The copy therefore happens before the fused norm+rope kernel, not
+//     after it.
+//   * v_norm runs on EVERY layer, not only the ones that took V from
+//     k_proj (ref/gemma4.py:1249 applies it after the branch).
+//   * the sliding window is per LAYER, and only the sliding layers have
+//     one.  launch_dflash2_block_attention computes each query's own
+//     [query_end - window, query_end) bound, which is what a batch needs
+//     and what launch_flash_prefill (no window at all) cannot give.
+//
+// SCOPE: prompt prefill only.  A verify batch (next_tokens) returns false
+// -- gemma-4 has no MTP head and its DFlash drafter has never been run,
+// so there is nothing to verify for yet, and a wrong verify path is worse
+// than none.  PP and TP return false for the same reason: unwired, not
+// broken.  Each falls back to sequential decode, which is correct.
+bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
+                              std::vector<int32_t>* next_tokens) {
+    const int M = int(tokens.size());
+    if (M <= 0 || pos + M > max_seq) return false;
+    if (next_tokens) return false;
+    if (pp_enabled() || tp_enabled()) return false;
+    const int start_pos = pos;
+    if (start_pos == 0 && restore_prefix(tokens)) return true;
+
+    const int H = cfg.hidden, QH = cfg.n_heads;
+    const int HDX = cfg.max_head_dim(), KVHX = cfg.max_kv_heads();
+    const int QWX = QH * HDX, KVWX = KVHX * HDX;
+    int IX = 0, WX = std::max({H, QWX, KVWX});
+    for (const auto& d : L) {
+        IX = std::max(IX, d.sh_gu.output_rows() / 2);
+        const DevQuant* ws[] = {&d.q_proj, &d.k_proj, &d.v_proj, &d.o_proj,
+                                &d.sh_gu, &d.sh_down};
+        for (const auto* w : ws) {
+            WX = std::max(WX, w->w.N);
+            WX = std::max(WX, w->w.K);
+        }
+    }
+    WX = std::max(WX, 2 * IX);
+
+    auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
+    float* h    = df(size_t(M) * H);
+    float* h2   = df(size_t(M) * H);
+    float* qv   = df(size_t(M) * QWX);
+    float* kv   = df(size_t(M) * KVWX);
+    float* vv   = df(size_t(M) * KVWX);
+    float* attn = df(size_t(M) * QWX);
+    float* proj = df(size_t(M) * H);
+    float* sh   = df(size_t(M) * H);
+    float* ff   = df(size_t(M) * 2 * size_t(IX ? IX : 1));
+    int32_t* dtok = sycl::malloc_device<int32_t>(size_t(M), q);
+    sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
+    std::vector<void*> mem = {(void*)h, (void*)h2, (void*)qv, (void*)kv,
+        (void*)vv, (void*)attn, (void*)proj, (void*)sh, (void*)ff,
+        (void*)dtok, (void*)xb};
+    auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
+    for (void* p : mem) if (!p) { cleanup(); return false; }
+
+    const std::vector<sycl::event> none{};
+    const float eps = cfg.rms_eps;
+
+    // Same opt-in escape hatch prefill() uses, for the same reason: without
+    // it none of this can be executed anywhere but the card.
+    const bool noxmx =
+        std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX") != nullptr &&
+        !q.get_device().is_gpu() &&
+        !q.get_device().has(sycl::aspect::ext_intel_matrix);
+
+    // RULE 1: GRIMOIRE_W4A8 FREES the MXFP4 payload of a converted weight,
+    // and launch_gemm_xmx dereferences it.  A converted weight still
+    // reports fmt == MXFP4, so the FORMAT is not a safe test -- the
+    // POINTER is.  gemv_any() is the decode path and reads whatever the
+    // weight actually became, so route there rather than take the card
+    // off the bus.
+    bool ok = true;
+    auto mmg = [&](const DevQuant& w, const float* x, float* y) {
+        if (!ok) return;
+        if (w.w.N <= 0) { ok = false; return; }
+        if (noxmx || !w.w.payload) {
+            if (!w.w.payload && !noxmx) {
+                for (int r = 0; r < M; ++r)
+                    gemv_any(w, x + size_t(r) * w.w.K,
+                             y + size_t(r) * w.w.N, none);
+                return;
+            }
+            launch_gemm_batched(q, w.w, x, y, M, none);
+            return;
+        }
+        launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
+        launch_gemm_xmx(q, w.w, xb, y, M, none);
+    };
+
+    q.memcpy(dtok, tokens.data(), size_t(M) * sizeof(int32_t));
+    launch_embed_batched(q, embed, dtok, h, M, H, none);
+    // Gemma4TextScaledWordEmbedding: the lookup is multiplied by
+    // sqrt(hidden) BEFORE the first norm.  Omitting it changes the scale
+    // every later RMSNorm sees.
+    if (cfg.embed_scale != 1.0f)
+        launch_scale(q, h, cfg.embed_scale, int(size_t(M) * H), none);
+
+    for (int i = 0; i < cfg.n_layers && ok; ++i) {
+        LayerDev& d = L[i];
+        const int HD = d.head_dim, KVH = d.kv_heads, QW = QH * HD;
+        const int KVW = KVH * HD;
+
+        // ---- attention (sandwich: in_norm -> attn -> post_norm -> add) --
+        launch_rmsnorm_residual_batched(q, h, nullptr, nullptr, d.in_norm,
+                                        h2, M, H, eps, nullptr, none);
+        mmg(d.q_proj, h2, qv);
+        mmg(d.k_proj, h2, kv);
+        if (!ok) break;
+
+        // attention_k_eq_v: a full-attention layer ships NO v_proj and V is
+        // the k_proj output BEFORE k_norm and BEFORE RoPE.  This copy must
+        // stay above the fused norm+rope call below; moving it under that
+        // call is the mistake this comment exists to prevent, and both
+        // orders produce fluent text.  A DevQuant that was never uploaded
+        // keeps w.N == 0, which is the shape test forward_gemma4() uses.
+        if (d.v_proj.w.N <= 0)
+            q.memcpy(vv, kv, size_t(M) * KVW * sizeof(float));
+        else
+            mmg(d.v_proj, h2, vv);
+        if (!ok) break;
+
+        // q_norm and k_norm, then RoPE -- fused, and in that order, which
+        // is forward_gemma4()'s order.  The norm convention is global
+        // (set_norm_convention in build()), so gemma-4's plain `w` applies
+        // here without being passed.
+        if (d.rope_proportional)
+            launch_qk_norm_rope_proportional_batched(q, qv, kv, d.q_norm,
+                d.k_norm, M, QH, KVH, HD, start_pos, d.rope_theta,
+                d.partial_rope, eps, none, 1.0f, d.rope_factor);
+        else
+            launch_qk_norm_rope_batched(q, qv, kv, d.q_norm, d.k_norm, M,
+                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps);
+
+        // v_norm on EVERY layer, scaleless, after the value source was
+        // chosen -- not only where V came from k_proj.  The rows are
+        // contiguous [M][KVH][HD], so M*KVH heads is one call.
+        if (gemma_vnorm)
+            launch_rmsnorm_heads(q, vv, gemma_vnorm, M * KVH, HD, eps,
+                                 false, none);
+
+        launch_kv_append_batched(q, kv, vv, d.k_cache, d.v_cache, M,
+                                 start_pos, KVH, HD, max_seq, none);
+
+        // Only the SLIDING layers have a window; the full-attention ones
+        // see the whole history.  Identical until the context passes the
+        // window, then quietly wrong.
+        const int window = cfg.layer_global(i) ? 0 : cfg.sliding_window;
+        launch_dflash2_block_attention(q, qv, d.k_cache, d.v_cache, attn,
+            M, start_pos, QH, KVH, HD, max_seq, window, true,
+            cfg.attn_softmax_scale(HD), none);
+        (void)QW;
+
+        mmg(d.o_proj, attn, proj);
+        if (!ok) break;
+        launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
+            d.post_norm, sh, M, H, cfg.post_norm_eps, nullptr, none);
+        launch_add(q, h, sh, int(size_t(M) * H), none);
+
+        // ---- feed-forward (sandwich: pre_ff -> GeGLU mlp -> post_ff) ----
+        launch_rmsnorm_residual_batched(q, h, nullptr, nullptr, d.pre_ff_norm,
+                                        h2, M, H, eps, nullptr, none);
+        const int I = d.sh_gu.output_rows() / 2;
+        mmg(d.sh_gu, h2, ff);
+        if (!ok) break;
+        // gelu_pytorch_tanh, not silu.  The two differ by up to 0.77 on the
+        // same input and nothing downstream would notice the substitution.
+        launch_geglu_batched(q, ff, ff, M, I, none);
+        mmg(d.sh_down, ff, proj);
+        if (!ok) break;
+        launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
+            d.post_ff_norm, sh, M, H, cfg.post_norm_eps, nullptr, none);
+        launch_add(q, h, sh, int(size_t(M) * H), none);
+
+        // hidden_states *= layer_scalar, the LAST act of the layer.
+        if (d.layer_scalar != 1.0f)
+            launch_scale(q, h, d.layer_scalar, int(size_t(M) * H), none);
+    }
+
+    if (!ok) { q.wait(); cleanup(); return false; }
+
+    // The caller's contract, matched to prefill(): the UNNORMALISED hidden
+    // state of the last processed token is left in s.h, the cursor moves by
+    // M, and a full prompt from position 0 populates the prefix cache.
+    q.memcpy(s.h, h + int64_t(M - 1) * H, size_t(H) * sizeof(float));
+    q.wait_and_throw();
+    pos += M;
+    set_cursor(pos);
+    cleanup();
+    if (start_pos == 0) save_prefix(tokens);
+    ++g_gemma4_batched_prefills;
+    return true;
+}
+
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens) {
     if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
         throw std::invalid_argument("prefill exceeds context capacity or is empty");
     for(auto t:tokens)if(t<0||t>=cfg.vocab)throw std::invalid_argument("invalid prefill token");
     if(tp_enabled())return false;
+    // GRIMOIRE_BATCHED_PREFILL_NOXMX: run the batched path on a device with
+    // NO matrix hardware, by routing every mm() through the plain-SYCL
+    // launch_gemm_batched() instead of the joint_matrix GEMM (see mm()).
+    // Without it the batched path is unreachable off the card, so nothing
+    // in it -- including a gemma-4 batched prefill -- can be checked against
+    // the sequential path that it has to agree with.
+    //
+    // Requires the device to actually lack matrix support, so setting it on
+    // a B70 does nothing and the Tower path is untouched.  CORRECTNESS ONLY:
+    // it is a sub-group GEMV per output row and is far slower than the tile
+    // it replaces.  Rule 8 -- no number from this configuration means
+    // anything.
+    const bool noxmx_gemm =
+        std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX")!=nullptr &&
+        !q.get_device().is_gpu() &&
+        !q.get_device().has(sycl::aspect::ext_intel_matrix);
     // The batched path is XMX/DPAS from end to end.  On a device with no
     // matrix hardware the runtime does not raise -- it takes the process
     // down with a SIGSEGV somewhere inside the JIT -- so refuse here and
@@ -8538,7 +8771,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         static const bool no_matrix =
             !q.get_device().is_gpu() &&
             !q.get_device().has(sycl::aspect::ext_intel_matrix);
-        if (no_matrix) {
+        if (no_matrix && !noxmx_gemm) {
             static bool said = false;
             if (!said) {
                 said = true;
@@ -8552,15 +8785,23 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
         return prefill_muse(tokens,next_tokens);
     }
-    // gemma-4 has no batched prefill yet.  The loop below is the Qwen
+    // gemma-4 has its own batched prefill: the loop below is the Qwen
     // residual graph -- attention output added raw, normalised on the way
-    // INTO the FFN -- and gemma-4 is a sandwich, so running the prompt
+    // INTO the FFN -- and gemma-4 is a sandwich, so running a prompt
     // through it would contradict forward_gemma4() token for token while
-    // still producing fluent text.  Returning false falls back to
-    // sequential decode through forward_gemma4(), which is slower and
-    // correct.  Batching it is a real task, not a flag: it needs the
-    // sandwich graph, the k_eq_v value and both rotations in batched form.
-    if (cfg.is_gemma4) return false;
+    // still producing fluent text.  prefill_gemma4() is that graph
+    // batched; it declines a verify batch and PP/TP, each of which falls
+    // back to sequential decode.
+    // OPT-IN until a B70 has run it (rule 8, rule 9).  The default is the
+    // sequential fallback, which is what shipped before this and is known
+    // correct; GRIMOIRE_GEMMA4_BATCHED_PREFILL=1 selects the batched
+    // sandwich path.  Wrong batching here is FLUENT, not loud, so the
+    // default must be the path that is already trusted -- flip it once
+    // bin/test_gemma4_prefill has been run on the card.
+    if (cfg.is_gemma4) {
+        if (!std::getenv("GRIMOIRE_GEMMA4_BATCHED_PREFILL")) return false;
+        return prefill_gemma4(tokens, next_tokens);
+    }
     const int M = int(tokens.size());
     if (M <= 0 || pos + M > max_seq) return false;
     const int start_pos = pos;
@@ -9153,6 +9394,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 return;
             }
         }
+        // NO-XMX FALLBACK, opt-in, for correctness testing off the card.
+        // launch_gemm_xmx() is joint_matrix from end to end, so on a device
+        // without matrix hardware the whole batched prefill is unreachable --
+        // which is why DAY-ONE lists the batched path as untestable off the
+        // Tower, and why a gemma-4 batched prefill had nowhere to be checked.
+        // launch_gemm_batched() is the plain-SYCL batched GEMM that already
+        // exists in prefill.cpp; it computes the same product from the f32
+        // activations and runs anywhere.
+        //
+        // This is CORRECTNESS ONLY and it is SLOW -- it is a sub-group GEMV
+        // per output row, not a tile.  It is gated on the env var AND on the
+        // device actually lacking matrix support, so a B70 never reaches it
+        // and the Tower path stays byte-identical.  Rule 8: nothing timed
+        // here means anything.
+        if(noxmx_gemm){ launch_gemm_batched(q,w.w,x,y,M); return; }
         launch_gemm_xmx(q,w.w,x_bf,y,M);
     };
     // bf16-activation twins of mm().  Several fast paths call the dense MXFP4
