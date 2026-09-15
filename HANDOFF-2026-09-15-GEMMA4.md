@@ -154,25 +154,59 @@ worth exactly the reference lookup behind it — that one had none.
 
 ## 5. What is LEFT — and what only the Tower can do
 
-### 5.1 Gemma-4 at its real head_dim — **the hard blocker**
+### 5.1 Gemma-4 at its real head_dim — **DONE (2026-09-15)**
 
-`google/gemma-4-31B-it` **refuses to load today**, by design, because its
-full-attention layers are head_dim 512 against the kernels' 256 (§2.2).
+`google/gemma-4-31B-it` no longer refuses.  The four flash kernels
+(`launch_flash_decode`, `launch_flash_decode_batched`,
+`launch_flash_prefill`, `launch_dflash2_block_attention`) are TEMPLATES on
+their accumulator width and are instantiated twice: head_dim <= 256 keeps
+the 16-slot kernel it has always used, and only a wider head reaches the
+32-slot one.  `unsupported_reason()` refuses above 512 now, not above 256.
 
-Raising the bound is **not a one-line constant bump**:
-`attention.cpp`'s accumulator loops run to `MAX_DPL` UNCONDITIONALLY,
-unlike `prefill.cpp` which guards each slot with `if (j < dpl)`. Doubling
-the constant doubles the accumulator work for EVERY model, head_dim 128
-included.
+**The reason this section originally gave for deferring was wrong, and it
+came from `b686d55`'s own commit message.** That message said
+"attention.cpp's accumulator loops run to MAX_DPL unconditionally --
+unlike prefill.cpp, which guards each slot with `if (j < dpl)`".  They do
+not.  The guards are in BOTH files and PREDATE that commit, which changed
+four lines, each a `constexpr` -> `static_assert` swap:
 
-The order is:
-1. Bound `attention.cpp`'s loops by `dpl`, as `prefill.cpp` already does.
-2. Raise `MAX_DPL` to 32 in `src/kernels.hpp` (one place — the
-   `static_assert`s will tell you if anything drifted).
-3. **Measure register pressure and TG at `dpl` 32 on a real B70**, for a
-   head_dim 128 model as well as gemma-4. Rule 8: generate text and read
-   it, do not quote a self-check.
-4. Only then relax the guard in `unsupported_reason()`.
+    git show b686d55^:src/attention.cpp | grep -c 'd < dpl'   ->  6
+    grep -c 'd < dpl' src/attention.cpp                       ->  6
+
+So "bound attention.cpp's loops by dpl first" was work that did not exist.
+What actually scaled with the constant was `float acc[MAX_DPL]` -- the
+private array is sized by the constant, not by the head -- so a plain bump
+would have doubled it for every model including Qwen at 128.  Templating
+is what confines that cost to the head that needs it, and it is why no
+existing model needs re-measuring.
+
+Verified off-card, on an OpenCL CPU device, at `28d1b30`:
+
+- `bin/test_model_matrix` **ALL PASS (0 failed cells)**.  `gemma4-hd512`
+  is a full row -- head_dim 512 loads, generates, stays in vocabulary,
+  reproduces and depends on its input, across all 7 projection formats --
+  and the refusal case moved up to head_dim 1024, which still refuses by
+  name.
+- `bin/test_spec_e2e` **ALL PASS (0 failures)**; MTP and DFlash identical
+  to plain decode, single process, TP and PP.
+- `bin/test_k2_kernels` **ALL PASS (0 failures)**.
+- The five pre-existing rows are unchanged and green.
+
+**STILL TOWER WORK (rule 8):** register pressure and throughput of the
+32-slot instantiation on a real B70.  Nothing here is a number.  Two
+things to look at when the card is up, neither of which a CPU device can
+show:
+
+1. **Occupancy at dpl 32.** The wide kernel holds 32 floats per lane
+   instead of 16.  Only gemma-4 pays it, but measure it there.
+2. **SLM, which is a HARD limit, not a gradient.** The three batched
+   kernels take `ks` and `vs` local accessors sized `head_dim * KT` with
+   KT 16, so at head_dim 512 that is 32 KB + 32 KB = **64 KB of SLM per
+   work-group** -- at or over a Xe work-group's budget.  The CPU device
+   used here reports 256 KB and so cannot fail this, which is exactly why
+   it proves nothing about the B70.  If a batched gemma-4 launch fails
+   for local memory, that is this, and the fix is tiling `KT` down for
+   wide heads rather than touching the accumulator.
 
 ### 5.2 Gemma-4 batched prefill — not written
 

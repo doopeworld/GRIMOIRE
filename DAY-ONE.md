@@ -340,27 +340,27 @@ software recovery. The known causes, all avoidable:
 - **Single-process cross-device.** Rule 7: the original failure was
   measured over USB4 and has not been retried on OCuLink. That is a
   hardware experiment, not a code change.
-- **gemma-4 at its real head_dim.** `google/gemma-4-31B-it` loads,
-  resolves and is implemented end to end — sandwich residual graph,
-  `k_eq_v` value, GeGLU, proportional RoPE, sliding window, per-layer
-  geometry, `layer_scalar`, embedding scale, logit softcap — and a
-  scaled-down fixture runs it in `bin/test_model_matrix` and
-  `bin/test_parallel_e2e`. The REAL checkpoint still refuses, for one
-  reason: its full-attention layers are **head_dim 512** and every flash
-  kernel accumulates a head into a private array of `MAX_DPL`(16) floats
-  per lane at `SG_SIZE` 16, i.e. 256 wide. Going past that writes off the
-  end of device stack memory — a DEVICE_LOST and a power cycle, so
-  `Grimoire::unsupported_reason()` refuses it rather than let it reach the
-  card.
+- **gemma-4 at its real head_dim. DONE 2026-09-15, off-card.**
+  `google/gemma-4-31B-it` loads at head_dim 512.  The four flash kernels
+  are templates on their accumulator width, instantiated at 16 and 32:
+  every head_dim <= 256 keeps the exact 16-slot kernel it always used, so
+  no model that ran before needs re-measuring, and only a wider head
+  reaches the 32-slot one.  `bin/test_model_matrix` carries `gemma4-hd512`
+  as a full row (all 7 formats, ALL PASS) and moves the refusal case to
+  head_dim 1024.
 
-  Raising the bound is a Tower job and not a one-line change:
-  `attention.cpp`'s accumulator loops run to `MAX_DPL` UNCONDITIONALLY,
-  unlike `prefill.cpp` which guards each slot with `if (j < dpl)`. So
-  doubling the constant doubles the accumulator work for every model,
-  head_dim 128 included. Bound those loops by `dpl` first, then measure
-  register pressure at `dpl` 32 on a real B70. Rule 8: no claim about it
-  from a container. Details and the full item list:
-  `GEMMA4-2026-09-14.md`.
+  An earlier note here said the blocker was that `attention.cpp`'s loops
+  run to `MAX_DPL` unconditionally while `prefill.cpp` guards its slots.
+  That was never true -- both files guard, and the guards predate the
+  commit that claimed otherwise.  The real cost was the private array
+  `float acc[MAX_DPL]`, sized by the constant rather than by the head.
+
+  What the Tower still owes: register pressure and throughput at dpl 32
+  (rule 8 -- no number came from a CPU device), and SLM headroom, which is
+  a hard limit.  The batched kernels take `head_dim * KT` floats of local
+  memory twice, i.e. 64 KB per work-group at head_dim 512; the CPU device
+  reports 256 KB and cannot fail it, a Xe work-group can.  Tile `KT` for
+  wide heads if a batched launch is refused for local memory.
 - **gemma-4 batched prefill.** Not written. `prefill()` returns false for
   gemma-4 and falls back to sequential decode, which is correct and slow.
   The batched loop is the Qwen residual graph, so running a gemma-4 prompt

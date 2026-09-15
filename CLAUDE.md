@@ -421,6 +421,35 @@ missing feature survived this long. The first model that needed it was
 gemma-4, and it was found by asking one question the test suite never
 asked.
 
+**13. A DEFERRAL IS A CLAIM, AND IT DECAYS LIKE ONE (learned
+2026-09-15).** `b686d55` deferred raising the head_dim bound with a
+specific technical reason: "attention.cpp's accumulator loops run to
+MAX_DPL unconditionally -- unlike prefill.cpp, which guards each slot with
+`if (j < dpl)`".  That reason was false when it was written.  Both files
+guard, all four flash kernels were already `dpl`-bounded, and the commit
+it appeared in touched four lines, each a `constexpr` -> `static_assert`
+swap.  One command settles it:
+
+    git show b686d55^:src/attention.cpp | grep -c 'd < dpl'   ->  6
+
+It then propagated verbatim into `GEMMA4-2026-09-14.md`, `DAY-ONE.md` and
+`HANDOFF-2026-09-15-GEMMA4.md`, and each copy read as independent
+confirmation.  The next session would have opened by "fixing" loops that
+were already correct.
+
+The real constraint was one the sentence never named: `float acc[MAX_DPL]`
+is sized by the CONSTANT, not by the head, so widening it costs every
+model.  Naming it correctly is what produced the fix -- template the
+kernels on the width and instantiate twice, so head_dim <= 256 keeps the
+kernel it always had and only a wider head pays.  A vague reason forecloses
+that; a precise one hands you the design.
+
+So: when you defer something, write the reason as a CHECKABLE claim and
+say how to check it.  When you inherit one, check it before you build on
+it -- especially a reason that is load-bearing for "this needs hardware",
+because that is the class nobody re-tests.  Repetition across handoffs is
+not evidence; it is usually one source copied.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the
