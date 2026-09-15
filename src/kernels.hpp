@@ -383,7 +383,7 @@ sycl::event launch_geglu_batched(sycl::queue& q, const float* gu, float* out,
 // head_dim/2.  See ops.cpp and ref/gemma4_proportional_rope.py.
 sycl::event launch_rope_proportional(sycl::queue& q, float* x, int n_heads,
     int head_dim, const int32_t* d_pos, float theta, float partial_factor,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, float freq_divisor = 1.0f);
 sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
     float w, int n, const std::vector<sycl::event>& deps = {});
 sycl::event launch_router_topk_k2(
@@ -408,7 +408,8 @@ sycl::event launch_qk_norm_rope_proportional_batched(
     sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
-    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
+    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f,
+    float freq_divisor = 1.0f);
 sycl::event launch_kv_append_batched(
     sycl::queue& q, const float* k, const float* v, uint8_t* k_cache,
     uint8_t* v_cache, int tokens, int start_pos, int n_kv_heads,

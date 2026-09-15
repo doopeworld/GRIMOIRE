@@ -226,6 +226,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if (block(rp_all, "full_attention", rp_full)) {
                 cfg.global_rope_theta   = cfg_f(rp_full, "rope_theta", 0.0f);
                 cfg.global_partial_rope = cfg_f(rp_full, "partial_rotary_factor", 1.0f);
+                // ref/gemma4_proportional_rope.py ends with
+                // `inv_freq /= factor`.  The 31B checkpoint does not set it
+                // (so it is 1.0 and changes nothing), but a config that did
+                // would rotate at the wrong frequencies while loading and
+                // generating perfectly well.
+                cfg.global_rope_factor  = cfg_f(rp_full, "factor", 1.0f);
+                if (cfg.global_rope_factor <= 0.0f) {
+                    err = "gemma-4 full_attention rope factor must be positive";
+                    return false;
+                }
                 std::string rt;
                 find_scalar(rp_full, "rope_type", rt);
                 cfg.global_rope_proportional = (rt == "proportional");
@@ -259,6 +269,33 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
         if (tcfg_b("use_double_wide_mlp", false)) {
             err = "gemma-4 use_double_wide_mlp is not implemented";
+            return false;
+        }
+        // use_bidirectional_attention == "all" makes every layer
+        // NON-causal (ref/gemma4.py:1179, `is_causal = ... != "all"`).
+        // Every attention kernel here is causal, and a causal model reading
+        // a bidirectional checkpoint stays fluent.  "vision" only affects
+        // the image tower, which this engine does not run.
+        {
+            std::string bidir;
+            if ((nested && find_scalar(tj, "use_bidirectional_attention", bidir))
+                || (!nested && find_scalar(j, "use_bidirectional_attention", bidir))) {
+                if (bidir == "all") {
+                    err = "gemma-4 use_bidirectional_attention=\"all\" makes "
+                          "every layer non-causal; this engine's attention is "
+                          "causal only";
+                    return false;
+                }
+            }
+        }
+        // per_layer_config, when a checkpoint spells it out, OVERRIDES the
+        // head_dim / num_key_value_heads this loader derives from the layer
+        // type (ref/gemma4.py:1173).  Deriving them anyway would give some
+        // layers the wrong geometry with nothing to report it.
+        if (cj.find("\"per_layer_config\"") != std::string::npos) {
+            err = "gemma-4 per_layer_config is present; this loader derives "
+                  "per-layer geometry from layer_types and would ignore the "
+                  "explicit overrides";
             return false;
         }
         // What this loader does NOT do here is decide whether the engine
@@ -307,13 +344,18 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if (!find_scalar(j, "hidden_activation", act))
                 find_scalar(j, "hidden_act", act);
         }
-        // "gelu" and "gelu_new" are NOT the tanh approximation.  The one
-        // kernel here is gelu_pytorch_tanh, so accepting the exact-erf
-        // spellings under the same flag would run tanh in erf's place --
-        // the same substitution one line down refuses by name.  Recognise
-        // only the tanh spellings; anything else gelu-ish falls through to
-        // the refusal below.
-        cfg.geglu = act == "gelu_pytorch_tanh" || act == "gelu_tanh";
+        // Which spellings mean the TANH approximation, which is the only
+        // gelu this engine has (launch_geglu).  In transformers' ACT2FN:
+        //   gelu_pytorch_tanh -> GELUTanh          tanh
+        //   gelu_new          -> NewGELUActivation tanh  <- same formula
+        //   gelu              -> GELUActivation    EXACT erf
+        // "gelu_new" is the tanh one despite the name giving no hint of
+        // it; an earlier comment here claimed the opposite and refused a
+        // checkpoint this engine can run exactly.  Plain "gelu" is erf and
+        // stays refused below -- running tanh there is the same silent
+        // substitution in the other direction.
+        cfg.geglu = act == "gelu_pytorch_tanh" || act == "gelu_tanh" ||
+                    act == "gelu_new";
         if (!act.empty() && act != "silu" && act != "swish" &&
             act != "silu_and_mul" && !cfg.geglu) {
             err = "config.json asks for hidden activation \"" + act +

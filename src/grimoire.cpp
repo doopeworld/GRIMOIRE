@@ -619,7 +619,7 @@ sycl::event launch_rope_dev(sycl::queue&, float*, int, int, const int32_t*,
 // partial_rope: different frequencies and a different dimension pairing.
 sycl::event launch_rope_proportional(sycl::queue&, float*, int, int,
                                      const int32_t*, float, float,
-                                     const std::vector<sycl::event>&);
+                                     const std::vector<sycl::event>&, float);
 sycl::event launch_geglu(sycl::queue&, const float*, const float*, float*, int,
                          const std::vector<sycl::event>&);
 sycl::event launch_geglu_batched(sycl::queue&, const float*, float*, int, int,
@@ -1903,6 +1903,9 @@ struct Grimoire {
         // rope_proportional is false.
         float rope_theta = 0.0f;
         float partial_rope = 1.0f;
+        // proportional RoPE divides every inverse frequency by this; 1.0
+        // everywhere else, which is the identity.
+        float rope_factor = 1.0f;
         bool  rope_proportional = false;
         // gemma-4: hidden_states *= layer_scalar as the LAST act of the
         // layer, after the residual add.  1.0 is the identity everywhere
@@ -2920,14 +2923,20 @@ std::string Grimoire::unsupported_reason() const {
     // At head_dim 24 the split pass writes 16 dimensions and the merge
     // reads 24, so the last 8 are whatever the previous token left there.
     // No supported model has a ragged head, and nothing would report it.
-    if (max_hd % SG_SIZE != 0 || cfg.head_dim % SG_SIZE != 0)
-        return "head_dim must be a multiple of " + std::to_string(SG_SIZE) +
-               " (got " + std::to_string(cfg.head_dim) +
-               (cfg.global_head_dim > 0
-                    ? "/" + std::to_string(cfg.global_head_dim) : "") +
-               ").  The flash kernels split by integer division and merge "
-               "by ceiling, so a ragged head leaves its last dimensions "
-               "holding the previous token's values.  Refusing.";
+    // Check EVERY width a layer can have, not the maximum and the
+    // model-wide one.  head_dim 32 with global_head_dim 24 passes both of
+    // those -- the max is aligned and the local value is aligned -- while
+    // the full-attention layers run ragged at 24.
+    for (int hd : {cfg.head_dim, cfg.global_head_dim})
+        if (hd > 0 && hd % SG_SIZE != 0)
+            return "head_dim must be a multiple of " + std::to_string(SG_SIZE) +
+                   " (got " + std::to_string(hd) +
+                   "; this model uses " + std::to_string(cfg.head_dim) +
+                   (cfg.global_head_dim > 0
+                        ? " and " + std::to_string(cfg.global_head_dim) : "") +
+                   ").  The flash kernels split by integer division and merge "
+                   "by ceiling, so a ragged head leaves its last dimensions "
+                   "holding the previous token's values.  Refusing.";
 
     // GeGLU.  forward_gemma4() is the ONLY path that dispatches it; every
     // other FFN dispatch here -- decode GEMV, batched prefill, the MoE
@@ -3227,6 +3236,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         g.rope_theta        = cfg.layer_rope_theta(i);
         g.partial_rope      = cfg.layer_partial_rope(i);
         g.rope_proportional = cfg.layer_rope_proportional(i);
+        g.rope_factor       = cfg.layer_rope_factor(i);
     }
     // Muse decoder projections remain checkpoint INT4-W4A16 while its
     // excluded lm_head stays BF16; these formats are intentionally distinct.
@@ -6389,15 +6399,23 @@ const float* Grimoire::forward_dag(int token) {
             // gemma-4 full-attention layers rotate with different
             // frequencies and a different pairing (see
             // launch_rope_proportional); calling the default kernel here
-            // would be silently wrong rather than an error.
-            auto rope = d.rope_proportional ? launch_rope_proportional
-                                            : launch_rope_dev;
-            sycl::event e_qr = rope(q, qvec, cfg.n_heads, d.head_dim,
-                s.d_pos, d.rope_theta, d.partial_rope,
-                deps({(dag_mask & 2) ? e_qn : e_kn}));
-            sycl::event e_kr = rope(q, s.zbuf, d.kv_heads, d.head_dim,
-                s.d_pos, d.rope_theta, d.partial_rope,
-                deps({(dag_mask & 2) ? e_kn : e_qr}));
+            // would be silently wrong rather than an error.  Written out
+            // rather than selected through a function pointer: the two
+            // kernels no longer share a signature, and a pointer that
+            // happens to match today is a trap for whoever adds the next
+            // parameter.
+            const auto qdeps = deps({(dag_mask & 2) ? e_qn : e_kn});
+            sycl::event e_qr = d.rope_proportional
+                ? launch_rope_proportional(q, qvec, cfg.n_heads, d.head_dim,
+                      s.d_pos, d.rope_theta, d.partial_rope, qdeps, d.rope_factor)
+                : launch_rope_dev(q, qvec, cfg.n_heads, d.head_dim,
+                      s.d_pos, d.rope_theta, d.partial_rope, qdeps);
+            const auto kdeps = deps({(dag_mask & 2) ? e_kn : e_qr});
+            sycl::event e_kr = d.rope_proportional
+                ? launch_rope_proportional(q, s.zbuf, d.kv_heads, d.head_dim,
+                      s.d_pos, d.rope_theta, d.partial_rope, kdeps, d.rope_factor)
+                : launch_rope_dev(q, s.zbuf, d.kv_heads, d.head_dim,
+                      s.d_pos, d.rope_theta, d.partial_rope, kdeps);
             sycl::event e_kv = launch_kv_append_dev(q, s.zbuf, s.bbuf,
                 d.k_cache, d.v_cache, s.d_pos, d.kv_heads, d.head_dim,
                 max_seq, deps({e_kr, e_vp}));
@@ -6697,7 +6715,12 @@ const float* Grimoire::forward_gemma4(int token) {
         // applies to the PAYLOAD, not the format, so test the shape here
         // and let gemv_any decide how to read it.
         const bool k_is_v = d.v_proj.w.N <= 0;
-        if (k_is_v) q.memcpy(s.bbuf, s.zbuf, size_t(KVH) * HD * sizeof(float)).wait();
+        // No .wait() here.  The queue is in-order (see the property list in
+        // make_queue), so the copy is already ordered after the k_proj that
+        // produced s.zbuf -- and a HOST-SIDE WAIT while a SYCL graph is
+        // recording throws, which would make gemma-4 the one architecture
+        // that cannot be captured.
+        if (k_is_v) q.memcpy(s.bbuf, s.zbuf, size_t(KVH) * HD * sizeof(float));
         else        gemv_any(d.v_proj, s.h2, s.bbuf, none);
 
         if (d.q_norm)
@@ -6713,9 +6736,11 @@ const float* Grimoire::forward_gemma4(int token) {
 
         if (d.rope_proportional) {
             launch_rope_proportional(q, s.qkv,  QH,  HD, s.d_pos,
-                                     d.rope_theta, d.partial_rope, none);
+                                     d.rope_theta, d.partial_rope, none,
+                                     d.rope_factor);
             launch_rope_proportional(q, s.zbuf, KVH, HD, s.d_pos,
-                                     d.rope_theta, d.partial_rope, none);
+                                     d.rope_theta, d.partial_rope, none,
+                                     d.rope_factor);
         } else {
             launch_rope_dev(q, s.qkv,  QH,  HD, s.d_pos,
                             d.rope_theta, d.partial_rope, none);
@@ -6994,9 +7019,11 @@ const float* Grimoire::forward(int token) {
                                          d.head_dim, cfg.rms_eps, true, none);
                 if (d.rope_proportional) {
                     launch_rope_proportional(q, qvec, qheads, d.head_dim,
-                        s.d_pos, d.rope_theta, d.partial_rope, none);
+                        s.d_pos, d.rope_theta, d.partial_rope, none,
+                        d.rope_factor);
                     launch_rope_proportional(q, s.zbuf, d.kv_heads, d.head_dim,
-                        s.d_pos, d.rope_theta, d.partial_rope, none);
+                        s.d_pos, d.rope_theta, d.partial_rope, none,
+                        d.rope_factor);
                 } else {
                     launch_rope_dev(q, qvec, qheads, d.head_dim, s.d_pos,
                                     d.rope_theta, d.partial_rope, none);
@@ -9516,7 +9543,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(d.rope_proportional)
                 launch_qk_norm_rope_proportional_batched(q,qv,t3,d.q_norm,
                     d.k_norm,M,cfg.n_heads,d.kv_heads,d.head_dim,pos,
-                    d.rope_theta,d.partial_rope,cfg.rms_eps);
+                    d.rope_theta,d.partial_rope,cfg.rms_eps,{},1.0f,
+                    d.rope_factor);
             else
                 launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
                     d.kv_heads,d.head_dim,pos,d.rope_theta,d.partial_rope,cfg.rms_eps);
@@ -10027,20 +10055,21 @@ bool Grimoire::build_graph() {
     // Socket send/receive is deliberately outside SYCL graph capture.
     if (pp_enabled() || tp_enabled()) return false;
     if (dag) return false;
+    // Saved OUTSIDE the try: capture moves the live sequence state before
+    // recording, and the catch has to be able to put it back.  Declared in
+    // the try they were out of scope exactly where they were needed.
+    int32_t saved_pos = 0, saved_seq = 0;
+    q.memcpy(&saved_pos, s.d_pos, sizeof(int32_t)).wait();
+    q.memcpy(&saved_seq, s.d_seq_len, sizeof(int32_t)).wait();
+    const int host_pos = pos;
     try {
         sycl_ext::command_graph<sycl_ext::graph_state::modifiable>
             g(q.get_context(), q.get_device());
 
         // Record against a scratch position so the recording itself does
-        // not advance the real sequence state.  The host-side pos and the
-        // device counters are saved and restored: build_graph() is called
+        // not advance the real sequence state.  build_graph() is called
         // AFTER prefill in the generate path, so the live sequence state
-        // must survive capture untouched.
-        int32_t saved_pos = 0, saved_seq = 0;
-        q.memcpy(&saved_pos, s.d_pos, sizeof(int32_t)).wait();
-        q.memcpy(&saved_seq, s.d_seq_len, sizeof(int32_t)).wait();
-        const int host_pos = pos;
-
+        // must survive capture untouched -- on the failure path too.
         const int32_t zero = 0;
         q.memcpy(s.d_pos, &zero, sizeof(int32_t)).wait();
         const int32_t one = 1;
@@ -10063,6 +10092,15 @@ bool Grimoire::build_graph() {
     } catch (const sycl::exception& e) {
         recording = false;
         graph_ok  = false;
+        // Capture MOVED the live sequence state before recording: device
+        // position, device length and the host counter were all set to a
+        // scratch value.  The success path puts them back; this one did
+        // not, so a throw anywhere inside forward() left the next real
+        // decode starting from the scratch position -- silently, and only
+        // on runtimes where capture fails at all.
+        q.memcpy(s.d_pos, &saved_pos, sizeof(int32_t)).wait();
+        q.memcpy(s.d_seq_len, &saved_seq, sizeof(int32_t)).wait();
+        pos = host_pos;
         std::printf("  graph capture unavailable (%s); using direct submission\n",
                     e.what());
         std::fflush(stdout);

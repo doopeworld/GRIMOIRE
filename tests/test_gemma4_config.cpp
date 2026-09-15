@@ -342,6 +342,63 @@ int main() {
         if (!ok) std::printf("  refused: %s\n", bad[i].what);
     }
 
+    // ---- config fields the REFERENCE reads and this engine does not ---
+    // Each is absent from the 31B config, so none of them is exercised by
+    // the checkpoint in hand -- which is exactly why they need a test: a
+    // sibling that sets one would load here and be wrong with no symptom.
+    {
+        struct Raw { const char* what; std::string from, to; };
+        const std::vector<Raw> raw = {
+            {"bidirectional attention",
+             "\"attention_k_eq_v\": true,",
+             "\"attention_k_eq_v\": true,\n    "
+             "\"use_bidirectional_attention\": \"all\","},
+            {"an explicit per_layer_config",
+             "\"attention_k_eq_v\": true,",
+             "\"attention_k_eq_v\": true,\n    "
+             "\"per_layer_config\": [{\"head_dim\": 128}],"},
+        };
+        for (size_t i = 0; i < raw.size(); ++i) {
+            std::string c = config(12);
+            const size_t at = c.find(raw[i].from);
+            CHECK(at != std::string::npos, "%s: anchor not found in the config",
+                  raw[i].what);
+            if (at == std::string::npos) continue;
+            c.replace(at, raw[i].from.size(), raw[i].to);
+            const fs::path d = root / ("raw" + std::to_string(i));
+            write_stub(d, c, tensor_names(12));
+            Qwen35Model l; std::string e;
+            const bool ok = l.load(d.string(), e, true, false);
+            CHECK(!ok, "%s must be refused, but loaded", raw[i].what);
+            if (!ok) std::printf("  refused: %s\n", raw[i].what);
+        }
+        // And the one that is IMPLEMENTED rather than refused: the
+        // proportional-RoPE frequency divisor.  Absent means 1.0.
+        {
+            std::string c = config(12);
+            const std::string from = "\"rope_type\": \"proportional\"";
+            const size_t at = c.find(from);
+            CHECK(at != std::string::npos, "rope factor: anchor not found");
+            if (at != std::string::npos) {
+                c.replace(at, from.size(), from + ", \"factor\": 8.0");
+                const fs::path d = root / "ropefactor";
+                write_stub(d, c, tensor_names(12));
+                Qwen35Model l; std::string e;
+                const bool ok = l.load(d.string(), e, true, true);
+                CHECK(ok, "a rope factor must LOAD, not be refused: %s", e.c_str());
+                if (ok) {
+                    CHECK(std::fabs(l.cfg.global_rope_factor - 8.0f) < 1e-6f,
+                          "rope factor parsed: got %f", double(l.cfg.global_rope_factor));
+                    EQ(l.cfg.layer_rope_factor(5) == 8.0f, 1,
+                       "a full layer carries the factor");
+                    EQ(l.cfg.layer_rope_factor(0) == 1.0f, 1,
+                       "a sliding layer does not");
+                    std::printf("  parsed: proportional rope factor\n");
+                }
+            }
+        }
+    }
+
     // ---- features that are configured off here, and must be refused ---
     // The 31B is dense with no KV sharing and no per-layer inputs.  A
     // sibling that turns any of them on is a different forward pass, and

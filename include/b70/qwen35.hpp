@@ -128,6 +128,10 @@ struct Qwen35Config {
     // the full-attention pair.
     float global_rope_theta = 0.0f;     // 0 == no per-type override
     float global_partial_rope = 1.0f;
+    // proportional RoPE divides every inverse frequency by this
+    // (ref/gemma4_proportional_rope.py, last line).  1.0 is the identity
+    // and is what the 31B checkpoint uses.
+    float global_rope_factor = 1.0f;
     bool  global_rope_proportional = false;
     // hidden_states *= layer_scalar as the LAST act of each decoder
     // layer, after the residual add.  Per layer, from the checkpoint.
@@ -182,6 +186,10 @@ struct Qwen35Config {
     }
     bool layer_rope_proportional(int i) const {
         return global_rope_proportional && layer_global(i);
+    }
+    // Frequency divisor for one layer.  Only proportional RoPE has one.
+    float layer_rope_factor(int i) const {
+        return layer_rope_proportional(i) ? global_rope_factor : 1.0f;
     }
     // Attention softmax scale for a layer of this head_dim.  Gemma-4 sets
     // `self.scaling = 1.0` flat (ref/gemma4.py) instead of the usual

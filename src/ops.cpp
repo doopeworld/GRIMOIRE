@@ -463,7 +463,8 @@ sycl::event launch_geglu_batched(sycl::queue& q, const float* gu, float* out,
 sycl::event launch_rope_proportional(sycl::queue& q, float* x, int n_heads,
                                      int head_dim, const int32_t* d_pos,
                                      float theta, float partial_factor,
-                                     const std::vector<sycl::event>& deps) {
+                                     const std::vector<sycl::event>& deps,
+                                     float freq_divisor) {
     const int half   = head_dim / 2;
     const int angles = int(partial_factor * float(head_dim) / 2.0f);
     const int rot    = angles < half ? angles : half;
@@ -478,8 +479,10 @@ sycl::event launch_rope_proportional(sycl::queue& q, float* x, int n_heads,
                 const int i    = t % rot;
                 const int pos  = d_pos[0];
                 // exponent over head_dim, NOT over the rotated width
+                // inv_freq /= factor, the reference's last line.  1.0 is
+                // the identity, which is every checkpoint seen so far.
                 const float inv = sycl::exp(-float(2 * i) / float(head_dim)
-                                            * sycl::log(theta));
+                                            * sycl::log(theta)) / freq_divisor;
                 const float ang = float(pos) * inv;
                 const float c = sycl::cos(ang), s = sycl::sin(ang);
                 float* p = x + int64_t(head) * head_dim;

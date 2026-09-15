@@ -757,7 +757,8 @@ sycl::event launch_qk_norm_rope_proportional_batched(
     sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
-    const std::vector<sycl::event>& deps, float weight_offset) {
+    const std::vector<sycl::event>& deps, float weight_offset,
+    float freq_divisor) {
     const int half = dim / 2;
     const int ang_n = int(partial_factor * float(dim) / 2.0f);
     const int rot = ang_n < half ? ang_n : half;
@@ -789,7 +790,8 @@ sycl::event launch_qk_norm_rope_proportional_batched(
                 for (int i = lane; i < rot; i += SG_SIZE) {
                     // exponent over dim, NOT over the rotated width
                     const float inv = sycl::exp(-float(2 * i) / float(dim)
-                                                * sycl::log(theta));
+                                                * sycl::log(theta))
+                                    / freq_divisor;
                     const float ang = float(pos) * inv;
                     const float cs = sycl::cos(ang), sn = sycl::sin(ang);
                     const float a = p[i], b = p[i + half];   // pairing over half
