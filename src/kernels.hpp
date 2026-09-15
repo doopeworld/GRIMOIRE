@@ -34,6 +34,18 @@ constexpr int SG_SIZE = 16;
 constexpr int MAX_DPL      = 16;
 constexpr int MAX_HEAD_DIM = MAX_DPL * SG_SIZE;
 
+// WIDE instantiation, for heads the 16-slot accumulator cannot hold.
+// gemma-4's full-attention layers are head_dim 512.  Each flash kernel is
+// a template on its accumulator width and is instantiated TWICE: every
+// head_dim <= MAX_HEAD_DIM keeps the 16-slot kernel it has always used --
+// same private array, same register footprint, nothing to re-measure --
+// and only a wider head reaches the 32-slot one.  Widening the constant
+// itself would have doubled the private array for EVERY model, including
+// Qwen at head_dim 128, which is a register-pressure change to the hot
+// decode kernel that cannot be judged off the card (rule 8).
+constexpr int MAX_DPL_WIDE      = 32;
+constexpr int MAX_HEAD_DIM_WIDE = MAX_DPL_WIDE * SG_SIZE;
+
 // Upper bound on FlashDecoding split-K chunks for single-token decode.
 // GRAPH_SPLITS (8) sizes the graph-recorded path and never scaled with
 // context depth: measured 2026-09-04 on Qwen3.8-27B at 4778 tokens, the 16

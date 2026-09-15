@@ -251,9 +251,12 @@ inline Arch dense(int L = 4, bool mtp = false) {
 //     layer_scalar, tied embeddings.
 //
 // 6 layers: 0,1 sliding, 2 full, 3,4 sliding, 5 full.
-inline Arch gemma4(int L = 6) {
+// GHD is the FULL-attention head_dim.  The default 32 keeps the fixture
+// small; gemma4_wide() raises it to 512, the real 31B checkpoint's width,
+// which is what exercises the 32-slot flash instantiation (kernels.hpp).
+inline Arch gemma4_at(int L, int GHD, const char* name) {
     const int H=64, V=128, QH=4;
-    const int SHD=16, SKV=2, GHD=32, GKV=1, I=128;
+    const int SHD=16, SKV=2, GKV=1, I=128;
     auto sliding = [](int l) { return (l % 3) != 2; };
     // Query width is QH * that LAYER's head_dim, so it differs between the
     // two layer types just as the KV width does -- 64 on a sliding layer,
@@ -266,7 +269,7 @@ inline Arch gemma4(int L = 6) {
   "model_type": "gemma4_text", "hidden_size": 64, "num_hidden_layers": )JSON" << L
       << R"JSON(, "vocab_size": 128,
   "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
-  "global_head_dim": 32, "num_global_key_value_heads": 1,
+  "global_head_dim": )JSON" << GHD << R"JSON(, "num_global_key_value_heads": 1,
   "intermediate_size": 128, "rms_norm_eps": 1e-06,
   "hidden_activation": "gelu_pytorch_tanh",
   "attention_k_eq_v": true, "final_logit_softcapping": 30.0,
@@ -281,7 +284,7 @@ inline Arch gemma4(int L = 6) {
         c << (l ? ", " : "")
           << (sliding(l) ? "\"sliding_attention\"" : "\"full_attention\"");
     c << "]\n}";
-    Arch a{"gemma4", c.str(), {}, V, L};
+    Arch a{name, c.str(), {}, V, L};
     auto& t = a.tensors;
     // Norm weights near ONE, not the file-wide N(0, 0.05).
     //
@@ -326,6 +329,14 @@ inline Arch gemma4(int L = 6) {
         t.push_back({m+"down_proj.weight", {H,I}});
     }
     return a;
+}
+
+inline Arch gemma4(int L = 6) { return gemma4_at(L, 32, "gemma4"); }
+// The real checkpoint's full-attention width.  Runs the same battery as
+// every other row, so a 512-wide head has to LOAD, GENERATE, stay in
+// vocabulary, reproduce, and depend on its input -- not merely not crash.
+inline Arch gemma4_wide(int L = 6) {
+    return gemma4_at(L, 512, "gemma4-hd512");
 }
 
 // ---- hybrid: DeltaNet linear attention + full attention ---------------

@@ -1193,7 +1193,8 @@ sycl::event launch_dflash_context_kv_f16w(
 // head. Its 16 subgroups each own one query, while all of them reuse the same
 // 16-key K/V tile staged in SLM. The former one-subgroup-per-query kernel read
 // the complete K/V history independently for every query.
-sycl::event launch_flash_prefill(
+template <int MAXD>
+static sycl::event launch_flash_prefill_impl(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int start_pos,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
@@ -1219,11 +1220,12 @@ sycl::event launch_flash_prefill(
                 const uint8_t* vh = v_cache + int64_t(kvh) * seq_cap * head_dim;
                 float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* vsl=vs.template get_multi_ptr<sycl::access::decorated::no>().get();
-                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
+                static_assert(MAXD == MAX_DPL || MAXD == MAX_DPL_WIDE,
+                              "kernels.hpp owns the accumulator widths");
                 const int dpl = head_dim / SG_SIZE;
-                float acc[MAX_DPL];
+                float acc[MAXD];
                 #pragma unroll
-                for (int j = 0; j < MAX_DPL; ++j) acc[j] = 0.0f;
+                for (int j = 0; j < MAXD; ++j) acc[j] = 0.0f;
                 float m = -std::numeric_limits<float>::infinity(), l = 0.0f;
                 const int end=t<tokens?start_pos+t+1:0;
                 const int tile_last=sycl::min(tokens-1,qt*QT+QT-1);
@@ -1250,10 +1252,10 @@ sycl::event launch_flash_prefill(
                     const float corr = sycl::isinf(m) ? 0.0f : sycl::exp(m - mn);
                     const float p = sycl::isinf(score) ? 0.0f : sycl::exp(score - mn);
                     l = sycl::fma(l, corr, sycl::reduce_over_group(sg, p, sycl::plus<float>()));
-                    for (int j = 0; j < MAX_DPL; ++j) if (j < dpl) acc[j] *= corr;
+                    for (int j = 0; j < MAXD; ++j) if (j < dpl) acc[j] *= corr;
                     for (int j = 0; j < KT && s0 + j < end; ++j) {
                         const float pb = sycl::group_broadcast(sg, p, j);
-                        for (int d = 0; d < MAX_DPL; ++d) if (d < dpl)
+                        for (int d = 0; d < MAXD; ++d) if (d < dpl)
                             acc[d]=sycl::fma(pb,vsl[int64_t(j)*head_dim+lane+d*SG_SIZE],acc[d]);
                     }
                     m = mn;
@@ -1262,16 +1264,28 @@ sycl::event launch_flash_prefill(
                 if(t<tokens){
                     float* o=out+(int64_t(t)*num_heads+qh0)*head_dim;
                     const float inv=l>0.0f?1.0f/l:0.0f;
-                    for(int d=0;d<MAX_DPL;++d)if(d<dpl)o[lane+d*SG_SIZE]=acc[d]*inv;
+                    for(int d=0;d<MAXD;++d)if(d<dpl)o[lane+d*SG_SIZE]=acc[d]*inv;
                 }
             });
     });
+}
+sycl::event launch_flash_prefill(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int start_pos,
+    int num_heads, int num_kv_heads, int head_dim, int seq_cap,
+    float softmax_scale, const std::vector<sycl::event>& deps) {
+    return head_dim > MAX_HEAD_DIM
+         ? launch_flash_prefill_impl<MAX_DPL_WIDE>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+           num_kv_heads, head_dim, seq_cap, softmax_scale, deps)
+         : launch_flash_prefill_impl<MAX_DPL>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+           num_kv_heads, head_dim, seq_cap, softmax_scale, deps);
 }
 
 // DFlash block attention. Full-attention heads are normally non-causal; Muse's
 // sliding-attention head is trained causally. K/V for context and query rows
 // use the target's FP8 E4M3 cache layout.
-sycl::event launch_dflash2_block_attention(
+template <int MAXD>
+static sycl::event launch_dflash2_block_attention_impl(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
@@ -1302,11 +1316,12 @@ sycl::event launch_dflash2_block_attention(
                 const uint8_t* vh=v_cache+int64_t(kvh)*seq_cap*head_dim;
                 float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* vsl=vs.template get_multi_ptr<sycl::access::decorated::no>().get();
-                static_assert(MAX_DPL==16,"kernels.hpp owns this bound");
+                static_assert(MAXD == MAX_DPL || MAXD == MAX_DPL_WIDE,
+                              "kernels.hpp owns the accumulator widths");
                 const int dpl=head_dim/SG_SIZE;
-                float acc[MAX_DPL];
+                float acc[MAXD];
                 #pragma unroll
-                for(int j=0;j<MAX_DPL;++j)acc[j]=0.0f;
+                for(int j=0;j<MAXD;++j)acc[j]=0.0f;
                 float m=-std::numeric_limits<float>::infinity(),l=0.0f;
                 for(int s0=begin;s0<end;s0+=KT){
                     for(int x=lid;x<head_dim*KT;x+=WG){
@@ -1333,10 +1348,10 @@ sycl::event launch_dflash2_block_attention(
                     const float corr=sycl::isinf(m)?0.0f:sycl::exp(m-mn);
                     const float p=sycl::isinf(score)?0.0f:sycl::exp(score-mn);
                     l=sycl::fma(l,corr,sycl::reduce_over_group(sg,p,sycl::plus<float>()));
-                    for(int j=0;j<MAX_DPL;++j)if(j<dpl)acc[j]*=corr;
+                    for(int j=0;j<MAXD;++j)if(j<dpl)acc[j]*=corr;
                     for(int j=0;j<KT&&s0+j<end;++j){
                         const float pb=sycl::group_broadcast(sg,p,j);
-                        for(int d=0;d<MAX_DPL;++d)if(d<dpl)
+                        for(int d=0;d<MAXD;++d)if(d<dpl)
                             acc[d]=sycl::fma(pb,vsl[int64_t(j)*head_dim+lane+d*SG_SIZE],acc[d]);
                     }
                     m=mn;
@@ -1345,11 +1360,25 @@ sycl::event launch_dflash2_block_attention(
                 if(t<tokens){
                     float* o=out+(int64_t(t)*num_heads+qh0)*head_dim;
                     const float inv=l>0.0f?1.0f/l:0.0f;
-                    for(int d=0;d<MAX_DPL;++d)if(d<dpl)
+                    for(int d=0;d<MAXD;++d)if(d<dpl)
                         o[lane+d*SG_SIZE]=acc[d]*inv;
                 }
             });
     });
+}
+sycl::event launch_dflash2_block_attention(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int context_len,
+    int num_heads, int num_kv_heads, int head_dim, int seq_cap,
+    int sliding_window, bool causal, float softmax_scale,
+    const std::vector<sycl::event>& deps) {
+    return head_dim > MAX_HEAD_DIM
+         ? launch_dflash2_block_attention_impl<MAX_DPL_WIDE>(q, qv, k_cache, v_cache, out, tokens, context_len, num_heads,
+           num_kv_heads, head_dim, seq_cap, sliding_window, causal,
+           softmax_scale, deps)
+         : launch_dflash2_block_attention_impl<MAX_DPL>(q, qv, k_cache, v_cache, out, tokens, context_len, num_heads,
+           num_kv_heads, head_dim, seq_cap, sliding_window, causal,
+           softmax_scale, deps);
 }
 
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,

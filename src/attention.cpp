@@ -68,7 +68,8 @@ static inline int decode_splits(const AttnParams& p) {
     return want > 0 ? want : 1;
 }
 
-sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
+template <int MAXD>
+static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                                 const std::vector<sycl::event>& deps) {
     const int HD  = p.head_dim;
     const int DPL = HD / SG_SIZE; (void)DPL;
@@ -128,18 +129,19 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                 // the WHOLE q vector -- it cannot be partitioned like the
                 // output accumulator. head_dim floats is 512 B, resident
                 // in L1 across the entire scan.
-                // MAX_DPL bounds head_dim/SG_SIZE. This model uses
+                // MAXD bounds head_dim/SG_SIZE. This model uses
                 // head_dim 256, so 16 accumulator slots per lane -- an
                 // 8-slot array silently computes only the first half of
                 // every head and leaves dims 128..255 holding whatever
                 // the previous token left there.
-                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
+                static_assert(MAXD == MAX_DPL || MAXD == MAX_DPL_WIDE,
+                              "kernels.hpp owns the accumulator widths");
                 const int dpl = HD / SG_SIZE;
                 float m   = -std::numeric_limits<float>::infinity();
                 float l   = 0.0f;
-                float acc[MAX_DPL];
+                float acc[MAXD];
                 #pragma unroll
-                for (int d = 0; d < MAX_DPL; ++d) acc[d] = 0.0f;
+                for (int d = 0; d < MAXD; ++d) acc[d] = 0.0f;
 
                 for (int s0 = s_beg; s0 < s_end; s0 += SG_SIZE) {
                     const int s = s0 + lane;
@@ -170,7 +172,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
 
                     l = sycl::fma(l, corr, psum);
                     #pragma unroll
-                    for (int d = 0; d < MAX_DPL; ++d)
+                    for (int d = 0; d < MAXD; ++d)
                         if (d < dpl) acc[d] *= corr;
 
                     // ---- accumulate V --------------------------------
@@ -182,7 +184,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                         const float pb = sycl::group_broadcast(sg, pj, j);
                         const uint8_t* vrow = vh + int64_t(s0 + j) * pp.head_dim;
                         #pragma unroll
-                        for (int d = 0; d < MAX_DPL; ++d)
+                        for (int d = 0; d < MAXD; ++d)
                             if (d < dpl)
                                 acc[d] = sycl::fma(pb, e4m3_to_f32(
                                     vrow[lane + d * SG_SIZE]), acc[d]);
@@ -196,7 +198,7 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                 const int64_t pidx = int64_t(head) * splits + part;
                 float* po = pp.partials + pidx * pp.head_dim;
                 #pragma unroll
-                for (int d = 0; d < MAX_DPL; ++d)
+                for (int d = 0; d < MAXD; ++d)
                     if (d < dpl) po[lane + d * SG_SIZE] = acc[d];
                 if (lane == 0) {
                     pp.part_m[pidx] = (s_beg >= s_end) ? -std::numeric_limits<float>::infinity() : m;
@@ -204,6 +206,12 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                 }
             });
     });
+}
+sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
+                                const std::vector<sycl::event>& deps) {
+    return p.head_dim > MAX_HEAD_DIM
+         ? launch_flash_decode_impl<MAX_DPL_WIDE>(q, p, deps)
+         : launch_flash_decode_impl<MAX_DPL>(q, p, deps);
 }
 
 // ---------------------------------------------------------------------
@@ -278,7 +286,8 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
 // than M times.  The split-K workspace is row-major:
 //   [query][head][split][head_dim], [query][head][split].
 // ---------------------------------------------------------------------
-sycl::event launch_flash_decode_batched(
+template <int MAXD>
+static sycl::event launch_flash_decode_batched_impl(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int base_seq_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
@@ -334,13 +343,14 @@ sycl::event launch_flash_decode_batched(
                 float* vsl = vs.template get_multi_ptr<
                     sycl::access::decorated::no>().get();
 
-                static_assert(MAX_DPL == 16, "kernels.hpp owns this bound");
+                static_assert(MAXD == MAX_DPL || MAXD == MAX_DPL_WIDE,
+                              "kernels.hpp owns the accumulator widths");
                 const int dpl = head_dim / SG_SIZE;
                 float m = -std::numeric_limits<float>::infinity();
                 float l = 0.0f;
-                float acc[MAX_DPL];
+                float acc[MAXD];
                 #pragma unroll
-                for (int d = 0; d < MAX_DPL; ++d) acc[d] = 0.0f;
+                for (int d = 0; d < MAXD; ++d) acc[d] = 0.0f;
 
                 for (int s0 = s_beg; s0 < s_end; s0 += KT) {
                     for (int x = lid; x < head_dim * KT; x += wg) {
@@ -373,12 +383,12 @@ sycl::event launch_flash_decode_batched(
                     l = sycl::fma(l, corr, sycl::reduce_over_group(
                         sg, p, sycl::plus<float>()));
                     #pragma unroll
-                    for (int d = 0; d < MAX_DPL; ++d)
+                    for (int d = 0; d < MAXD; ++d)
                         if (d < dpl) acc[d] *= corr;
                     for (int j = 0; j < KT && s0 + j < s_end; ++j) {
                         const float pb = sycl::group_broadcast(sg, p, j);
                         #pragma unroll
-                        for (int d = 0; d < MAX_DPL; ++d)
+                        for (int d = 0; d < MAXD; ++d)
                             if (d < dpl)
                                 acc[d] = sycl::fma(pb,
                                     vsl[int64_t(j) * head_dim + lane +
@@ -393,7 +403,7 @@ sycl::event launch_flash_decode_batched(
                         (int64_t(row) * num_heads + head) * splits + part;
                     float* po = partials + pidx * head_dim;
                     #pragma unroll
-                    for (int d = 0; d < MAX_DPL; ++d)
+                    for (int d = 0; d < MAXD; ++d)
                         if (d < dpl) po[lane + d * SG_SIZE] = acc[d];
                     if (lane == 0) {
                         part_m[pidx] = (s_beg >= s_end || s_beg >= row_seq)
@@ -442,6 +452,20 @@ sycl::event launch_flash_decode_batched(
                 }
             });
     });
+}
+sycl::event launch_flash_decode_batched(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int base_seq_len,
+    int num_heads, int num_kv_heads, int head_dim, int seq_cap,
+    float softmax_scale, float* partials, float* part_m, float* part_l,
+    int splits, const std::vector<sycl::event>& deps) {
+    return head_dim > MAX_HEAD_DIM
+         ? launch_flash_decode_batched_impl<MAX_DPL_WIDE>(q, qv, k_cache, v_cache, out, tokens, base_seq_len, num_heads,
+           num_kv_heads, head_dim, seq_cap, softmax_scale, partials,
+           part_m, part_l, splits, deps)
+         : launch_flash_decode_batched_impl<MAX_DPL>(q, qv, k_cache, v_cache, out, tokens, base_seq_len, num_heads,
+           num_kv_heads, head_dim, seq_cap, softmax_scale, partials,
+           part_m, part_l, splits, deps);
 }
 
 } // namespace b70

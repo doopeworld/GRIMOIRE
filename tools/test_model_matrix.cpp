@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
 
     std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
                                       mini::hybrid(), mini::k2(),
-                                      mini::gemma4() };
+                                      mini::gemma4(), mini::gemma4_wide() };
 
     std::printf("%-12s", "");
     for (const auto& f : kFormats) std::printf("%-10s", f.name);
@@ -196,23 +196,24 @@ int main(int argc, char** argv) {
     // path with the wrong residual graph and emit fluent text -- cannot be
     // caught by the table above, because that cell would read "ok".
     //
-    // gemma-4 itself now RUNS (the row above), but only below head_dim
-    // 256: every flash kernel accumulates a head into a private array of
-    // MAX_DPL floats per lane, and the real 31B checkpoint's
-    // full-attention layers are 512 wide.  Going past that is a
-    // DEVICE_LOST, so it must refuse rather than reach the card.  The
-    // fixture here is the same model with ONE value changed, which is what
-    // makes this a test of the bound and not of gemma-4.
+    // gemma-4 RUNS at its real 512-wide full-attention head (the
+    // gemma4-hd512 row above, which reaches the 32-slot flash
+    // instantiation).  The bound did not disappear, it moved: every flash
+    // kernel still accumulates a head into a private array, now MAXD 32
+    // floats per lane, so 512 is the widest head that fits and 1024 still
+    // has to refuse rather than reach the card.  The fixture here is the
+    // same model with ONE value changed, which is what makes this a test
+    // of the bound and not of gemma-4.
     {
         std::printf("\nmust be refused, not silently run:\n");
         mini::Arch wide = mini::gemma4();
         const std::string from = "\"global_head_dim\": 32";
-        const std::string to   = "\"global_head_dim\": 512";
+        const std::string to   = "\"global_head_dim\": 1024";
         const size_t at = wide.config.find(from);
         if (at == std::string::npos) {
             ++fails;
             std::printf("  %-14s fixture no longer declares global_head_dim; "
-                        "this case proves nothing\n", "head_dim 512");
+                        "this case proves nothing\n", "head_dim 1024");
         } else {
             wide.config.replace(at, from.size(), to);
             const fs::path dir = root / "refuse-wide-head";
@@ -226,9 +227,9 @@ int main(int argc, char** argv) {
             }
             if (loaded) {
                 ++fails;
-                std::printf("  %-14s LOADED -- a 512-wide head overruns a "
+                std::printf("  %-14s LOADED -- a 1024-wide head overruns a "
                             "device stack array, which is a DEVICE_LOST\n",
-                            "head_dim 512");
+                            "head_dim 1024");
             } else if (err.find("exceeds what the flash-attention kernels")
                        == std::string::npos) {
                 // The fixture is deliberately inconsistent in other ways
@@ -237,9 +238,9 @@ int main(int argc, char** argv) {
                 // reason and leave the bound untested.
                 ++fails;
                 std::printf("  %-14s refused, but for the wrong reason: %s\n",
-                            "head_dim 512", err.c_str());
+                            "head_dim 1024", err.c_str());
             } else {
-                std::printf("  %-14s refused by name\n", "head_dim 512");
+                std::printf("  %-14s refused by name\n", "head_dim 1024");
             }
         }
     }

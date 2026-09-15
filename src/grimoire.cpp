@@ -2900,21 +2900,31 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
     // head_dim per lane.  Every flash kernel in attention.cpp and
-    // prefill.cpp accumulates its head into a PRIVATE array of MAX_DPL
-    // floats, with dpl = head_dim / SG_SIZE and SG_SIZE 16 -- so head_dim
-    // above 256 writes past the end of a device stack array.  That is a
-    // DEVICE_LOST, not a wrong number, and no supported model has ever
-    // exceeded it (Qwen 128, K2/Muse 256).  gemma-4's full-attention
-    // layers are 512.  Raising MAX_DPL is a register-pressure change to
-    // the hot decode kernel and has to be measured on the card, so bound
-    // it here rather than guess.
+    // prefill.cpp accumulates its head into a PRIVATE array of MAXD
+    // floats, with dpl = head_dim / SG_SIZE and SG_SIZE 16 -- so a head
+    // wider than the array writes past the end of device stack memory.
+    // That is a DEVICE_LOST, not a wrong number.
+    //
+    // Each of those kernels is now a TEMPLATE on that width and is
+    // instantiated twice (kernels.hpp): head_dim <= MAX_HEAD_DIM keeps the
+    // 16-slot kernel it has always used, and a wider head dispatches to
+    // the 32-slot one, so gemma-4's 512-wide full-attention layers run
+    // without changing the private array of any narrower model.  The bound
+    // that remains is the wide instantiation's own.
+    //
+    // NOT VERIFIED ON THE CARD: the 32-slot kernel doubles the private
+    // array for the models that reach it, and register pressure at dpl 32
+    // is a B70 measurement (rule 8).  Correctness is gated off-card by
+    // bin/test_model_matrix, which runs a 512-wide head and diffs it
+    // against a host reference; throughput at that width is not.
     const int max_hd = cfg.max_head_dim();
-    if (max_hd > MAX_HEAD_DIM)
+    if (max_hd > MAX_HEAD_DIM_WIDE)
         return "head_dim " + std::to_string(max_hd) +
                " exceeds what the flash-attention kernels can hold "
-               "(MAX_DPL " + std::to_string(MAX_DPL) + " x SG_SIZE " +
-               std::to_string(SG_SIZE) + " = " +
-               std::to_string(MAX_HEAD_DIM) + ").  Every head accumulates "
+               "(MAX_DPL_WIDE " + std::to_string(MAX_DPL_WIDE) +
+               " x SG_SIZE " + std::to_string(SG_SIZE) + " = " +
+               std::to_string(MAX_HEAD_DIM_WIDE) +
+               ").  Every head accumulates "
                "into a private array of that size, so a wider head writes "
                "past the end of device stack memory -- a DEVICE_LOST, not a "
                "wrong answer.  Refusing.";
