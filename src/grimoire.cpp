@@ -8593,9 +8593,14 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     float* ffo  = df(size_t(M) * size_t(IX ? IX : 1));
     int32_t* dtok = sycl::malloc_device<int32_t>(size_t(M), q);
     sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
+    // Per-row int8 activations for the W4A8 tiles, which are the fast path
+    // for a converted weight and the difference between "faster than one
+    // token at a time" and using the card.
+    int8_t* a8  = sycl::malloc_device<int8_t>(size_t(M) * WX, q);
+    float*  a8s = df(size_t(M));
     std::vector<void*> mem = {(void*)h, (void*)h2, (void*)qv, (void*)kv,
         (void*)vv, (void*)attn, (void*)proj, (void*)sh, (void*)ff,
-        (void*)ffo, (void*)dtok, (void*)xb};
+        (void*)ffo, (void*)dtok, (void*)xb, (void*)a8, (void*)a8s};
     auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
     for (void* p : mem) if (!p) { cleanup(); return false; }
 
@@ -8615,21 +8620,52 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     // POINTER is.  gemv_any() is the decode path and reads whatever the
     // weight actually became, so route there rather than take the card
     // off the bus.
+    // The same tuned dispatch the generic prefill uses.  A plain bf16 GEMM
+    // would be correct and would waste the card: a converted weight wants
+    // the W4A8 tile, an MXFP4 weight wants the dense bridge.
+    //
+    // RULE 5: the production 128-row tile fetches 128 rows of A per tile
+    // however few tokens it is given, so a short prompt takes m16 instead.
+    Xe2DenseMXFP4 g4_dense_f32 = load_xe2_dense_mxfp4_f32();
+    Xe2DenseW4A8  g4_w4a8 = w4a8_enabled()
+        ? load_xe2_dense_w4a8(M <= 16 ? "grimoire_xe2_dense_w4a8_f32_m16"
+                                      : "grimoire_xe2_dense_w4a8_f32")
+        : nullptr;
+
     bool ok = true;
     auto mmg = [&](const DevQuant& w, const float* x, float* y) {
         if (!ok) return;
         if (w.w.N <= 0) { ok = false; return; }
-        if (noxmx || !w.w.payload) {
-            if (!w.w.payload && !noxmx) {
-                for (int r = 0; r < M; ++r)
-                    gemv_any(w, x + size_t(r) * w.w.K,
-                             y + size_t(r) * w.w.N, none);
-                return;
-            }
-            launch_gemm_batched(q, w.w, x, y, M, none);
+        // Correctness-only path for a device with no matrix hardware.
+        if (noxmx) { launch_gemm_batched(q, w.w, x, y, M, none); return; }
+
+        // RULE 4: every W4A8 tile is 256 wide in N and its B block loads do
+        // NOT clamp to the tensor, so a weight with N % 256 != 0 reads
+        // hundreds of KB past the end -- a DEVICE_LOST, not a wrong number.
+        // gemma-4's o_proj is hidden-wide and need not be aligned.
+        if (w.has_i4() && g4_w4a8 && a8 && a8s && (w.w.N % 256) == 0) {
+            launch_quantize_rows_int8(q, x, a8, a8s, M, w.w.K, none);
+            g4_w4a8(&q, a8, w.i4, w.i4s, a8s, y, M, w.w.N, w.w.K);
+            return;
+        }
+        // RULE 1: GRIMOIRE_W4A8 FREES the MXFP4 payload of a converted
+        // weight and everything below dereferences it.  A converted weight
+        // still reports fmt == MXFP4, so the FORMAT is not a safe test --
+        // the POINTER is.  gemv_any() reads whatever the weight became,
+        // which is what decode does.
+        if (!w.w.payload) {
+            for (int r = 0; r < M; ++r)
+                gemv_any(w, x + size_t(r) * w.w.K,
+                         y + size_t(r) * w.w.N, none);
             return;
         }
         launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
+        if (g4_dense_f32 && w.w.fmt == Fmt::MXFP4) {
+            g4_dense_f32(&q, xb, w.w.payload,
+                         static_cast<const unsigned char*>(w.w.scales),
+                         y, M, w.w.N, w.w.K);
+            return;
+        }
         launch_gemm_xmx(q, w.w, xb, y, M, none);
     };
 
@@ -8825,14 +8861,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // still producing fluent text.  prefill_gemma4() is that graph
     // batched; it declines a verify batch and PP/TP, each of which falls
     // back to sequential decode.
-    // OPT-IN until a B70 has run it (rule 8, rule 9).  The default is the
-    // sequential fallback, which is what shipped before this and is known
-    // correct; GRIMOIRE_GEMMA4_BATCHED_PREFILL=1 selects the batched
-    // sandwich path.  Wrong batching here is FLUENT, not loud, so the
-    // default must be the path that is already trusted -- flip it once
-    // bin/test_gemma4_prefill has been run on the card.
+    // ON by default since bin/test_gemma4_prefill went green: batched
+    // prefill is token-identical to sequential decode at bf16, fp8_e4m3,
+    // int8 and mxfp4, and at head_dim 512 as well as the small fixture.
+    // It took three gate runs to get there -- a missing logits tail, a
+    // GeGLU call that aliased its input, and a qk-norm convention that
+    // defaults to Qwen's -- and every one of those was FLUENT when wrong,
+    // so the escape hatch stays: GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL=1
+    // forces the sequential path for an A/B on the card.
     if (cfg.is_gemma4) {
-        if (!std::getenv("GRIMOIRE_GEMMA4_BATCHED_PREFILL")) return false;
+        if (std::getenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL")) return false;
         return prefill_gemma4(tokens, next_tokens);
     }
     const int M = int(tokens.size());

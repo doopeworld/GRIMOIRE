@@ -55,9 +55,9 @@ static bool gen(const std::string& dir, Fmt fmt, bool batched,
         // matrix hardware; the second var selects it at all (it is
         // opt-in until a B70 has run this gate).
         ::setenv("GRIMOIRE_BATCHED_PREFILL_NOXMX", "1", 1);
-        ::setenv("GRIMOIRE_GEMMA4_BATCHED_PREFILL", "1", 1);
+        ::unsetenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL");
     } else {
-        ::unsetenv("GRIMOIRE_GEMMA4_BATCHED_PREFILL");
+        ::setenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL", "1", 1);
     }
     const long before = g_gemma4_batched_prefills;
     std::string err;
