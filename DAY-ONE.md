@@ -361,9 +361,27 @@ software recovery. The known causes, all avoidable:
   memory twice, i.e. 64 KB per work-group at head_dim 512; the CPU device
   reports 256 KB and cannot fail it, a Xe work-group can.  Tile `KT` for
   wide heads if a batched launch is refused for local memory.
-- **gemma-4 batched prefill.** Not written. `prefill()` returns false for
-  gemma-4 and falls back to sequential decode, which is correct and slow.
-  The batched loop is the Qwen residual graph, so running a gemma-4 prompt
-  through it would contradict `forward_gemma4()` token for token while
-  still producing fluent text. Batching it needs the sandwich graph, the
-  `k_eq_v` value and both rotations in batched form.
+- **gemma-4 batched prefill. DONE 2026-09-15, off-card, ON by default.**
+  `prefill_gemma4()` is `forward_gemma4()`'s sandwich graph batched --
+  `k_eq_v`, the always-on `v_norm`, GeGLU, both rotations, and the
+  per-layer sliding window through `launch_dflash2_block_attention`,
+  which computes each query's own window bound. Projections take the same
+  tuned dispatch as the generic prefill: W4A8 tile (m16 below 17 tokens,
+  rule 5; guarded on `N % 256`, rule 4), MXFP4 dense bridge, and
+  `gemv_any` for a payload-free converted weight (rule 1).
+
+  `bin/test_gemma4_prefill` asserts batched == sequential token for token
+  at bf16/fp8_e4m3/int8/mxfp4 and at head_dim 512, and asserts the batched
+  path actually RAN before it compares anything -- without that a path
+  that declined would make both sides the same sequential run. It caught
+  three bugs that were all FLUENT when wrong: a missing logits tail (the
+  caller takes the first generated token from `s.logits`), a GeGLU call
+  that aliased its input, and a qk-norm `weight_offset` defaulting to
+  Qwen's `(1 + w)`. `GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL=1` forces the old
+  path for an A/B.
+
+  **First thing to run on the card**, because the CPU device could not:
+  the W4A8 and MXFP4 branches are BRIDGES, null off-card, so the gate
+  above exercised the plain-SYCL fallback and not one line of them. Run
+  `bin/test_gemma4_prefill` on the B70, where they load. A verify batch,
+  PP and TP still decline and fall back -- unwired, not broken.

@@ -208,13 +208,37 @@ show:
    for local memory, that is this, and the fix is tiling `KT` down for
    wide heads rather than touching the accumulator.
 
-### 5.2 Gemma-4 batched prefill — not written
+### 5.2 Gemma-4 batched prefill — **DONE (2026-09-15), ON by default**
 
-`prefill()` returns false for gemma-4 and falls back to sequential decode:
-correct, and slow. The batched loop is the Qwen residual graph, so running
-a gemma-4 prompt through it would contradict `forward_gemma4()` token for
-token while still looking fluent. Batching it needs the sandwich graph,
-the `k_eq_v` value and both rotations in batched form. A task, not a flag.
+`prefill_gemma4()` is `forward_gemma4()`'s sandwich graph batched, with
+the same tuned projection dispatch the generic prefill uses (W4A8 tile,
+MXFP4 dense bridge, `gemv_any` for a payload-free weight). All five gates
+are green with it on.
+
+The gate that made it safe is `bin/test_gemma4_prefill`: batched output
+must equal sequential decode token for token, and the batched path must
+be PROVEN to have run before any token is compared. It failed three times
+before it passed, and every failure produced fluent, in-vocabulary,
+reproducible output:
+
+1. **No logits tail.** `prefill()`'s contract includes `s.logits` for the
+   last row even when `next_tokens` is null -- the caller takes the first
+   generated token from it. Mine read whatever the previous request left.
+2. **GeGLU aliased its input.** `launch_geglu_batched` writes
+   `out[r*I+c]` while other work-items read `gu[r'*2I+…]`; one buffer for
+   both is a race. Decode survives it only because M is 1.
+3. **The qk-norm convention.** `launch_rmsnorm_residual_batched` READS the
+   global `set_norm_convention()`; `launch_qk_norm_rope_batched` takes it
+   as a PARAMETER that defaults to `1.0` — Qwen's `(1 + w)`. gemma-4
+   applies `w` directly. Rule 11, in a place rule 11's "one place" fix
+   does not reach. Now read back with `get_norm_convention()`.
+
+Still unwired, each falling back to sequential: a verify batch
+(`next_tokens`), PP, and TP.
+
+**On the card first:** the W4A8 and MXFP4 branches are bridges and are
+null off-card, so the gate exercised the plain-SYCL fallback and NOT one
+line of them. Run `bin/test_gemma4_prefill` on the B70.
 
 ### 5.3 Gemma-4 speculation — untested, not blocked
 
