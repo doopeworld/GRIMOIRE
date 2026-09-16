@@ -20,8 +20,9 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
   parallel-ffn, gemma4, gemma4 at head_dim 512
 - PP and TP produce token-identical output to a single process, in BF16
-  and FP8, for dense, MoE, hybrid and gemma-4 (`test_parallel_e2e`) --
-  40 matching cases.  **Its k2-horizon bf16 cell does NOT pass on a CPU
+  and FP8, for dense, MoE, hybrid, gemma-4, **gemma-4 at head_dim 512**,
+  **Muse** and the **parallel-FFN fold** (`test_parallel_e2e`) -- 48
+  matching cases.  **Its k2-horizon bf16 cell does NOT pass on a CPU
   device** and never has: the Intel OpenCL CPU runtime crashes compiling
   that kernel (SIGSEGV, with the runtime's own "PLEASE submit a bug
   report" line just above it), so the gate exits 1 with 1 failure.
