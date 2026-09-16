@@ -295,6 +295,17 @@ sycl::event launch_gate_sigmoid_mul_bf16_io(sycl::queue& q,
     const sycl_bf16* x,const float* gate,sycl_bf16* out,size_t n,
     const std::vector<sycl::event>& deps = {});
 
+// ---- Qwen4-Exp PLE n-gram embedding (host ref: b70/qwen4_exp.hpp) ----
+// The 20M-row table itself lives in HOST memory (vLLM pins it too); these
+// produce the ids to gather and the gate that scales the result.
+sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
+    int64_t* out, int n_tokens, const int64_t* multipliers,
+    const int64_t* sizes, const int64_t* offsets, int ngram_context_len,
+    int heads_per_ngram, int ngram_heads, int eos_token_id,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_ple_gate(sycl::queue& q, const float* key,
+    const float* query, float* out, int rows, int H, float eps,
+    const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
 sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
     const uint8_t* k_cache, const uint8_t* v_cache, const int32_t* idx,

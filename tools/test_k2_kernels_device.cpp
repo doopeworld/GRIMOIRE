@@ -1126,6 +1126,123 @@ int main() {
         sycl::free(d_vc,q); sycl::free(d_ao,q);
     }
 
+    // ---- Qwen4-Exp PLE n-gram embedding ----------------------------
+    {
+        const int nt = 12, hpn = 4, orders = 2;       // bigram + trigram
+        const int nheads = orders * hpn, ctx = orders;
+        const int eos = 7;
+        std::vector<int32_t> toks(size_t(nt), 0);
+        std::mt19937 rng(20260918);
+        for (int i = 0; i < nt; ++i) toks[size_t(i)] = int32_t(rng() % 50);
+        toks[5] = eos;                                 // force a boundary
+        std::vector<int64_t> mul(size_t(ctx + 1), 0), sz(size_t(nheads), 0),
+                             off(size_t(nheads), 0);
+        for (int i = 0; i <= ctx; ++i) mul[size_t(i)] = 0x9E3779B1LL * (i + 1);
+        for (int h = 0; h < nheads; ++h) {
+            sz[size_t(h)]  = 1000 + h * 37;
+            off[size_t(h)] = int64_t(h) * 100000;
+        }
+        int32_t* d_t = sycl::malloc_device<int32_t>(toks.size(), q);
+        int64_t* d_o = sycl::malloc_device<int64_t>(size_t(nt)*nheads, q);
+        int64_t* d_m = sycl::malloc_device<int64_t>(mul.size(), q);
+        int64_t* d_s = sycl::malloc_device<int64_t>(sz.size(), q);
+        int64_t* d_f = sycl::malloc_device<int64_t>(off.size(), q);
+        q.memcpy(d_t, toks.data(), toks.size()*sizeof(int32_t));
+        q.memcpy(d_m, mul.data(), mul.size()*sizeof(int64_t));
+        q.memcpy(d_s, sz.data(), sz.size()*sizeof(int64_t));
+        q.memcpy(d_f, off.data(), off.size()*sizeof(int64_t)).wait();
+        launch_ple_ngram_ids(q, d_t, d_o, nt, d_m, d_s, d_f, ctx, hpn,
+                             nheads, eos, {});
+        q.wait();
+        std::vector<int64_t> got(size_t(nt)*nheads), want(size_t(nt)*nheads);
+        q.memcpy(got.data(), d_o, got.size()*sizeof(int64_t)).wait();
+        for (int t = 0; t < nt; ++t)
+            qwen4_exp::ple_ngram_ids(toks[size_t(t)], toks.data(), t,
+                                     mul.data(), sz.data(), off.data(),
+                                     ctx, hpn, nheads, eos,
+                                     want.data() + size_t(t)*nheads);
+        int bad = 0;
+        for (size_t i = 0; i < got.size(); ++i) if (got[i] != want[i]) ++bad;
+        std::printf("%-16s %-40s %d mismatches\n", "ple ngram ids",
+                    "per-head order, sticky EOS", bad);
+        CHECK(bad == 0, "launch_ple_ngram_ids does not match the host reference");
+
+        // A/B 1: every head at the SAME order is the natural shortcut and
+        // still yields valid table indices.  Bigram and trigram heads must
+        // differ for the same token, or the orders are not really there.
+        {
+            int same = 0;
+            for (int t = ctx; t < nt; ++t)
+                if (got[size_t(t)*nheads + 0] - off[0] ==
+                    got[size_t(t)*nheads + hpn] - off[size_t(hpn)]) ++same;
+            std::printf("%-16s %-40s %d/%d rows identical\n", "ple order A/B",
+                        "bigram head vs trigram head", same, nt - ctx);
+            CHECK(same < (nt - ctx),
+                  "bigram and trigram heads hash identically, so the per-head "
+                  "n-gram order is not being applied");
+        }
+        // A/B 2: the sticky-EOS walk.  Positions after the boundary must
+        // differ from what a non-sticky walk would produce, or the
+        // document boundary is being read straight through.
+        {
+            std::vector<int64_t> nonsticky(size_t(nheads), 0);
+            // The probe must sit so that a predecessor BEYOND the EOS is
+            // still inside some head's window, or sticky and non-sticky
+            // are identical by construction and this A/B proves nothing.
+            // eos is at index 5, so t=6 puts it at shift 1 and index 4 at
+            // shift 2 -- which the ORDER-3 heads include and stickiness
+            // rewrites to eos.  (t=7 put the eos at shift 2, the last
+            // shift any head reads, so nothing downstream of it existed.)
+            const int t = 6;
+            for (int h = 0; h < nheads; ++h) {
+                const int order = h / hpn + 2;
+                int64_t mixed = int64_t(toks[size_t(t)]) * mul[0];
+                for (int shift = 1; shift <= ctx; ++shift) {
+                    const int at = t - shift;
+                    const int64_t cand = at >= 0 ? int64_t(toks[size_t(at)]) : 0;
+                    if (order > shift) mixed ^= cand * mul[size_t(shift)];
+                }
+                int64_t r = mixed % sz[size_t(h)]; if (r < 0) r += sz[size_t(h)];
+                nonsticky[size_t(h)] = r + off[size_t(h)];
+            }
+            int differ = 0;
+            for (int h = 0; h < nheads; ++h)
+                if (nonsticky[size_t(h)] != got[size_t(t)*nheads + h]) ++differ;
+            std::printf("%-16s %-40s %d/%d heads differ\n", "ple eos A/B",
+                        "sticky vs reading through the boundary", differ, nheads);
+            CHECK(differ > 0, "sticky and non-sticky EOS agree here, so the "
+                              "document boundary is untested");
+        }
+
+        // --- the gate -------------------------------------------------
+        const int grows = 5, GH = 64;
+        std::vector<float> gk(size_t(grows)*GH, 0.0f), gq(size_t(grows)*GH, 0.0f);
+        std::uniform_real_distribution<float> gd(-1.0f, 1.0f);
+        for (auto& v : gk) v = gd(rng);
+        for (auto& v : gq) v = gd(rng);
+        float* d_gk = sycl::malloc_device<float>(gk.size(), q);
+        float* d_gq = sycl::malloc_device<float>(gq.size(), q);
+        float* d_gg = sycl::malloc_device<float>(size_t(grows), q);
+        q.memcpy(d_gk, gk.data(), gk.size()*sizeof(float));
+        q.memcpy(d_gq, gq.data(), gq.size()*sizeof(float)).wait();
+        launch_ple_gate(q, d_gk, d_gq, d_gg, grows, GH, 1e-6f, {});
+        q.wait();
+        std::vector<float> gg(size_t(grows), 0.0f), gw(size_t(grows), 0.0f);
+        q.memcpy(gg.data(), d_gg, gg.size()*sizeof(float)).wait();
+        for (int r = 0; r < grows; ++r)
+            gw[size_t(r)] = qwen4_exp::ple_gate(gk.data() + size_t(r)*GH,
+                                                gq.data() + size_t(r)*GH,
+                                                GH, 1e-6f);
+        std::printf("%-16s %-40s %.3e\n", "ple gate",
+                    "sigmoid(sign(d)*sqrt(|d|)), each rms'd", worst_abs(gw, gg));
+        CHECK(worst_abs(gw, gg) < 2e-5,
+              "launch_ple_gate does not match the host reference");
+
+        sycl::free(d_t,q); sycl::free(d_o,q); sycl::free(d_m,q);
+        sycl::free(d_s,q); sycl::free(d_f,q); sycl::free(d_gk,q);
+        sycl::free(d_gq,q); sycl::free(d_gg,q);
+    }
+
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

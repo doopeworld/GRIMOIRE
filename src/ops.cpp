@@ -1909,4 +1909,97 @@ sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
     });
 }
 
+// ---------------------------------------------------------------------
+//  PLE -- the per-layer n-gram embedding (Qwen4-Exp).
+//  Host reference and derivation: include/b70/qwen4_exp.hpp.
+// ---------------------------------------------------------------------
+
+// n-gram ids.  One work-item per (token, head).
+//
+// head h covers n-gram ORDER h/heads_per_ngram + 2, and only predecessors
+// with shift < order enter its xor.  Mixing every predecessor into every
+// head collapses the orders into one and is completely silent -- the
+// hashes are still valid table indices.
+//
+// The EOS walk is STICKY: once a predecessor is EOS, every older one is
+// treated as EOS too, which is what keeps an n-gram inside one document.
+sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
+                                 int64_t* out, int n_tokens,
+                                 const int64_t* multipliers,
+                                 const int64_t* sizes, const int64_t* offsets,
+                                 int ngram_context_len, int heads_per_ngram,
+                                 int ngram_heads, int eos_token_id,
+                                 const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n_tokens) * ngram_heads),
+            [=](sycl::id<1> id) {
+                const int t  = int(id[0] / ngram_heads);
+                const int hh = int(id[0] % ngram_heads);
+                const int order = hh / heads_per_ngram + 2;
+                int64_t mixed = int64_t(tokens[t]) * multipliers[0];
+                bool crossed = false;
+                for (int shift = 1; shift <= ngram_context_len; ++shift) {
+                    const int at = t - shift;
+                    int64_t cand = (at >= 0) ? int64_t(tokens[at]) : 0;
+                    if (crossed) cand = eos_token_id;
+                    if (cand == eos_token_id) crossed = true;
+                    if (order > shift) mixed ^= cand * multipliers[shift];
+                }
+                int64_t r = sizes[hh] ? (mixed % sizes[hh]) : 0;
+                if (r < 0) r += sizes[hh];      // torch.remainder semantics
+                out[int64_t(t) * ngram_heads + hh] = r + offsets[hh];
+            });
+    });
+}
+
+// The PLE gate: d = dot(rms(key), rms(query)) / sqrt(H), then
+// sigmoid(sign(d) * sqrt(max(|d|, 1e-6))).
+//
+// key and query are normalised SEPARATELY.  Normalising the concatenated
+// pair, or skipping one, changes d's scale and the gate still lands in
+// (0,1) -- nothing downstream would notice.
+sycl::event launch_ple_gate(sycl::queue& q, const float* key,
+                            const float* query, float* out, int rows,
+                            int H, float eps,
+                            const std::vector<sycl::event>& deps) {
+    constexpr int WG = 128;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> rk(WG, h), rq(WG, h), rd(WG, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int row  = int(it.get_group(0));
+                const int lane = int(it.get_local_id(0));
+                const float* k = key   + int64_t(row) * H;
+                const float* v = query + int64_t(row) * H;
+                float ks = 0.0f, qs = 0.0f;
+                for (int i = lane; i < H; i += WG) { ks += k[i]*k[i]; qs += v[i]*v[i]; }
+                rk[lane] = ks; rq[lane] = qs;
+                sycl::group_barrier(it.get_group());
+                for (int s = WG/2; s; s >>= 1) {
+                    if (lane < s) { rk[lane] += rk[lane+s]; rq[lane] += rq[lane+s]; }
+                    sycl::group_barrier(it.get_group());
+                }
+                const float ki = sycl::rsqrt(rk[0]/float(H) + eps);
+                const float qi = sycl::rsqrt(rq[0]/float(H) + eps);
+                float dot = 0.0f;
+                for (int i = lane; i < H; i += WG) dot += (k[i]*ki) * (v[i]*qi);
+                rd[lane] = dot;
+                sycl::group_barrier(it.get_group());
+                for (int s = WG/2; s; s >>= 1) {
+                    if (lane < s) rd[lane] += rd[lane+s];
+                    sycl::group_barrier(it.get_group());
+                }
+                if (lane == 0) {
+                    const float d = rd[0] / sycl::sqrt(float(H));
+                    const float sgn = d < 0.0f ? -1.0f : 1.0f;
+                    const float mag = sycl::fabs(d) > 1e-6f ? sycl::fabs(d) : 1e-6f;
+                    const float z = sgn * sycl::sqrt(mag);
+                    out[row] = 1.0f / (1.0f + sycl::exp(-z));
+                }
+            });
+    });
+}
+
 } // namespace b70

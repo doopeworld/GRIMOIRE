@@ -48,6 +48,7 @@
 #include <cmath>
 #include <cstddef>
 #include <vector>
+#include <cstdint>
 #include <limits>
 #include <algorithm>
 
@@ -246,6 +247,88 @@ inline void qsa_attention(const float* q, const float* k, const float* v,
         for (int d = 0; d < head_dim; ++d)
             out[size_t(h) * head_dim + d] = acc[size_t(d)] * inv;
     }
+}
+
+// ---------------------------------------------------------------------
+//  PLE -- the per-layer n-gram embedding.
+//
+//  Extracted from the kernel and its docstring in vLLM,
+//  vllm/models/qwen4_exp/nvidia/ops/ple.py (copied to
+//  ref/qwen4_exp_nvidia_ngram_embedding.py / ple_layer.py).  The
+//  docstring states the whole contract:
+//
+//    ids:  offset[h] + (xor_i(token[t-i] * multiplier[i]) % size[h])
+//    gate: d = dot(RMSNorm(key), RMSNorm(query)) / sqrt(H)
+//          g = sigmoid(sign(d) * sqrt(max(abs(d), 1e-6)))
+//    conv: silu(sum_k weight[k] * history[t + k*dilation]) added to the
+//          gated output, updating a persistent history
+//
+//  A NOTE ON SIZE, because it decides whether this model can run here at
+//  all: the table is ngram_vocab_size_base (20,000,000) rows and vLLM
+//  keeps it in PINNED HOST memory (Qwen4ExpPLEPinnedHostEmbedding), not
+//  in VRAM.  It is a sparse gather -- only the rows for the current
+//  tokens are touched -- so host residency is the intended design rather
+//  than a fallback.  GRIMOIRE is otherwise VRAM-only; this one table is
+//  the exception the architecture expects.
+//
+//  Two details below are silent when wrong:
+//
+//  1. EACH HEAD HAS ITS OWN N-GRAM ORDER.  head h covers order
+//     h / heads_per_ngram + 2, so with heads_per_ngram 8 the first eight
+//     heads are BIGRAMS and the next eight TRIGRAMS.  The xor for a head
+//     includes a predecessor only while shift < order.  Mixing every
+//     predecessor into every head makes them all the same order, which
+//     still hashes, still indexes, and still produces text.
+//
+//  2. THE EOS BOUNDARY IS STICKY.  Walking backwards, once a predecessor
+//     is the EOS token every older position is treated as EOS too.  That
+//     is what stops an n-gram spanning two documents.  Dropping it reads
+//     across the boundary and is invisible in any single-document test.
+// ---------------------------------------------------------------------
+
+// n-gram ids for ONE token position.  `hist` is the preceding tokens,
+// newest last, at least ngram_context_len long; `hist_len` may be
+// shorter at the start of a sequence, where the missing predecessors
+// read as 0 exactly as the kernel's masked load does.
+inline void ple_ngram_ids(int token, const int* hist, int hist_len,
+                          const int64_t* multipliers, const int64_t* sizes,
+                          const int64_t* offsets, int ngram_context_len,
+                          int heads_per_ngram, int ngram_heads,
+                          int eos_token_id, int64_t* out) {
+    for (int h = 0; h < ngram_heads; ++h) {
+        const int order = h / heads_per_ngram + 2;
+        int64_t mixed = int64_t(token) * multipliers[0];
+        bool crossed = false;
+        for (int shift = 1; shift <= ngram_context_len; ++shift) {
+            const int at = hist_len - shift;
+            int64_t cand = (at >= 0) ? int64_t(hist[at]) : 0;
+            // sticky EOS: everything older than a boundary is EOS
+            if (crossed) cand = eos_token_id;
+            if (cand == eos_token_id) crossed = true;
+            if (order > shift)
+                mixed ^= cand * multipliers[shift];
+        }
+        int64_t r = sizes[h] ? (mixed % sizes[h]) : 0;
+        if (r < 0) r += sizes[h];           // torch.remainder semantics
+        out[h] = r + offsets[h];
+    }
+}
+
+// The PLE gate.  `key` and `query` are H long and each is RMS-normalised
+// on its own before the dot; normalising the pair jointly is a different
+// number.  The sqrt-of-magnitude shaping keeps the gate responsive near
+// zero, and the 1e-6 floor is what stops sqrt'(0) blowing up.
+inline float ple_gate(const float* key, const float* query, int H, float eps) {
+    double ks = 0.0, qs = 0.0;
+    for (int i = 0; i < H; ++i) { ks += double(key[i])*key[i]; qs += double(query[i])*query[i]; }
+    const float ki = 1.0f / std::sqrt(float(ks / H) + eps);
+    const float qi = 1.0f / std::sqrt(float(qs / H) + eps);
+    double dot = 0.0;
+    for (int i = 0; i < H; ++i) dot += double(key[i]*ki) * double(query[i]*qi);
+    const float d = float(dot) / std::sqrt(float(H));
+    const float sgn = d < 0.0f ? -1.0f : 1.0f;
+    const float mag = std::fabs(d) > 1e-6f ? std::fabs(d) : 1e-6f;
+    return sigmoid(sgn * std::sqrt(mag));
 }
 
 } // namespace qwen4_exp
