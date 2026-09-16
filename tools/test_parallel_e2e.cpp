@@ -179,6 +179,23 @@ int main(int argc, char** argv) {
         // fallback across ranks.
         { mini::gemma4(6), "bf16" },
         { mini::gemma4(6), "fp8"  },
+        // gemma-4 at the REAL checkpoint's full-attention width.  head_dim
+        // 512 takes the 32-slot flash instantiation, a different kernel
+        // from every case above, and PP/TP shard it the same way.  It also
+        // now has a batched prefill, so unlike the 6-layer case above this
+        // one drives prefill_gemma4() across ranks rather than the
+        // sequential fallback.
+        { mini::gemma4_wide(6), "bf16" },
+        // Muse: the sandwich graph with an attention output gate and
+        // scaleless qk/embed norms, and the only architecture here whose
+        // sliding layers carry a per-layer window.  Nothing had ever run
+        // it under PP or TP.
+        { mini::muse(6),  "bf16" },
+        { mini::muse(6),  "fp8"  },
+        // The parallel-FFN fold widens dense_inter at upload.  A pipeline
+        // split has to agree with that widened size on both sides of the
+        // boundary, and a tensor split has to shard the FOLDED matrix.
+        { mini::parallel_ffn(4), "bf16" },
     };
 
     for (size_t ci = 0; ci < cases.size(); ++ci) {
