@@ -16,8 +16,9 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
 
 - every SYCL source compiles; `bin/grimoire` and `bin/grimoire-server` link
 - the new kernels RUN and match their host references (`test_k2_kernels`)
-- 3 architectures x 7 projection formats all load and generate
-  (`test_model_matrix`)
+- 8 architectures x 7 projection formats all load and generate
+  (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
+  parallel-ffn, gemma4, gemma4 at head_dim 512
 - PP and TP produce token-identical output to a single process, in BF16
   and FP8, for dense, MoE and K2 (`test_parallel_e2e`)
 
@@ -449,6 +450,38 @@ say how to check it.  When you inherit one, check it before you build on
 it -- especially a reason that is load-bearing for "this needs hardware",
 because that is the class nobody re-tests.  Repetition across handoffs is
 not evidence; it is usually one source copied.
+
+**14. "ALL GREEN" MEANS "EVERY TEST I HAVE PASSES", NOT "THERE ARE NO
+BUGS" (learned 2026-09-16).** On 2026-09-15 this file said three
+architectures were verified and every gate was green, and that was true.
+It also read as "the engine is checked", which was not true: Muse Glimmer
+had NO fixture and NO gate row, so `forward_muse()` and `prefill_muse()`
+-- about 460 lines -- had never been executed anywhere but the Tower, by
+hand.  The Agnes parallel-FFN fold had never been executed at all.
+
+Writing the two fixtures found four defects in an afternoon, and three of
+them were the SAME mistake: the Muse path conflates "the format I am
+converting to" with "the format the checkpoint is in".
+
+- the FFN was resolved with `packed()` only -- compressed-tensors MXFP4 --
+  with no fallback, so a bf16 Muse checkpoint could not load, and said
+  "expected tensors missing: mlp.gate_proj", which points at NAMING
+- the QKV fuse branched on `PF == Fmt::INT4`, the format being uploaded
+  TO, while `concat_upload_many_int4_t` requires the SOURCE to already be
+  compressed int4 -- so asking for int4 failed the whole upload
+- the sliding window: `prefill_muse` hardcoded `window_left = 2047` and
+  `forward_muse` set none at all, so prefill and decode disagreed about
+  how much history a sliding layer sees (`ref/muse_glimmer.py:1191`)
+
+None of it had ever hurt Ian, because his Muse checkpoint IS compressed
+and his contexts were shorter than the window.  Code written against one
+checkpoint works for that checkpoint and is silent for every other.
+
+Two rules follow.  When reporting state, say what is COVERED and name
+what is not -- "green on what we test, and X has no test" is the honest
+sentence, and "all green" on its own has repeatedly been heard as "done".
+And when adding an architecture, add its fixture row the same day: the
+gap is not that the code is wrong, it is that nothing would say so.
 
 ## Where to look for current status
 

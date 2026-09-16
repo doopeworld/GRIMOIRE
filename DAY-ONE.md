@@ -323,6 +323,13 @@ software recovery. The known causes, all avoidable:
 
 ## 6. What is still open
 
+- **Coverage, 2026-09-16.** `bin/test_model_matrix` now drives EIGHT
+  architectures x 7 formats: dense, moe, hybrid, k2-horizon, **muse**,
+  **parallel-ffn**, gemma4 and gemma4 at head_dim 512.  Muse and the
+  Agnes parallel-FFN fold had never been executed off the card; adding
+  the fixtures found three Muse format assumptions and confirmed the fold
+  was correct.  See CLAUDE.md rule 14.
+
 - **Batched prefill under TENSOR parallel.** TP declines the batched path
   outright, so a TP run processes its prompt a token at a time. The
   capability matrix says so, and says not to benchmark it as prompt
