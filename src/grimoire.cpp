@@ -3429,7 +3429,22 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     }
                 }
             }
-            if(cfg.is_muse&&PF==Fmt::INT4&&!tp_enabled()){
+            // Fused QKV for prefill_muse's W4A16 path.  The condition was
+            // the REQUESTED format (PF == INT4) while
+            // concat_upload_many_int4_t requires the SOURCE tensors to
+            // already be compressed INT4 -- so asking for int4 on a Muse
+            // checkpoint that is not compressed failed the whole upload
+            // with "direct compressed INT4 concatenate failed", and the
+            // model would not load at all.  Third format assumption in the
+            // Muse path, after the FFN resolve and the FFN fallback.
+            //
+            // Test the SOURCE.  When it is not compressed the fusion is
+            // simply skipped: q/k/v stay separate, which is what every
+            // other architecture uses, and prefill_muse's W4A16 path
+            // already declines and falls back when qkv_proj is absent.
+            if(cfg.is_muse&&PF==Fmt::INT4&&!tp_enabled()&&
+               src.q_proj.compressed_int4&&src.k_proj.compressed_int4&&
+               src.v_proj.compressed_int4){
                 d.qkv_proj=concat_upload_many_int4_t(lq,ck,
                     {src.q_proj,src.k_proj,src.v_proj},"self_attn.qkv_proj",&ok);
             }
