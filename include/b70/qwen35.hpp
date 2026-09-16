@@ -119,6 +119,49 @@ struct Qwen35Config {
     // heads, full-attention layers head_dim 512 over 4.  See
     // GEMMA4-2026-09-14.md and ref/gemma4.py -- every item below is
     // silent if implemented wrongly.
+    // ---- Qwen4-Exp / Qwen3.8-Flash-Next -----------------------------
+    // model_type "qwen4_exp" / "qwen4_exp_text".  Its text config INHERITS
+    // Qwen3NextConfig (ref/qwen4_exp_config.py:34), so the Gated-DeltaNet +
+    // MoE hybrid underneath is the shape this engine already runs.  Three
+    // mechanisms are layered on top and NONE of them exists here yet:
+    //
+    //   QSA   qwen_sparse_attention layers.  An MQA "indexer" mean-pools
+    //         keys into blocks, scores sum_h relu(q.k)/sqrt(d), keeps the
+    //         top blocks, and attention runs over THAT GATHERED LIST.
+    //         ref/qwen4_exp_nvidia_indexer_qsa.py, .../qsa.py
+    //   PLE   a per-layer n-gram embedding: a 20M-entry bigram/trigram
+    //         table read at the ple_layer_ids layers, through a short
+    //         conv.  ref/qwen4_exp_nvidia_ngram_embedding.py, ple_layer.py
+    //   HC    HyperConnections: the residual is hc_count STREAMS wide with
+    //         a low-rank mix, so the layer's mix/combine is not this
+    //         engine's single-stream residual at all.
+    //         ref/qwen4_exp_common_hyperconnection.py
+    //
+    // Parsed so the loader can SAY what the file is (rule 10) and
+    // unsupported_reason() can refuse it by name.  Nothing consumes these
+    // yet -- adding a field without a path that uses it is exactly the
+    // silent-wrong-output trap rule 10 warns about, so the refusal is
+    // what keeps them honest.
+    bool  is_qwen4_exp    = false;
+    int   hc_count        = 0;      // HyperConnection streams (ref default 4)
+    int   hc_lowrank      = 0;      // its low-rank width (ref default 320)
+    int   ngram_size      = 0;      // 3 == bigrams+trigrams
+    int   heads_per_ngram = 0;
+    int   ple_embed_dim   = 0;
+    int   ple_conv_kernel = 0;
+    int64_t ngram_vocab_base = 0;   // 20,000,000 in the reference
+    std::vector<int> ple_layer_ids; // 1-BASED in the config (ref:127)
+    // QSA indexer.  All five are required together once any is present,
+    // indexer_kv_heads must be 1 (the MQA operators assume it), and
+    // indexer_budget / indexer_compress_ratio must be 512 or 2048
+    // (ref/qwen4_exp_config.py:_validate_qsa_config).
+    int   indexer_n_heads = 0;
+    int   indexer_kv_heads = 0;
+    int   indexer_head_dim = 0;
+    int   indexer_budget  = 0;
+    int   indexer_compress_ratio = 0;
+    std::vector<bool> qsa_attention;  // per layer: is this a QSA layer
+
     bool  is_gemma4       = false;
     int   global_head_dim = 0;      // full-attention head_dim (0 == same)
     int   n_global_kv_heads = 0;    // full-attention KV heads (0 == same)

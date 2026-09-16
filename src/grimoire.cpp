@@ -2901,6 +2901,52 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
+    // Qwen4-Exp / Qwen3.8-Flash-Next.  The loader resolves this config
+    // (rule 10: the loader says what the file IS), and the engine says
+    // here what it cannot RUN.  Its Qwen3-Next base -- Gated DeltaNet
+    // layers interleaved with MoE -- is a shape this engine already
+    // executes, which is exactly why the refusal has to be specific: the
+    // parts that are missing are NOT the parts that look familiar.
+    //
+    // Refuse before a single byte is uploaded, and name the mechanism,
+    // because each of the three is silent rather than loud if faked:
+    // running QSA as dense attention, dropping the n-gram embedding, or
+    // collapsing the hyper-connection streams to one residual all produce
+    // fluent text that is not the model's output.
+    if (cfg.is_qwen4_exp) {
+        std::string missing;
+        bool any_qsa = false;
+        for (bool b : cfg.qsa_attention) any_qsa = any_qsa || b;
+        if (any_qsa || cfg.indexer_n_heads > 0)
+            missing += "qwen_sparse_attention (the QSA indexer scores "
+                       "mean-pooled key blocks and attention runs over the "
+                       "top-k gathered blocks; this engine has only dense "
+                       "and sliding-window flash attention)";
+        if (!cfg.ple_layer_ids.empty() || cfg.ngram_vocab_base > 0) {
+            if (!missing.empty()) missing += "; ";
+            missing += "the PLE n-gram embedding (a " +
+                       std::to_string(cfg.ngram_vocab_base) +
+                       "-entry bigram/trigram table read at the ple_layer_ids "
+                       "layers through a short conv; nothing here reads an "
+                       "n-gram table)";
+        }
+        if (cfg.hc_count > 1) {
+            if (!missing.empty()) missing += "; ";
+            missing += "HyperConnections (the residual stream is " +
+                       std::to_string(cfg.hc_count) +
+                       " streams wide with a rank-" +
+                       std::to_string(cfg.hc_lowrank) +
+                       " mix, not this engine's single residual)";
+        }
+        if (missing.empty())
+            missing = "its Qwen4-Exp specific layers";
+        return "qwen4_exp (Qwen3.8-Flash-Next) needs " + missing +
+               ".  The Gated-DeltaNet + MoE base underneath IS supported, "
+               "which is why this refuses by name rather than running the "
+               "part it recognises -- each missing piece is fluent when "
+               "faked, not loud.  Reference: ref/qwen4_exp_*.py.  Refusing.";
+    }
+
     // head_dim per lane.  Every flash kernel in attention.cpp and
     // prefill.cpp accumulates its head into a PRIVATE array of MAXD
     // floats, with dpl = head_dim / SG_SIZE and SG_SIZE 16 -- so a head

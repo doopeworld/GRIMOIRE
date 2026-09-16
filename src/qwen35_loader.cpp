@@ -115,6 +115,14 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     // default the layer_types check above exists to remove.
     const bool gemma4 = model_type == "gemma4" || model_type == "gemma4_text"
                      || j.find("\"gemma4_text\"") != std::string::npos;
+    // Qwen4-Exp (Qwen3.8-Flash-Next).  "qwen4_exp" is the multimodal
+    // wrapper and "qwen4_exp_text" the text tower
+    // (ref/qwen4_exp_config.py:30,35), so match both and the nested
+    // spelling, exactly as the gemma-4 check above does.  NOT a prefix
+    // match on "qwen4": nothing else by that name is this architecture.
+    const bool qwen4_exp = model_type == "qwen4_exp"
+                        || model_type == "qwen4_exp_text"
+                        || j.find("\"qwen4_exp_text\"") != std::string::npos;
     // Any multimodal config nests the language model under "text_config".
     // This used to be extracted for Muse alone, so every other nested
     // config was read by scanning the WHOLE file -- which finds whichever
@@ -416,6 +424,49 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
     }
 
+    if (qwen4_exp) {
+        cfg.is_qwen4_exp = true;
+        // Defaults are the reference's own (ref/qwen4_exp_config.py:41-49),
+        // so a config that omits one resolves the way vLLM would rather
+        // than to zero.
+        cfg.hc_count         = cfg_i(cj, "hc_count", 4);
+        cfg.hc_lowrank       = cfg_i(cj, "hc_lowrank", 320);
+        cfg.ngram_size       = cfg_i(cj, "ngram_size", 3);
+        cfg.heads_per_ngram  = cfg_i(cj, "heads_per_ngram", 8);
+        cfg.ple_conv_kernel  = cfg_i(cj, "ple_conv_kernel_size", 4);
+        cfg.ngram_vocab_base = cfg_i(cj, "ngram_vocab_size_base", 20000000);
+        // ple_embed_dim defaults to hidden_size in the reference when the
+        // config omits it (ref:85).
+        cfg.ple_embed_dim    = cfg_i(cj, "ple_embed_dim", cfg.hidden);
+        // The five QSA indexer fields have NO defaults: the reference
+        // requires all five together or none (ref:_validate_qsa_config),
+        // so 0 here means "absent" and the refusal below says which.
+        cfg.indexer_n_heads        = cfg_i(cj, "indexer_n_heads", 0);
+        cfg.indexer_kv_heads       = cfg_i(cj, "indexer_kv_heads", 0);
+        cfg.indexer_head_dim       = cfg_i(cj, "indexer_head_dim", 0);
+        cfg.indexer_budget         = cfg_i(cj, "indexer_budget", 0);
+        cfg.indexer_compress_ratio = cfg_i(cj, "indexer_compress_ratio", 0);
+        // ple_layer_ids is a 1-BASED list in the config (ref:127).  Store
+        // it verbatim; converting here would hide that from the test.
+        {
+            const size_t at = cj.find("\"ple_layer_ids\"");
+            if (at != std::string::npos) {
+                const size_t lb = cj.find('[', at), rb = cj.find(']', at);
+                if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+                    const std::string arr = cj.substr(lb + 1, rb - lb - 1);
+                    size_t q2 = 0;
+                    while (q2 < arr.size()) {
+                        while (q2 < arr.size() && !std::isdigit((unsigned char)arr[q2])) ++q2;
+                        if (q2 >= arr.size()) break;
+                        size_t e2 = q2;
+                        while (e2 < arr.size() && std::isdigit((unsigned char)arr[e2])) ++e2;
+                        cfg.ple_layer_ids.push_back(std::atoi(arr.substr(q2, e2 - q2).c_str()));
+                        q2 = e2;
+                    }
+                }
+            }
+        }
+    }
     if (muse) {
         cfg.is_muse = true;
         cfg.attn_out_gate = true;
@@ -571,9 +622,25 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     // that would swallow every future spelling back into
                     // the silent FULL_ATTN default this check exists to
                     // remove.  List what is known; refuse the rest.
+                    // Qwen4-Exp labels its sparse-attention layers
+                    // "qwen_sparse_attention" (ref/qwen4_exp_config.py:25).
+                    // They are an ATTENTION layer as far as the layer
+                    // TABLE is concerned -- the reference's own
+                    // layers_block_type maps them onto "attention"
+                    // (ref:176) -- but they are NOT full attention: QSA
+                    // scores blocks with an indexer and attends to a
+                    // gathered subset.  Recognised here so the file parses
+                    // (rule 10), recorded in qsa_attention so
+                    // unsupported_reason() can refuse by name, and never
+                    // silently executed as dense attention.
+                    const bool qsa    = v == "qwen_sparse_attention";
                     const bool full   = v == "full_attention" ||
                                         v == "sliding_attention" ||
+                                        qsa ||
                                         v.find("global") != std::string::npos;
+                    if (int(cfg.qsa_attention.size()) < cfg.n_layers)
+                        cfg.qsa_attention.assign(size_t(cfg.n_layers), false);
+                    cfg.qsa_attention[size_t(i)] = qsa;
                     if (!linear && !full) {
                         err = "config.json layer_types[" + std::to_string(i) +
                               "] is \"" + v + "\", which this loader does not "
