@@ -596,6 +596,38 @@ sycl::event launch_rmsnorm_gate_silu(sycl::queue&, float*, const float*, const b
 sycl::event launch_qk_norm_rope(sycl::queue&, float*, float*, const bf16_t*,
                                 const bf16_t*, int, int, int, const int32_t*,
                                 float, float, float, const std::vector<sycl::event>&);
+// ONE OWNER for "can this device actually RUN a joint_matrix kernel".
+//
+// The aspect alone is not proof.  On 2026-09-16 this container was
+// rescheduled from a Xeon @ 2.80GHz to a Xeon @ 2.10GHz whose OpenCL CPU
+// runtime ADVERTISES ext_intel_matrix -- so every predicate that trusted
+// the aspect flipped, batched prefill turned itself on for the first time
+// on a CPU device, and the joint_matrix kernels reached a JIT that cannot
+// compile them.  Four gates went red with no code change behind them.
+//
+// The aspect answers "does this device CLAIM matrix support".  What every
+// caller actually needs is "can it run the kernel", and a CPU that claims
+// it and then crashes its own JIT answers yes to one and no to the other.
+//
+// A GPU is trusted outright: a B70 IS a GPU, and the original reason this
+// predicate leads with is_gpu() stands -- a driver that under-reports must
+// not cost the card its batched prefill.  This only refuses the converse,
+// a non-GPU that over-reports.  GRIMOIRE_TRUST_MATRIX_ASPECT=1 restores
+// the old behaviour for a CPU device that genuinely can.
+//
+// Three callers used to compute this separately -- Grimoire::prefill's
+// guard, its NOXMX escape hatch, and the capability banner -- and when the
+// host changed they disagreed: the banner printed "batched" while the
+// engine had fallen back, which is precisely the drift the banner exists
+// to expose.  Keep it in one place.
+static bool device_can_matrix(const sycl::queue& q) {
+    static const bool trust =
+        std::getenv("GRIMOIRE_TRUST_MATRIX_ASPECT") != nullptr;
+    const auto& d = q.get_device();
+    if (d.is_gpu()) return true;
+    return trust && d.has(sycl::aspect::ext_intel_matrix);
+}
+
 sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
                                  float, bool, const std::vector<sycl::event>&);
 sycl::event launch_scale(sycl::queue&, float*, float, int,
@@ -5224,8 +5256,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // Grimoire::prefill).  Saying "batched" there would be the exact
         // silent-fallback problem this matrix exists to remove.
         // Same predicate Grimoire::prefill uses, for the same reason.
-        const bool batched_ok = q.get_device().is_gpu() ||
-            q.get_device().has(sycl::aspect::ext_intel_matrix);
+        const bool batched_ok = device_can_matrix(q);
         std::printf("    prefill       %s\n",
             tp_enabled()  ? "SEQUENTIAL fallback (no batched TP prefill) -- "
                             "do not benchmark this as prompt-processing throughput"
@@ -8897,10 +8928,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // it is a sub-group GEMV per output row and is far slower than the tile
     // it replaces.  Rule 8 -- no number from this configuration means
     // anything.
+    // Requires the device to genuinely lack matrix support.  This used to
+    // test the aspect directly, which meant an over-reporting CPU turned
+    // the fallback OFF -- exactly on the device that needed it -- and sent
+    // gemma-4's batched prefill into launch_gemm_xmx on a JIT that cannot
+    // build it.  device_can_matrix() is the single owner of that question.
     const bool noxmx_gemm =
         std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX")!=nullptr &&
-        !q.get_device().is_gpu() &&
-        !q.get_device().has(sycl::aspect::ext_intel_matrix);
+        !device_can_matrix(q);
     // The batched path is XMX/DPAS from end to end.  On a device with no
     // matrix hardware the runtime does not raise -- it takes the process
     // down with a SIGSEGV somewhere inside the JIT -- so refuse here and
@@ -8944,12 +8979,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         //
         // GRIMOIRE_TRUST_MATRIX_ASPECT=1 restores the old predicate for
         // anyone who wants to test a CPU device that really can.
-        static const bool trust_aspect =
-            std::getenv("GRIMOIRE_TRUST_MATRIX_ASPECT") != nullptr;
-        static const bool no_matrix =
-            !q.get_device().is_gpu() &&
-            (!trust_aspect ||
-             !q.get_device().has(sycl::aspect::ext_intel_matrix));
+        const bool no_matrix = !device_can_matrix(q);
         if (no_matrix && !noxmx_gemm) {
             static bool said = false;
             if (!said) {
