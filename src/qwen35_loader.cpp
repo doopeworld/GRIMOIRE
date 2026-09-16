@@ -971,9 +971,25 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                         cfg.hidden, cfg.moe_inter, ".down");
             }
         } else if (cfg.is_muse) {
+            // Muse ships compressed-tensors MXFP4 for the FFN
+            // (.weight_packed + .weight_scale), which uploads straight to
+            // VRAM.  This was the ONLY shape accepted, with no fallback --
+            // so a Muse checkpoint whose FFN is plain .weight (a bf16
+            // release, or one converted locally) failed to load with
+            // "expected tensors missing: mlp.gate_proj", which reads like a
+            // naming problem and is really a FORMAT assumption.  The
+            // attention projections in the same model have always used
+            // linear(), so the two halves disagreed about what a Muse
+            // checkpoint looks like.
+            //
+            // Take packed when it is there -- unchanged for a real
+            // compressed checkpoint -- and fall back to plain otherwise.
             lay.sh_gate = packed(m + "gate_proj");
             lay.sh_up   = packed(m + "up_proj");
             lay.sh_down = packed(m + "down_proj");
+            if (!lay.sh_gate.ok()) lay.sh_gate = linear(m + "gate_proj");
+            if (!lay.sh_up.ok())   lay.sh_up   = linear(m + "up_proj");
+            if (!lay.sh_down.ok()) lay.sh_down = linear(m + "down_proj");
         } else {
             lay.sh_gate = linear(m + "gate_proj");
             lay.sh_up   = linear(m + "up_proj");

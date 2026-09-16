@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     // and no window at all in the other survived.
     std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
                                       mini::hybrid(), mini::k2(),
-                                      mini::muse(),
+                                      mini::muse(), mini::parallel_ffn(),
                                       mini::gemma4(), mini::gemma4_wide() };
 
     std::printf("%-12s", "");

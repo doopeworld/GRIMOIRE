@@ -236,6 +236,62 @@ inline Arch dense(int L = 4, bool mtp = false) {
     return a;
 }
 
+// Agnes' PARALLEL FFN, folded at upload.  A layer carries a SECOND
+// SwiGLU (mlp.parallel_ffn.{gate,up,down}_proj) whose output is summed
+// with the first, and the uploader concatenates the two into one wider
+// FFN so nothing downstream knows it happened
+// (grimoire.cpp "mlp.gate_up+parallel_ffn").
+//
+// That fold had never been executed: no fixture declared
+// parallel_ffn_intermediate_size, so the only coverage was
+// tests/test_agnes_config.cpp, which checks the PARSE and never uploads.
+// A wrong fold -- misordered halves, a wrong stride, the second FFN
+// dropped -- runs and emits fluent text, because dense_inter has already
+// been widened to the folded size and every shape downstream agrees.
+//
+// The fold is NOT gated on is_agnes: any checkpoint declaring the field
+// takes it, so a plain dense model exercises exactly the same code.
+inline Arch parallel_ffn(int L = 4) {
+    const int H=64, Q=64, KV=32, I=128, PI=64, V=128;
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "parallel_ffn_intermediate_size": 64,
+  "rms_norm_eps": 1e-06,
+  "tie_word_embeddings": false, "rope_theta": 1000000.0
+})JSON";
+    Arch a{"parallel-ffn", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+          {"lm_head.weight", {V,H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        t.push_back({b+"input_layernorm.weight", {H}});
+        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        const std::string s = b + "self_attn.";
+        t.push_back({s+"q_proj.weight", {Q,H}});
+        t.push_back({s+"k_proj.weight", {KV,H}});
+        t.push_back({s+"v_proj.weight", {KV,H}});
+        t.push_back({s+"o_proj.weight", {H,Q}});
+        t.push_back({s+"q_norm.weight", {16}});
+        t.push_back({s+"k_norm.weight", {16}});
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate_proj.weight", {I,H}});
+        t.push_back({m+"up_proj.weight",   {I,H}});
+        t.push_back({m+"down_proj.weight", {H,I}});
+        // The second SwiGLU.  All three must be present or the loader
+        // refuses by name -- a declared parallel FFN with one projection
+        // missing would otherwise fold silently and run narrow.
+        const std::string pf = m + "parallel_ffn.";
+        t.push_back({pf+"gate_proj.weight", {PI,H}});
+        t.push_back({pf+"up_proj.weight",   {PI,H}});
+        t.push_back({pf+"down_proj.weight", {H,PI}});
+    }
+    return a;
+}
+
 // ---- gemma-4: per-layer-type geometry, sandwich norms, k_eq_v ---------
 // Scaled down from google/gemma-4-31B-it but keeping every shape that
 // matters, because each of them is silent if implemented wrongly:
