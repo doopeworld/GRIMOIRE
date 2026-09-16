@@ -8916,9 +8916,40 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // this branch has been clearing out.  A B70 is a GPU, so on the
         // card this predicate is false and behaviour is exactly as
         // before; the escape hatch exists only for a non-GPU device.
+        //
+        // AND THE ASPECT IS NOT ENOUGH ON A CPU (measured 2026-09-16).
+        // This container was rescheduled onto a different host mid-session
+        // -- Xeon @ 2.80GHz to Xeon @ 2.10GHz -- and the OpenCL CPU
+        // runtime on the second one ADVERTISES ext_intel_matrix.  So
+        // no_matrix went false, batched prefill switched itself on for the
+        // first time ever on a CPU device, and the joint_matrix kernels
+        // reached a JIT that cannot compile them:
+        //
+        //   test_k2_e2e         SIGSEGV, with the Intel runtime's own
+        //                       "PLEASE submit a bug report" line
+        //   test_gemma4_prefill MISMATCH (batched vs sequential)
+        //   test_spec_e2e       32 failures, batched verify now live
+        //
+        // Four gates red, nothing in the engine changed, and every symptom
+        // pointed at whatever had been committed most recently.  The
+        // banner is what gave it away: it read "prefill batched" where
+        // every earlier run on a CPU said "SEQUENTIAL fallback".
+        //
+        // The aspect answers "does this device CLAIM matrix support".  The
+        // question is "can it RUN a joint_matrix kernel", and a CPU that
+        // advertises the aspect and then crashes its own JIT answers yes
+        // to the first and no to the second.  So require a GPU as well:
+        // the aspect alone may enable it on a real GPU that reports it,
+        // but never on a CPU.  A B70 is a GPU and is unaffected.
+        //
+        // GRIMOIRE_TRUST_MATRIX_ASPECT=1 restores the old predicate for
+        // anyone who wants to test a CPU device that really can.
+        static const bool trust_aspect =
+            std::getenv("GRIMOIRE_TRUST_MATRIX_ASPECT") != nullptr;
         static const bool no_matrix =
             !q.get_device().is_gpu() &&
-            !q.get_device().has(sycl::aspect::ext_intel_matrix);
+            (!trust_aspect ||
+             !q.get_device().has(sycl::aspect::ext_intel_matrix));
         if (no_matrix && !noxmx_gemm) {
             static bool said = false;
             if (!said) {
