@@ -22,6 +22,7 @@
 // =====================================================================
 #include "kernels.hpp"
 #include "b70/k2_horizon.hpp"
+#include "b70/qwen4_exp.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -815,6 +816,156 @@ int main() {
         set_norm_convention(1, 1.0f);            // leave the default in place
         CHECK(!norm_is_grouped(hidden), "default convention must not be grouped");
         sycl::free(d_h,q); sycl::free(d_r,q); sycl::free(d_o,q); sycl::free(d_w,q);
+    }
+
+    // ---- Qwen4-Exp HyperConnections --------------------------------
+    // The residual stream is hc_count wide.  Three things here are silent
+    // when wrong, so each is diffed against b70/qwen4_exp.hpp rather than
+    // eyeballed:
+    //   * the norm is GROUPED per stream and applies (1 + w), NOT w --
+    //     the class is called GroupedGemmaRMSNorm and gemma-4 is the one
+    //     model here that applies its weight directly (rule 11)
+    //   * the /hc_count sits INSIDE silu and sigmoid, not outside
+    //   * combine adds to the UNNORMALISED stream
+    {
+        const int rows = 3, hc = 4, hidden = 32, lowrank = 16;
+        const int wide = hc * hidden;
+        std::mt19937 rng(20260916);
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<float> hyper(size_t(rows) * wide), blk(size_t(rows) * hidden);
+        std::vector<bf16_t> nw((size_t(wide)));
+        for (auto& v : hyper) v = d(rng);
+        for (auto& v : blk)   v = d(rng);
+        for (auto& v : nw)    v = f32_to_bf16(d(rng) * 0.1f);
+
+        float* d_hyper = sycl::malloc_device<float>(hyper.size(), q);
+        float* d_norm  = sycl::malloc_device<float>(hyper.size(), q);
+        float* d_blk   = sycl::malloc_device<float>(blk.size(), q);
+        float* d_out   = sycl::malloc_device<float>(hyper.size(), q);
+        bf16_t* d_nw   = sycl::malloc_device<bf16_t>(nw.size(), q);
+        q.memcpy(d_hyper, hyper.data(), hyper.size()*sizeof(float));
+        q.memcpy(d_blk, blk.data(), blk.size()*sizeof(float));
+        q.memcpy(d_nw, nw.data(), nw.size()*sizeof(bf16_t)).wait();
+
+        // --- grouped norm -------------------------------------------
+        launch_hc_norm(q, d_hyper, d_nw, d_norm, rows, hc, hidden, 1e-6f, {});
+        q.wait();
+        std::vector<float> got(hyper.size()), want(hyper.size());
+        q.memcpy(got.data(), d_norm, got.size()*sizeof(float)).wait();
+        std::vector<float> wf((size_t(wide)));
+        for (int i = 0; i < wide; ++i) wf[size_t(i)] = bf16_to_f32(nw[size_t(i)]);
+        for (int r = 0; r < rows; ++r)
+            qwen4_exp::hc_norm(hyper.data() + size_t(r)*wide, wf.data(),
+                               want.data() + size_t(r)*wide, hc, hidden, 1e-6f);
+        std::printf("%-16s %-40s %.3e\n", "hc norm",
+                    "grouped per stream, (1 + w)", worst_abs(want, got));
+        CHECK(worst_abs(want, got) < 2e-5,
+              "hc_norm does not match the host reference");
+
+        // A ones-valued weight under (1 + w) is a DOUBLING, and under
+        // plain w it is the identity.  If the kernel ever drifts to the
+        // gemma-4 convention this separates them by 2x rather than by
+        // rounding, which the tolerance above would not catch on its own.
+        {
+            std::vector<bf16_t> ones(size_t(wide), f32_to_bf16(1.0f));
+            q.memcpy(d_nw, ones.data(), ones.size()*sizeof(bf16_t)).wait();
+            launch_hc_norm(q, d_hyper, d_nw, d_norm, rows, hc, hidden, 1e-6f, {});
+            q.wait();
+            std::vector<float> g2(hyper.size()), plain(hyper.size());
+            q.memcpy(g2.data(), d_norm, g2.size()*sizeof(float)).wait();
+            std::vector<float> zw(size_t(wide), 0.0f);
+            for (int r = 0; r < rows; ++r)
+                qwen4_exp::hc_norm(hyper.data() + size_t(r)*wide, zw.data(),
+                                   plain.data() + size_t(r)*wide, hc, hidden, 1e-6f);
+            // plain == the (1+0) result == normalized.  got should be 2x it.
+            double worst = 0.0;
+            for (size_t i = 0; i < g2.size(); ++i)
+                worst = std::max(worst, std::abs(double(g2[i]) - 2.0*plain[i]));
+            std::printf("%-16s %-40s %.3e\n", "hc norm w=1",
+                        "(1+w) doubles; plain w would not", worst);
+            CHECK(worst < 2e-5, "hc_norm is not applying (1 + w)");
+            q.memcpy(d_nw, nw.data(), nw.size()*sizeof(bf16_t)).wait();
+            launch_hc_norm(q, d_hyper, d_nw, d_norm, rows, hc, hidden, 1e-6f, {});
+            q.wait();
+        }
+
+        // --- gated mean ---------------------------------------------
+        // Stand in for the up projection with random logits: the kernel
+        // owns sigmoid + the mean, and that is what is being pinned.
+        std::vector<float> upo(size_t(rows) * wide);
+        for (auto& v : upo) v = d(rng) * 3.0f;
+        float* d_upo = sycl::malloc_device<float>(upo.size(), q);
+        float* d_mix = sycl::malloc_device<float>(size_t(rows)*hidden, q);
+        q.memcpy(d_upo, upo.data(), upo.size()*sizeof(float)).wait();
+        launch_hc_gated_mean(q, d_upo, d_norm, d_mix, rows, hc, hidden, {});
+        q.wait();
+        std::vector<float> mix_got(size_t(rows)*hidden), mix_want(size_t(rows)*hidden);
+        q.memcpy(mix_got.data(), d_mix, mix_got.size()*sizeof(float)).wait();
+        q.memcpy(got.data(), d_norm, got.size()*sizeof(float)).wait();
+        for (int r = 0; r < rows; ++r)
+            for (int hh = 0; hh < hidden; ++hh) {
+                float acc = 0.0f;
+                for (int c = 0; c < hc; ++c) {
+                    const size_t i = size_t(r)*wide + size_t(c)*hidden + hh;
+                    acc += qwen4_exp::sigmoid(upo[i]) * got[i];
+                }
+                mix_want[size_t(r)*hidden + hh] = acc / float(hc);
+            }
+        std::printf("%-16s %-40s %.3e\n", "hc gated mean",
+                    "sigmoid(up) * normed, averaged", worst_abs(mix_want, mix_got));
+        CHECK(worst_abs(mix_want, mix_got) < 2e-5,
+              "hc_gated_mean does not match the host reference");
+
+        // --- combine -------------------------------------------------
+        std::vector<float> injo(size_t(rows) * hc);
+        for (auto& v : injo) v = d(rng) * 3.0f;
+        float* d_injo = sycl::malloc_device<float>(injo.size(), q);
+        q.memcpy(d_injo, injo.data(), injo.size()*sizeof(float)).wait();
+        launch_hc_combine(q, d_hyper, d_injo, d_blk, d_out, rows, hc, hidden, {});
+        q.wait();
+        std::vector<float> cgot(hyper.size()), cwant(hyper.size());
+        q.memcpy(cgot.data(), d_out, cgot.size()*sizeof(float)).wait();
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < hc; ++c) {
+                const float wgt = 2.0f * qwen4_exp::sigmoid(
+                    injo[size_t(r)*hc + c] / float(hc));
+                for (int hh = 0; hh < hidden; ++hh) {
+                    const size_t i = size_t(r)*wide + size_t(c)*hidden + hh;
+                    // the UNNORMALISED stream, deliberately
+                    cwant[i] = hyper[i] + blk[size_t(r)*hidden + hh] * wgt;
+                }
+            }
+        std::printf("%-16s %-40s %.3e\n", "hc combine",
+                    "adds to the UNNORMALISED stream", worst_abs(cwant, cgot));
+        CHECK(worst_abs(cwant, cgot) < 2e-5,
+              "hc_combine does not match the host reference");
+
+        // And it must NOT be the normalised stream: with these inputs the
+        // two differ by ~1, so a swap is loud rather than a rounding
+        // difference.  Without this the check above passes either way when
+        // the injection gate happens to be near 1.
+        {
+            std::vector<float> swapped(hyper.size());
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < hc; ++c) {
+                    const float wgt = 2.0f * qwen4_exp::sigmoid(
+                        injo[size_t(r)*hc + c] / float(hc));
+                    for (int hh = 0; hh < hidden; ++hh) {
+                        const size_t i = size_t(r)*wide + size_t(c)*hidden + hh;
+                        swapped[i] = got[i] + blk[size_t(r)*hidden + hh] * wgt;
+                    }
+                }
+            const double apart = worst_abs(swapped, cgot);
+            std::printf("%-16s %-40s %.3e\n", "hc combine A/B",
+                        "vs adding to the NORMALISED stream", apart);
+            CHECK(apart > 1e-3,
+                  "combine cannot tell the raw stream from the normalised one "
+                  "on this input, so the check above proves nothing");
+        }
+
+        sycl::free(d_hyper,q); sycl::free(d_norm,q); sycl::free(d_blk,q);
+        sycl::free(d_out,q); sycl::free(d_nw,q); sycl::free(d_upo,q);
+        sycl::free(d_mix,q); sycl::free(d_injo,q);
     }
 
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

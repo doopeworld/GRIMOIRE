@@ -1719,4 +1719,107 @@ sycl::event launch_silu_scale_accum(sycl::queue& q, const float* in, float* out,
     });
 }
 
+// ---------------------------------------------------------------------
+//  Qwen4-Exp (Qwen3.8-Flash-Next) HyperConnections.
+//
+//  The residual stream is hc_count streams wide.  mix() collapses it to
+//  one hidden-wide block input; combine() injects the block output back
+//  into every stream.  Host reference and the full derivation:
+//  include/b70/qwen4_exp.hpp -- these are its parallel form and
+//  bin/test_k2_kernels diffs them against it.
+//
+//  The two projections (down/up in mix, inject in combine) are ordinary
+//  matmuls and go through the engine's existing GEMV, so what is here is
+//  only the part that has no existing kernel: the grouped norm, the
+//  gated mean, and the injection.
+// ---------------------------------------------------------------------
+
+// GroupedGemmaRMSNorm: one variance PER hc stream, weight applied as
+// (1 + w) across the whole hc*hidden row.  One work-group per (row,
+// stream) so the reduction stays inside a group.
+sycl::event launch_hc_norm(sycl::queue& q, const float* x, const bf16_t* w,
+                           float* out, int rows, int hc_count, int hidden,
+                           float eps, const std::vector<sycl::event>& deps) {
+    constexpr int WG = 256;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> red(WG, h);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(rows) * hc_count * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int gid  = int(it.get_group(0));
+                const int row  = gid / hc_count;
+                const int c    = gid % hc_count;
+                const int lane = int(it.get_local_id(0));
+                const int64_t base = (int64_t(row) * hc_count + c) * hidden;
+                float acc = 0.0f;
+                for (int i = lane; i < hidden; i += WG) {
+                    const float v = x[base + i];
+                    acc += v * v;
+                }
+                red[lane] = acc;
+                sycl::group_barrier(it.get_group());
+                for (int s = WG / 2; s; s >>= 1) {
+                    if (lane < s) red[lane] += red[lane + s];
+                    sycl::group_barrier(it.get_group());
+                }
+                const float inv = sycl::rsqrt(red[0] / float(hidden) + eps);
+                // The affine weight spans hc*hidden, so it is indexed by
+                // the stream too -- not reused across streams.
+                for (int i = lane; i < hidden; i += WG)
+                    out[base + i] = x[base + i] * inv *
+                                    (1.0f + bf16_to_f32(w[size_t(c) * hidden + i]));
+            });
+    });
+}
+
+// mix() tail: gate = sigmoid(up_out), then the gated MEAN over streams.
+// `up_out` is the [rows][hc*hidden] result of the up projection, which
+// the caller produces with the ordinary GEMV.
+sycl::event launch_hc_gated_mean(sycl::queue& q, const float* up_out,
+                                 const float* normed, float* out, int rows,
+                                 int hc_count, int hidden,
+                                 const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * hidden),
+            [=](sycl::id<1> id) {
+                const int row = int(id[0] / hidden);
+                const int hh  = int(id[0] % hidden);
+                const int64_t rb = int64_t(row) * hc_count * hidden;
+                float acc = 0.0f;
+                for (int c = 0; c < hc_count; ++c) {
+                    const int64_t i = rb + int64_t(c) * hidden + hh;
+                    acc += (1.0f / (1.0f + sycl::exp(-up_out[i]))) * normed[i];
+                }
+                out[int64_t(row) * hidden + hh] = acc / float(hc_count);
+            });
+    });
+}
+
+// combine(): out[c][h] = hyper[c][h] + block[h] * 2*sigmoid(inj_out[c]/hc).
+// `inj_out` is the [rows][hc_count] result of the injection projection.
+//
+// NOTE the residual is the UNNORMALISED `hyper`, not `normed`.  Adding to
+// the normalised copy loses the stream the layer is built on and is
+// silent -- the shapes are identical either way.
+sycl::event launch_hc_combine(sycl::queue& q, const float* hyper,
+                              const float* inj_out, const float* block,
+                              float* out, int rows, int hc_count, int hidden,
+                              const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * hc_count * hidden),
+            [=](sycl::id<1> id) {
+                const int64_t i = int64_t(id[0]);
+                const int hh  = int(i % hidden);
+                const int c   = int((i / hidden) % hc_count);
+                const int row = int(i / (int64_t(hidden) * hc_count));
+                const float z = inj_out[int64_t(row) * hc_count + c] / float(hc_count);
+                const float wgt = 2.0f / (1.0f + sycl::exp(-z));
+                out[i] = hyper[i] + block[int64_t(row) * hidden + hh] * wgt;
+            });
+    });
+}
+
 } // namespace b70

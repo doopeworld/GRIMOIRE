@@ -242,6 +242,14 @@ int main(int argc, char** argv) {
         // no recurrent state at all, so nothing was testing that code.
         { mini::hybrid(4, true), "bf16" },
         { mini::hybrid(4, true), "fp8"  },
+        // Muse: the SANDWICH forward path.  Every case above is the Qwen
+        // residual graph, so nothing was checking that speculation stays
+        // exact when the layer graph differs -- the drafter chains on the
+        // UNNORMALISED hidden state, and forward_muse leaves a different
+        // one there than forward() does.  Muse ran nowhere off the card
+        // before 2026-09-16; this is the last of its paths to get a gate.
+        { mini::muse(6, true), "bf16" },
+        { mini::muse(6, true), "fp8"  },
     };
 
     for (auto& c : cases) {

@@ -323,7 +323,7 @@ inline Arch parallel_ffn(int L = 4) {
 // convention, i.e. (1 + 0).  That is the engine's `muse_zero` buffer, not
 // a tensor, so this fixture ships no q_norm/k_norm -- shipping ones-valued
 // ones instead would be a DIFFERENT model that still produced fluent text.
-inline Arch muse(int L = 6) {
+inline Arch muse(int L = 6, bool mtp = false) {
     const int H = 64, V = 128, QH = 4, KVH = 2, HD = 16, I = 128;
     auto sliding = [](int l) { return (l % 3) != 2; };
     const int QW = QH * HD, KVW = KVH * HD;
@@ -369,6 +369,11 @@ inline Arch muse(int L = 6) {
         t.push_back({m + "up_proj.weight",   {I, H}});
         t.push_back({m + "down_proj.weight", {H, I}});
     }
+    // MTP head, so bin/test_spec_e2e can drive speculation against the
+    // SANDWICH forward path.  Every other spec case is a Qwen-graph
+    // model; the drafter chaining across verify steps reads the
+    // UNNORMALISED hidden state, and Muse leaves a different one there.
+    if (mtp) add_mtp(t, H, QW, KVW, HD, I, 0, 0);
     return a;
 }
 

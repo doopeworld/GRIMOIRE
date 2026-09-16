@@ -295,6 +295,20 @@ sycl::event launch_gate_sigmoid_mul_bf16_io(sycl::queue& q,
     const sycl_bf16* x,const float* gate,sycl_bf16* out,size_t n,
     const std::vector<sycl::event>& deps = {});
 
+// ---- Qwen4-Exp HyperConnections (host reference: b70/qwen4_exp.hpp) ---
+// The residual stream is hc_count wide; mix() collapses it for the block
+// and combine() injects the block output back into every stream.  The
+// two projections use the ordinary GEMV -- only these three have no
+// existing kernel.
+sycl::event launch_hc_norm(sycl::queue& q, const float* x, const bf16_t* w,
+    float* out, int rows, int hc_count, int hidden, float eps,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_gated_mean(sycl::queue& q, const float* up_out,
+    const float* normed, float* out, int rows, int hc_count, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_combine(sycl::queue& q, const float* hyper,
+    const float* inj_out, const float* block, float* out, int rows,
+    int hc_count, int hidden, const std::vector<sycl::event>& deps = {});
 sycl::event launch_gemm_batched(sycl::queue& q, const QuantWeight& w,
                                 const float* x, float* y, int M,
                                 const std::vector<sycl::event>& deps = {});
