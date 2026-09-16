@@ -1869,8 +1869,10 @@ struct Grimoire {
     bool spec_verify_available() const {
         if (!has_recurrent_state()) return true;
         if (tp_enabled()) return false;
-        return q.get_device().is_gpu() ||
-               q.get_device().has(sycl::aspect::ext_intel_matrix);
+        // device_can_matrix, not the raw aspect: a CPU that advertises
+        // ext_intel_matrix and cannot compile joint_matrix would claim a
+        // batched verify it then fails to run.
+        return device_can_matrix(q);
     }
 
     bool pp_sync_tokens(std::vector<int32_t>& toks);
@@ -7817,9 +7819,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // the card.  A B70 is a GPU, so on the card this is false and the
     // behaviour is exactly as before.  The row loop is the same math the
     // single-token decode path already runs.
-    static const bool no_matrix =
-        !q.get_device().is_gpu() &&
-        !q.get_device().has(sycl::aspect::ext_intel_matrix);
+    static const bool no_matrix = !device_can_matrix(q);
     auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
         if(cfg.is_muse&&w.fp16){
             const sycl::half* out=mm_f16_raw(w,x,rows);
@@ -8721,8 +8721,7 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     // it none of this can be executed anywhere but the card.
     const bool noxmx =
         std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX") != nullptr &&
-        !q.get_device().is_gpu() &&
-        !q.get_device().has(sycl::aspect::ext_intel_matrix);
+        !device_can_matrix(q);
 
     // RULE 1: GRIMOIRE_W4A8 FREES the MXFP4 payload of a converted weight,
     // and launch_gemm_xmx dereferences it.  A converted weight still
