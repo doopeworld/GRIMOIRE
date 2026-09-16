@@ -295,6 +295,25 @@ sycl::event launch_gate_sigmoid_mul_bf16_io(sycl::queue& q,
     const sycl_bf16* x,const float* gate,sycl_bf16* out,size_t n,
     const std::vector<sycl::event>& deps = {});
 
+// ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
+sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
+    const uint8_t* k_cache, const uint8_t* v_cache, const int32_t* idx,
+    float* out, int rows, int n_heads, int kv_heads, int head_dim,
+    int seq_cap, int n_idx, float softmax_scale,
+    const std::vector<sycl::event>& deps = {});
+
+// Stage 1 scores every compressed key block with the MQA indexer; stage 3
+// turns the selected blocks into token indices.  Stage 2 (top-k) reuses
+// the engine's existing top-k, and the attention that consumes the index
+// list is launch_qsa_attention in attention.cpp.
+sycl::event launch_qsa_index_logits(sycl::queue& q, const float* qv,
+    const float* keys, float* logits, int rows, int n_heads, int head_dim,
+    int n_blocks, const int32_t* visible,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
+    int32_t* out, int rows, int block_topk, int compress_ratio,
+    int token_topk, const int32_t* seq_len,
+    const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp HyperConnections (host reference: b70/qwen4_exp.hpp) ---
 // The residual stream is hc_count wide; mix() collapses it for the block
 // and combine() injects the block output back into every stream.  The

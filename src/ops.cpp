@@ -1822,4 +1822,91 @@ sycl::event launch_hc_combine(sycl::queue& q, const float* hyper,
     });
 }
 
+// ---------------------------------------------------------------------
+//  QSA -- Qwen Sparse Attention (Qwen4-Exp).
+//
+//  Host reference and the full derivation: include/b70/qwen4_exp.hpp.
+//  Three stages, and the attention that consumes them is in attention.cpp
+//  because it is the existing flash math with the key loop driven by an
+//  index array instead of a range.
+// ---------------------------------------------------------------------
+
+// Stage 1.  MQA indexer: relu per head, THEN summed across heads, THEN
+// scaled by 1/sqrt(head_dim).  One sub-group per (row, block).
+//
+// The order is the whole algorithm.  Summing before the relu, or scaling
+// before it, changes which blocks are selected -- and a wrong selection
+// still produces fluent text, because attention over the wrong 2048
+// tokens is still attention.
+sycl::event launch_qsa_index_logits(sycl::queue& q, const float* qv,
+                                    const float* keys, float* logits,
+                                    int rows, int n_heads, int head_dim,
+                                    int n_blocks, const int32_t* visible,
+                                    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(rows) * n_blocks * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int gid  = int(it.get_group(0));
+                const int row  = gid / n_blocks;
+                const int n    = gid % n_blocks;
+                const int vis  = visible ? visible[row] : n_blocks;
+                if (n >= vis) {
+                    if (lane == 0)
+                        logits[int64_t(row) * n_blocks + n] =
+                            -std::numeric_limits<float>::infinity();
+                    return;
+                }
+                const float* kn = keys + (int64_t(row) * n_blocks + n) * head_dim;
+                float acc = 0.0f;
+                for (int hh = 0; hh < n_heads; ++hh) {
+                    const float* qh = qv +
+                        (int64_t(row) * n_heads + hh) * head_dim;
+                    float dot = 0.0f;
+                    for (int d = lane; d < head_dim; d += SG_SIZE)
+                        dot = sycl::fma(qh[d], kn[d], dot);
+                    dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+                    // relu per head, before the sum
+                    if (lane == 0) acc += dot > 0.0f ? dot : 0.0f;
+                }
+                if (lane == 0)
+                    logits[int64_t(row) * n_blocks + n] =
+                        acc / sycl::sqrt(float(head_dim));
+            });
+    });
+}
+
+// Stage 3.  Selected blocks -> token indices.  A hole (-1) stays a hole:
+// clamping it to 0 would make every short sequence attend to its first
+// block over and over, which is silent.
+sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
+                                     int32_t* out, int rows, int block_topk,
+                                     int compress_ratio, int token_topk,
+                                     const int32_t* seq_len,
+                                     const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * token_topk),
+            [=](sycl::id<1> id) {
+                const int row = int(id[0] / token_topk);
+                const int w   = int(id[0] % token_topk);
+                const int b   = w / compress_ratio;
+                const int r   = w % compress_ratio;
+                int t = -1;
+                if (b < block_topk) {
+                    const int bi = blocks[int64_t(row) * block_topk + b];
+                    if (bi >= 0) {
+                        const int cand = bi * compress_ratio + r;
+                        const int len = seq_len ? seq_len[row] : 0;
+                        if (cand >= 0 && cand < len) t = cand;
+                    }
+                }
+                out[int64_t(row) * token_topk + w] = t;
+            });
+    });
+}
+
 } // namespace b70

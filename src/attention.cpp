@@ -468,4 +468,113 @@ sycl::event launch_flash_decode_batched(
            part_m, part_l, splits, deps);
 }
 
+// ---------------------------------------------------------------------
+//  QSA sparse attention (Qwen4-Exp).
+//
+//  The same online-softmax flash math as launch_flash_decode, with ONE
+//  difference: the key loop is driven by a GATHERED INDEX ARRAY rather
+//  than a contiguous [lo, seq) range.  That is what QSA is -- the indexer
+//  picks which blocks a query may see, and this attends to exactly those.
+//
+//  A -1 entry is a HOLE and must contribute nothing.  Treating it as key
+//  0 is the silent failure here: the row still softmaxes to something
+//  plausible, so a short sequence quietly attends to its first token
+//  repeatedly instead of to fewer keys.
+//
+//  Templated on the accumulator width like every other flash kernel in
+//  this file (see kernels.hpp), so a head wider than MAX_HEAD_DIM takes
+//  the 32-slot instantiation rather than overrunning device stack.
+// ---------------------------------------------------------------------
+template <int MAXD>
+static sycl::event launch_qsa_attention_impl(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, const int32_t* idx, float* out, int rows,
+    int n_heads, int kv_heads, int head_dim, int seq_cap, int n_idx,
+    float softmax_scale, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(rows) * n_heads * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  gid  = int(it.get_group(0));
+                const int  row  = gid / n_heads;
+                const int  head = gid % n_heads;
+                const int  kvh  = head / (n_heads / kv_heads);
+
+                static_assert(MAXD == MAX_DPL || MAXD == MAX_DPL_WIDE,
+                              "kernels.hpp owns the accumulator widths");
+                const int dpl = head_dim / SG_SIZE;
+                const float* qh = qv + (int64_t(row) * n_heads + head) * head_dim;
+                const uint8_t* kh = k_cache + int64_t(kvh) * head_dim * seq_cap;
+                const uint8_t* vh = v_cache + int64_t(kvh) * seq_cap * head_dim;
+                const int32_t* ri = idx + int64_t(row) * n_idx;
+
+                float m = -std::numeric_limits<float>::infinity();
+                float l = 0.0f;
+                float acc[MAXD];
+                #pragma unroll
+                for (int d = 0; d < MAXD; ++d) acc[d] = 0.0f;
+
+                for (int i0 = 0; i0 < n_idx; i0 += SG_SIZE) {
+                    const int i = i0 + lane;
+                    const int s = (i < n_idx) ? ri[i] : -1;
+                    float score = -std::numeric_limits<float>::infinity();
+                    if (s >= 0 && s < seq_cap) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                            dot = sycl::fma(qh[d], e4m3_to_f32(
+                                kh[int64_t(d) * seq_cap + s]), dot);
+                        score = dot * softmax_scale;
+                    }
+                    const float mblk = sycl::reduce_over_group(
+                        sg, score, sycl::maximum<float>());
+                    const float mnew = sycl::fmax(m, mblk);
+                    const float corr = sycl::isinf(m) ? 0.0f : sycl::exp(m - mnew);
+                    const float pj = sycl::isinf(score) ? 0.0f
+                                                        : sycl::exp(score - mnew);
+                    const float psum = sycl::reduce_over_group(
+                        sg, pj, sycl::plus<float>());
+                    l = sycl::fma(l, corr, psum);
+                    #pragma unroll
+                    for (int d = 0; d < MAXD; ++d)
+                        if (d < dpl) acc[d] *= corr;
+                    for (int j = 0; j < SG_SIZE; ++j) {
+                        if (i0 + j >= n_idx) break;
+                        const int sj = ri[i0 + j];
+                        if (sj < 0 || sj >= seq_cap) continue;   // a hole
+                        const float pb = sycl::group_broadcast(sg, pj, j);
+                        const uint8_t* vrow = vh + int64_t(sj) * head_dim;
+                        #pragma unroll
+                        for (int d = 0; d < MAXD; ++d)
+                            if (d < dpl)
+                                acc[d] = sycl::fma(pb, e4m3_to_f32(
+                                    vrow[lane + d * SG_SIZE]), acc[d]);
+                    }
+                    m = mnew;
+                }
+                const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+                float* o = out + (int64_t(row) * n_heads + head) * head_dim;
+                #pragma unroll
+                for (int d = 0; d < MAXD; ++d)
+                    if (d < dpl) o[lane + d * SG_SIZE] = acc[d] * inv;
+            });
+    });
+}
+
+sycl::event launch_qsa_attention(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, const int32_t* idx, float* out, int rows,
+    int n_heads, int kv_heads, int head_dim, int seq_cap, int n_idx,
+    float softmax_scale, const std::vector<sycl::event>& deps) {
+    return head_dim > MAX_HEAD_DIM
+         ? launch_qsa_attention_impl<MAX_DPL_WIDE>(q, qv, k_cache, v_cache,
+             idx, out, rows, n_heads, kv_heads, head_dim, seq_cap, n_idx,
+             softmax_scale, deps)
+         : launch_qsa_attention_impl<MAX_DPL>(q, qv, k_cache, v_cache,
+             idx, out, rows, n_heads, kv_heads, head_dim, seq_cap, n_idx,
+             softmax_scale, deps);
+}
+
 } // namespace b70

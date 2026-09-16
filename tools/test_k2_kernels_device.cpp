@@ -968,6 +968,164 @@ int main() {
         sycl::free(d_mix,q); sycl::free(d_injo,q);
     }
 
+    // ---- Qwen4-Exp QSA ---------------------------------------------
+    // The indexer decides WHICH keys the model sees.  A wrong selection
+    // is attention over the wrong 2048 tokens, which is still attention
+    // and still fluent, so every stage is diffed against
+    // b70/qwen4_exp.hpp and the two easiest mistakes get an explicit A/B.
+    {
+        const int rows = 2, ih = 4, ihd = 32, nblk = 24, vis = 17;
+        std::mt19937 rng(20260917);
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<float> iq(size_t(rows)*ih*ihd), ik(size_t(rows)*nblk*ihd);
+        for (auto& v : iq) v = d(rng);
+        for (auto& v : ik) v = d(rng);
+        std::vector<int32_t> visv(size_t(rows), vis);
+
+        float* d_iq = sycl::malloc_device<float>(iq.size(), q);
+        float* d_ik = sycl::malloc_device<float>(ik.size(), q);
+        float* d_lg = sycl::malloc_device<float>(size_t(rows)*nblk, q);
+        int32_t* d_vis = sycl::malloc_device<int32_t>(visv.size(), q);
+        q.memcpy(d_iq, iq.data(), iq.size()*sizeof(float));
+        q.memcpy(d_ik, ik.data(), ik.size()*sizeof(float));
+        q.memcpy(d_vis, visv.data(), visv.size()*sizeof(int32_t)).wait();
+
+        launch_qsa_index_logits(q, d_iq, d_ik, d_lg, rows, ih, ihd, nblk,
+                                d_vis, {});
+        q.wait();
+        std::vector<float> lg(size_t(rows)*nblk), lgw(size_t(rows)*nblk);
+        q.memcpy(lg.data(), d_lg, lg.size()*sizeof(float)).wait();
+        for (int r = 0; r < rows; ++r)
+            qwen4_exp::qsa_index_logits(iq.data() + size_t(r)*ih*ihd,
+                                        ik.data() + size_t(r)*nblk*ihd,
+                                        lgw.data() + size_t(r)*nblk,
+                                        ih, ihd, nblk, vis);
+        // -inf == -inf compares equal under subtraction only if both are
+        // -inf; compare the visible part numerically and the masked part
+        // structurally so an accidental finite value is caught.
+        double worst = 0.0; int mask_bad = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int n = 0; n < nblk; ++n) {
+                const size_t i = size_t(r)*nblk + n;
+                if (n >= vis) { if (!std::isinf(lg[i]) || lg[i] > 0) ++mask_bad; }
+                else worst = std::max(worst, std::abs(double(lg[i]) - lgw[i]));
+            }
+        std::printf("%-16s %-40s %.3e\n", "qsa index",
+                    "relu per head, THEN summed, /sqrt(d)", worst);
+        CHECK(worst < 2e-5, "qsa_index_logits does not match the host reference");
+        CHECK(mask_bad == 0, "qsa_index_logits did not mask beyond `visible`");
+
+        // A/B: sum-then-relu is the natural misreading and gives a
+        // DIFFERENT ranking.  Without this the check above passes for any
+        // implementation that happens to agree on this input.
+        {
+            std::vector<float> alt(size_t(rows)*nblk);
+            for (int r = 0; r < rows; ++r)
+                for (int n = 0; n < nblk; ++n) {
+                    float acc = 0.0f;
+                    for (int hh = 0; hh < ih; ++hh) {
+                        float dot = 0.0f;
+                        for (int dd = 0; dd < ihd; ++dd)
+                            dot += iq[(size_t(r)*ih+hh)*ihd+dd] *
+                                   ik[(size_t(r)*nblk+n)*ihd+dd];
+                        acc += dot;                       // no relu here
+                    }
+                    alt[size_t(r)*nblk+n] = (acc > 0 ? acc : 0) /
+                                            std::sqrt(float(ihd));
+                }
+            double apart = 0.0;
+            for (int r = 0; r < rows; ++r)
+                for (int n = 0; n < vis; ++n)
+                    apart = std::max(apart,
+                        std::abs(double(lg[size_t(r)*nblk+n]) - alt[size_t(r)*nblk+n]));
+            std::printf("%-16s %-40s %.3e\n", "qsa index A/B",
+                        "vs sum-then-relu (the misreading)", apart);
+            CHECK(apart > 1e-3, "relu-then-sum and sum-then-relu agree on this "
+                                "input, so the check above proves nothing");
+        }
+
+        // --- expand ---------------------------------------------------
+        const int ratio = 4, btopk = 5, ttopk = btopk * ratio, seq = 34;
+        std::vector<int32_t> blocks(size_t(rows)*btopk);
+        for (int r = 0; r < rows; ++r)
+            for (int b = 0; b < btopk; ++b)
+                blocks[size_t(r)*btopk+b] = (b == btopk-1) ? -1 : (b*3 + r);
+        std::vector<int32_t> seqv(size_t(rows), seq);
+        int32_t* d_blk = sycl::malloc_device<int32_t>(blocks.size(), q);
+        int32_t* d_exp = sycl::malloc_device<int32_t>(size_t(rows)*ttopk, q);
+        int32_t* d_seq = sycl::malloc_device<int32_t>(seqv.size(), q);
+        q.memcpy(d_blk, blocks.data(), blocks.size()*sizeof(int32_t));
+        q.memcpy(d_seq, seqv.data(), seqv.size()*sizeof(int32_t)).wait();
+        launch_qsa_expand_blocks(q, d_blk, d_exp, rows, btopk, ratio, ttopk,
+                                 d_seq, {});
+        q.wait();
+        std::vector<int32_t> eg(size_t(rows)*ttopk), ew(size_t(rows)*ttopk);
+        q.memcpy(eg.data(), d_exp, eg.size()*sizeof(int32_t)).wait();
+        for (int r = 0; r < rows; ++r)
+            qwen4_exp::qsa_expand_blocks(blocks.data() + size_t(r)*btopk,
+                                         btopk, ratio, ttopk, seq,
+                                         ew.data() + size_t(r)*ttopk);
+        int diff = 0, holes = 0;
+        for (size_t i = 0; i < eg.size(); ++i) {
+            if (eg[i] != ew[i]) ++diff;
+            if (ew[i] < 0) ++holes;
+        }
+        std::printf("%-16s %-40s %d mismatches, %d holes\n", "qsa expand",
+                    "block -> tokens, -1 stays -1", diff, holes);
+        CHECK(diff == 0, "qsa_expand_blocks does not match the host reference");
+        // If nothing was a hole this case proves nothing about the -1 path,
+        // which is the one that is silent when clamped to token 0.
+        CHECK(holes > 0, "the expand fixture produced no holes, so the -1 "
+                         "path is untested");
+
+        // --- sparse attention over the gathered list -------------------
+        const int nh = 4, kvh = 2, hd = 32, cap = 64;
+        std::vector<float> aq(size_t(rows)*nh*hd);
+        std::vector<uint8_t> kc(size_t(kvh)*hd*cap), vc(size_t(kvh)*cap*hd);
+        for (auto& v : aq) v = d(rng);
+        for (auto& v : kc) v = uint8_t(rng() & 0x7f);
+        for (auto& v : vc) v = uint8_t(rng() & 0x7f);
+        // Reuse the expanded list: it has real indices AND holes.
+        float* d_aq = sycl::malloc_device<float>(aq.size(), q);
+        uint8_t* d_kc = sycl::malloc_device<uint8_t>(kc.size(), q);
+        uint8_t* d_vc = sycl::malloc_device<uint8_t>(vc.size(), q);
+        float* d_ao = sycl::malloc_device<float>(size_t(rows)*nh*hd, q);
+        q.memcpy(d_aq, aq.data(), aq.size()*sizeof(float));
+        q.memcpy(d_kc, kc.data(), kc.size());
+        q.memcpy(d_vc, vc.data(), vc.size()).wait();
+        const float sms = 1.0f / std::sqrt(float(hd));
+        launch_qsa_attention(q, d_aq, d_kc, d_vc, d_exp, d_ao, rows, nh, kvh,
+                             hd, cap, ttopk, sms, {});
+        q.wait();
+        std::vector<float> ag(size_t(rows)*nh*hd), aw(size_t(rows)*nh*hd);
+        q.memcpy(ag.data(), d_ao, ag.size()*sizeof(float)).wait();
+        std::vector<float> kf(kc.size()), vf(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) kf[i] = e4m3_to_f32(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vf[i] = e4m3_to_f32(vc[i]);
+        // The host reference indexes K as [kvh][seq][d]; the cache is
+        // D-major ([kvh][d][seq]) so transpose into the shape it expects.
+        std::vector<float> kT(kf.size());
+        for (int c = 0; c < kvh; ++c)
+            for (int dd = 0; dd < hd; ++dd)
+                for (int t = 0; t < cap; ++t)
+                    kT[(size_t(c)*cap + t)*hd + dd] = kf[(size_t(c)*hd + dd)*cap + t];
+        for (int r = 0; r < rows; ++r)
+            qwen4_exp::qsa_attention(aq.data() + size_t(r)*nh*hd,
+                                     kT.data(), vf.data(),
+                                     eg.data() + size_t(r)*ttopk,
+                                     aw.data() + size_t(r)*nh*hd,
+                                     nh, kvh, hd, ttopk, cap, sms);
+        std::printf("%-16s %-40s %.3e\n", "qsa attention",
+                    "gathered index list, holes skipped", worst_abs(aw, ag));
+        CHECK(worst_abs(aw, ag) < 2e-4,
+              "launch_qsa_attention does not match the host reference");
+
+        sycl::free(d_iq,q); sycl::free(d_ik,q); sycl::free(d_lg,q);
+        sycl::free(d_vis,q); sycl::free(d_blk,q); sycl::free(d_exp,q);
+        sycl::free(d_seq,q); sycl::free(d_aq,q); sycl::free(d_kc,q);
+        sycl::free(d_vc,q); sycl::free(d_ao,q);
+    }
+
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

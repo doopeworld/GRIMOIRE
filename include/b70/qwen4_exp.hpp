@@ -48,6 +48,8 @@
 #include <cmath>
 #include <cstddef>
 #include <vector>
+#include <limits>
+#include <algorithm>
 
 namespace b70 {
 namespace qwen4_exp {
@@ -122,6 +124,127 @@ inline void hc_combine(const float* hyper, const float* normed,
         const float w = 2.0f * sigmoid(float(acc) / float(hc_count));
         for (int h = 0; h < hidden; ++h)
             out[size_t(c) * hidden + h] = hyper[size_t(c) * hidden + h] + block[h] * w;
+    }
+}
+
+// ---------------------------------------------------------------------
+//  QSA -- Qwen Sparse Attention.
+//
+//  Extracted from the reference implementation in vLLM's own test,
+//  tests/models/qwen4_exp/test_qsa_reference.py, which is plain torch
+//  (the shipped path is CUDA kernels).  Three stages:
+//
+//    1. INDEX.  An MQA "indexer" scores every compressed key block:
+//         scores = einsum("rhd,rnd->rnh", q, keys)
+//         logits = relu(scores).sum(dim=-1) / sqrt(d)
+//       Note the order: relu FIRST, then sum ACROSS HEADS, then scale.
+//       Summing before the relu, or scaling before it, changes which
+//       blocks win and is completely silent.
+//    2. SELECT.  Top block_topk = indexer_budget / compress_ratio blocks
+//       per query, over that query's visible range only.
+//    3. EXPAND.  Each chosen block b becomes compress_ratio consecutive
+//       TOKENS [b*ratio, b*ratio + ratio), truncated to indexer_budget
+//       and masked to < seq_len.  Selecting one token therefore brings
+//       its whole block -- that is the "coarser index" QSA is built on.
+//
+//  Attention then runs over the GATHERED token list, not a range:
+//         scores = einsum("hd,khd->hk", q, keys)
+//         p      = softmax(scores * softmax_scale)
+//  which is the ordinary flash math with the key loop driven by an index
+//  array.  -1 entries are holes and contribute nothing.
+// ---------------------------------------------------------------------
+
+// Stage 1.  `q` is [n_heads][head_dim] for one query row, `keys` is
+// [n_blocks][head_dim] -- MQA, so ONE key stream is shared by every
+// indexer head (the config requires indexer_kv_heads == 1).
+// `visible` is how many blocks this query may see; the rest are -inf.
+inline void qsa_index_logits(const float* q, const float* keys, float* logits,
+                             int n_heads, int head_dim, int n_blocks,
+                             int visible) {
+    const float inv = 1.0f / std::sqrt(float(head_dim));
+    for (int n = 0; n < n_blocks; ++n) {
+        if (n >= visible) {
+            logits[n] = -std::numeric_limits<float>::infinity();
+            continue;
+        }
+        const float* kn = keys + size_t(n) * head_dim;
+        float acc = 0.0f;
+        for (int h = 0; h < n_heads; ++h) {
+            const float* qh = q + size_t(h) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += qh[d] * kn[d];
+            // relu per head, THEN summed.  Not sum-then-relu.
+            acc += dot > 0.0f ? dot : 0.0f;
+        }
+        logits[n] = acc * inv;
+    }
+}
+
+// Stage 2.  Top-`topk` block indices by logit, descending.  Fewer than
+// topk visible blocks leaves the tail as -1, which stage 3 treats as a
+// hole -- it must not be clamped to block 0, which would silently make
+// every short sequence attend to its first block repeatedly.
+inline void qsa_topk_blocks(const float* logits, int n_blocks, int visible,
+                            int topk, int* out) {
+    for (int i = 0; i < topk; ++i) out[i] = -1;
+    std::vector<int> idx;
+    idx.reserve(size_t(visible > 0 ? visible : 0));
+    for (int n = 0; n < n_blocks && n < visible; ++n) idx.push_back(n);
+    std::stable_sort(idx.begin(), idx.end(),
+                     [&](int a, int b) { return logits[a] > logits[b]; });
+    const int width = int(idx.size()) < topk ? int(idx.size()) : topk;
+    for (int i = 0; i < width; ++i) out[i] = idx[size_t(i)];
+}
+
+// Stage 3.  Block indices -> token indices.  `out` is indexer_budget
+// wide; entries outside the sequence, and holes from stage 2, are -1.
+inline void qsa_expand_blocks(const int* blocks, int block_topk,
+                              int compress_ratio, int token_topk,
+                              int seq_len, int* out) {
+    int w = 0;
+    for (int b = 0; b < block_topk && w < token_topk; ++b) {
+        for (int r = 0; r < compress_ratio && w < token_topk; ++r, ++w) {
+            const int t = blocks[b] >= 0 ? blocks[b] * compress_ratio + r : -1;
+            out[w] = (t >= 0 && t < seq_len) ? t : -1;
+        }
+    }
+    for (; w < token_topk; ++w) out[w] = -1;
+}
+
+// The attention itself, over the gathered list.  Plain softmax here
+// because this is the reference; the kernel uses the same online form
+// every other flash path in this engine does.
+inline void qsa_attention(const float* q, const float* k, const float* v,
+                          const int* idx, float* out, int n_heads,
+                          int kv_heads, int head_dim, int n_idx, int seq_cap,
+                          float softmax_scale) {
+    const int repeats = n_heads / (kv_heads > 0 ? kv_heads : 1);
+    for (int h = 0; h < n_heads; ++h) {
+        const int kvh = h / (repeats > 0 ? repeats : 1);
+        float m = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < n_idx; ++i) {
+            if (idx[i] < 0) continue;
+            const float* kk = k + (size_t(kvh) * seq_cap + idx[i]) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += q[size_t(h)*head_dim+d] * kk[d];
+            dot *= softmax_scale;
+            if (dot > m) m = dot;
+        }
+        float l = 0.0f;
+        std::vector<float> acc(size_t(head_dim), 0.0f);
+        for (int i = 0; i < n_idx; ++i) {
+            if (idx[i] < 0) continue;
+            const float* kk = k + (size_t(kvh) * seq_cap + idx[i]) * head_dim;
+            const float* vv = v + (size_t(kvh) * seq_cap + idx[i]) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += q[size_t(h)*head_dim+d] * kk[d];
+            const float p = std::exp(dot * softmax_scale - m);
+            l += p;
+            for (int d = 0; d < head_dim; ++d) acc[size_t(d)] += p * vv[d];
+        }
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (int d = 0; d < head_dim; ++d)
+            out[size_t(h) * head_dim + d] = acc[size_t(d)] * inv;
     }
 }
 
