@@ -20,7 +20,14 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
   parallel-ffn, gemma4, gemma4 at head_dim 512
 - PP and TP produce token-identical output to a single process, in BF16
-  and FP8, for dense, MoE and K2 (`test_parallel_e2e`)
+  and FP8, for dense, MoE, hybrid and gemma-4 (`test_parallel_e2e`) --
+  40 matching cases.  **Its k2-horizon bf16 cell does NOT pass on a CPU
+  device** and never has: the Intel OpenCL CPU runtime crashes compiling
+  that kernel (SIGSEGV, with the runtime's own "PLEASE submit a bug
+  report" line just above it), so the gate exits 1 with 1 failure.
+  Verified 2026-09-16 to be identical at `a4e3775` and at HEAD, i.e.
+  PRE-EXISTING and not engine code.  Re-run it on the B70, where the
+  kernel compiles; do not spend time bisecting it off-card.
 
 What is NOT verified and only the Tower can settle: the OCuLink link
 itself, every XMX tile, the AOT image, and every number.
