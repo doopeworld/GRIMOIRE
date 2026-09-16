@@ -6582,6 +6582,18 @@ const float* Grimoire::forward_muse(int token) {
         ap.softmax_scale = sm_scale;
         ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
         ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
+        // Muse iRoPE: the SLIDING layers are the rope-using ones and they
+        // are the ones with a window (ref/muse_glimmer.py:1191 --
+        // `sliding_window = None if not self.use_rope else
+        // config.sliding_window`).  The full-attention layers are NoPE and
+        // see everything.
+        //
+        // This line did not exist: AttnParams is zero-initialised, so every
+        // Muse layer attended to the WHOLE history while prefill_muse
+        // windowed its sliding layers at a hardcoded 2047.  Prefill and
+        // decode therefore disagreed, and only past the window -- a short
+        // prompt cannot show it, which is why nothing caught it.
+        ap.window_left = d.muse_sliding ? cfg.sliding_window : 0;
         launch_flash_decode(q, ap, none);
         launch_flash_merge(q, ap, none);
         // per-head attention output gate (separate projection).  K2 uses
@@ -8433,7 +8445,13 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
         launch_kv_append_f16_paged(q,kh,vh,d.k_cache_f16,d.v_cache_f16,M,
             start_pos,KVH,HD,target_block_size,{});
         mt_mark("kv append");
-        const int window_left=d.muse_sliding?2047:-1;
+        // FA2 counts window_left as keys STRICTLY LEFT of the query, so a
+        // window of W is W-1 here plus the query itself.  This was
+        // hardcoded 2047 (i.e. W = 2048) and so was wrong for any
+        // checkpoint whose config says otherwise -- silently, and only
+        // past the window.  cfg.sliding_window is now parsed for Muse.
+        const int msw=cfg.sliding_window>0?cfg.sliding_window:2048;
+        const int window_left=d.muse_sliding?msw-1:-1;
         const int window_right=d.muse_sliding?0:-1;
         const int rc=fa2_paged(&q,qh,d.k_cache_f16,d.v_cache_f16,oh,M,used,
             QH,KVH,HD,target_block_size,target_num_blocks,

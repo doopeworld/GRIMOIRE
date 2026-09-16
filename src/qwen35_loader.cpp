@@ -419,6 +419,13 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     if (muse) {
         cfg.is_muse = true;
         cfg.attn_out_gate = true;
+        // sliding_window was read ONLY inside the gemma-4 block, so Muse
+        // never got one -- and BOTH Muse paths then invented their own:
+        // prefill_muse hardcoded window_left 2047 and forward_muse set
+        // none at all, so prefill and decode disagreed about how much
+        // history a sliding layer sees.  ref/muse_glimmer.py:1191 takes
+        // it from the config for exactly the rope-using (sliding) layers.
+        cfg.sliding_window = cfg_i(cj, "sliding_window", 0);
         float qk = cfg_f(cj, "qk_scale_factor", 0.0f);
         float ex = cfg_f(cj, "scale_query_by", 0.0f);
         cfg.query_prescale = ex > 0.0f ? ex : (qk > 0.0f ? qk : 1.0f);

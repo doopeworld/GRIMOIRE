@@ -254,6 +254,68 @@ inline Arch dense(int L = 4, bool mtp = false) {
 // GHD is the FULL-attention head_dim.  The default 32 keeps the fixture
 // small; gemma4_wide() raises it to 512, the real 31B checkpoint's width,
 // which is what exercises the 32-slot flash instantiation (kernels.hpp).
+// Muse Glimmer: a dense Gemma-sandwich transformer with a per-head
+// SIGMOID attention output gate (ref/muse_glimmer.py:1229 -- the config
+// carries no attention_gate_func, and MuseGlimmer ALWAYS gates) and
+// SCALELESS qk/embed norms.  forward_muse() and
+// prefill_muse() are ~460 lines that no gate covered until this fixture
+// existed -- the matrix ran dense, moe, hybrid, k2 and gemma4, and Muse
+// was executed by nothing off the card.
+//
+// Scaleless is the trap worth restating (rule 11): Muse normalises q, k
+// and the embedding against a ZERO weight vector under the zero-centered
+// convention, i.e. (1 + 0).  That is the engine's `muse_zero` buffer, not
+// a tensor, so this fixture ships no q_norm/k_norm -- shipping ones-valued
+// ones instead would be a DIFFERENT model that still produced fluent text.
+inline Arch muse(int L = 6) {
+    const int H = 64, V = 128, QH = 4, KVH = 2, HD = 16, I = 128;
+    auto sliding = [](int l) { return (l % 3) != 2; };
+    const int QW = QH * HD, KVW = KVH * HD;
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "muse_glimmer_text", "hidden_size": 64,
+  "num_hidden_layers": )JSON" << L << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "rms_norm_eps": 1e-06,
+  "hidden_act": "silu",
+  "sliding_window": 8,
+  "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+  "layer_types": [)JSON";
+    for (int l = 0; l < L; ++l)
+        c << (l ? ", " : "")
+          << (sliding(l) ? "\"sliding_attention\"" : "\"full_attention\"");
+    c << "]\n}";
+    Arch a{"muse", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    // Sandwich norms sit near ONE, as they do in a real checkpoint: four
+    // norms a layer at N(0, 0.05) under (1 + w) is survivable, but the
+    // gemma4 fixture's comment explains why this is worth being explicit
+    // about rather than lucky.
+    auto ones = [](int n) { return std::vector<float>(size_t(n), 1.0f); };
+    t = { {"model.embed_tokens.weight", {V, H}},
+          {"model.norm.weight", {H}, ones(H)},
+          {"lm_head.weight", {V, H}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        t.push_back({b + "input_layernorm.weight", {H}, ones(H)});
+        t.push_back({b + "post_attention_layernorm.weight", {H}, ones(H)});
+        t.push_back({b + "pre_feedforward_layernorm.weight", {H}, ones(H)});
+        t.push_back({b + "post_feedforward_layernorm.weight", {H}, ones(H)});
+        const std::string s = b + "self_attn.";
+        t.push_back({s + "q_proj.weight", {QW, H}});
+        t.push_back({s + "k_proj.weight", {KVW, H}});
+        t.push_back({s + "v_proj.weight", {KVW, H}});
+        t.push_back({s + "o_proj.weight", {H, QW}});
+        // The attention OUTPUT gate -- softplus here, per attention_gate_func.
+        t.push_back({s + "gate_proj.weight", {QW, H}});
+        const std::string m = b + "mlp.";
+        t.push_back({m + "gate_proj.weight", {I, H}});
+        t.push_back({m + "up_proj.weight",   {I, H}});
+        t.push_back({m + "down_proj.weight", {H, I}});
+    }
+    return a;
+}
+
 inline Arch gemma4_at(int L, int GHD, const char* name) {
     const int H=64, V=128, QH=4;
     const int SHD=16, SKV=2, GKV=1, I=128;

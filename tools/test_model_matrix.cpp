@@ -124,8 +124,13 @@ int main(int argc, char** argv) {
     const fs::path root = tmpl;
     const char* self = argv[0];
 
+    // Muse was executed by NOTHING off the card until 2026-09-16:
+    // forward_muse() and prefill_muse() are ~460 lines and no gate had a
+    // fixture for them.  That is how a hardcoded sliding window in one
+    // and no window at all in the other survived.
     std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
                                       mini::hybrid(), mini::k2(),
+                                      mini::muse(),
                                       mini::gemma4(), mini::gemma4_wide() };
 
     std::printf("%-12s", "");
