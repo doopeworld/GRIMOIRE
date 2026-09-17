@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -302,16 +303,25 @@ int main(int argc, char** argv) {
     // embedding, and the model reads perfectly well with it.
     {
         mini::Arch bad = mini::qwen4_exp(4, /*fp8_table=*/true);
-        size_t at = bad.tensors.size();
-        for (size_t i = 0; i < bad.tensors.size(); ++i)
-            if (bad.tensors[i].name.find("ngram_embedding.weight_scale")
-                != std::string::npos) at = i;
-        if (at == bad.tensors.size()) {
+        // EVERY scale, not one of them.  The fixture carries PLE weights
+        // on two layers so the one-based ple_layer_ids can be tested, and
+        // only one of those layers is actually named by the config --
+        // removing the other layer's scale removes a tensor nothing
+        // reads and the model loads cleanly, which is a case that proves
+        // nothing.  It took a gate run to notice.
+        const size_t before = bad.tensors.size();
+        bad.tensors.erase(
+            std::remove_if(bad.tensors.begin(), bad.tensors.end(),
+                [](const mini::Tn& t) {
+                    return t.name.find("ngram_embedding.weight_scale")
+                           != std::string::npos;
+                }),
+            bad.tensors.end());
+        if (bad.tensors.size() == before) {
             ++fails;
             std::printf("  %-14s the FP8 fixture ships no weight_scale to "
                         "remove; this case proves nothing\n", "ple fp8 scale");
         } else {
-            bad.tensors.erase(bad.tensors.begin() + long(at));
             const fs::path dir = root / "refuse-ple-fp8-noscale";
             mini::write_model(dir, bad);
             std::string err;
