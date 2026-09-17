@@ -6,11 +6,18 @@
 //  container. The model loads ONCE at startup and stays resident; requests
 //  are served against that live engine.
 //
-//  GRIMOIRE's KV cache and generation state are NOT safe for concurrent
-//  decode. Requests are served one at a time behind a mutex -- a second
-//  request queues rather than corrupting the first's state. That is a real
-//  difference from vLLM's continuous batching and should be documented as
-//  such, not hidden.
+//  Requests that overlap in time are STEPPED TOGETHER by a resident
+//  scheduler (see grimoire_scheduler_new): one thread owns the engine,
+//  each request gets its own sequence slot, and a decode step carries one
+//  token for every live request.  A decode step's cost is reading the
+//  weights, not producing the token, so this is most of the bill for
+//  concurrent work -- and it is exactly the shape agentic use has.
+//
+//  It was a mutex held for the whole of a request, which meant the second
+//  caller waited for the first to FINISH.  Where the engine still cannot
+//  batch -- a linear-attention model, TP, PP, a loaded drafter -- the
+//  scheduler runs one request at a time by the old path, speculation
+//  included, and says so on startup.  Nothing here has to ask which.
 // =====================================================================
 #include "b70/formats.hpp"
 #include "b70/tokenizer.hpp"
@@ -113,7 +120,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ready. listening on %s:%d\n", host.c_str(), port);
 
     std::unique_ptr<b70::Grimoire,void(*)(b70::Grimoire*)> owner(e,b70::grimoire_delete);
-    std::mutex engine_mu;
+    // How many requests may be in flight together.  The engine caps it at
+    // what the KV cache was allocated for (GRIMOIRE_SEQ_SLOTS) and at its
+    // own row limit, so asking for more than the box can hold is not an
+    // error, just a smaller number.
+    const char* bw = std::getenv("GRIMOIRE_MAX_BATCH");
+    std::unique_ptr<b70::GrimoireScheduler,void(*)(b70::GrimoireScheduler*)>
+        sched(b70::grimoire_scheduler_new(*e, bw && *bw ? std::atoi(bw) : 8),
+              b70::grimoire_scheduler_delete);
     httplib::Server svr;
     auto error_json=[](const std::string& message,const char* type) {
         return std::string("{\"error\":{\"message\":\"")+json_escape(message)+
@@ -130,7 +144,8 @@ int main(int argc, char** argv) {
     });
     svr.Get("/v1/models",[&](const httplib::Request&,httplib::Response& res) {
         res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\""+json_escape(model_dir)+
-            "\",\"object\":\"model\"}],\"grimoire\":{\"decoding\":\"greedy\",\"concurrency\":1}}","application/json");
+            "\",\"object\":\"model\"}],\"grimoire\":{\"decoding\":\"greedy\",\"concurrency\":"+
+            std::to_string(b70::grimoire_scheduler_width(*sched))+"}}","application/json");
     });
     auto handle=[&](const httplib::Request& req,httplib::Response& res,bool chat) {
         const auto request=b70::parse_completion_request(req.body,chat);
@@ -142,7 +157,6 @@ int main(int argc, char** argv) {
         if(request.stream) {
             res.set_chunked_content_provider("text/event-stream",
                 [&,ids,budget,chat,model,request_id](size_t,httplib::DataSink& sink) {
-                    std::lock_guard<std::mutex> lock(engine_mu);
                     auto send=[&](const std::string& payload) {
                         const auto line="data: "+payload+"\n\n";return sink.write(line.data(),line.size());
                     };
@@ -159,8 +173,9 @@ int main(int argc, char** argv) {
                     try {
                         b70::FinishReason finish;
                         std::vector<int32_t> out;
-                        const int n=b70::grimoire_serve_generate(*e,ids,budget,tk.eos(),out,
-                            tk.special_id("<|eot|>"),[&](int32_t t){return decoder.push(t,emit);},&finish);
+                        const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
+                            tk.eos(),tk.special_id("<|eot|>"),out,
+                            [&](int32_t t){return decoder.push(t,emit);},&finish);
                         if(connected)connected=decoder.finish(emit);
                         if(connected)send(prefix+",\"choices\":[{\"index\":0,"+
                             (chat?"\"delta\":{}":"\"text\":\"\"")+",\"finish_reason\":\""+
@@ -175,10 +190,10 @@ int main(int argc, char** argv) {
                     sink.done();return false;
                 });
         } else {
-            std::lock_guard<std::mutex> lock(engine_mu);
             b70::FinishReason finish;
             std::vector<int32_t> out;
-            const int n=b70::grimoire_serve_generate(*e,ids,budget,tk.eos(),out,tk.special_id("<|eot|>"),{},&finish);
+            const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
+                tk.special_id("<|eot|>"),out,{},&finish);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model);
             auto emit=[&](const std::string& p,bool r){(r?reasoning:content)+=p;return true;};

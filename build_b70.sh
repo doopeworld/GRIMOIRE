@@ -287,6 +287,8 @@ icpx -fsycl -fsycl-targets=spir64 \
 #                              to re-reading it, and does less work
 #   bin/test_batch_decode      several conversations stepped TOGETHER answer
 #                              exactly what each answers alone
+#   bin/test_scheduler         requests issued from several threads at once
+#                              answer what they answer one at a time
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
@@ -307,13 +309,14 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
               test_qwen4_exp_e2e:test_qwen4_exp_e2e \
               test_nvfp4_e2e:test_nvfp4_e2e \
               test_prefix_reuse:test_prefix_reuse \
-              test_batch_decode:test_batch_decode ; do
+              test_batch_decode:test_batch_decode \
+              test_scheduler:test_scheduler ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"
     icpx -fsycl -fsycl-targets=spir64 \
          -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
          -fsycl-device-code-split=per_kernel \
          -I include -I src \
-         "tools/${gsrc}.cpp" "${ENGINE_SRC[@]}" -o "bin/${gbin}" \
+         "tools/${gsrc}.cpp" "${ENGINE_SRC[@]}" -lpthread -o "bin/${gbin}" \
       && echo "built  : bin/${gbin}" || echo "warn: ${gbin} failed to build"
   done
 else

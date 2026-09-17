@@ -48,6 +48,9 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <chrono>
 #include <random>
 #include <cstdlib>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <algorithm>
 #include <numeric>
 #include <array>
@@ -12501,6 +12504,293 @@ int grimoire_serve_generate_batch(Grimoire& e,
     e.sync();
     e.reset();
     return int(prompts.size());
+}
+
+// =====================================================================
+//  A resident batching scheduler.
+//
+//  The server used to hold a mutex for the whole of a request, so a
+//  second caller waited for the first to FINISH -- not for the card, for
+//  the reply.  For agentic work that is the wrong unit of sharing
+//  entirely: eight agents each want a few hundred tokens and each pays
+//  the full weight traffic of every step alone.
+//
+//  Here the engine belongs to one thread.  Request threads hand it a
+//  prompt and wait for tokens; that thread admits what it has room for,
+//  reads each new prompt into its own sequence slot, and then steps
+//  every live request TOGETHER.  A request that arrives mid-flight joins
+//  at the next admission rather than at the end of a queue, and one that
+//  finishes leaves without disturbing the rest.
+//
+//  When the engine cannot batch this model or this device (see
+//  batch_unsupported_reason) the width is one and each request is served
+//  by the ordinary path, speculation included -- byte for byte what the
+//  server did before.  The point is that nothing has to ASK: the caller
+//  submits either way.
+// =====================================================================
+namespace {
+struct SchedJob {
+    // Set by the submitting thread, read by the scheduler.
+    std::vector<int32_t> prompt;
+    int budget = 0, eos = -1, eot = -1;
+    // Scheduler-owned.
+    int slot = -1, pos = 0, next = -1;
+    // Shared, under mu.
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<int32_t> ready;     // produced, in order
+    size_t taken = 0;               // how many the caller has consumed
+    bool done = false;
+    bool cancelled = false;         // caller hung up or said stop
+    std::string error;
+    FinishReason reason = FinishReason::Length;
+};
+} // namespace
+
+struct GrimoireScheduler {
+    Grimoire& e;
+    int width;
+    bool batchable;
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<SchedJob>> pending;
+    bool stopping = false;
+    std::thread th;
+
+    GrimoireScheduler(Grimoire& eng, int w)
+        : e(eng), width(w), batchable(eng.batch_unsupported_reason().empty()) {}
+
+    void submit(const std::shared_ptr<SchedJob>& j) {
+        { std::lock_guard<std::mutex> l(m); pending.push_back(j); }
+        cv.notify_one();
+    }
+    void stop() {
+        { std::lock_guard<std::mutex> l(m); stopping = true; }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+    }
+    // Hand a token to the waiting caller.  Returns false once the caller
+    // has gone away, which is how a disconnected client stops costing
+    // the card anything.
+    static bool push(const std::shared_ptr<SchedJob>& j, int32_t t) {
+        std::lock_guard<std::mutex> l(j->mu);
+        if (j->cancelled) return false;
+        j->ready.push_back(t);
+        j->cv.notify_all();
+        return true;
+    }
+    static void finish(const std::shared_ptr<SchedJob>& j, FinishReason r,
+                       std::string err = {}) {
+        { std::lock_guard<std::mutex> l(j->mu);
+          j->reason = r; j->error = std::move(err); j->done = true; }
+        j->cv.notify_all();
+    }
+    static bool cancelled(const std::shared_ptr<SchedJob>& j) {
+        std::lock_guard<std::mutex> l(j->mu);
+        return j->cancelled;
+    }
+    void run();
+};
+
+void GrimoireScheduler::run() {
+    std::vector<std::shared_ptr<SchedJob>> active;
+    std::vector<bool> slot_busy(size_t(std::max(1, e.n_seq_slots)), false);
+    for (;;) {
+        // ---- admit ---------------------------------------------------
+        std::vector<std::shared_ptr<SchedJob>> taking;
+        {
+            std::unique_lock<std::mutex> l(m);
+            if (active.empty() && pending.empty()) {
+                if (stopping) return;
+                cv.wait(l, [&]{ return stopping || !pending.empty(); });
+                if (stopping && pending.empty()) return;
+            }
+            while (int(active.size() + taking.size()) < width && !pending.empty()) {
+                taking.push_back(pending.front());
+                pending.pop_front();
+            }
+        }
+        for (auto& j : taking) {
+            if (cancelled(j)) { finish(j, FinishReason::Cancelled); continue; }
+            int slot = -1;
+            for (size_t i = 0; i < slot_busy.size(); ++i)
+                if (!slot_busy[i]) { slot = int(i); break; }
+            if (slot < 0) {   // no room after all; put it back
+                std::lock_guard<std::mutex> l(m);
+                pending.push_front(j);
+                continue;
+            }
+            try {
+                if (!batchable) {
+                    // One at a time, by the ordinary path.  Speculation,
+                    // the prefix cache and the graph all still apply --
+                    // this is the server exactly as it was.
+                    std::vector<int32_t> out;
+                    FinishReason r = FinishReason::Length;
+                    grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
+                        j->eot, [&](int32_t t){ return push(j, t); }, &r);
+                    finish(j, r);
+                    continue;
+                }
+                e.sync();
+                e.reset();
+                e.bind_seq_slot(slot);
+                e.pos = 0;
+                e.set_cursor(0);
+                if (!e.prefill(j->prompt))
+                    for (int32_t t : j->prompt)
+                        if (!e.forward(t))
+                            throw std::runtime_error("prompt ingestion failed");
+                e.sync();
+                j->slot = slot;
+                j->pos  = e.pos;
+                j->next = e.argmax_token();
+                slot_busy[size_t(slot)] = true;
+                const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                                  (j->eot >= 0 && j->next == j->eot);
+                if (stop) {
+                    slot_busy[size_t(slot)] = false;
+                    finish(j, FinishReason::Stop);
+                } else if (!push(j, int32_t(j->next))) {
+                    slot_busy[size_t(slot)] = false;
+                    finish(j, FinishReason::Cancelled);
+                } else if (j->budget <= 1) {
+                    slot_busy[size_t(slot)] = false;
+                    finish(j, FinishReason::Length);
+                } else {
+                    active.push_back(j);
+                }
+            } catch (const std::exception& ex) {
+                if (j->slot >= 0) slot_busy[size_t(j->slot)] = false;
+                finish(j, FinishReason::Length, ex.what());
+            }
+        }
+        if (active.empty()) continue;
+
+        // ---- step every live request together ------------------------
+        std::vector<int32_t> toks; std::vector<int> slots, poss;
+        std::vector<size_t> which;
+        for (size_t k = 0; k < active.size(); ++k) {
+            auto& j = active[k];
+            if (cancelled(j)) continue;
+            toks.push_back(int32_t(j->next));
+            slots.push_back(j->slot);
+            poss.push_back(j->pos);
+            which.push_back(k);
+        }
+        std::vector<int32_t> got;
+        bool failed = false; std::string err;
+        if (!toks.empty()) {
+            try {
+                if (!e.decode_batch(toks, slots, poss, got) ||
+                    got.size() != toks.size()) {
+                    failed = true; err = "batched decode step failed";
+                }
+            } catch (const std::exception& ex) { failed = true; err = ex.what(); }
+        }
+        std::vector<std::shared_ptr<SchedJob>> keep;
+        for (size_t k = 0; k < active.size(); ++k) {
+            auto& j = active[k];
+            // A row that was cancelled, or that the step never covered,
+            // is retired here rather than silently carried.
+            size_t at = which.size();
+            for (size_t i = 0; i < which.size(); ++i) if (which[i] == k) { at = i; break; }
+            if (failed || at == which.size()) {
+                slot_busy[size_t(j->slot)] = false;
+                finish(j, cancelled(j) ? FinishReason::Cancelled
+                                       : FinishReason::Length, err);
+                continue;
+            }
+            ++j->pos;
+            const int t = got[at];
+            const bool stop = (j->eos >= 0 && t == j->eos) ||
+                              (j->eot >= 0 && t == j->eot);
+            size_t n = 0;
+            { std::lock_guard<std::mutex> l(j->mu); n = j->ready.size(); }
+            if (stop) {
+                slot_busy[size_t(j->slot)] = false;
+                finish(j, FinishReason::Stop);
+            } else if (!push(j, int32_t(t))) {
+                slot_busy[size_t(j->slot)] = false;
+                finish(j, FinishReason::Cancelled);
+            } else if (int(n) + 1 >= j->budget || j->pos >= e.max_seq) {
+                slot_busy[size_t(j->slot)] = false;
+                finish(j, FinishReason::Length);
+            } else {
+                j->next = t;
+                keep.push_back(j);
+            }
+        }
+        active.swap(keep);
+    }
+}
+
+GrimoireScheduler* grimoire_scheduler_new(Grimoire& e, int width) {
+    const int cap = std::min({width > 0 ? width : 1,
+                              Grimoire::kMaxBatchRows,
+                              std::max(1, e.n_seq_slots)});
+    const std::string why = e.batch_unsupported_reason();
+    auto* sc = new GrimoireScheduler(e, why.empty() ? cap : 1);
+    std::fprintf(stderr, "  scheduler: %s\n",
+        why.empty()
+            ? ("batching up to " + std::to_string(sc->width) +
+               " requests per step").c_str()
+            : ("one request at a time -- " + why).c_str());
+    sc->th = std::thread([sc]{ sc->run(); });
+    return sc;
+}
+
+// How many requests this scheduler will step together.  The server
+// reports it on /v1/models, where it used to print the literal 1.
+int grimoire_scheduler_width(GrimoireScheduler& sc) { return sc.width; }
+
+void grimoire_scheduler_delete(GrimoireScheduler* sc) {
+    if (!sc) return;
+    sc->stop();
+    delete sc;
+}
+
+int grimoire_scheduler_generate(GrimoireScheduler& sc,
+        const std::vector<int32_t>& prompt, int n_predict, int eos_id,
+        int eot_id, std::vector<int32_t>& out,
+        const std::function<bool(int32_t)>& on_token, FinishReason* finish) {
+    out.clear();
+    auto j = std::make_shared<SchedJob>();
+    j->prompt = prompt;
+    // Thrown HERE, on the caller's thread, so a bad request is a 400 from
+    // the handler that made it rather than a scheduler error with no
+    // request attached.
+    j->budget = generation_budget(prompt, n_predict, sc.e.max_seq, sc.e.cfg.vocab);
+    j->eos = eos_id; j->eot = eot_id;
+    if (j->budget == 0) { if (finish) *finish = FinishReason::Length; return 0; }
+    sc.submit(j);
+    std::unique_lock<std::mutex> l(j->mu);
+    for (;;) {
+        j->cv.wait(l, [&]{ return j->done || j->taken < j->ready.size(); });
+        while (j->taken < j->ready.size()) {
+            const int32_t t = j->ready[j->taken++];
+            l.unlock();
+            out.push_back(t);
+            bool keep_going = true;
+            if (on_token) keep_going = on_token(t);
+            l.lock();
+            if (!keep_going) {
+                j->cancelled = true;
+                // Wait for the scheduler to let the slot go, or the next
+                // request could be admitted into a slot still in use.
+                j->cv.wait(l, [&]{ return j->done; });
+                if (finish) *finish = FinishReason::Cancelled;
+                return int(out.size());
+            }
+        }
+        if (j->done && j->taken >= j->ready.size()) break;
+    }
+    const std::string err = j->error;
+    const FinishReason r = j->reason;
+    l.unlock();
+    if (!err.empty()) throw std::runtime_error(err);
+    if (finish) *finish = r;
+    return int(out.size());
 }
 
 void grimoire_delete(Grimoire* e) { if(e){e->release();delete e;} }
