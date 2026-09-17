@@ -29,6 +29,17 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
 - the whole suite was re-run end to end at `5825caf` on 2026-09-17 and all
   SEVEN device gates are green, plus the 13 host suites and a link of both
   `bin/grimoire` and `bin/grimoire-server`
+- **several agents are served in ONE pass** (`test_batch_decode`,
+  `test_scheduler`).  The server held one lock for the whole of a
+  request, so the second caller waited for the first to FINISH.  It now
+  steps every overlapping request together -- dense, MoE and HYBRID,
+  which is Ornith.  Requests from six threads at once answer exactly
+  what they answer one at a time, and the counter is read so a path that
+  quietly queued them could not pass.  `GRIMOIRE_SEQ_SLOTS=8`,
+  `GRIMOIRE_MAX_BATCH=8`; the banner says what it decided.  **No speed
+  number exists and none can be taken here** -- the saving is XMX-shaped
+  and off-card the batched GEMM runs on a plain-SYCL fallback.  See rule
+  19 and `DAY-ONE.md` section 2d.
 - **NVFP4 checkpoints load** (`test_nvfp4_e2e`).  NVIDIA's Blackwell 4-bit
   format -- E2M1 with E4M3 scales per 16 and one FP32 global scale per
   tensor -- is decoded at load and handed to the ordinary quantizer, so
@@ -664,6 +675,51 @@ both hold the identical value, required to generate identical tokens.
 Every failure mode of this format produces finite, plausible numbers, so
 nothing weaker can see them.
 
+**19. A FIXTURE CAN BE TOO SMALL TO CONTAIN THE BUG, AND IT PASSES
+BEAUTIFULLY WHILE IT IS (learned 2026-09-17).**
+
+The gate for batched decode ran four conversations of two to six tokens
+and required them to answer exactly what they answer alone.  Dense, MoE
+and hybrid: all identical, every cell green, and the negative controls
+proved it caught a wrong per-row POSITION.
+
+Then the control for the thing that actually matters -- every row
+sharing one DeltaNet state -- **passed**.  A shared conv ring failed one
+cell out of two.  On a hybrid model the recurrent state IS the
+conversation, so that gate was green on its most important claim while
+testing nothing about it: at six tokens there is not yet enough in the
+state for sharing it to change an answer.
+
+Raising the prompts to 17-41 tokens and the reply to 12 turned both
+controls red -- and turned the REAL code red too.  The batch drivers
+called `reset()` and THEN bound the slot, so they cleared whichever slot
+happened to be live and left the new sequence starting on whatever its
+own slot still held.  A dense or MoE model cannot show that: a stale KV
+row past `pos` is masked out and the answers are exactly right.  A
+hybrid starts mid-thought and stays fluent.  `clear_seq_slot()` makes
+binding part of clearing so the order cannot be got wrong again.
+
+Three things follow.
+
+- **Run the negative control at the size the gate runs.**  A control
+  that passes is not reassurance, it is the gate telling you it is
+  blind.  This one was run only because the fix seemed too easy.
+- **Size the fixture by what has to ACCUMULATE.**  A KV cache is wrong
+  from the first token; a recurrent state, an attention sink, a sliding
+  window and a prefix cache all need length before they can be wrong.
+  Ask what the mechanism remembers, then make the sequence longer than
+  that.
+- **The bug class follows the architecture.**  Dense models are the
+  forgiving case for anything stateful, so "green on dense and MoE" says
+  very little about a hybrid.  Add the architecture whose state is
+  hardest, and make its row long.
+
+A related, smaller version of the same thing: the ragged arm hardcoded
+its stop token.  It suited dense and MoE and appeared nowhere in the
+hybrid fixture, so that cell ran to the full budget and asserted a
+narrowing that could not happen -- a test failing on the test.  It picks
+a token from what the fixture actually emits now.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the
@@ -684,7 +740,14 @@ per session, most recent state and next-steps at the bottom of each file:
   win (split-K decode, dynamic verify width) buys nothing until continuous
   batching exists. Also the launch count, what is worth copying and what is
   not, and two settled results from that stack that are free to take.
-- `QWEN4-EXP-2026-09-16.md` — **newest.** Qwen3.8-Flash-Next: the
+- `CONCURRENCY-2026-09-17.md` — **newest.** Serving several agents at
+  once: what was wrong (the server was serial AND every turn re-read its
+  history), what changed, what it refuses by name, the flags, how each
+  claim is checked, and the six ways the gates were verified to
+  discriminate. Ends with what only the Tower can measure — in order.
+  Read this with `PERF-2026-09-17.md`, which is the measurement that
+  started it.
+- `QWEN4-EXP-2026-09-16.md` — Qwen3.8-Flash-Next: the
   architecture, the three mechanisms, and (bottom section, which
   supersedes the rest of that file) what the forward path actually does,
   the three things the first pass got wrong, and what is verified versus

@@ -42,6 +42,9 @@ order, and stops at the first required failure:
 | `bin/test_gemma4_prefill` | gemma-4 batched prefill == sequential decode |
 | `bin/test_qwen4_exp_e2e` | Qwen3.8-Flash-Next: each mechanism is LIVE, and batched prefill == sequential decode |
 | `bin/test_nvfp4_e2e` | an NVFP4 checkpoint decodes to the same numbers as a bf16 twin |
+| `bin/test_prefix_reuse` | resuming a conversation answers what re-reading it answers, and copies no cache |
+| `bin/test_batch_decode` | conversations stepped TOGETHER answer what each answers alone |
+| `bin/test_scheduler` | requests from several threads at once answer what they answer one at a time |
 | generate | real model, real prompt — **you read the output** |
 
 **Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say
@@ -243,6 +246,48 @@ slice — it is routed through the full all-gathered projection instead.
 Correct, but the draft-vocab speedup is not available there. Another
 reason PP is the default choice for two cards.
 
+## 2d. Several agents at once
+
+New on 2026-09-17. The server used to hold one lock for the whole of a
+request, so the second caller waited for the first to FINISH. It now
+steps every overlapping request together: a decode step reads all the
+active weights to produce one token and reads the SAME weights to
+produce eight, so eight agents cost about what one costs.
+
+```bash
+GRIMOIRE_SEQ_SLOTS=8   # how many conversations the KV cache holds
+GRIMOIRE_MAX_BATCH=8   # how many are stepped together
+```
+
+`GRIMOIRE_SEQ_SLOTS` multiplies the KV cache: eight slots is eight times
+the cache, so size `--ctx` and the slot count against the VRAM the model
+leaves you. The banner prints what it decided —
+
+```
+    prefix cache  8 conversations resident
+    batching      up to 8 sequences per step
+```
+
+— and if it says `one at a time` it names the reason. Read that line
+before concluding the flags did nothing.
+
+Also worth setting, and independent of batching:
+
+```bash
+GRIMOIRE_PREFIX_CACHE=1   # a chat turn resumes instead of re-reading
+```
+
+Without it every turn of a conversation re-reads the whole history. With
+it the turn processes only the new tokens. For agentic work, where the
+prompt is long and the reply is short, that is the larger of the two
+wins on a single card.
+
+**What is NOT covered by any of this**: speculation. A loaded drafter
+turns batching off (the banner says so) and the server falls back to one
+request at a time, which is what it did before. MTP or DFlash versus
+eight-way batching is a real trade nobody has measured -- that is a
+Tower measurement and it is in the open list below.
+
 ## 2c. More than two cards, or cards that are not the same
 
 GRIMOIRE runs on any Battlemage part, and a box can mix them. Two things
@@ -325,6 +370,35 @@ software recovery. The known causes, all avoidable:
 - reading `w.payload` after W4A8 freed it (rule 1)
 
 ## 6. What is still open
+
+- **Concurrency: measure it. 2026-09-17.** Several agents are now served
+  in one pass instead of one after another, and every claim about it that
+  can be checked off the card has been (`bin/test_batch_decode`,
+  `bin/test_scheduler`). What CANNOT be checked here is the only thing
+  the change is for. Off-card the batched GEMM runs through a plain-SYCL
+  fallback that is far slower than the tile it replaces, so no number
+  from this container means anything (rule 8). On the Tower:
+
+  * tok/s aggregate at 1, 2, 4 and 8 concurrent requests, same prompt,
+    same model. The claim being tested is that 8 costs about what 1
+    costs, and the honest failure mode is that it does not -- attention
+    is looped per row, so a long context could make attention the
+    bottleneck before the weights are.
+  * where that breaks down. Find the width at which aggregate tok/s
+    stops rising; that is the real `GRIMOIRE_MAX_BATCH` for this box.
+  * **batching versus speculation.** A drafter turns batching off today.
+    MTP at ~2 accepted/step against 8-way batching is a genuine trade and
+    the repo holds no measurement either way. Do not assume; run both.
+  * VRAM. Eight slots is eight KV caches. Check what `--ctx` actually
+    fits alongside the model before recommending a slot count.
+
+- **Batching plus speculation, together.** They are mutually exclusive
+  right now and the refusal is explicit. A verify batch and a
+  multi-sequence batch both want the same M rows of the same prefill
+  path, so combining them is a scheduling question -- how many draft
+  tokens for how many sequences -- not a kernel one. Worth doing only if
+  the measurement above says speculation wins at the concurrency Ian
+  actually runs.
 
 - **Coverage, 2026-09-16.** `bin/test_model_matrix` now drives EIGHT
   architectures x 7 formats: dense, moe, hybrid, k2-horizon, **muse**,
