@@ -206,6 +206,21 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
   && echo "built  : bin/grimoire-server" \
   || { echo "=== GRIMOIRE-SERVER BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
+# The launch-count probe.  Not a gate: a measuring instrument, and the
+# one performance number that is honest off the card because it is a
+# COUNT.  tools/count_launches.sh drives it.
+icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
+     -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -fsycl-device-code-split=per_kernel \
+     -I include -I src \
+     tools/count_launches_probe.cpp src/grimoire.cpp src/qwen35_loader.cpp \
+     src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
+     src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
+     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/tokenizer.cpp -o bin/count_launches_probe \
+  && echo "built  : bin/count_launches_probe" \
+  || echo "warn: count_launches_probe failed to build"
+
 icpx -O2 -std=c++17 -I include \
      tools/verify_tokenizer.cpp src/tokenizer.cpp -o bin/b70-verify-tok \
   && echo "built  : bin/b70-verify-tok" || echo "warn: verify-tok failed"

@@ -678,6 +678,12 @@ per session, most recent state and next-steps at the bottom of each file:
 - `HANDOFF-2026-09-15-GEMMA4.md` — gemma-4 end to end, the three
   pre-existing engine bugs it uncovered (tied embeddings, head_dim > 256,
   graph-capture cleanup), two external audits, and exactly what is left.
+- `PERF-2026-09-17.md` — **read before any performance work.** Where the
+  speed actually is, measured against an AMD RDNA4 stack serving the same
+  model family. The headline: **the server is SERIAL**, so every batch-side
+  win (split-K decode, dynamic verify width) buys nothing until continuous
+  batching exists. Also the launch count, what is worth copying and what is
+  not, and two settled results from that stack that are free to take.
 - `QWEN4-EXP-2026-09-16.md` — **newest.** Qwen3.8-Flash-Next: the
   architecture, the three mechanisms, and (bottom section, which
   supersedes the rest of that file) what the forward path actually does,
