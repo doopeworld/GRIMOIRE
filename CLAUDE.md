@@ -26,6 +26,9 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   failures, the whole gate green.**
 - gemma-4 batched prefill is token-identical to sequential decode at four
   projection formats and at head_dim 512 (`test_gemma4_prefill`)
+- the whole suite was re-run end to end at `5825caf` on 2026-09-17 and all
+  SEVEN device gates are green, plus the 13 host suites and a link of both
+  `bin/grimoire` and `bin/grimoire-server`
 - speculation (MTP and DFlash) is identical to plain decode, single
   process and under TP and PP, now including Muse (`test_spec_e2e`)
 - **Qwen4-Exp / Qwen3.8-Flash-Next runs** (`test_qwen4_exp_e2e`):
