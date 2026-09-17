@@ -280,6 +280,71 @@ int main() {
               "so something is copying the KV cache again");
     }
 
+    // ---- WITH A DRAFTER LOADED ---------------------------------------
+    // The cache used to refuse whenever speculation was on.  That
+    // refusal arrived with a PIPELINE-PARALLEL deadlock fix and was
+    // never about MTP itself (rule 13); PP is refused separately, so all
+    // it did was cost single-process runs their cache -- in the exact
+    // configuration the recipe recommends, which is where a conversation
+    // re-reading its whole history hurts most.
+    //
+    // What has to be true is the same thing as everywhere else in this
+    // file: the resumed conversation answers what the re-read one
+    // answers.  Speculation cannot change that -- a draft is verified
+    // and a bad one is rejected -- but the drafter's own KV cache is not
+    // in the snapshot, so a resume that left it holding the previous
+    // conversation would still be wrong in the one way that matters,
+    // acceptance.  It is zeroed on restore; this arm checks the tokens,
+    // which is the part that can be checked here.
+    {
+        const fs::path mdir = root / "dense-mtp";
+        mini::write_model(mdir, mini::dense(4, /*mtp=*/true));
+        ::setenv("GRIMOIRE_MTP", "1", 1);
+        ::setenv("GRIMOIRE_MTP_K", "3", 1);
+        ::setenv("GRIMOIRE_BATCHED_PREFILL_NOXMX", "1", 1);
+        std::vector<std::vector<int32_t>> cold, warm;
+        long resumes = 0;
+        for (int arm = 0; arm < 2; ++arm) {
+            if (arm) ::setenv("GRIMOIRE_PREFIX_CACHE", "1", 1);
+            else     ::unsetenv("GRIMOIRE_PREFIX_CACHE");
+            Grimoire* e = grimoire_new();
+            std::string err;
+            if (!e || !grimoire_load(*e, mdir.string(), Fmt::BF16, 256, err)) {
+                ++g_fail;
+                std::printf("    FAIL: mtp load failed: %s\n", err.c_str());
+                break;
+            }
+            const long before = b70::g_prefix_tokens_reused_calls;
+            std::vector<int32_t> conv{7, 11, 3, 42};
+            for (int t = 0; t < 3; ++t) {
+                std::vector<int32_t> out; FinishReason r{};
+                grimoire_serve_generate(*e, conv, 6, -1, out, -1, {}, &r);
+                (arm ? warm : cold).push_back(out);
+                conv.insert(conv.end(), out.begin(), out.end());
+                conv.push_back(int32_t(50 + t));
+            }
+            if (arm) resumes = b70::g_prefix_tokens_reused_calls - before;
+            grimoire_delete(e);
+        }
+        ::unsetenv("GRIMOIRE_MTP");
+        ::unsetenv("GRIMOIRE_MTP_K");
+        ::unsetenv("GRIMOIRE_BATCHED_PREFILL_NOXMX");
+        bool same = cold.size() == warm.size() && !cold.empty();
+        for (size_t t = 0; t < cold.size() && same; ++t)
+            same = cold[t] == warm[t];
+        std::printf("%-22s %ld resumes, answers %s\n", "with a drafter",
+                    resumes, same ? "identical" : "DIFFER");
+        CHECK(same,
+              "a conversation resumed with a drafter loaded answered "
+              "differently from the same conversation re-read");
+        // And it must actually have resumed: if the refusal were still
+        // there the answers would match trivially, because both arms
+        // would be re-reading.
+        CHECK(resumes > 0,
+              "the cache still refuses when a drafter is loaded, so this "
+              "compared re-reading with re-reading");
+    }
+
     if (!g_fail) fs::remove_all(root);
     else std::printf("\nfixtures kept in %s\n", root.c_str());
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

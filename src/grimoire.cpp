@@ -2207,6 +2207,7 @@ struct Grimoire {
     // Empty a named slot and leave it live.  See the definition for why
     // the order matters.
     void clear_seq_slot(int j);
+    void clear_drafter_cache();
     static bool prefix_cache_enabled() {
         const char* e = std::getenv("GRIMOIRE_PREFIX_CACHE");
         return e && *e && std::atoi(e) != 0;
@@ -2448,10 +2449,22 @@ struct Grimoire {
     size_t spec_dn_elems = 0, spec_conv_elems = 0;
     size_t spec_conv_input_elems = 0;
     static constexpr int kSpecBatch = 16;
+    // Read EVERY time, not captured in a static.  A static answers with
+    // whatever the environment was at the FIRST call in the process,
+    // which is a different engine's answer -- and the call sites are all
+    // per-build or per-request, never per-token, so there is nothing to
+    // save by caching it.
+    //
+    // This is the second time the same shape has bitten here.  It cost a
+    // gate run when prefix_cache_slots() did it, and then it silently
+    // emptied a gate: a test that set GRIMOIRE_MTP for its last arm got
+    // the first arm's value, no drafter loaded, and the arm checked a
+    // configuration it was not in.  The negative control is what caught
+    // it -- restoring the refusal the arm was supposed to detect changed
+    // nothing, which can only mean the arm was never in that case.
     static bool mtp_enabled() {
-        static const bool v = []{ const char* e = std::getenv("GRIMOIRE_MTP");
-            return e && *e && std::atoi(e) != 0; }();
-        return v;
+        const char* e = std::getenv("GRIMOIRE_MTP");
+        return e && *e && std::atoi(e) != 0;
     }
 
     Scratch s{};
@@ -5998,7 +6011,30 @@ void Grimoire::clear_seq_slot(int j) {
 // there in the first place.
 bool Grimoire::prefix_cache_usable() const {
     if (!prefix_cache_enabled() || cfg.is_muse) return false;
-    if (mtp.ok || dflash2.ok) return false;
+    // MTP IS ALLOWED, AND WAS REFUSED FOR A REASON THAT WAS NOT ABOUT IT
+    // (rule 13).  The refusal arrived with the F2 fix at 4cdcba8, whose
+    // subject was a PP DEADLOCK: an earlier stage cached a prompt the
+    // last stage declined to cache, returned from prefill without
+    // sending the hidden state, and the last stage blocked forever.  PP
+    // is refused outright three lines down, so that case is covered
+    // twice and this half only ever cost single-process runs the cache.
+    //
+    // What a drafter and a restored prefix actually interact through is
+    // the drafter's OWN KV cache, which the snapshot does not cover.  On
+    // a resume the head would attend to whatever conversation ran last.
+    // That cannot make the output wrong -- speculation is exact, every
+    // draft is verified and a bad one is rejected (test_spec_e2e) -- it
+    // can only lower acceptance.  restore zeroes that cache, which is
+    // the same condition every request already starts from today
+    // (reset() clears it per request, deliberately; see mtp_warm).
+    //
+    // DFlash is still refused, and NOT by elimination: its drafter
+    // ingests target context through taps captured during prefill, and
+    // dflash2.context_pos counts from the last reset.  A resume would
+    // leave it pointing into a span whose taps were never captured.
+    // Lifting that needs the tap buffer in the snapshot; nobody has
+    // done it, so it says so rather than being quietly allowed.
+    if (dflash2.ok) return false;
     // Under PP, refuse outright.
     //
     // A cache HIT makes prefill() return before it sends the hidden state,
@@ -6178,6 +6214,19 @@ bool Grimoire::decode_batch(const std::vector<int32_t>& toks,
     return prefill(toks, &out, &b);
 }
 
+// The drafter's KV cache is NOT in the snapshot, so a resumed request
+// would find it holding whatever conversation ran last.  That cannot
+// make the answer wrong -- every draft is verified and a bad one is
+// rejected -- but it would have the head attending to another chat, and
+// acceptance is the one thing a drafter is for.  Zeroing is exactly the
+// condition reset() already gives every request today.
+void Grimoire::clear_drafter_cache() {
+    if (!mtp.ok || !mtp.L.k_cache || !mtp.L.v_cache) return;
+    const size_t kv_bytes = size_t(mtp.L.kv_heads) * mtp.L.head_dim * max_seq;
+    q.memset(mtp.L.k_cache, 0, kv_bytes);
+    q.memset(mtp.L.v_cache, 0, kv_bytes);
+}
+
 void Grimoire::bind_seq_slot(int j) {
     if (j < 0 || j >= n_seq_slots || j == seq_slot) return;
     for (auto& d : L) {
@@ -6229,6 +6278,7 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     // its rows.  Only the recurrent state is copied -- see save_prefix()
     // for why those two are treated differently.
     bind_seq_slot(hit);
+    clear_drafter_cache();
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
         if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
@@ -6261,6 +6311,7 @@ bool Grimoire::restore_prefix_upto(int n) {
     // Same move as restore_prefix(): the KV rows are already in this
     // slot, so binding it is the restore.
     bind_seq_slot(prefix_hit);
+    clear_drafter_cache();
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
         if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
