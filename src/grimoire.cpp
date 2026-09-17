@@ -6422,6 +6422,18 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
 }
 
 void Grimoire::release() {
+    // DRAIN BEFORE FREEING.  Everything below hands device pointers to
+    // sycl::free while the queue may still hold work that reads them --
+    // undefined, and on this runtime it surfaces as a SIGSEGV inside the
+    // JIT at some LATER point, usually in the next engine that loads.
+    // That is what made it look environmental: the crash never lands
+    // where the fault is, and it only shows up when the timing is right,
+    // which was one run in three.
+    //
+    // wait(), not wait_and_throw(): release() is called from a destructor
+    // path (grimoire_delete) and an exception escaping there would take
+    // the process down in a worse way than the leak it is reporting.
+    try { q.wait(); if (q1) q1->wait(); q_aux.wait(); } catch (...) {}
     if(dflash2.fc_plan){
         auto od=load_onednn_bf16();
         if(od)od.destroy(dflash2.fc_plan);
@@ -12629,8 +12641,19 @@ int grimoire_serve_generate_batch(Grimoire& e,
             Row& r = rows[which[j]];
             ++r.pos;                       // the token it just consumed
             const int t = got[j];
-            if (t < 0 || t >= e.cfg.vocab)
-                throw std::runtime_error("engine returned an invalid token");
+            if (t < 0 || t >= e.cfg.vocab) {
+                // Say WHICH row, and say it differently from the serial
+                // path's identical-sounding message.  The two share a
+                // process, and a message that cannot tell you which one
+                // produced it turns a five-minute diagnosis into an
+                // afternoon of bisecting by deletion.
+                char buf[192];
+                std::snprintf(buf, sizeof buf,
+                    "batched decode returned a token outside the vocabulary: "
+                    "row %zu of %zu, slot %d, position %d, token %d",
+                    j, which.size(), r.slot, r.pos - 1, t);
+                throw std::runtime_error(buf);
+            }
             if (stop(t)) { r.live = false; continue; }
             out_ids[r.idx].push_back(t);
             r.next = t;

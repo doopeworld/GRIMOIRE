@@ -74,8 +74,10 @@ int main() {
     // through the same batched prefill, so the only thing this gate
     // varies is how the DECODE steps were taken.  CORRECTNESS ONLY:
     // nothing timed here means anything (rule 8).
-    ::setenv("GRIMOIRE_SEQ_SLOTS", "8", 1);
-    ::setenv("GRIMOIRE_BATCHED_PREFILL_NOXMX", "1", 1);
+    // overwrite=0: an operator bisecting a failure can pin either of
+    // these from the shell without editing the gate.
+    ::setenv("GRIMOIRE_SEQ_SLOTS", "8", 0);
+    ::setenv("GRIMOIRE_BATCHED_PREFILL_NOXMX", "1", 0);
 
     char tmpl[] = "/tmp/grimoire-batch-XXXXXX";
     if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
@@ -140,8 +142,14 @@ int main() {
                 }
                 for (int k = 0; k < K; ++k) {
                     FinishReason r{};
-                    grimoire_serve_generate(*e, prompts[size_t(k)], 12, -1,
-                                            alone[size_t(k)], -1, {}, &r);
+                    try {
+                        grimoire_serve_generate(*e, prompts[size_t(k)], 12, -1,
+                                                alone[size_t(k)], -1, {}, &r);
+                    } catch (const std::exception& ex) {
+                        ++g_fail;
+                        std::printf("    FAIL: %s %s serial arm, request %d: %s\n",
+                                    cell.name, fname, k, ex.what());
+                    }
                 }
                 grimoire_delete(e);
             }
@@ -160,8 +168,16 @@ int main() {
                 }
                 const long s0 = b70::g_batch_decode_steps;
                 const long r0 = b70::g_batch_decode_rows;
-                const int n = grimoire_serve_generate_batch(
-                    *e, prompts, 12, -1, together, -1);
+                int n = 0;
+                try {
+                    n = grimoire_serve_generate_batch(
+                        *e, prompts, 12, -1, together, -1);
+                } catch (const std::exception& ex) {
+                    ++g_fail;
+                    std::printf("    FAIL: %s %s batched arm: %s\n",
+                                cell.name, fname, ex.what());
+                    n = K;   // reported; do not also report a count mismatch
+                }
                 steps = b70::g_batch_decode_steps - s0;
                 rows  = b70::g_batch_decode_rows  - r0;
                 if (n != K) {
@@ -234,25 +250,41 @@ int main() {
                 std::vector<std::vector<int32_t>> a2; a2.resize(size_t(K));
                 std::vector<std::vector<int32_t>> b2; b2.resize(size_t(K));
                 std::string err;
-                Grimoire* e1 = grimoire_new();
-                Grimoire* e2 = grimoire_new();
-                if (!e1 || !e2 ||
-                    !grimoire_load(*e1, dir.string(), fmt, 256, err) ||
-                    !grimoire_load(*e2, dir.string(), fmt, 256, err)) {
-                    ++g_fail;
-                    std::printf("    FAIL: %s %s ragged load: %s\n",
-                                cell.name, fname, err.c_str());
-                } else {
-                    for (int k = 0; k < K; ++k) {
-                        FinishReason r{};
-                        grimoire_serve_generate(*e1, prompts[size_t(k)], 12,
-                                                kEos, a2[size_t(k)], -1, {}, &r);
+                // ONE ENGINE ALIVE AT A TIME.  These two arms are
+                // independent, so there is no reason to hold both --
+                // and holding both is the only thing this gate did that
+                // no other gate does.  See the note below.
+                long st = 0, rw = 0;
+                bool loaded = true;
+                {
+                    Grimoire* e1 = grimoire_new();
+                    if (!e1 || !grimoire_load(*e1, dir.string(), fmt, 256, err)) {
+                        ++g_fail; loaded = false;
+                        std::printf("    FAIL: %s %s ragged load: %s\n",
+                                    cell.name, fname, err.c_str());
+                    } else {
+                        for (int k = 0; k < K; ++k) {
+                            FinishReason r{};
+                            grimoire_serve_generate(*e1, prompts[size_t(k)], 12,
+                                                    kEos, a2[size_t(k)], -1, {}, &r);
+                        }
+                    }
+                    grimoire_delete(e1);
+                }
+                if (!loaded) { /* reported above */ } else {
+                    Grimoire* e2 = grimoire_new();
+                    if (!e2 || !grimoire_load(*e2, dir.string(), fmt, 256, err)) {
+                        ++g_fail;
+                        std::printf("    FAIL: %s %s ragged batch load: %s\n",
+                                    cell.name, fname, err.c_str());
+                        continue;
                     }
                     const long s0 = b70::g_batch_decode_steps;
                     const long r0 = b70::g_batch_decode_rows;
                     grimoire_serve_generate_batch(*e2, prompts, 12, kEos, b2, -1);
-                    const long st = b70::g_batch_decode_steps - s0;
-                    const long rw = b70::g_batch_decode_rows  - r0;
+                    st = b70::g_batch_decode_steps - s0;
+                    rw = b70::g_batch_decode_rows  - r0;
+                    grimoire_delete(e2);
                     bool ok2 = true;
                     for (int k = 0; k < K; ++k)
                         ok2 = ok2 && a2[size_t(k)] == b2[size_t(k)];
@@ -271,8 +303,6 @@ int main() {
                           "the ragged batch did not actually narrow, so the "
                           "path a real server spends its time in is untested");
                 }
-                grimoire_delete(e1);
-                grimoire_delete(e2);
             }
         }
     }

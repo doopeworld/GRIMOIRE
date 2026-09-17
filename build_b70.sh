@@ -323,6 +323,19 @@ else
   echo "note : GRIMOIRE_SKIP_GATES set -- engine gates not built"
 fi
 
+# A reproducer, not a gate: an intermittent in-kernel fault on a MoE
+# prompt of 32+ tokens through the batched prefill.  Not fixed; the
+# header says exactly what is established and what is not.  Built here so
+# it is one command away on the Tower, where the open question -- whether
+# the B70 is affected or only the off-card fallback -- gets answered.
+icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
+     -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -fsycl-device-code-split=per_kernel -I include -I src -I tools \
+     tools/repro_moe_prefill_crash.cpp "${ENGINE_SRC[@]}" \
+     -o bin/repro_moe_prefill_crash \
+  && echo "built  : bin/repro_moe_prefill_crash" \
+  || echo "warn: repro_moe_prefill_crash failed"
+
 # ---------------------------------------------------------------------
 if [[ "$REQUIRED_FAILED" -ne 0 ]]; then
   echo
