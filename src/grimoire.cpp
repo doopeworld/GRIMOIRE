@@ -5950,9 +5950,38 @@ void Grimoire::release() {
                         (void*)d.gu_zero, (void*)d.dn_zero,
                         (void*)d.dn_state, (void*)d.conv_ring,
                         (void*)d.k_cache, (void*)d.v_cache,
-                        (void*)d.k_cache_f16, (void*)d.v_cache_f16})
+                        (void*)d.k_cache_f16, (void*)d.v_cache_f16,
+                        // Qwen4-Exp.  ple_table is HOST memory and is
+                        // the largest single allocation this engine ever
+                        // makes -- ~51 GB for the published checkpoint.
+                        // A server that reloads a model and leaks that
+                        // does not leak a buffer, it runs the box out of
+                        // RAM on the second load.
+                        (void*)d.hc_attn.norm, (void*)d.hc_mlp.norm,
+                        (void*)d.ix_qn, (void*)d.ix_kn,
+                        (void*)d.ix_kraw, (void*)d.ix_kcmp,
+                        (void*)d.ple_nk, (void*)d.ple_nq, (void*)d.ple_nc,
+                        (void*)d.ple_cw, (void*)d.ple_hist,
+                        (void*)d.ple_mul, (void*)d.ple_size, (void*)d.ple_off,
+                        const_cast<void*>(d.ple_table)})
             if (p) sycl::free(p, q);
+        d.hc_attn.down.release(q); d.hc_attn.inject.release(q);
+        d.hc_attn.up.release(q);
+        d.hc_mlp.down.release(q);  d.hc_mlp.inject.release(q);
+        d.hc_mlp.up.release(q);
+        d.ix_qk.release(q);
+        d.ple_key.release(q); d.ple_value.release(q);
     }
+    hc_final.down.release(q); hc_final.up.release(q);
+    for (void** p : {(void**)&hc_final.norm, (void**)&q4_hyper,
+                     (void**)&q4_normed, (void**)&q4_gate, (void**)&q4_lora,
+                     (void**)&q4_inj, (void**)&q4_pinj, (void**)&q4_pend,
+                     (void**)&q4_ixqk, (void**)&q4_pool, (void**)&q4_lg,
+                     (void**)&q4_blk, (void**)&q4_idx, (void**)&q4_vis,
+                     (void**)&q4_seq, (void**)&q4_qpos, (void**)&q4_emb,
+                     (void**)&q4_kv, (void**)&q4_gated, (void**)&q4_conv,
+                     (void**)&q4_ids, (void**)&q4_tok})
+        if (*p) { sycl::free(*p, q); *p = nullptr; }
     {
         LayerDev& d = mtp.L;
         mtp.fc.release(q);
@@ -11594,6 +11623,20 @@ bool Grimoire::build_graph() {
     // Socket send/receive is deliberately outside SYCL graph capture.
     if (pp_enabled() || tp_enabled()) return false;
     if (dag) return false;
+    // Qwen4-Exp's decode is NOT capture-safe, and the way it fails is
+    // the worst kind: capture bakes every host-side argument into the
+    // recorded node, and forward_qwen4_exp() has several.  The token
+    // itself reaches launch_embed by value (the other paths read
+    // s.d_tok while recording); the PLE layer writes q4_tok[pos] with a
+    // captured pos; the QSA indexer ropes at a captured position, picks
+    // its compressed-key block from pos/ratio, and stores its raw key at
+    // a captured offset.  A replayed graph would decode position 0 with
+    // token 1 forever -- fluently.
+    //
+    // Refusing is the honest fix until someone moves those onto the
+    // device cursor AND has a number saying it is worth it; nobody has
+    // measured this model on a B70 at all yet (rule 8).
+    if (cfg.is_qwen4_exp) return false;
     // Saved OUTSIDE the try: capture moves the live sequence state before
     // recording, and the catch has to be able to put it back.  Declared in
     // the try they were out of scope exactly where they were needed.
