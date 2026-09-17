@@ -35,6 +35,7 @@ using namespace b70;
 namespace b70 {
 extern long g_prefix_tokens_reused;
 extern long g_prefix_tokens_reused_calls;
+extern long g_prefix_bytes_copied;
 }
 
 static int g_fail = 0;
@@ -224,6 +225,59 @@ int main() {
                       "conversation's state");
             }
         }
+    }
+
+    // ---- THE CACHE IS NOT COPIED -------------------------------------
+    // Resuming used to memcpy every layer's whole KV cache, sized by
+    // max_seq rather than by the conversation -- so a 30-token chat in an
+    // 8192-token window moved the entire window, twice per turn.  The
+    // cache is now allocated one copy per slot and the live pointers are
+    // a VIEW onto the bound slot, so a resume moves a pointer.
+    //
+    // Nothing in the output can show that: a copying cache and a viewing
+    // one answer identically, which is exactly why this needs its own
+    // check.  The property that separates them is INDEPENDENCE FROM
+    // max_seq.  Run the same conversation twice, once in a window four
+    // times the size, and require the bytes copied to be EQUAL -- not
+    // "small", not "less than before", equal.  A copy of the cache cannot
+    // satisfy that, and a fixed threshold could be met by a cache that
+    // merely got cheaper.
+    //
+    // What it CANNOT see: a copy nobody accounted.  The counter is
+    // incremented beside each memcpy, so a new one added without its
+    // line is invisible here -- verified by the opposite experiment, a
+    // build that accounts a max_seq-sized term and nothing else, which
+    // turns this arm red (134400 vs 527616).  Add the accounting when
+    // you add the copy.
+    {
+        ::setenv("GRIMOIRE_PREFIX_CACHE", "1", 1);
+        ::unsetenv("GRIMOIRE_PREFIX_SLOTS");
+        long bytes[2] = {0, 0};
+        const int caps[2] = {256, 1024};
+        for (int arm = 0; arm < 2; ++arm) {
+            Grimoire* e = grimoire_new();
+            std::string err;
+            if (!e || !grimoire_load(*e, dir.string(), Fmt::BF16, caps[arm], err)) {
+                ++g_fail;
+                std::printf("    FAIL: cap %d load failed: %s\n", caps[arm], err.c_str());
+                break;
+            }
+            std::vector<int32_t> conv{7, 11, 3, 42};
+            const long before = b70::g_prefix_bytes_copied;
+            for (int t = 0; t < 3; ++t) {
+                std::vector<int32_t> out; FinishReason r{};
+                grimoire_serve_generate(*e, conv, 5, -1, out, -1, {}, &r);
+                conv.insert(conv.end(), out.begin(), out.end());
+                conv.push_back(int32_t(50 + t));
+            }
+            bytes[arm] = b70::g_prefix_bytes_copied - before;
+            grimoire_delete(e);
+        }
+        std::printf("%-22s %ld at ctx %d, %ld at ctx %d\n",
+                    "bytes copied", bytes[0], caps[0], bytes[1], caps[1]);
+        CHECK(bytes[0] == bytes[1] && bytes[0] > 0,
+              "the bytes a resume copies changed with the context window, "
+              "so something is copying the KV cache again");
     }
 
     if (!g_fail) fs::remove_all(root);

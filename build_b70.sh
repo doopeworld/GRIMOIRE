@@ -253,14 +253,23 @@ icpx -fsycl -fsycl-targets="$TARGET" \
 # decode are on the SAME norm convention -- a divergence there would be
 # completely silent.  It takes no model and runs in seconds.
 #   ./bin/test_k2_kernels
+#
+# src/attention.cpp is in this list because the gate covers QSA, whose
+# attention kernel lives there -- without it the link fails on
+# launch_qsa_attention and the gate is simply not built.  That was a
+# WARNING, so the build printed one line and carried on, and preflight
+# then reported the gate missing rather than the build broken.  A gate
+# that does not link is a gate that does not run: this one is required
+# now, like bin/grimoire itself.
 icpx -fsycl -fsycl-targets=spir64 \
      -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
      -fsycl-device-code-split=per_kernel \
      -I include -I src \
      tools/test_k2_kernels_device.cpp src/ops.cpp src/prefill.cpp \
-     src/quantize.cpp \
+     src/attention.cpp src/quantize.cpp \
      -o bin/test_k2_kernels \
-  && echo "built  : bin/test_k2_kernels" || echo "warn: k2 kernel test failed"
+  && echo "built  : bin/test_k2_kernels" \
+  || { echo "=== K2 KERNEL GATE BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
 # Engine gates.  All three write their own synthetic checkpoints, so
 # they need no model, no tokenizer and no network, and they run in

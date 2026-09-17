@@ -704,6 +704,7 @@ sycl::event launch_probe(sycl::queue&, const float*, int, float*,
 extern long g_nvfp4_tensors;
 extern long g_prefix_tokens_reused;
 extern long g_prefix_tokens_reused_calls;
+extern long g_prefix_bytes_copied;
 
 // ---------------------------------------------------------------------
 // Upload helpers
@@ -2045,7 +2046,15 @@ struct Grimoire {
         bf16_t*  router_bias = nullptr;      // mlp.gate.bias
 
         float *dn_state = nullptr, *conv_ring = nullptr;
+        // k_cache/v_cache are a VIEW into k_base/v_base, which hold
+        // n_seq_slots copies of this layer's cache back to back.
+        // bind_seq_slot() moves the view; every one of the forty-odd
+        // readers below still says d.k_cache and none of them had to
+        // change.  The OWNER is k_base -- release() frees that, never the
+        // view, which points at whichever slot happened to be live.
         uint8_t *k_cache = nullptr, *v_cache = nullptr;
+        uint8_t *k_base  = nullptr, *v_base  = nullptr;
+        size_t   kv_slot = 0;          // elements per slot
         sycl::half *k_cache_f16 = nullptr, *v_cache_f16 = nullptr;
         bool muse_sliding = false;
 
@@ -2145,9 +2154,13 @@ struct Grimoire {
 
     // Single-entry exact prompt-prefix cache. State stays device-resident so
     // a cache hit restores KV + recurrent state with device-to-device copies.
+    // What a slot has to COPY.  The KV cache is not in here: each slot
+    // owns its own rows inside the layer's allocation and the live
+    // pointers are a view onto them, so switching conversations moves a
+    // pointer.  The recurrent state is different and does need a copy --
+    // see save_prefix().
     struct PrefixLayerCache {
         float *dn = nullptr, *conv = nullptr;
-        uint8_t *k = nullptr, *v = nullptr;
     };
     struct PrefixCache {
         bool valid = false;
@@ -2171,6 +2184,13 @@ struct Grimoire {
     std::vector<PrefixCache> prefix_slots;
     uint64_t prefix_clock = 0;
     mutable int prefix_hit = -1;          // slot prefix_reuse() matched
+    // How many conversations the KV cache has room for, and which one is
+    // live.  Fixed at build() because the cache is allocated that deep:
+    // reading the environment later would describe a cache that does not
+    // exist.
+    int n_seq_slots = 1;
+    int seq_slot = 0;
+    void bind_seq_slot(int j);
     static bool prefix_cache_enabled() {
         const char* e = std::getenv("GRIMOIRE_PREFIX_CACHE");
         return e && *e && std::atoi(e) != 0;
@@ -3345,6 +3365,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     max_seq = opt.max_seq;
     if(max_seq<2 || max_seq==INT32_MAX){err="invalid context capacity";return false;}
+    // Resolved HERE, once, because the KV cache is allocated this deep a
+    // few hundred lines below.  Without the cache enabled there is one
+    // slot and the allocation is byte-for-byte what it always was.
+    n_seq_slots = prefix_cache_enabled() ? prefix_cache_slots() : 1;
+    seq_slot = 0;
 
     if (pp_enabled() && tp_enabled()) {
         err = "GRIMOIRE_PP_RANK and GRIMOIRE_TP_RANK are mutually exclusive";
@@ -3969,9 +3994,16 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // value and this expression is exactly what it was.
             // Geometry was resolved for every layer right after L.resize().
             const size_t kv_elems = size_t(d.kv_heads) * d.head_dim * max_seq;
-            d.k_cache = sycl::malloc_device<uint8_t>(kv_elems, lq);
-            d.v_cache = sycl::malloc_device<uint8_t>(kv_elems, lq);
-            acct(2 * kv_elems);
+            // n_seq_slots copies, so several conversations can be resident
+            // at once and switching between them is a pointer move rather
+            // than a copy of the whole cache.  At the default of one slot
+            // this allocates exactly what it always did.
+            d.kv_slot = kv_elems;
+            d.k_base = sycl::malloc_device<uint8_t>(kv_elems * size_t(n_seq_slots), lq);
+            d.v_base = sycl::malloc_device<uint8_t>(kv_elems * size_t(n_seq_slots), lq);
+            d.k_cache = d.k_base;
+            d.v_cache = d.v_base;
+            acct(2 * kv_elems * size_t(n_seq_slots));
             if(cfg.is_muse){
                 // Match Fusion's XPU FlashAttention KV-cache group.
                 constexpr int block_size=64;
@@ -5709,6 +5741,25 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         "head did not load\n");
         else                   std::printf("    speculation   none\n");
 
+        // Say what the cache DECIDED, not what was asked for.  The
+        // depth is fixed at allocation from the environment, but
+        // prefix_cache_usable() can refuse afterwards -- a drafter loads
+        // later in build() than the cache is sized, so asking for eight
+        // slots and a DFlash model reserves eight copies of the KV cache
+        // and then never uses one.  That is worth a line rather than a
+        // silent multiple of VRAM.
+        if (n_seq_slots > 1 || prefix_cache_enabled()) {
+            if (!prefix_cache_usable())
+                std::printf("    prefix cache  DISABLED (%d slot%s reserved) -- "
+                            "not usable with %s\n", n_seq_slots,
+                            n_seq_slots == 1 ? "" : "s",
+                            cfg.is_muse ? "Muse"
+                          : pp_enabled() ? "pipeline parallel"
+                          : "a speculative drafter");
+            else
+                std::printf("    prefix cache  %d conversation%s resident\n",
+                            n_seq_slots, n_seq_slots == 1 ? "" : "s");
+        }
         // A device with no XMX cannot run the batched path at all (see
         // Grimoire::prefill).  Saying "batched" there would be the exact
         // silent-fallback problem this matrix exists to remove.
@@ -5758,6 +5809,22 @@ void Grimoire::reset() {
     // still holds the previous request's states, and they describe a
     // different sequence.
     spec_hidden_valid = false;
+    // MOVE BEFORE WIPING.  The live KV pointers are a view into one
+    // slot's rows, so zeroing "the cache" zeroes THAT CONVERSATION.
+    // Staying put would evict the most recently used slot, which is the
+    // worst possible choice; taking a free one, or the least recently
+    // used, is the eviction this cache is supposed to do.  The slot
+    // chosen is then no longer a conversation and must say so, or the
+    // next request would match its token list and resume from rows that
+    // have just been cleared.
+    if (prefix_cache_usable() && n_seq_slots > 1) {
+        prefix_hit = -1;                       // not resuming anything
+        const int j = prefix_slot_for_write();
+        bind_seq_slot(j);
+        prefix_slots[size_t(j)].valid = false;
+    } else if (!prefix_slots.empty() && seq_slot < int(prefix_slots.size())) {
+        prefix_slots[size_t(seq_slot)].valid = false;
+    }
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const int qkv_ch = 2 * cfg.lin_k_heads * cfg.lin_k_dim + Hv * Dv;
     for (auto& d : L) {
@@ -5849,13 +5916,7 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
         Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
-    // Sized PER LAYER: on gemma-4 a full-attention layer's cache is a
-    // different size from a sliding one, so one model-wide kv_bytes would
-    // under-allocate half the layers and copy past the end of the other half.
-    auto layer_kv_bytes = [&](size_t i) {
-        return size_t(L[i].kv_heads) * L[i].head_dim * max_seq;
-    };
-    if (prefix_slots.empty()) prefix_slots.resize(size_t(prefix_cache_slots()));
+    if (prefix_slots.empty()) prefix_slots.resize(size_t(n_seq_slots));
     // Remember which slot this conversation owns.  A request can save
     // TWICE -- prefill() snapshots the prompt at start_pos 0, and the
     // caller snapshots prompt-plus-reply at the end -- and without this
@@ -5864,20 +5925,20 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     // prompt-only snapshot that the longer one supersedes immediately.
     // With four slots and two agents that is the whole cache spent on
     // dead duplicates, and each duplicate is a full copy of the KV.
-    prefix_hit = prefix_slot_for_write();
+    // The slot this conversation ran IN is the slot it saves to: its KV
+    // rows are already there, because the live pointers have been a view
+    // onto them since the request started.  Writing anywhere else would
+    // mean copying the cache, which is the thing this avoids.
+    prefix_hit = seq_slot;
     PrefixCache& prefix_cache = prefix_slots[size_t(prefix_hit)];
     if (prefix_cache.layers.empty()) {
         prefix_cache.layers.resize(L.size());
         for (size_t i = 0; i < L.size(); ++i) {
             auto& c = prefix_cache.layers[i];
             const auto& d = L[i];
-            const size_t kv_bytes = layer_kv_bytes(i);
             if (d.dn_state) c.dn = sycl::malloc_device<float>(dn_bytes / sizeof(float), q);
             if (d.conv_ring) c.conv = sycl::malloc_device<float>(conv_bytes / sizeof(float), q);
-            if (d.k_cache) c.k = sycl::malloc_device<uint8_t>(kv_bytes, q);
-            if (d.v_cache) c.v = sycl::malloc_device<uint8_t>(kv_bytes, q);
-            if ((d.dn_state && !c.dn) || (d.conv_ring && !c.conv) ||
-                (d.k_cache && !c.k) || (d.v_cache && !c.v)) {
+            if ((d.dn_state && !c.dn) || (d.conv_ring && !c.conv)) {
                 std::fprintf(stderr, "  prefix cache allocation failed\n");
                 return false;
             }
@@ -5886,16 +5947,22 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
         prefix_cache.logits = sycl::malloc_device<float>(cfg.vocab, q);
         if (!prefix_cache.hidden || !prefix_cache.logits) return false;
     }
+    // The RECURRENT state is still copied, and the asymmetry is the
+    // point.  A KV row beyond `pos` is dead -- the next write overwrites
+    // it -- so a slot's cache is correct just by being left alone.  The
+    // conv ring and the DeltaNet state are order-dependent: a prefill
+    // that submitted work and then failed has already advanced them, and
+    // the retry has to put them back.  They are also small: constant in
+    // context length, where the cache is linear in it.
     for (size_t i = 0; i < L.size(); ++i) {
         const auto& d = L[i]; auto& c = prefix_cache.layers[i];
-        const size_t kv_bytes = layer_kv_bytes(i);
-        if (d.dn_state) q.memcpy(c.dn, d.dn_state, dn_bytes);
-        if (d.conv_ring) q.memcpy(c.conv, d.conv_ring, conv_bytes);
-        if (d.k_cache) q.memcpy(c.k, d.k_cache, kv_bytes);
-        if (d.v_cache) q.memcpy(c.v, d.v_cache, kv_bytes);
+        if (d.dn_state) { q.memcpy(c.dn, d.dn_state, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
+        if (d.conv_ring) { q.memcpy(c.conv, d.conv_ring, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
     }
     q.memcpy(prefix_cache.hidden, s.h, size_t(cfg.hidden) * sizeof(float));
     q.memcpy(prefix_cache.logits, s.logits, size_t(cfg.vocab) * sizeof(float)).wait();
+    g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float)) +
+                             long(size_t(cfg.vocab) * sizeof(float));
     prefix_cache.tokens = tokens;
     prefix_cache.valid = true;
     prefix_cache.used = ++prefix_clock;
@@ -5944,11 +6011,37 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
     return best;
 }
 
+// Move the live KV view onto slot j.  This is the whole of "switch
+// conversations" for the cache: the rows never move, only the pointer
+// that names them.  It is O(layers) pointer writes where the copy it
+// replaced was linear in max_seq -- and, more to the point, it is what
+// lets several sequences be resident at once, which is what a batched
+// decode across conversations will need.
+//
+// graph_ok goes false because a recorded command graph BAKES the
+// pointers it was captured with.  Replaying one after a rebind would
+// write this conversation's keys into the previous one's rows: correct
+// arithmetic, wrong sequence, and nothing to see in the output but a
+// reply that drifts.
+void Grimoire::bind_seq_slot(int j) {
+    if (j < 0 || j >= n_seq_slots || j == seq_slot) return;
+    for (auto& d : L) {
+        if (d.k_base) d.k_cache = d.k_base + size_t(j) * d.kv_slot;
+        if (d.v_base) d.v_cache = d.v_base + size_t(j) * d.kv_slot;
+    }
+    seq_slot = j;
+    graph_ok = false;
+}
+
+// Which slot a request that is NOT resuming should run in.  Since the
+// cache stopped copying, this is an eviction choice and not a
+// bookkeeping one: whatever slot this returns is about to be cleared by
+// reset() and the conversation in it is gone.
+//
+// A resuming request never comes here -- it runs in the slot it matched,
+// which is what keeps a conversation in one slot as it grows.
 int Grimoire::prefix_slot_for_write() {
-    if (prefix_slots.empty()) prefix_slots.resize(size_t(prefix_cache_slots()));
-    // Extend the slot this request resumed from: a conversation must not
-    // consume a fresh slot every turn, or N slots hold one conversation's
-    // history and every other agent is evicted.
+    if (prefix_slots.empty()) prefix_slots.resize(size_t(n_seq_slots));
     if (prefix_hit >= 0 && size_t(prefix_hit) < prefix_slots.size())
         return prefix_hit;
     for (size_t i = 0; i < prefix_slots.size(); ++i)
@@ -5975,16 +6068,19 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
         Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    // The cache does not move: bind the slot and the live pointers ARE
+    // its rows.  Only the recurrent state is copied -- see save_prefix()
+    // for why those two are treated differently.
+    bind_seq_slot(hit);
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
-        const size_t kv_bytes = size_t(d.kv_heads) * d.head_dim * max_seq;
-        if (d.dn_state) q.memcpy(d.dn_state, c.dn, dn_bytes);
-        if (d.conv_ring) q.memcpy(d.conv_ring, c.conv, conv_bytes);
-        if (d.k_cache) q.memcpy(d.k_cache, c.k, kv_bytes);
-        if (d.v_cache) q.memcpy(d.v_cache, c.v, kv_bytes);
+        if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
+        if (d.conv_ring) { q.memcpy(d.conv_ring, c.conv, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
     }
     q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
     q.memcpy(s.logits, prefix_cache.logits, size_t(cfg.vocab) * sizeof(float));
+    g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float)) +
+                             long(size_t(cfg.vocab) * sizeof(float));
     pos = int(tokens.size());
     set_cursor(pos); q.wait_and_throw();
     std::printf("  prefix cache HIT: %zu tokens\n", tokens.size());
@@ -6005,15 +6101,16 @@ bool Grimoire::restore_prefix_upto(int n) {
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
         Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    // Same move as restore_prefix(): the KV rows are already in this
+    // slot, so binding it is the restore.
+    bind_seq_slot(prefix_hit);
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
-        const size_t kv_bytes = size_t(d.kv_heads) * d.head_dim * max_seq;
-        if (d.dn_state) q.memcpy(d.dn_state, c.dn, dn_bytes);
-        if (d.conv_ring) q.memcpy(d.conv_ring, c.conv, conv_bytes);
-        if (d.k_cache) q.memcpy(d.k_cache, c.k, kv_bytes);
-        if (d.v_cache) q.memcpy(d.v_cache, c.v, kv_bytes);
+        if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
+        if (d.conv_ring) { q.memcpy(d.conv_ring, c.conv, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
     }
     q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
+    g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float));
     pos = n;
     set_cursor(pos);
     q.wait_and_throw();
@@ -6161,7 +6258,10 @@ void Grimoire::release() {
                         (void*)d.gu_scale, (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
                         (void*)d.dn_state, (void*)d.conv_ring,
-                        (void*)d.k_cache, (void*)d.v_cache,
+                        // k_base, NOT k_cache: the cache is a view into
+                        // whichever slot was last bound, and freeing a
+                        // view frees the middle of an allocation.
+                        (void*)d.k_base, (void*)d.v_base,
                         (void*)d.k_cache_f16, (void*)d.v_cache_f16,
                         // Qwen4-Exp.  ple_table is HOST memory and is
                         // the largest single allocation this engine ever
@@ -6308,7 +6408,7 @@ void Grimoire::release() {
     // first would leak the rest -- and the rest is where the memory is.
     for (auto& pc : prefix_slots) {
         for (auto& c : pc.layers)
-            for (void* p : {(void*)c.dn, (void*)c.conv, (void*)c.k, (void*)c.v})
+            for (void* p : {(void*)c.dn, (void*)c.conv})
                 if (p) sycl::free(p, q);
         if (pc.hidden) sycl::free(pc.hidden, q);
         if (pc.logits) sycl::free(pc.logits, q);
@@ -9536,6 +9636,12 @@ long g_nvfp4_tensors = 0;
 // design -- the whole claim is that it changes nothing but the work.
 long g_prefix_tokens_reused = 0;
 long g_prefix_tokens_reused_calls = 0;
+// Bytes a save or a restore actually copies.  It exists to be ASSERTED
+// ON, not read: the claim "the KV cache is no longer copied" is
+// invisible in the output -- a copying cache and a viewing one answer
+// identically -- and the only thing that distinguishes them is that one
+// of them moves bytes proportional to max_seq.
+long g_prefix_bytes_copied = 0;
 long g_gemma4_batched_prefills = 0;
 // Same, for Qwen4-Exp: a prefill-vs-decode gate that cannot see the
 // fallback proves nothing at all.
