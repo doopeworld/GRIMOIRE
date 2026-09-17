@@ -702,6 +702,8 @@ sycl::event launch_probe(sycl::queue&, const float*, int, float*,
 // DIFFERENT, internal-linkage symbol -- which compiles, and then fails
 // to link against the definition the gate reads.
 extern long g_nvfp4_tensors;
+extern long g_prefix_tokens_reused;
+extern long g_prefix_tokens_reused_calls;
 
 // ---------------------------------------------------------------------
 // Upload helpers
@@ -2158,7 +2160,18 @@ struct Grimoire {
         return e && *e && std::atoi(e) != 0;
     }
     bool restore_prefix(const std::vector<int32_t>& tokens);
+    // How many leading tokens the snapshot covers (0 == no reuse), and
+    // the restore that leaves the cursor there so the rest can be
+    // prefilled on top.
+    int  prefix_reuse(const std::vector<int32_t>& tokens) const;
+    bool restore_prefix_upto(int n);
     bool save_prefix(const std::vector<int32_t>& tokens);
+    // What generate_tokens() calls at the end of a request, covering the
+    // prompt AND the reply.  Named apart from save_prefix() so the
+    // generation template does not depend on the private one's contract.
+    void save_prefix_now(const std::vector<int32_t>& tokens) {
+        (void)save_prefix(tokens);
+    }
 
     bf16_t*  embed = nullptr;
     int embed_begin = 0, embed_count = 0;
@@ -5844,6 +5857,38 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     return true;
 }
 
+// How many leading tokens of `tokens` the snapshot already covers.
+//
+// The cache used to demand EQUALITY, which is the one thing a chat never
+// gives you: every turn is the previous prompt plus a reply plus a new
+// message, so the snapshot is always a strict PREFIX of the next request
+// and the cache missed every single time.  A ten-turn conversation
+// re-read its first nine turns on turn ten, at concurrency one, by
+// design.
+//
+// A prefix match is the whole fix.  The snapshot is taken at the end of
+// a request, so it describes the state after exactly those tokens --
+// which is precisely the state a longer prompt beginning with them wants
+// to start from.  Returning 0 means no reuse and the caller prefills
+// everything, exactly as before.
+//
+// It has to be a PREFIX and not a longest-common-prefix: the recurrent
+// state of a hybrid model is not indexed by position, so it cannot be
+// rewound to an arbitrary point.  The only position it can resume from
+// is the one it was snapshotted at.
+int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
+    if (!prefix_cache_usable() || !prefix_cache.valid) return 0;
+    const size_t n = prefix_cache.tokens.size();
+    // Leave at least one token to process: prefill() owes s.logits for the
+    // last row, and a zero-token prefill would leave the caller reading
+    // the PREVIOUS request's logits -- in vocabulary, right length, and
+    // the wrong continuation (rule 12's failure mode exactly).
+    if (n == 0 || n >= tokens.size()) return 0;
+    if (!std::equal(prefix_cache.tokens.begin(), prefix_cache.tokens.end(),
+                    tokens.begin())) return 0;
+    return int(n);
+}
+
 bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     if (!prefix_cache_usable() || !prefix_cache.valid ||
         prefix_cache.tokens != tokens) return false;
@@ -5864,6 +5909,34 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     pos = int(tokens.size());
     set_cursor(pos); q.wait_and_throw();
     std::printf("  prefix cache HIT: %zu tokens\n", tokens.size());
+    return true;
+}
+
+// Restore the snapshot and leave the cursor AT ITS LENGTH, so the caller
+// can prefill the remaining tokens on top.  Shares its body with
+// restore_prefix(); the only difference is that the caller is not
+// claiming the request is finished after it.
+bool Grimoire::restore_prefix_upto(int n) {
+    if (n <= 0 || !prefix_cache_usable() || !prefix_cache.valid) return false;
+    if (size_t(n) != prefix_cache.tokens.size()) return false;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
+    const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
+    const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
+        Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    for (size_t i = 0; i < L.size(); ++i) {
+        auto& d = L[i]; const auto& c = prefix_cache.layers[i];
+        const size_t kv_bytes = size_t(d.kv_heads) * d.head_dim * max_seq;
+        if (d.dn_state) q.memcpy(d.dn_state, c.dn, dn_bytes);
+        if (d.conv_ring) q.memcpy(d.conv_ring, c.conv, conv_bytes);
+        if (d.k_cache) q.memcpy(d.k_cache, c.k, kv_bytes);
+        if (d.v_cache) q.memcpy(d.v_cache, c.v, kv_bytes);
+    }
+    q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
+    pos = n;
+    set_cursor(pos);
+    q.wait_and_throw();
+    ++g_prefix_tokens_reused_calls;
+    g_prefix_tokens_reused += n;
     return true;
 }
 
@@ -9369,6 +9442,12 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 // arm quietly took some other path, and every failure mode of this
 // format is a number rather than an error.
 long g_nvfp4_tensors = 0;
+// Prompt tokens NOT re-processed because a prefix was already resident.
+// A gate that compares reuse against a full prefill proves nothing if no
+// reuse happened, and the difference is invisible in the output by
+// design -- the whole claim is that it changes nothing but the work.
+long g_prefix_tokens_reused = 0;
+long g_prefix_tokens_reused_calls = 0;
 long g_gemma4_batched_prefills = 0;
 // Same, for Qwen4-Exp: a prefill-vs-decode gate that cannot see the
 // fallback proves nothing at all.

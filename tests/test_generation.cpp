@@ -1,4 +1,5 @@
 #include "b70/generation.hpp"
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 
@@ -17,6 +18,33 @@ struct Engine {
     std::vector<int32_t> history;
     float logits=0;
     void reset(){++resets;pos=0;history.clear();}
+    // Prefix reuse, modelled exactly as the engine does it: a snapshot of
+    // the tokens resident at the end of a request, reusable by a LONGER
+    // prompt that begins with them.  `snap_enabled` off means the old
+    // behaviour -- reset and prefill everything -- so both arms are
+    // reachable from one test.
+    bool snap_enabled=false;
+    std::vector<int32_t> snap;      // the snapshotted token list
+    int reuses=0, reused_tokens=0;
+    int prefix_reuse(const std::vector<int32_t>& ids) const {
+        if(!snap_enabled||snap.empty()||snap.size()>=ids.size())return 0;
+        return std::equal(snap.begin(),snap.end(),ids.begin())?int(snap.size()):0;
+    }
+    bool restore_prefix_upto(int n){
+        if(n<=0||size_t(n)!=snap.size())return false;
+        ++reuses;reused_tokens+=n;
+        history=snap;pos=n;return true;
+    }
+    void save_prefix_now(const std::vector<int32_t>& ids){
+        if(!snap_enabled)return;
+        // The real engine snapshots DEVICE state, so a token list that
+        // does not match what it actually processed is a lie it cannot
+        // detect.  Assert the correspondence here, where it is cheap:
+        // this is the exact off-by-one that reached the device gate.
+        assert(ids.size()==history.size());
+        assert(std::equal(ids.begin(),ids.end(),history.begin()));
+        snap=ids;
+    }
     void sync(){}
     int argmax_token(){assert(!history.empty());return (history.back()+1)%cfg.vocab;}
     const float* forward(int t){
@@ -174,6 +202,62 @@ int main(){
         Engine ne;GenerationOptions no{8,-1,-1,4,false,true,false};
         assert(no.stats==nullptr);
         generate_tokens(ne,prompt,no,out,{},reason);
+    }
+    {   // ---- PREFIX REUSE ------------------------------------------
+        // A conversation: each turn is the previous turn's prompt plus its
+        // reply plus a new message.  With reuse the engine must process
+        // only the NEW part and must answer identically to an engine that
+        // re-reads everything, because reuse is a claim about work and not
+        // about output.
+        //
+        // The comparison is between two engines rather than two runs of
+        // one, so the reuse arm cannot be "right" merely by having seen
+        // the tokens already.
+        auto turn=[](Engine& en,const std::vector<int32_t>& p,int n){
+            std::vector<int32_t> o2;FinishReason r2;
+            GenerationOptions go{n,-1,-1,0,false,false,false};
+            generate_tokens(en,p,go,o2,{},r2);
+            return o2;
+        };
+        Engine cold, warm;          // cold re-reads everything, warm reuses
+        warm.snap_enabled=true;
+        std::vector<int32_t> convo{1,2,3};
+        for(int t=0;t<3;++t){
+            const std::vector<int32_t> a=turn(cold,convo,4);
+            const std::vector<int32_t> b=turn(warm,convo,4);
+            // Identical answers, every turn.
+            assert(a==b);
+            // And identical state, which a wrong resume would break
+            // without changing the first few tokens.
+            assert(cold.history==warm.history);
+            convo.insert(convo.end(),a.begin(),a.end());
+            convo.push_back(int32_t(40+t));      // the next user message
+        }
+        // The point of the whole exercise: the warm engine did LESS work.
+        assert(warm.reuses>0);
+        assert(warm.forward_calls<cold.forward_calls);
+        std::cout<<"  prefix reuse: "<<warm.reuses<<" resumes, "
+                 <<warm.reused_tokens<<" tokens not re-read; forwards "
+                 <<cold.forward_calls<<" -> "<<warm.forward_calls<<"\n";
+        // And the snapshot GREW -- covering replies, not just the first
+        // prompt.  Without that, reuse would cover turn one forever.
+        assert(warm.reused_tokens>int(3));
+    }
+    {   // A prompt that is NOT an extension of the snapshot must fall back
+        // to a full prefill.  Reusing on a divergent prompt would answer
+        // from somebody else's conversation.
+        Engine w;w.snap_enabled=true;
+        std::vector<int32_t> o2;FinishReason r2;
+        GenerationOptions go{4,-1,-1,0,false,false,false};
+        generate_tokens(w,{1,2,3},go,o2,{},r2);
+        const int before=w.reuses;
+        generate_tokens(w,{9,9,9,9,9},go,o2,{},r2);   // different opening
+        assert(w.reuses==before);
+        // An EQUAL prompt must not reuse either: prefix_reuse keeps a
+        // token back so prefill still produces this request's logits
+        // rather than leaving the previous request's in place.
+        generate_tokens(w,{9,9,9,9,9},go,o2,{},r2);
+        assert(w.reuses==before);
     }
     throws([&]{generate_tokens(e,{},o,out,{},reason);});
     throws([&]{generate_tokens(e,{-1},o,out,{},reason);});
