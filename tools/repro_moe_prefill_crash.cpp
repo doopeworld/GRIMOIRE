@@ -2,9 +2,22 @@
 //  repro_moe_prefill_crash.cpp -- a MoE prompt of 32+ tokens through the
 //  BATCHED prefill faults intermittently inside a kernel.
 //
-//  NOT a gate.  A reproducer, kept because the bug is not fixed and the
-//  next person to see a random SIGSEGV in an off-card MoE run should be
-//  able to confirm it in one command instead of re-deriving it.
+//  FIXED on 2026-09-17, same day.  Kept as the regression guard for it,
+//  and because the way it was found is worth being able to repeat: the
+//  fault never landed near its cause.
+//
+//  THE CAUSE.  prefill()'s MoE branch has an `if (M >= 32)` arm whose
+//  every path ends in launch_gemm_xmx -- called DIRECTLY, not through
+//  mm().  mm() has carried the no-matrix fallback for a while; these two
+//  call sites bypass it and never got one.  So on a device with no
+//  matrix hardware, a MoE prompt of 32 tokens or more reached a JIT that
+//  cannot compile joint_matrix.  The branch is now gated on
+//  device_can_matrix(q) and falls through to the plain-SYCL
+//  launch_moe_*_batched pair, which is what M < 32 always did.
+//
+//  A B70 can run the tile, so the Tower path never changed -- which is
+//  exactly why this survived: the only thing it broke was the ability to
+//  CHECK MoE batched prefill off the card.
 //
 //  What it does: writes a miniature checkpoint, loads it, and answers
 //  four identical requests at two projection formats.  Nothing else --
@@ -35,12 +48,15 @@
 //      SIGSEGV, or "engine returned an invalid token" from an argmax over
 //      a buffer that was never written.
 //
-//  WHAT IS NOT ESTABLISHED, and matters most: whether the B70 is
-//  affected.  On the card `noxmx_gemm` is false and mm() uses the XMX
-//  tile instead of launch_gemm_batched, so the failing configuration may
-//  be the fallback only -- or may not.  An Ornith prompt is far longer
-//  than 32 tokens, so if it is not the fallback, this is live on the
-//  Tower.  Run this there, both ways, before trusting a long MoE prompt.
+//  The threshold was measured, not guessed: clean at 31 tokens over four
+//  runs, three failures in four at 32.  That exactness is what named the
+//  branch.
+//
+//  WHAT THE FIX DOES NOT GIVE YOU.  Off the card, M >= 32 now takes the
+//  plain-SYCL pair while the B70 takes the grouped/XMX path.  So this
+//  makes MoE batched prefill RUNNABLE here; it does not make it the same
+//  code the card runs.  A green run here is not a statement about the
+//  tile.
 //
 //  Usage:
 //    repro_moe_prefill_crash [dense|moe|hybrid] [prompt_len] [n_tokens]

@@ -12000,7 +12000,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         return false;
                 }
             }
-            if(M>=32){
+            // device_can_matrix, NOT M alone.  Everything under this
+            // branch ends in launch_gemm_xmx -- directly, not through
+            // mm() -- and launch_gemm_xmx is joint_matrix from end to
+            // end.  mm() has had the no-matrix fallback for a while;
+            // these two call sites bypass mm() entirely and never got
+            // it, so on a device without matrix hardware a MoE prompt of
+            // 32 tokens or more reached a JIT that cannot compile the
+            // kernel.  The symptom was a SIGSEGV inside Intel's runtime
+            // about half the time, or an argmax over a buffer nothing
+            // wrote -- "engine returned an invalid token".  Never on a
+            // B70, which is why it survived: it is the off-card
+            // verification path that was broken, so MoE batched prefill
+            // was the one thing that could not be checked here.
+            //
+            // Rule 18, again: the first guard found is not the last.
+            //   grep -n 'launch_gemm_xmx' src/grimoire.cpp
+            // is the whole check, and it is what found these two.
+            //
+            // Below 32 rows, and now on any device that cannot run the
+            // tile, the plain-SYCL launch_moe_*_batched pair does the
+            // same arithmetic and runs anywhere.  A B70 can, so the
+            // Tower path is unchanged.
+            if(M>=32 && device_can_matrix(q)){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);

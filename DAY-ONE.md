@@ -371,8 +371,8 @@ software recovery. The known causes, all avoidable:
 
 ## 6. What is still open
 
-- **An intermittent in-kernel fault on a long MoE prompt. UNFIXED, and
-  the open question is whether it touches the B70 at all.** Off the card,
+- **An intermittent in-kernel fault on a long MoE prompt. FIXED
+  2026-09-17, and it never touched the B70.** Off the card,
   a MoE prompt of 32 tokens or more through the BATCHED prefill faults
   about half the time -- either a SIGSEGV inside JIT-generated code, or
   an argmax over a buffer nothing wrote, which surfaces as "engine
@@ -381,22 +381,21 @@ software recovery. The known causes, all avoidable:
   `bad=0`); and it is NOT new -- the same reproducer built against
   acadf5f, before any of this week's work, faults 6 times out of 6.
 
-  `bin/repro_moe_prefill_crash` is that reproducer and its header holds
-  the full evidence. **Run it on the Tower, first thing:**
+  The cause: prefill()'s MoE branch has an `if (M >= 32)` arm whose every
+  path ends in `launch_gemm_xmx`, called DIRECTLY rather than through
+  `mm()`. `mm()` has carried the no-matrix fallback for a while; those
+  two call sites bypassed it. The branch is now gated on
+  `device_can_matrix(q)`. A B70 can run the tile, so nothing on the box
+  changes — the only thing the bug broke was the ability to CHECK MoE
+  batched prefill off the card, which is why it lasted.
 
-  ```bash
-  for i in 1 2 3 4 5 6; do ./bin/repro_moe_prefill_crash moe 41 4; done
-  ```
+  `bin/repro_moe_prefill_crash` is kept as the regression guard; its
+  header has the full evidence and the measured threshold (clean at 31
+  tokens, fails at 32).
 
-  On the card `noxmx_gemm` is false and mm() uses the XMX tile rather
-  than launch_gemm_batched, so this may be the off-card fallback only.
-  It may also not be. An Ornith prompt is far longer than 32 tokens, so
-  if it is not the fallback then it is live on the box, and that is worth
-  ten minutes before trusting a long MoE prompt.
-
-  It also makes `bin/test_batch_decode` flaky off the card, in its MoE
-  cells only. A red run there whose log ends in Intel's "PLEASE submit a
-  bug report" is this, not the batching.
+  Worth knowing anyway: off the card, M >= 32 now takes the plain-SYCL
+  pair while the B70 takes the grouped/XMX path. A green MoE run here is
+  not a statement about the tile.
 
 - **Concurrency: measure it. 2026-09-17.** Several agents are now served
   in one pass instead of one after another, and every claim about it that

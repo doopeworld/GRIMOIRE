@@ -720,6 +720,48 @@ hybrid fixture, so that cell ran to the full budget and asserted a
 narrowing that could not happen -- a test failing on the test.  It picks
 a token from what the fixture actually emits now.
 
+**20. A GUARD ON `mm()` IS NOT A GUARD ON THE KERNEL `mm()` WRAPS
+(learned 2026-09-17).**  Rule 18 said a predicate in one place is
+probably a predicate in four.  Here it was two, and the two that were
+missed are the ones that did not go through the wrapper at all.
+
+`mm()` has carried the no-matrix fallback since gemma-4's batched
+prefill needed checking off the card.  prefill()'s MoE branch has an
+`if (M >= 32)` arm whose every path ends in `launch_gemm_xmx` CALLED
+DIRECTLY -- so a MoE prompt of 32 tokens or more on a device without
+matrix hardware reached a JIT that cannot compile `joint_matrix`.  About
+half the time that was a SIGSEGV inside Intel's runtime; the rest of the
+time it was an argmax over a buffer nothing wrote, which surfaces as
+"engine returned an invalid token".  Same fault, two faces, because on a
+CPU device USM is host malloc: an out-of-bounds read usually returns
+garbage and occasionally hits an unmapped page.
+
+Three things are worth keeping.
+
+- **The fault never landed near its cause.**  It showed up in whichever
+  engine loaded next, in the SERIAL arm of a test about batching, at a
+  cell that varied run to run.  Every instinct said "the new concurrency
+  code".  What settled it was a forty-line reproducer -- load, generate,
+  delete -- built against a commit from BEFORE that work, which faulted
+  six times out of six.  Build the old one; it is ten minutes and it
+  replaces an argument with a fact.
+- **An exact threshold names the branch.**  Clean at 31 tokens, three
+  failures in four at 32.  Nothing else in the file keys on 32 without a
+  bridge being loaded, so the bisect pointed at one `if` -- far faster
+  than reading the MoE path looking for something wrong.
+- **What the bug BROKE was the ability to check.**  A B70 runs the tile,
+  so the Tower was never affected; the only casualty was MoE batched
+  prefill off the card, which therefore had never been executed
+  anywhere but on the card.  Rule 14's gap with a mechanism: not "nobody
+  wrote the test" but "the path the test would take crashes, so nobody
+  could".  When a gate cannot run somewhere, ask whether it is the gate
+  or the ENGINE that refuses.
+
+And the honest limit: off the card M >= 32 now takes the plain-SYCL
+pair, while the card takes the grouped/XMX path.  The MoE batched
+prefill is RUNNABLE here now; it is not the same code, and a green run
+here says nothing about the tile.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the
