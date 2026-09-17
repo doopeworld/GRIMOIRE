@@ -625,14 +625,23 @@ per session, most recent state and next-steps at the bottom of each file:
   ranked next-steps plan
 - `HANDOFF-2026-08-27-PP-TP-COMPLETE.md` — multiprocess PP/TP, prefix cache,
   Muse Glimmer integration, and the CURRENT next-steps (Muse batched prefill)
-- `HANDOFF-2026-09-15-GEMMA4.md` — **newest.** gemma-4 end to end, the three
+- `HANDOFF-2026-09-15-GEMMA4.md` — gemma-4 end to end, the three
   pre-existing engine bugs it uncovered (tied embeddings, head_dim > 256,
   graph-capture cleanup), two external audits, and exactly what is left.
-  Read this one first if you are picking the project up.
+- `QWEN4-EXP-2026-09-16.md` — **newest.** Qwen3.8-Flash-Next: the
+  architecture, the three mechanisms, and (bottom section, which
+  supersedes the rest of that file) what the forward path actually does,
+  the three things the first pass got wrong, and what is verified versus
+  what only the Tower can settle. Read this one first if you are picking
+  the project up.
 
 `ref/` holds extracted vLLM reference implementations (DFlash2, Muse Glimmer
-modeling code) — pulled from the vLLM nightly image specifically so nobody
-has to guess an architecture's exact forward pass again. Read the actual
+and Qwen4-Exp modeling code) — pulled from the vLLM nightly image, and for
+Qwen4-Exp from a github.com clone of vLLM, specifically so nobody has to
+guess an architecture's exact forward pass again. **Read the reference's
+own TEST as well as the module that ships** (rule 17): the shipped path is
+often a fused kernel and the plain-torch test beside it is the
+specification. Read the actual
 reference before implementing a new model or speculative decoding scheme;
 several sessions were burned guessing norm order / concat order instead of
 extracting the real code first.
