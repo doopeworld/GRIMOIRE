@@ -740,6 +740,37 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         auto it = index.find(n);
         return it == index.end() ? TensorRef{} : it->second;
     };
+    // NVFP4 (NVIDIA Blackwell) wears the SAME .weight_packed name and the
+    // same [N][K/2] E2M1 payload as MXFP4.  What tells them apart is the
+    // GLOBAL SCALE: NVFP4 ships one FP32 per tensor and MXFP4 has no such
+    // tensor at all.  Nothing else is a reliable discriminator -- the
+    // scale tensor's dtype would be, but only if the writer declared it,
+    // and the shape ratio (K/16 vs K/32) is a second opinion rather than
+    // a first one.  So: global scale present -> NVFP4, and the caller
+    // must keep it OFF the direct-MXFP4 upload, which would read E4M3
+    // per-16 scales as E8M0 per-32 and produce a fluent wrong model.
+    //
+    // Derivation and the merged-partition trap: b70/nvfp4.hpp.
+    auto mark_nvfp4 = [&](TensorRef& p, const TensorRef& sc,
+                          const std::string& base) -> bool {
+        TensorRef gs = get(base + ".weight_global_scale");
+        if (!gs.ok()) return false;
+        if (p.t.shape.size() != 2 || sc.t.shape.size() != 2) return false;
+        const int N = int(p.t.shape[0]);
+        const int K = int(p.t.shape[1]) * 2;
+        // One E4M3 scale per 16 elements.  If the checkpoint disagrees,
+        // this is not NVFP4 as this engine understands it and guessing
+        // would be worse than declining to recognise it.
+        if (int(sc.t.shape[0]) != N || int(sc.t.shape[1]) * 16 != K) return false;
+        p.nvfp4 = true;
+        p.scales_shard = sc.shard;
+        p.scales_t = sc.t;
+        p.gscale_shard = gs.shard;
+        p.gscale_t = gs.t;
+        p.t.shape = {N, K};
+        return true;
+    };
+
     auto linear = [&](const std::string& base) {
         TensorRef r = get(base + ".weight");
         if (r.ok()) {
@@ -757,6 +788,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
         TensorRef cp = get(base + ".weight_packed");
         TensorRef cs = get(base + ".weight_scale");
+        if (cp.ok() && cs.ok() && mark_nvfp4(cp, cs, base)) return cp;
         if (cp.ok() && cs.ok() && cp.t.dtype == STDtype::I32 &&
             cs.t.dtype == STDtype::BF16 && cp.t.shape.size() == 2 &&
             cs.t.shape.size() == 2 && cp.t.shape[0] == cs.t.shape[0]) {
@@ -796,6 +828,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         if (!p.ok()) return TensorRef{};
         TensorRef sc = get(base + ".weight_scale");
         if (!sc.ok()) return TensorRef{};
+        if (mark_nvfp4(p, sc, base)) return p;
         p.scales_shard = sc.shard;
         p.scales_t = sc.t;
         const int N = int(p.t.shape[0]);

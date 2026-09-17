@@ -36,11 +36,12 @@ order, and stops at the first required failure:
 | `make test`, `make test-correctness` | 13 host suites |
 | `bin/test_k2_kernels` | every new kernel matches its host reference |
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
-| `bin/test_model_matrix` | 9 architectures × 7 projection formats, plus the refusals |
+| `bin/test_model_matrix` | 10 architectures × 7 projection formats, plus the refusals |
 | `bin/test_parallel_e2e` | PP and TP give the SAME tokens as one process |
 | `bin/test_spec_e2e` | speculation gives the SAME tokens as plain decode, incl. dual GPU, MTP and DFlash |
 | `bin/test_gemma4_prefill` | gemma-4 batched prefill == sequential decode |
 | `bin/test_qwen4_exp_e2e` | Qwen3.8-Flash-Next: each mechanism is LIVE, and batched prefill == sequential decode |
+| `bin/test_nvfp4_e2e` | an NVFP4 checkpoint decodes to the same numbers as a bf16 twin |
 | generate | real model, real prompt — **you read the output** |
 
 **Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say

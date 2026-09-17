@@ -48,7 +48,7 @@ namespace fs = std::filesystem;
 // storing them in `dt`.  That is what makes an FP8-vs-BF16 A/B possible:
 // two checkpoints whose tables differ only in ENCODING hold numerically
 // identical values, so they must generate identical tokens.
-enum class TnType { BF16, F8_E4M3, F32 };
+enum class TnType { BF16, F8_E4M3, F32, U8 };
 
 struct Tn {
     std::string name;
@@ -72,10 +72,15 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
     std::ofstream(dir/"config.json") << a.config;
 
     auto esz = [](TnType t) -> size_t {
-        return t == TnType::F32 ? 4u : (t == TnType::F8_E4M3 ? 1u : 2u);
+        if (t == TnType::F32) return 4u;
+        if (t == TnType::F8_E4M3 || t == TnType::U8) return 1u;
+        return 2u;
     };
     auto dname = [](TnType t) -> const char* {
-        return t == TnType::F32 ? "F32" : (t == TnType::F8_E4M3 ? "F8_E4M3" : "BF16");
+        if (t == TnType::F32)     return "F32";
+        if (t == TnType::F8_E4M3) return "F8_E4M3";
+        if (t == TnType::U8)      return "U8";
+        return "BF16";
     };
 
     std::ostringstream h; h << '{';
@@ -128,6 +133,12 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
                 case TnType::F8_E4M3:
                     dst[k] = f32_to_e4m3(v);
                     break;
+                // Raw bytes.  `fill` carries the byte VALUE, not a number
+                // to convert -- an NVFP4 payload is two E2M1 nibbles per
+                // byte and converting it would be meaningless.
+                case TnType::U8:
+                    dst[k] = uint8_t(v);
+                    break;
                 case TnType::BF16: {
                     const bf16_t b = f32_to_bf16(v);
                     std::memcpy(dst + k * 2, &b, 2);
@@ -143,6 +154,82 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
     f << hs;
     f.write(reinterpret_cast<const char*>(data.data()),
             std::streamsize(data.size()));
+}
+
+// ---- NVFP4 -----------------------------------------------------------
+// Rewrite every 2-D PROJECTION weight of an architecture as NVFP4, the
+// way a compressed-tensors NVFP4 checkpoint stores it:
+//
+//   <base>.weight_packed        [N][K/2]   U8, two E2M1 nibbles, low first
+//   <base>.weight_scale         [N][K/16]  E4M3, one per 16 elements
+//   <base>.weight_global_scale  [1]        F32, one for the whole tensor
+//
+// and RETURN THE EXACT SAME NUMBERS as a plain bf16 arm, so the two can
+// be required to generate identically.  That is the only check that
+// says the reader computed the right values; "it loaded" is satisfied by
+// any reader that produces finite numbers, and this format's failure
+// mode -- E4M3 per-16 scales read as E8M0 per-32 -- does exactly that.
+//
+// 1-D tensors, the embedding, the norms and lm_head stay bf16, which is
+// also what a real checkpoint does (its `ignore` list names them).
+//
+// The values are chosen to be EXACTLY representable: a code from the
+// E2M1 grid times an E4M3 scale times a power-of-two global scale is
+// exact in bf16 as well, so the twin is not an approximation of the
+// NVFP4 arm -- it is the same number. See b70/nvfp4.hpp.
+struct NvfpPair { Arch nvfp4; Arch bf16; };
+
+inline NvfpPair to_nvfp4(const Arch& src, float gscale = 0.5f) {
+    NvfpPair out{src, src};
+    out.nvfp4.name = "nvfp4";
+    out.bf16.name  = "nvfp4-twin";
+    out.nvfp4.tensors.clear();
+    out.bf16.tensors.clear();
+
+    for (const Tn& t : src.tensors) {
+        const bool proj = t.shape.size() == 2 &&
+                          t.name.find("_proj.weight") != std::string::npos &&
+                          (t.shape[1] % 16) == 0;
+        if (!proj) { out.nvfp4.tensors.push_back(t); out.bf16.tensors.push_back(t); continue; }
+
+        const int N = int(t.shape[0]), K = int(t.shape[1]);
+        const std::string base = t.name.substr(0, t.name.size() - 7);  // drop ".weight"
+        uint32_t h = 2166136261u;
+        for (unsigned char ch : t.name) { h ^= ch; h *= 16777619u; }
+        std::mt19937 rng(h);
+
+        std::vector<float> bytes(size_t(N) * (K / 2), 0.f);
+        std::vector<float> scal(size_t(N) * (K / 16), 0.f);
+        std::vector<float> deq(size_t(N) * K, 0.f);
+        for (int n = 0; n < N; ++n) {
+            for (int g = 0; g < K / 16; ++g) {
+                // An E4M3 value, taken through the encoder so the scale
+                // the twin multiplies by is the one the reader will
+                // decode -- not a nearby float.
+                const uint8_t se = f32_to_e4m3(0.25f + float(rng() % 16) * 0.125f);
+                scal[size_t(n) * (K / 16) + g] = float(se);
+                const float sv = e4m3_to_f32(se);
+                for (int j = 0; j < 16; ++j) {
+                    const int k = g * 16 + j;
+                    const uint8_t lo = uint8_t(rng() & 0x0F);
+                    if ((k & 1) == 0) bytes[size_t(n) * (K / 2) + k / 2] = float(lo);
+                    else bytes[size_t(n) * (K / 2) + k / 2] =
+                             float(uint8_t(int(bytes[size_t(n) * (K / 2) + k / 2]) | (lo << 4)));
+                    deq[size_t(n) * K + k] = e2m1_to_f32(lo) * sv * gscale;
+                }
+            }
+        }
+        Tn pk{base + ".weight_packed", {N, K / 2}, bytes};  pk.dt = TnType::U8;
+        Tn sc{base + ".weight_scale", {N, K / 16}, scal};   sc.dt = TnType::U8;
+        Tn gs{base + ".weight_global_scale", {1}, {gscale}}; gs.dt = TnType::F32;
+        out.nvfp4.tensors.push_back(pk);
+        out.nvfp4.tensors.push_back(sc);
+        out.nvfp4.tensors.push_back(gs);
+
+        Tn tw{t.name, t.shape, deq};
+        out.bf16.tensors.push_back(tw);
+    }
+    return out;
 }
 
 // ---- K2-Horizon: MoVA + grouped norm + softplus gate + sigmoid router --

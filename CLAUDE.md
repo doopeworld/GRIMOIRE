@@ -16,10 +16,10 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
 
 - every SYCL source compiles; `bin/grimoire` and `bin/grimoire-server` link
 - the new kernels RUN and match their host references (`test_k2_kernels`)
-- 9 architectures x 7 projection formats all load and generate
+- 10 architectures x 7 projection formats all load and generate
   (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
   parallel-ffn, gemma4, gemma4 at head_dim 512, **qwen4_exp
-  (Qwen3.8-Flash-Next)**
+  (Qwen3.8-Flash-Next)** and an **NVFP4** checkpoint
 - PP and TP produce token-identical output to a single process, in BF16
   and FP8, for dense, MoE, hybrid, gemma-4, gemma-4 at head_dim 512, Muse
   and the parallel-FFN fold (`test_parallel_e2e`) -- **50 matches, 0
@@ -29,6 +29,14 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
 - the whole suite was re-run end to end at `5825caf` on 2026-09-17 and all
   SEVEN device gates are green, plus the 13 host suites and a link of both
   `bin/grimoire` and `bin/grimoire-server`
+- **NVFP4 checkpoints load** (`test_nvfp4_e2e`).  NVIDIA's Blackwell 4-bit
+  format -- E2M1 with E4M3 scales per 16 and one FP32 global scale per
+  tensor -- is decoded at load and handed to the ordinary quantizer, so
+  `--proj` can then pack it to mxfp4, int4, fp8 or anything else here.
+  No NVFP4 kernel and none needed.  Same move AMD's ROCm blog makes for
+  CDNA4 and GGZ14/vllm-mxfp4 for RDNA4, except going through f32 means
+  the destination is not one hardcoded pair.  See `b70/nvfp4.hpp` and
+  rule 18.
 - speculation (MTP and DFlash) is identical to plain decode, single
   process and under TP and PP, now including Muse (`test_spec_e2e`)
 - **Qwen4-Exp / Qwen3.8-Flash-Next runs** (`test_qwen4_exp_e2e`):
@@ -616,6 +624,45 @@ the shipped path is a fused kernel and the test is the specification.
 The check that catches this is not a parity check against a host
 reference written from the same misreading -- it is one property stated
 in the model's own terms: *can the query reach its own token?*
+
+**18. A FORMAT THAT SHARES ANOTHER'S TENSOR NAMES NEEDS ITS
+DISCRIMINATOR AT EVERY FAST PATH, AND THERE WERE FOUR (learned
+2026-09-17).**
+
+NVFP4 (NVIDIA Blackwell) and MXFP4 both store `.weight_packed` as
+[N][K/2] E2M1 nibbles.  They differ in the SCALE -- E4M3 per 16 against
+E8M0 per 32 -- plus a per-tensor FP32 global scale MXFP4 has no
+counterpart for.  So the tensor NAME, which four separate upload paths
+were testing, discriminates nothing:
+
+    grep -n 'weight_packed' src/grimoire.cpp   ->  4 direct-read sites
+
+quantize_upload_t's direct MXFP4 upload, concat_upload_t's, and both
+expert readers.  Each would copy an NVFP4 payload to VRAM unchanged and
+hand the kernel E4M3 bytes to read as E8M0, under-reading the scale
+buffer by half on top.  The result loads, runs and is wrong.
+
+Three things worth keeping:
+
+- **The first guard found was not the last.**  Rule 15 said the same
+  thing about a device predicate in seven places and it was still only
+  three-of-four here on the first pass.  The grep IS the check; run it
+  before believing the fix is complete.
+- **The gate found the missed one, and found it in the right place.**
+  NVFP4 -> bf16 passed while NVFP4 -> MXFP4 crashed, which points
+  straight at a path only MXFP4 takes.  A gate that only asked "does it
+  load" would have reported green at bf16 and never run the other.
+- **A merged linear is where the global scale bites.**  gate_up carries
+  TWO, one per partition, and vLLM's stock path collapses them with
+  `.max()` -- which the vllm-mxfp4 authors call out as a real accuracy
+  loss.  Dequantizing per TensorRef, before concatenation, makes that
+  correct by construction instead of by care.
+
+The reading gate is an EQUALITY, not a smoke test: two checkpoints built
+from the same numbers, one NVFP4 and one bf16, chosen on the E2M1 grid so
+both hold the identical value, required to generate identical tokens.
+Every failure mode of this format produces finite, plausible numbers, so
+nothing weaker can see them.
 
 ## Where to look for current status
 

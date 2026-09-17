@@ -280,6 +280,15 @@ struct TensorRef {
     // can be passed directly to oneDNN after exposing the logical [N,K].
     bool     compressed_int4 = false;
     bool     row_scaled = false; // FP8 payload with separate [N,1] scale
+    // NVFP4 (NVIDIA Blackwell): the SAME [N,K/2] E2M1 payload as MXFP4,
+    // with E4M3 scales per 16 instead of E8M0 per 32, plus one FP32
+    // scale for the whole tensor.  A .weight_packed name says nothing
+    // about which of the two you hold -- only .weight_global_scale does,
+    // which is why this flag exists and why the direct-MXFP4 upload has
+    // to test it.  See b70/nvfp4.hpp.
+    bool     nvfp4 = false;
+    int      gscale_shard = -1;
+    STTensor gscale_t;
     int      qzeros_shard = -1, scales_shard = -1;
     STTensor qzeros_t, scales_t;
     int      gptq_group = 0;

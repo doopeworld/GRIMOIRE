@@ -28,6 +28,7 @@
 #include "b70/qwen35.hpp"
 #include "b70/dflash_config.hpp"
 #include "b70/qwen4_exp.hpp"
+#include "b70/nvfp4.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -695,6 +696,13 @@ sycl::event launch_probe(sycl::queue&, const float*, int, float*,
                          const std::vector<sycl::event>&);
 
 
+// Counts NVFP4 tensors actually DECODED; defined beside the other gate
+// counters further down.  It is declared HERE, before the anonymous
+// namespace opens, because a declaration inside that namespace names a
+// DIFFERENT, internal-linkage symbol -- which compiles, and then fails
+// to link against the definition the gate reads.
+extern long g_nvfp4_tensors;
+
 // ---------------------------------------------------------------------
 // Upload helpers
 // ---------------------------------------------------------------------
@@ -905,6 +913,7 @@ bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
 bool read_scalar_f32(const Qwen35Model& ck, const TensorRef& r,
                      float& out, std::string& err);
 
+
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
     if (r.native) return ck.read_native_f32(r,dst,err);
@@ -927,6 +936,30 @@ bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
         for (int n = 0; n < w.N; ++n)
             for (int k = 0; k < w.K; ++k)
                 dst[int64_t(n) * w.K + k] = w.at(n, k);
+        return true;
+    }
+    // NVFP4 must be DECODED, like compressed INT4 above and for the same
+    // reason: the logical shape says [N][K] while the payload holds K/2
+    // bytes per row, so the plain read below would overread the mapping
+    // by 2x and ignore both scales.  Decoding here is also what keeps
+    // the merged-linear trap closed -- each TensorRef carries its OWN
+    // global scale, so gate and up are dequantized with theirs before
+    // concat_upload_t joins them.  b70/nvfp4.hpp has the derivation.
+    if (r.nvfp4) {
+        ++g_nvfp4_tensors;
+        const int N = int(r.t.shape[0]), K = int(r.t.shape[1]);
+        std::vector<uint8_t> pk(size_t(N) * K / 2);
+        std::vector<uint8_t> sc(size_t(N) * K / kNVFP4Block);
+        TensorRef scr; scr.shard = r.scales_shard; scr.t = r.scales_t;
+        TensorRef gsr; gsr.shard = r.gscale_shard; gsr.t = r.gscale_t;
+        float g = 1.0f;
+        if (!ck.read_raw(r, pk.data(), err) ||
+            !ck.read_raw(scr, sc.data(), err)) return false;
+        if (!read_scalar_f32(ck, gsr, g, err)) {
+            err = "NVFP4 weight_global_scale could not be read: " + err;
+            return false;
+        }
+        nvfp4_dequant(pk.data(), sc.data(), g, N, K, dst);
         return true;
     }
     if (!r.gptq) {
@@ -1173,7 +1206,11 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         d.w=QuantWeight{fmt,N,K,d.payload,d.scales,nullptr,int64_t(K),1};
         if(!d.payload||!d.scales)*ok=false;return d;
     }
-    if(fmt==Fmt::BF16&&!r.row_scaled&&!r.native&&r.t.dtype==STDtype::BF16){
+    // !r.nvfp4: this tensor's LOGICAL shape is [N][K] while its payload
+    // is K/2 bytes per row, so a straight BF16 read would ask for 4x the
+    // bytes that exist.  The dtype test alone should already exclude it;
+    // one more term costs nothing and removes the whole class.
+    if(fmt==Fmt::BF16&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16){
         std::vector<uint8_t> hp(size_t(N)*K*sizeof(bf16_t));std::string rr;
         if(!ck.read_raw(r,hp.data(),rr)){std::printf("\n  direct BF16 read failed for %s: %s\n",what,rr.c_str());*ok=false;return d;}
         d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
@@ -1184,8 +1221,13 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // compressed-tensors weight_packed -> direct MXFP4 upload (no re-quant).
     // r carries the weight_scale in scales_shard/scales_t; both are already
     // in GRIMOIRE's MXFP4 layout (E2M1 payload + E8M0 group-32 scales).
+    // !r.nvfp4 is load-bearing.  An NVFP4 tensor is ALSO called
+    // weight_packed and ALSO holds E2M1 nibbles; copying it straight to
+    // VRAM would hand the kernel E4M3 per-16 scales to read as E8M0
+    // per-32, and under-read the scale buffer by half on top.  The
+    // result is a model that loads, runs and is wrong.  b70/nvfp4.hpp.
     if (r.t.name.find("weight_packed") != std::string::npos && !r.native &&
-        (fmt == Fmt::MXFP4)) {
+        !r.nvfp4 && (fmt == Fmt::MXFP4)) {
         DevQuant d;
         const size_t pb = size_t(N) * K / 2;
         const size_t sb = size_t(N) * (K / kMXBlock);
@@ -1494,7 +1536,17 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     // compressed-tensors weight_packed (HF safetensors): same MXFP4 layout,
     // read via read_raw and concatenate gate|up along N.
+    // !nvfp4 on BOTH sides, and this is the site where getting it wrong
+    // costs most.  A merged linear is where NVFP4's per-tensor global
+    // scale actually bites: gate and up each carry THEIR OWN, and the
+    // reference implementations call out collapsing them (vLLM's stock
+    // path takes .max()) as a real accuracy loss.  Falling through to
+    // the generic path below dequantizes each side through
+    // read_matrix_f32 -- with its own global scale -- before they are
+    // concatenated, which is what makes that correct by construction
+    // rather than by care.  b70/nvfp4.hpp.
     const bool hf_packed = !ra.native && !rb.native &&
+        !ra.nvfp4 && !rb.nvfp4 &&
         ra.t.name.find("weight_packed") != std::string::npos &&
         rb.t.name.find("weight_packed") != std::string::npos && fmt == Fmt::MXFP4;
     if (hf_packed) {
@@ -3964,9 +4016,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                            !ck.shards[r.scales_shard]->read_f32(r.scales_t,hs.data(),rr))return false;
                         std::memcpy(scales,hs.data(),size_t(N)*sizeof(float));return true;
                     }
-                    if(EF==Fmt::BF16&&!r.row_scaled&&!r.native&&r.t.dtype==STDtype::BF16)
+                    if(EF==Fmt::BF16&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
                         return ck.read_raw(r,payload,rr);
-                    const bool packed = EF==Fmt::MXFP4&&!r.gptq&&!r.row_scaled&&
+                    // !r.nvfp4: an NVFP4 expert is also called
+                    // weight_packed and also holds E2M1 nibbles; reading
+                    // it straight would hand E4M3 per-16 scales to a
+                    // kernel expecting E8M0 per-32.  b70/nvfp4.hpp.
+                    const bool packed = EF==Fmt::MXFP4&&!r.gptq&&!r.row_scaled&&!r.nvfp4&&
                                         r.t.name.find("weight_packed") != std::string::npos;
                     if (packed) return ck.read_raw(r, payload, rr);
                     PackedWeight pw;
@@ -4009,6 +4065,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     }
                     std::string rr;
                     const bool direct=EF==Fmt::MXFP4&&!src.e_gate_p[e].gptq&&!src.e_gate_p[e].row_scaled&&
+                                        !src.e_gate_p[e].nvfp4&&!src.e_up_p[e].nvfp4&&
                                         src.e_gate_p[e].t.name.find("weight_packed") != std::string::npos;
                     bool rok;
                     if (direct) {
@@ -9307,6 +9364,11 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 // batched path quietly declined and fell back -- which is the same shape
 // of silence rule 12 was written about.  The gate reads this to prove the
 // path it is comparing actually ran.
+// Counts NVFP4 tensors actually DECODED.  A gate that compares an
+// NVFP4 checkpoint against a bf16 twin proves nothing if the NVFP4
+// arm quietly took some other path, and every failure mode of this
+// format is a number rather than an error.
+long g_nvfp4_tensors = 0;
 long g_gemma4_batched_prefills = 0;
 // Same, for Qwen4-Exp: a prefill-vs-decode gate that cannot see the
 // fallback proves nothing at all.

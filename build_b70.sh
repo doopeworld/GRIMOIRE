@@ -257,6 +257,8 @@ icpx -fsycl -fsycl-targets=spir64 \
 #   bin/test_gemma4_prefill    gemma-4 batched prefill == sequential decode
 #   bin/test_qwen4_exp_e2e     Qwen4-Exp's three mechanisms are LIVE, and
 #                              its batched prefill == sequential decode
+#   bin/test_nvfp4_e2e         an NVFP4 checkpoint reads to the same numbers
+#                              as a bf16 twin holding them exactly
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
@@ -274,7 +276,8 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
               test_parallel_e2e:test_parallel_e2e \
               test_spec_e2e:test_spec_e2e \
               test_gemma4_prefill:test_gemma4_prefill \
-              test_qwen4_exp_e2e:test_qwen4_exp_e2e ; do
+              test_qwen4_exp_e2e:test_qwen4_exp_e2e \
+              test_nvfp4_e2e:test_nvfp4_e2e ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"
     icpx -fsycl -fsycl-targets=spir64 \
          -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \

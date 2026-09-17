@@ -133,7 +133,14 @@ int main(int argc, char** argv) {
                                       mini::hybrid(), mini::k2(),
                                       mini::muse(), mini::parallel_ffn(),
                                       mini::gemma4(), mini::gemma4_wide(),
-                                      mini::qwen4_exp() };
+                                      mini::qwen4_exp(),
+                                      // An NVFP4 checkpoint at every projection
+                                      // format.  bin/test_nvfp4_e2e proves the
+                                      // VALUES are right against a bf16 twin;
+                                      // this proves requantizing OUT of it works
+                                      // for all seven, which is the claim a
+                                      // dedicated NVFP4->MXFP4 path cannot make.
+                                      mini::to_nvfp4(mini::dense()).nvfp4 };
 
     std::printf("%-12s", "");
     for (const auto& f : kFormats) std::printf("%-10s", f.name);
