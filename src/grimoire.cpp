@@ -2154,11 +2154,44 @@ struct Grimoire {
         std::vector<int32_t> tokens;
         std::vector<PrefixLayerCache> layers;
         float *hidden = nullptr, *logits = nullptr;
-    } prefix_cache;
+        uint64_t used = 0;                 // LRU stamp
+    };
+    // N conversations, not one.
+    //
+    // With a single snapshot two agents wipe each other's on every turn
+    // and both fall back to re-reading their whole history -- the exact
+    // cost prefix reuse exists to remove, reintroduced by the second
+    // caller.  A slot per conversation is what makes reuse survive
+    // interleaving, and it is worth having before batched decode exists:
+    // agents still take turns on the card, but each one resumes.
+    //
+    // Each slot is a FULL copy of the KV and recurrent state, so N slots
+    // cost N times the cache.  Sized by GRIMOIRE_PREFIX_SLOTS and 1 by
+    // default, which is byte-for-byte today's behaviour.
+    std::vector<PrefixCache> prefix_slots;
+    uint64_t prefix_clock = 0;
+    mutable int prefix_hit = -1;          // slot prefix_reuse() matched
     static bool prefix_cache_enabled() {
         const char* e = std::getenv("GRIMOIRE_PREFIX_CACHE");
         return e && *e && std::atoi(e) != 0;
     }
+    // Read EVERY time, not captured in a static.  The count is consumed
+    // once per engine (prefix_slots is sized on first use and never
+    // resized), so caching it buys nothing -- and a static captures
+    // whatever the environment happened to be at the first call in the
+    // process, which is a different engine's answer.  That cost a gate
+    // run: a test that sets the variable for its second arm got the
+    // first arm's value and both agents shared one slot.
+    static int prefix_cache_slots() {
+        const char* e = std::getenv("GRIMOIRE_PREFIX_SLOTS");
+        const int v = e && *e ? std::atoi(e) : 1;
+        return v < 1 ? 1 : (v > 64 ? 64 : v);
+    }
+    // The slot to write this request's snapshot into: the one it resumed
+    // from (extend it in place -- a conversation should not consume a
+    // second slot every turn), otherwise a free one, otherwise the
+    // least recently used.
+    int prefix_slot_for_write();
     bool restore_prefix(const std::vector<int32_t>& tokens);
     // How many leading tokens the snapshot covers (0 == no reuse), and
     // the restore that leaves the cursor there so the rest can be
@@ -5822,6 +5855,17 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     auto layer_kv_bytes = [&](size_t i) {
         return size_t(L[i].kv_heads) * L[i].head_dim * max_seq;
     };
+    if (prefix_slots.empty()) prefix_slots.resize(size_t(prefix_cache_slots()));
+    // Remember which slot this conversation owns.  A request can save
+    // TWICE -- prefill() snapshots the prompt at start_pos 0, and the
+    // caller snapshots prompt-plus-reply at the end -- and without this
+    // the second save sees prefix_hit == -1, takes a DIFFERENT free
+    // slot, and every cold request costs two slots: one holding a
+    // prompt-only snapshot that the longer one supersedes immediately.
+    // With four slots and two agents that is the whole cache spent on
+    // dead duplicates, and each duplicate is a full copy of the KV.
+    prefix_hit = prefix_slot_for_write();
+    PrefixCache& prefix_cache = prefix_slots[size_t(prefix_hit)];
     if (prefix_cache.layers.empty()) {
         prefix_cache.layers.resize(L.size());
         for (size_t i = 0; i < L.size(); ++i) {
@@ -5854,6 +5898,7 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
     q.memcpy(prefix_cache.logits, s.logits, size_t(cfg.vocab) * sizeof(float)).wait();
     prefix_cache.tokens = tokens;
     prefix_cache.valid = true;
+    prefix_cache.used = ++prefix_clock;
     return true;
 }
 
@@ -5877,21 +5922,55 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
 // rewound to an arbitrary point.  The only position it can resume from
 // is the one it was snapshotted at.
 int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
-    if (!prefix_cache_usable() || !prefix_cache.valid) return 0;
-    const size_t n = prefix_cache.tokens.size();
-    // Leave at least one token to process: prefill() owes s.logits for the
-    // last row, and a zero-token prefill would leave the caller reading
-    // the PREVIOUS request's logits -- in vocabulary, right length, and
-    // the wrong continuation (rule 12's failure mode exactly).
-    if (n == 0 || n >= tokens.size()) return 0;
-    if (!std::equal(prefix_cache.tokens.begin(), prefix_cache.tokens.end(),
-                    tokens.begin())) return 0;
-    return int(n);
+    prefix_hit = -1;
+    if (!prefix_cache_usable()) return 0;
+    int best = 0;
+    for (size_t sl = 0; sl < prefix_slots.size(); ++sl) {
+        const PrefixCache& c = prefix_slots[sl];
+        if (!c.valid) continue;
+        const size_t n = c.tokens.size();
+        // Leave at least one token to process: prefill() owes s.logits for
+        // the last row, and a zero-token prefill would leave the caller
+        // reading the PREVIOUS request's logits -- in vocabulary, right
+        // length, and the wrong continuation (rule 12's failure mode).
+        if (n == 0 || n >= tokens.size()) continue;
+        if (!std::equal(c.tokens.begin(), c.tokens.end(), tokens.begin()))
+            continue;
+        // Longest wins.  Two conversations can share an opening -- the
+        // same system prompt and tool list is the NORMAL case for agents
+        // -- so the first match is not the best one.
+        if (int(n) > best) { best = int(n); prefix_hit = int(sl); }
+    }
+    return best;
+}
+
+int Grimoire::prefix_slot_for_write() {
+    if (prefix_slots.empty()) prefix_slots.resize(size_t(prefix_cache_slots()));
+    // Extend the slot this request resumed from: a conversation must not
+    // consume a fresh slot every turn, or N slots hold one conversation's
+    // history and every other agent is evicted.
+    if (prefix_hit >= 0 && size_t(prefix_hit) < prefix_slots.size())
+        return prefix_hit;
+    for (size_t i = 0; i < prefix_slots.size(); ++i)
+        if (!prefix_slots[i].valid) return int(i);
+    size_t lru = 0;
+    for (size_t i = 1; i < prefix_slots.size(); ++i)
+        if (prefix_slots[i].used < prefix_slots[lru].used) lru = i;
+    return int(lru);
 }
 
 bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
-    if (!prefix_cache_usable() || !prefix_cache.valid ||
-        prefix_cache.tokens != tokens) return false;
+    if (!prefix_cache_usable()) return false;
+    int hit = -1;
+    for (size_t sl = 0; sl < prefix_slots.size(); ++sl)
+        if (prefix_slots[sl].valid && prefix_slots[sl].tokens == tokens) hit = int(sl);
+    if (hit < 0) return false;
+    // Claim the slot, for the same reason save_prefix() does: whatever
+    // this request saves next belongs to the conversation it just
+    // restored, not to a fresh slot.
+    prefix_hit = hit;
+    PrefixCache& prefix_cache = prefix_slots[size_t(hit)];
+    prefix_cache.used = ++prefix_clock;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
@@ -5917,8 +5996,11 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
 // restore_prefix(); the only difference is that the caller is not
 // claiming the request is finished after it.
 bool Grimoire::restore_prefix_upto(int n) {
-    if (n <= 0 || !prefix_cache_usable() || !prefix_cache.valid) return false;
-    if (size_t(n) != prefix_cache.tokens.size()) return false;
+    if (n <= 0 || !prefix_cache_usable()) return false;
+    if (prefix_hit < 0 || size_t(prefix_hit) >= prefix_slots.size()) return false;
+    PrefixCache& prefix_cache = prefix_slots[size_t(prefix_hit)];
+    if (!prefix_cache.valid || size_t(n) != prefix_cache.tokens.size()) return false;
+    prefix_cache.used = ++prefix_clock;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
     const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
@@ -6221,12 +6303,18 @@ void Grimoire::release() {
     if (spec_dn_steps) sycl::free(spec_dn_steps, q);
     if (spec_conv_inputs) sycl::free(spec_conv_inputs, q);
     if (spec_hidden_steps) sycl::free(spec_hidden_steps, q);
-    for (auto& c : prefix_cache.layers)
-        for (void* p : {(void*)c.dn, (void*)c.conv, (void*)c.k, (void*)c.v})
-            if (p) sycl::free(p, q);
-    if (prefix_cache.hidden) sycl::free(prefix_cache.hidden, q);
-    if (prefix_cache.logits) sycl::free(prefix_cache.logits, q);
-    prefix_cache = {};
+    // Every slot, not just one.  N slots is N full copies of the KV and
+    // recurrent state, so a server reloading a model and freeing only the
+    // first would leak the rest -- and the rest is where the memory is.
+    for (auto& pc : prefix_slots) {
+        for (auto& c : pc.layers)
+            for (void* p : {(void*)c.dn, (void*)c.conv, (void*)c.k, (void*)c.v})
+                if (p) sycl::free(p, q);
+        if (pc.hidden) sycl::free(pc.hidden, q);
+        if (pc.logits) sycl::free(pc.logits, q);
+    }
+    prefix_slots.clear();
+    prefix_hit = -1;
 }
 
 } // namespace b70
@@ -11886,6 +11974,18 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
 // The server (tools/grimoire_server.cpp) only needs an opaque handle plus
 // these three calls; it never sees the Grimoire struct definition.
 Grimoire* grimoire_new() { return new Grimoire(); }
+
+// How many prefix slots currently hold a conversation.  Exposed for the
+// gate, which needs to assert an invariant no token stream can show:
+// that N turns of one conversation occupy ONE slot.  Everything about
+// slot bookkeeping is silent -- a conversation that took a fresh slot
+// per turn would still answer correctly, right up to the point where it
+// had evicted every other agent.
+int grimoire_prefix_slots_used(Grimoire& e) {
+    int n = 0;
+    for (const auto& c : e.prefix_slots) if (c.valid) ++n;
+    return n;
+}
 
 bool grimoire_load(Grimoire& e, const std::string& dir, Fmt proj_fmt,
                     int max_seq, std::string& err) {

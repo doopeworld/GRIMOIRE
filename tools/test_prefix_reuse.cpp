@@ -128,6 +128,104 @@ int main() {
               "the restored state is not the state it claims to be");
     }
 
+    // ---- TWO AGENTS, INTERLEAVED -------------------------------------
+    // The case this is actually for.  With one snapshot each request
+    // evicts the other's and both fall back to re-reading everything --
+    // the very cost reuse exists to remove, reintroduced by the second
+    // caller.  With a slot each, both resume.
+    //
+    // The check is again identity, not speed: agent A resuming must
+    // answer exactly what agent A re-reading answers.  A slot that
+    // returned agent B's state would be FLUENT -- it is a real
+    // conversation, just not this one.
+    //
+    // It also asserts the invariant the token stream cannot show: SIX
+    // turns of TWO conversations must occupy TWO slots.  A conversation
+    // that takes a fresh slot per turn answers perfectly and evicts every
+    // other agent, so nothing in the output would say so -- the budget is
+    // deliberately roomy (8) precisely so the count is free to be wrong.
+    //
+    // One way to be wrong is only reachable on hardware this container
+    // does not have: a cold request saves TWICE where batched prefill
+    // runs -- the prompt at start_pos 0 from inside prefill(), then
+    // prompt-plus-reply at the end -- and the second save must land in
+    // the same slot as the first.  On a CPU device prefill() declines and
+    // the caller falls back to forward(), so only the second save ever
+    // happens here and this arm CANNOT see that case.  The occupancy
+    // assertion is what would catch it on the card; it is stated here
+    // rather than only on the Tower because stating it costs nothing.
+    {
+        ::setenv("GRIMOIRE_PREFIX_CACHE", "1", 1);
+        ::setenv("GRIMOIRE_PREFIX_SLOTS", "8", 1);
+        Grimoire* e = grimoire_new();
+        std::string err;
+        if (!e || !grimoire_load(*e, dir.string(), Fmt::BF16, 256, err)) {
+            ++g_fail;
+            std::printf("    FAIL: two-agent load failed: %s\n", err.c_str());
+        } else {
+            std::vector<int32_t> a{7, 11, 3, 42}, b{90, 1, 64, 23};
+            std::vector<std::vector<int32_t>> got_a, got_b;
+            const long before = b70::g_prefix_tokens_reused_calls;
+            for (int t = 0; t < 3; ++t) {
+                std::vector<int32_t> oa, ob; FinishReason r{};
+                grimoire_serve_generate(*e, a, 5, -1, oa, -1, {}, &r);
+                got_a.push_back(oa);
+                a.insert(a.end(), oa.begin(), oa.end()); a.push_back(int32_t(50 + t));
+                // B's request lands BETWEEN A's turns, which is what
+                // evicts a single-slot cache.
+                grimoire_serve_generate(*e, b, 5, -1, ob, -1, {}, &r);
+                got_b.push_back(ob);
+                b.insert(b.end(), ob.begin(), ob.end()); b.push_back(int32_t(60 + t));
+            }
+            const long resumes = b70::g_prefix_tokens_reused_calls - before;
+            const int slots = grimoire_prefix_slots_used(*e);
+            grimoire_delete(e);
+            std::printf("%-22s %ld resumes across two interleaved agents\n",
+                        "two agents", resumes);
+            std::printf("%-22s %d occupied after 6 turns of 2 conversations\n",
+                        "slots", slots);
+            CHECK(slots == 2,
+                  "two conversations did not settle into two slots, so a "
+                  "conversation is consuming a slot it should be extending "
+                  "and will evict every other agent as it grows");
+            // Four of the six turns can resume (each agent's turns 2 and
+            // 3).  With one slot it would be zero, because every request
+            // evicts the other's snapshot.
+            CHECK(resumes >= 4,
+                  "interleaved agents did not both resume, so a second "
+                  "caller is still evicting the first's context");
+
+            // And the answers must match the same conversations run
+            // WITHOUT any cache at all.
+            ::unsetenv("GRIMOIRE_PREFIX_CACHE");
+            ::unsetenv("GRIMOIRE_PREFIX_SLOTS");
+            Grimoire* c = grimoire_new();
+            if (!c || !grimoire_load(*c, dir.string(), Fmt::BF16, 256, err)) {
+                ++g_fail;
+                std::printf("    FAIL: cold two-agent load failed: %s\n", err.c_str());
+            } else {
+                std::vector<int32_t> ca{7, 11, 3, 42}, cb{90, 1, 64, 23};
+                bool same = true;
+                for (int t = 0; t < 3; ++t) {
+                    std::vector<int32_t> oa, ob; FinishReason r{};
+                    grimoire_serve_generate(*c, ca, 5, -1, oa, -1, {}, &r);
+                    same = same && oa == got_a[size_t(t)];
+                    ca.insert(ca.end(), oa.begin(), oa.end()); ca.push_back(int32_t(50 + t));
+                    grimoire_serve_generate(*c, cb, 5, -1, ob, -1, {}, &r);
+                    same = same && ob == got_b[size_t(t)];
+                    cb.insert(cb.end(), ob.begin(), ob.end()); cb.push_back(int32_t(60 + t));
+                }
+                grimoire_delete(c);
+                std::printf("%-22s %s\n", "two agents, answers",
+                            same ? "identical to no cache" : "DIFFER");
+                CHECK(same,
+                      "an agent resuming answered differently from the same "
+                      "agent re-reading, so a slot returned the wrong "
+                      "conversation's state");
+            }
+        }
+    }
+
     if (!g_fail) fs::remove_all(root);
     else std::printf("\nfixtures kept in %s\n", root.c_str());
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);
