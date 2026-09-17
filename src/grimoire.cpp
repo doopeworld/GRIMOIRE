@@ -2050,7 +2050,15 @@ struct Grimoire {
         std::vector<DevQuant> v_experts;
         bf16_t*  router_bias = nullptr;      // mlp.gate.bias
 
+        // Views into dn_base/conv_base, which hold n_seq_slots copies --
+        // exactly as k_cache is a view into k_base.  A hybrid model keeps
+        // its whole history in these two buffers rather than in a KV
+        // cache, so ONE copy per engine is what stopped several
+        // conversations being stepped together: they would advance the
+        // same state and each would read the others' history.
         float *dn_state = nullptr, *conv_ring = nullptr;
+        float *dn_base = nullptr, *conv_base = nullptr;
+        size_t dn_slot = 0, conv_slot = 0;      // elements per slot
         // k_cache/v_cache are a VIEW into k_base/v_base, which hold
         // n_seq_slots copies of this layer's cache back to back.
         // bind_seq_slot() moves the view; every one of the forty-odd
@@ -2196,6 +2204,9 @@ struct Grimoire {
     int n_seq_slots = 1;
     int seq_slot = 0;
     void bind_seq_slot(int j);
+    // Empty a named slot and leave it live.  See the definition for why
+    // the order matters.
+    void clear_seq_slot(int j);
     static bool prefix_cache_enabled() {
         const char* e = std::getenv("GRIMOIRE_PREFIX_CACHE");
         return e && *e && std::atoi(e) != 0;
@@ -3851,13 +3862,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.la_norm = dev_copy_t<bf16_t>(lq, ck, src.la_norm, "la.norm", &ok);
 
             // recurrent state: constant in context length
-            d.dn_state  = sycl::malloc_device<float>(size_t(Hv) * Dv * Dk, lq);
             const int conv_ch = src.la_conv1d.ok() && !src.la_conv1d.t.shape.empty()
                               ? int(src.la_conv1d.t.shape[0]) : qkv_ch;
             const int conv_k  = src.la_conv1d.ok() && src.la_conv1d.t.shape.size() >= 3
                               ? int(src.la_conv1d.t.shape[2]) : cfg.conv_kernel;
-            d.conv_ring = sycl::malloc_device<float>(size_t(conv_ch) * (conv_k - 1), lq);
-            acct(size_t(Hv) * Dv * Dk * 4 + size_t(conv_ch) * (conv_k - 1) * 4);
+            d.dn_slot   = size_t(Hv) * Dv * Dk;
+            d.conv_slot = size_t(conv_ch) * (conv_k - 1);
+            // One copy per sequence slot.  Constant in context length, so
+            // N of them is cheap next to N KV caches -- and without them a
+            // hybrid model cannot have two conversations resident at all.
+            d.dn_base   = sycl::malloc_device<float>(d.dn_slot * size_t(n_seq_slots), lq);
+            d.conv_base = sycl::malloc_device<float>(d.conv_slot * size_t(n_seq_slots), lq);
+            d.dn_state  = d.dn_base;
+            d.conv_ring = d.conv_base;
+            acct((d.dn_slot + d.conv_slot) * 4 * size_t(n_seq_slots));
         } else {
             d.q_proj = quantize_upload_t(lq, ck, src.q_proj, PF, "self_attn.q_proj", &ok);
             d.k_proj = quantize_upload_t(lq, ck, src.k_proj, PF, "self_attn.k_proj", &ok);
@@ -5730,6 +5748,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
     std::printf("ok\n  zeroing recurrent state ... ");
     std::fflush(stdout);
+    // EVERY slot, not just the bound one.  reset() clears the sequence
+    // that is live; a slot nobody has used yet holds whatever the
+    // allocator left, and the first conversation admitted into it would
+    // start from that.  Uninitialised recurrent state is not a crash, it
+    // is a fluent answer conditioned on noise.
+    for (auto& d : L) {
+        if (d.dn_base)
+            q.memset(d.dn_base, 0, d.dn_slot * size_t(n_seq_slots) * sizeof(float));
+        if (d.conv_base)
+            q.memset(d.conv_base, 0, d.conv_slot * size_t(n_seq_slots) * sizeof(float));
+    }
+    q.wait_and_throw();
     reset();
     std::printf("ok\n");
     vram_gb = double(bytes) / 1073741824.0;
@@ -5796,16 +5826,36 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // and then never uses one.  That is worth a line rather than a
         // silent multiple of VRAM.
         if (n_seq_slots > 1 || prefix_cache_enabled()) {
-            if (!prefix_cache_usable())
-                std::printf("    prefix cache  DISABLED (%d slot%s reserved) -- "
-                            "not usable with %s\n", n_seq_slots,
-                            n_seq_slots == 1 ? "" : "s",
-                            cfg.is_muse ? "Muse"
-                          : pp_enabled() ? "pipeline parallel"
-                          : "a speculative drafter");
+            // Name the REAL reason.  This printed "not usable with a
+            // speculative drafter" whenever the cache was simply switched
+            // off, because the reason was chosen by elimination from a
+            // list the actual cause was not on.  A status line that can
+            // only give reasons from a fixed set will give the wrong one,
+            // and this is the instrument someone reads when a slot count
+            // does not do what they expected.
+            const char* why =
+                  !prefix_cache_enabled() ? "GRIMOIRE_PREFIX_CACHE is not set"
+                : cfg.is_muse             ? "not usable with Muse"
+                : pp_enabled()            ? "not usable under pipeline parallel"
+                : (mtp.ok || dflash2.ok)  ? "not usable with a speculative drafter"
+                                          : nullptr;
+            if (why)
+                std::printf("    prefix cache  off (%d sequence slot%s "
+                            "reserved) -- %s\n", n_seq_slots,
+                            n_seq_slots == 1 ? "" : "s", why);
             else
                 std::printf("    prefix cache  %d conversation%s resident\n",
                             n_seq_slots, n_seq_slots == 1 ? "" : "s");
+        }
+        // And say whether requests will be batched, which is a separate
+        // question from whether their contexts are cached.
+        {
+            const std::string bw = batch_unsupported_reason();
+            if (bw.empty())
+                std::printf("    batching      up to %d sequences per step\n",
+                            std::min(n_seq_slots, kMaxBatchRows));
+            else
+                std::printf("    batching      one at a time -- %s\n", bw.c_str());
         }
         // A device with no XMX cannot run the batched path at all (see
         // Grimoire::prefill).  Saying "batched" there would be the exact
@@ -5852,26 +5902,38 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 // no error and no obvious symptom.
 // ---------------------------------------------------------------------
 void Grimoire::reset() {
+    // MOVE BEFORE WIPING.  The live pointers are a view into one slot,
+    // so zeroing "the state" zeroes THAT CONVERSATION.  Staying put
+    // would evict the most recently used slot, which is the worst
+    // possible choice; taking a free one, or the least recently used, is
+    // the eviction this cache is supposed to do.
+    if (prefix_cache_usable() && n_seq_slots > 1) {
+        prefix_hit = -1;                       // not resuming anything
+        bind_seq_slot(prefix_slot_for_write());
+    }
+    clear_seq_slot(seq_slot);
+}
+
+// Empty a NAMED slot and leave it live.
+//
+// Binding first is the whole point, and getting it backwards is a bug
+// that only one kind of model can show.  A batch driver that reset() and
+// then bound would clear whatever slot happened to be live -- somebody
+// else's conversation -- and leave this one starting on whatever its
+// slot still held.  On a dense or MoE model that is invisible: a stale
+// KV row past `pos` is masked out and the answers are exactly right.  On
+// a hybrid model the ENTIRE history is the conv ring and the DeltaNet
+// state, so the sequence starts mid-thought and stays fluent.  It took
+// prompts long enough for that state to accumulate before any gate could
+// see it.
+void Grimoire::clear_seq_slot(int j) {
+    bind_seq_slot(j);
     // A new sequence inherits nothing, this flag included: the buffer
     // still holds the previous request's states, and they describe a
     // different sequence.
     spec_hidden_valid = false;
-    // MOVE BEFORE WIPING.  The live KV pointers are a view into one
-    // slot's rows, so zeroing "the cache" zeroes THAT CONVERSATION.
-    // Staying put would evict the most recently used slot, which is the
-    // worst possible choice; taking a free one, or the least recently
-    // used, is the eviction this cache is supposed to do.  The slot
-    // chosen is then no longer a conversation and must say so, or the
-    // next request would match its token list and resume from rows that
-    // have just been cleared.
-    if (prefix_cache_usable() && n_seq_slots > 1) {
-        prefix_hit = -1;                       // not resuming anything
-        const int j = prefix_slot_for_write();
-        bind_seq_slot(j);
-        prefix_slots[size_t(j)].valid = false;
-    } else if (!prefix_slots.empty() && seq_slot < int(prefix_slots.size())) {
+    if (!prefix_slots.empty() && seq_slot < int(prefix_slots.size()))
         prefix_slots[size_t(seq_slot)].valid = false;
-    }
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const int qkv_ch = 2 * cfg.lin_k_heads * cfg.lin_k_dim + Hv * Dv;
     for (auto& d : L) {
@@ -6075,11 +6137,11 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
 //
 // Every entry here is a real coupling, not caution:
 //
-//  * a recurrent layer carries ONE conv ring and ONE DeltaNet state for
-//    the whole engine.  Two conversations stepped together would advance
-//    the same state and each would read the other's history -- fluent
-//    output from a mixture of two chats.  Per-slot recurrent state is
-//    what lifts this, and it is not written yet.
+//  * a recurrent layer used to be here: one conv ring and one DeltaNet
+//    state for the whole engine meant two conversations stepped together
+//    would advance the same state and each would read the other's
+//    history.  Both are now allocated per sequence slot, like the KV
+//    cache, so hybrid models -- Ornith among them -- batch.
 //  * Muse, gemma-4 and Qwen4-Exp each have their OWN batched path with
 //    their own residual graph.  The loop this parameter modifies is the
 //    Qwen graph; running them through it would contradict their decode
@@ -6096,10 +6158,6 @@ std::string Grimoire::batch_unsupported_reason() const {
     if (pp_enabled())     return "pipeline parallel";
     if (mtp.ok || dflash2.ok)
         return "a speculative drafter is loaded";
-    for (const auto& d : L)
-        if (d.kind == LayerKind::LINEAR_ATTN)
-            return "linear-attention layers keep one recurrent state per engine, "
-                   "not per sequence";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
     if (!device_can_matrix(q) && !std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX"))
@@ -6125,6 +6183,8 @@ void Grimoire::bind_seq_slot(int j) {
     for (auto& d : L) {
         if (d.k_base) d.k_cache = d.k_base + size_t(j) * d.kv_slot;
         if (d.v_base) d.v_cache = d.v_base + size_t(j) * d.kv_slot;
+        if (d.dn_base) d.dn_state = d.dn_base + size_t(j) * d.dn_slot;
+        if (d.conv_base) d.conv_ring = d.conv_base + size_t(j) * d.conv_slot;
     }
     seq_slot = j;
     graph_ok = false;
@@ -6354,7 +6414,10 @@ void Grimoire::release() {
                         (void*)d.la_norm,  (void*)d.q_norm, (void*)d.k_norm, (void*)d.gu_pack,
                         (void*)d.gu_scale, (void*)d.dn_pack, (void*)d.dn_scale,
                         (void*)d.gu_zero, (void*)d.dn_zero,
-                        (void*)d.dn_state, (void*)d.conv_ring,
+                        // Bases, not views, for the same reason as the
+                        // cache below: a view points into the middle of
+                        // the allocation that owns it.
+                        (void*)d.dn_base, (void*)d.conv_base,
                         // k_base, NOT k_cache: the cache is a view into
                         // whichever slot was last bound, and freeing a
                         // view frees the middle of an allocation.
@@ -11431,7 +11494,27 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if (capture_spec)
                 q.memcpy(spec_conv_inputs + spec_xoff[li], t0,
                          size_t(M) * ch * sizeof(float));
-            if(bf_dn_qkv)
+            if(seqb){
+                // ONE ROW AT A TIME, each over its OWN ring.  The ring is
+                // this layer's whole memory of the conversation -- the
+                // last kernel-1 inputs -- so rows sharing one would each
+                // convolve over the others' tokens.  Fluent, wrong, and
+                // nothing in the output says so.
+                //
+                // tokens=1 makes the same kernel do exactly what decode
+                // does: read the ring for all K-1 history taps, then
+                // shift this token in.  Calling the batched routine with
+                // one row rather than writing a second one is what keeps
+                // the two from drifting apart.
+                for(int r=0;r<M;++r){
+                    float* ring=d.conv_base+size_t(seqb->slot[r])*d.conv_slot;
+                    ConvParams cp{t0+int64_t(r)*ch,d.la_conv,ring,nullptr,
+                                  ch,cfg.conv_kernel};
+                    launch_causal_conv1d_split_prefill(q,cp,1,
+                        t1+int64_t(r)*qs,t2+int64_t(r)*qs,t3+int64_t(r)*vs,
+                        nullptr,qs,vs);
+                }
+            }else if(bf_dn_qkv)
                 launch_causal_conv1d_split_bf16_prefill(q,grouped_out,d.la_conv,
                     d.conv_ring,ch,cfg.conv_kernel,M,native_fq,native_fk,native_fv,
                     qs,vs);
@@ -11483,7 +11566,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // the token dimension anyway, so at small M just run the decode
                 // kernel once per token: 4 tokens = 1.7 ms instead of 7.2.
                 // This is what makes an MTP verify batch affordable.
-                if(M<=16){
+                if(seqb||M<=16){
                     for(int t=0;t<M;++t){
                         DeltaNetParams sp{};
                         sp.q     = t1 + size_t(t)*Hk*Dk;
@@ -11491,7 +11574,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         sp.v     = t3 + size_t(t)*Hv*Dv;
                         sp.a     = alpha + size_t(t)*Hv;
                         sp.beta  = beta  + size_t(t)*Hv;
-                        sp.state = d.dn_state;
+                        // The one line that makes a hybrid model
+                        // concurrent.  Rows of a batch are different
+                        // conversations, so each advances ITS OWN delta
+                        // state; rows of a prompt are one conversation
+                        // and advance the bound slot's, as before.
+                        sp.state = seqb
+                            ? d.dn_base+size_t(seqb->slot[t])*d.dn_slot
+                            : d.dn_state;
                         sp.out   = t0 + size_t(t)*Hv*Dv;
                         sp.n_heads = Hv; sp.k_dim = Dk; sp.v_dim = Dv;
                         sp.n_k_heads = Hk;
@@ -12445,10 +12535,7 @@ int grimoire_serve_generate_batch(Grimoire& e,
                                              budget_cap, e.cfg.vocab);
         if (budget <= 0) continue;
         e.sync();
-        e.reset();
-        e.bind_seq_slot(slot);
-        e.pos = 0;
-        e.set_cursor(0);
+        e.clear_seq_slot(slot);
         if (!e.prefill(prompts[i]))
             for (int32_t t : prompts[i])
                 if (!e.forward(t))
@@ -12633,10 +12720,7 @@ void GrimoireScheduler::run() {
                     continue;
                 }
                 e.sync();
-                e.reset();
-                e.bind_seq_slot(slot);
-                e.pos = 0;
-                e.set_cursor(0);
+                e.clear_seq_slot(slot);
                 if (!e.prefill(j->prompt))
                     for (int32_t t : j->prompt)
                         if (!e.forward(t))

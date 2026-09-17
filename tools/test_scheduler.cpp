@@ -79,25 +79,38 @@ int main() {
     if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
     const fs::path root = tmpl;
 
-    const std::vector<std::vector<int32_t>> prompts = {
-        {7, 11, 3},
-        {90, 1, 64, 23, 5, 18},
-        {42, 42},
-        {3, 9, 27, 81, 19},
-        {5},
-        {64, 64, 64, 12},
-    };
-    const int K = int(prompts.size());
+    // Long enough for a recurrent state to accumulate, and all different
+    // lengths.  Short prompts made this test blind on exactly the model
+    // that matters most: with two-to-six-token sequences a hybrid model
+    // answered identically even when every row shared one DeltaNet
+    // state, because there was nothing in the state yet to share.
+    const int K = 6;
+    std::vector<std::vector<int32_t>> prompts;
+    {
+        const int len[K] = {41, 23, 34, 17, 29, 13};
+        for (int k = 0; k < K; ++k) {
+            std::vector<int32_t> p;
+            uint32_t x = uint32_t(1 + k) * 2654435761u;
+            for (int i = 0; i < len[k]; ++i) {
+                x = x * 1664525u + 1013904223u;
+                p.push_back(int32_t((x >> 9) % 120));
+            }
+            prompts.push_back(p);
+        }
+    }
 
     struct Cell { const char* name; mini::Arch arch; bool expect_batched; };
     std::vector<Cell> cells;
     cells.push_back({"dense",  mini::dense(),  true});
     cells.push_back({"moe",    mini::moe(),    true});
-    // Linear attention cannot batch: one recurrent state per ENGINE.  The
-    // scheduler must notice and serve one at a time -- and concurrent
-    // callers must still get right answers, because that is the path
-    // every hybrid checkpoint takes.
-    cells.push_back({"hybrid", mini::hybrid(), false});
+    // A hybrid model -- linear-attention layers mixed with full
+    // attention -- is the shape that matters most in practice here, and
+    // it is the one that used to refuse.  Its whole memory of a
+    // conversation lives in the conv ring and the DeltaNet state rather
+    // than a KV cache, so this cell is really asking whether those are
+    // per sequence.  If they were not, the answers would still be
+    // fluent; they would just be conditioned on the other agents.
+    cells.push_back({"hybrid", mini::hybrid(), true});
 
     for (auto& cell : cells) {
         const fs::path dir = root / cell.name;
@@ -115,7 +128,7 @@ int main() {
             }
             for (int k = 0; k < K; ++k) {
                 FinishReason r{};
-                grimoire_serve_generate(*e, prompts[size_t(k)], 6, -1,
+                grimoire_serve_generate(*e, prompts[size_t(k)], 12, -1,
                                         alone[size_t(k)], -1, {}, &r);
             }
             grimoire_delete(e);
@@ -146,7 +159,7 @@ int main() {
                     gate.wait();
                     try {
                         FinishReason r{};
-                        grimoire_scheduler_generate(*sc, prompts[size_t(k)], 6,
+                        grimoire_scheduler_generate(*sc, prompts[size_t(k)], 12,
                                                     -1, -1, conc[size_t(k)],
                                                     {}, &r);
                     } catch (const std::exception& ex) {

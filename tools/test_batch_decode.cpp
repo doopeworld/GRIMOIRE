@@ -84,18 +84,42 @@ int main() {
     // Different lengths AND different content.  Same-length prompts make
     // every per-row position identical and the test blind to the bug
     // class it exists for.
-    const std::vector<std::vector<int32_t>> prompts = {
-        {7, 11, 3},
-        {90, 1, 64, 23, 5, 18},
-        {42, 42},
-        {3, 9, 27, 81, 19},
-    };
-    const int K = int(prompts.size());
+    //
+    // And LONG ENOUGH TO MATTER.  The first version used prompts of two
+    // to six tokens, and on a hybrid model that was not a test: a
+    // DeltaNet state shared between all four rows changed NOTHING in the
+    // output, and a shared conv ring showed up in one cell out of two.
+    // The recurrent state has to accumulate before crossing it is
+    // visible, so a short sequence tests the attention half and quietly
+    // passes the recurrent half.  Verified by re-running both negative
+    // controls at this length, where each fails every hybrid cell.
+    const int K = 4;
+    std::vector<std::vector<int32_t>> prompts;
+    {
+        // Deterministic and distinct.  A different multiplier per
+        // sequence, so no two share a prefix and their recurrent states
+        // diverge from the first token rather than the tenth.
+        const int len[K] = {41, 23, 34, 17};
+        for (int k = 0; k < K; ++k) {
+            std::vector<int32_t> p;
+            uint32_t x = uint32_t(1 + k) * 2654435761u;
+            for (int i = 0; i < len[k]; ++i) {
+                x = x * 1664525u + 1013904223u;
+                p.push_back(int32_t((x >> 9) % 120));
+            }
+            prompts.push_back(p);
+        }
+    }
 
     struct Cell { const char* name; mini::Arch arch; };
     std::vector<Cell> cells;
     cells.push_back({"dense", mini::dense()});
     cells.push_back({"moe",   mini::moe()});
+    // Hybrid: DeltaNet layers carry the conversation in a recurrent
+    // state, not a cache.  Batching it is a stronger claim than batching
+    // attention -- a shared state would mix the conversations together
+    // token by token and still read as English.
+    cells.push_back({"hybrid", mini::hybrid()});
 
     for (auto& cell : cells) {
         for (Fmt fmt : {Fmt::BF16, Fmt::FP8_E4M3}) {
@@ -116,7 +140,7 @@ int main() {
                 }
                 for (int k = 0; k < K; ++k) {
                     FinishReason r{};
-                    grimoire_serve_generate(*e, prompts[size_t(k)], 6, -1,
+                    grimoire_serve_generate(*e, prompts[size_t(k)], 12, -1,
                                             alone[size_t(k)], -1, {}, &r);
                 }
                 grimoire_delete(e);
@@ -137,7 +161,7 @@ int main() {
                 const long s0 = b70::g_batch_decode_steps;
                 const long r0 = b70::g_batch_decode_rows;
                 const int n = grimoire_serve_generate_batch(
-                    *e, prompts, 6, -1, together, -1);
+                    *e, prompts, 12, -1, together, -1);
                 steps = b70::g_batch_decode_steps - s0;
                 rows  = b70::g_batch_decode_rows  - r0;
                 if (n != K) {
@@ -181,10 +205,32 @@ int main() {
             // dropping a finished row and stepping the rest -- never ran.
             // That is the path a real server is in almost all the time.
             //
-            // 126 is a token all four fixtures emit, at different steps,
-            // so using it as the stop token retires the rows unevenly.
+            // The stop token is CHOSEN FROM WHAT THIS FIXTURE ACTUALLY
+            // EMITS, not hardcoded.  A fixed token happened to suit the
+            // dense and MoE cells and appeared nowhere in the hybrid
+            // one, so that cell ran every sequence to the full budget and
+            // the arm asserted a narrowing that could not happen --
+            // a test failing on the test, which is worth avoiding by
+            // construction rather than by picking a luckier constant.
+            //
+            // Pick a token that sequence 0 emits and some OTHER sequence
+            // never does: then row 0 retires early and that row does not,
+            // so the batch is guaranteed to narrow.
             {
-                const int kEos = 126;
+                int kEos = -1;
+                for (size_t i = 1; i < alone[0].size() && kEos < 0; ++i) {
+                    const int cand = alone[0][i];
+                    for (int k = 1; k < K; ++k) {
+                        bool seen = false;
+                        for (int32_t t : alone[size_t(k)]) if (t == cand) seen = true;
+                        if (!seen) { kEos = cand; break; }
+                    }
+                }
+                if (kEos < 0) {
+                    std::printf("    ragged: skipped -- every sequence emits "
+                                "every token this one does\n");
+                    continue;
+                }
                 std::vector<std::vector<int32_t>> a2; a2.resize(size_t(K));
                 std::vector<std::vector<int32_t>> b2; b2.resize(size_t(K));
                 std::string err;
@@ -199,12 +245,12 @@ int main() {
                 } else {
                     for (int k = 0; k < K; ++k) {
                         FinishReason r{};
-                        grimoire_serve_generate(*e1, prompts[size_t(k)], 6,
+                        grimoire_serve_generate(*e1, prompts[size_t(k)], 12,
                                                 kEos, a2[size_t(k)], -1, {}, &r);
                     }
                     const long s0 = b70::g_batch_decode_steps;
                     const long r0 = b70::g_batch_decode_rows;
-                    grimoire_serve_generate_batch(*e2, prompts, 6, kEos, b2, -1);
+                    grimoire_serve_generate_batch(*e2, prompts, 12, kEos, b2, -1);
                     const long st = b70::g_batch_decode_steps - s0;
                     const long rw = b70::g_batch_decode_rows  - r0;
                     bool ok2 = true;
