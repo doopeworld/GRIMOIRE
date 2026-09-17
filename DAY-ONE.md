@@ -347,6 +347,14 @@ software recovery. The known causes, all avoidable:
 - **Single-process cross-device.** Rule 7: the original failure was
   measured over USB4 and has not been retried on OCuLink. That is a
   hardware experiment, not a code change.
+- **Everything off-card is green as of 2026-09-17.** All six gates pass
+  on an OpenCL CPU device: test_k2_kernels, test_k2_e2e,
+  test_gemma4_prefill (8/8 batched == sequential), test_model_matrix
+  (8 architectures x 7 formats), test_spec_e2e, and test_parallel_e2e
+  (50 matches, 0 failures).  The k2-horizon cell this file previously
+  called a Tower-only Intel-runtime crash was the over-reporting
+  ext_intel_matrix aspect -- see CLAUDE.md rule 15 -- and passes now.
+
 - **gemma-4 at its real head_dim. DONE 2026-09-15, off-card.**
   `google/gemma-4-31B-it` loads at head_dim 512.  The four flash kernels
   are templates on their accumulator width, instantiated at 16 and 32:

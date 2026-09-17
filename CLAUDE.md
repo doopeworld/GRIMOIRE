@@ -20,15 +20,29 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
   parallel-ffn, gemma4, gemma4 at head_dim 512
 - PP and TP produce token-identical output to a single process, in BF16
-  and FP8, for dense, MoE, hybrid, gemma-4, **gemma-4 at head_dim 512**,
-  **Muse** and the **parallel-FFN fold** (`test_parallel_e2e`) -- 48
-  matching cases.  **Its k2-horizon bf16 cell does NOT pass on a CPU
-  device** and never has: the Intel OpenCL CPU runtime crashes compiling
-  that kernel (SIGSEGV, with the runtime's own "PLEASE submit a bug
-  report" line just above it), so the gate exits 1 with 1 failure.
-  Verified 2026-09-16 to be identical at `a4e3775` and at HEAD, i.e.
-  PRE-EXISTING and not engine code.  Re-run it on the B70, where the
-  kernel compiles; do not spend time bisecting it off-card.
+  and FP8, for dense, MoE, hybrid, gemma-4, gemma-4 at head_dim 512, Muse
+  and the parallel-FFN fold (`test_parallel_e2e`) -- **50 matches, 0
+  failures, the whole gate green.**
+- gemma-4 batched prefill is token-identical to sequential decode at four
+  projection formats and at head_dim 512 (`test_gemma4_prefill`)
+- speculation (MTP and DFlash) is identical to plain decode, single
+  process and under TP and PP, now including Muse (`test_spec_e2e`)
+
+**RETRACTION (2026-09-17) of the note added at d8507c9.** That note said
+`test_parallel_e2e`'s k2-horizon bf16 cell "does NOT pass on a CPU device
+and never has", and called it a pre-existing Intel-runtime crash needing
+the B70. Both halves were wrong, and the way they were wrong is worth
+keeping.
+
+It was the SAME over-reporting `ext_intel_matrix` aspect described in
+rule 15 -- batched prefill enabling itself on a CPU whose JIT cannot
+compile `joint_matrix`. With `device_can_matrix()` in place the cell
+passes. The claim was "established by bisect", and the bisect was real:
+the gate was built and run at `a4e3775` and failed identically. But BOTH
+runs were on a host with the bad aspect, so the experiment could only
+ever compare code against code -- it had no way to see the variable that
+actually differed. A bisect controls for the commit; it does not control
+for the machine.
 
 What is NOT verified and only the Tower can settle: the OCuLink link
 itself, every XMX tile, the AOT image, and every number.
@@ -490,6 +504,54 @@ what is not -- "green on what we test, and X has no test" is the honest
 sentence, and "all green" on its own has repeatedly been heard as "done".
 And when adding an architecture, add its fixture row the same day: the
 gap is not that the code is wrong, it is that nothing would say so.
+
+**15. A DEVICE ASPECT IS A CLAIM, NOT A CAPABILITY -- AND A BISECT DOES
+NOT CONTROL FOR THE MACHINE (learned 2026-09-16/17).**
+
+Four gates went red at once with no commit behind them.  The container
+had been rescheduled from a Xeon @ 2.80GHz to a Xeon @ 2.10GHz whose
+OpenCL CPU runtime ADVERTISES `ext_intel_matrix`:
+
+    Intel(R) Xeon(R) Processor @ 2.10GHz  is_gpu=0  ext_intel_matrix=1
+
+so `!is_gpu() && !has(ext_intel_matrix)` went false, batched prefill
+enabled itself on a CPU for the first time ever, and the `joint_matrix`
+kernels reached a JIT that cannot build them.  `test_k2_e2e` died inside
+Intel's runtime printing its own "PLEASE submit a bug report";
+`test_gemma4_prefill` returned wrong tokens; `test_spec_e2e` lost 32
+cases; `test_parallel_e2e` crashed on k2.
+
+Three lessons, in the order they cost time.
+
+**The aspect answers the wrong question.**  It says "does this device
+CLAIM matrix support".  What every caller needs is "can it RUN the
+kernel".  A CPU that claims it and then crashes its own JIT answers yes
+to one and no to the other.  `device_can_matrix()` is now the single
+owner: a GPU is trusted outright (a B70 IS a GPU, so the Tower is
+unaffected and the original is_gpu()-first reasoning is preserved), a
+non-GPU only under `GRIMOIRE_TRUST_MATRIX_ASPECT=1`.
+
+**The predicate was in SEVEN places.**  The first fix found three and
+declared it solved -- while writing a commit message about how duplicated
+predicates drift.  Four copies remained, and one of them
+(`prefill_gemma4`'s own `mmg`) kept a gate red after the others went
+green.  `grep -n ext_intel_matrix src/*.cpp` is the whole check, and it
+is what would have made the first fix complete.
+
+**A BISECT CONTROLS FOR THE COMMIT, NOT FOR THE MACHINE.**  The k2-horizon
+crash was "established by bisect" at d8507c9 and written into this file
+as pre-existing and Tower-only.  The bisect was real -- built and run at
+`a4e3775`, failed identically -- but both runs were on a host with the
+bad aspect, so it could only compare code against code.  It had no way to
+see the variable that actually differed, and a clean negative result made
+the wrong conclusion feel settled.  When a bisect says "not my code",
+that is evidence about the code and says nothing about the environment.
+
+**The banner is the instrument.**  It read `prefill       batched` where
+every earlier CPU run said `SEQUENTIAL fallback (not a GPU, no matrix
+hardware)`.  That one line located a bug that four red gates and a bisect
+had pointed the wrong way.  It is worth printing what the engine DECIDED
+about the device it found, not just what it is about to do.
 
 ## Where to look for current status
 
