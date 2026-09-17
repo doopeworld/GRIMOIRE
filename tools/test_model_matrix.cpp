@@ -131,7 +131,8 @@ int main(int argc, char** argv) {
     std::vector<mini::Arch> archs = { mini::dense(), mini::moe(),
                                       mini::hybrid(), mini::k2(),
                                       mini::muse(), mini::parallel_ffn(),
-                                      mini::gemma4(), mini::gemma4_wide() };
+                                      mini::gemma4(), mini::gemma4_wide(),
+                                      mini::qwen4_exp() };
 
     std::printf("%-12s", "");
     for (const auto& f : kFormats) std::printf("%-10s", f.name);
@@ -246,6 +247,50 @@ int main(int argc, char** argv) {
                             "head_dim 1024", err.c_str());
             } else {
                 std::printf("  %-14s refused by name\n", "head_dim 1024");
+            }
+        }
+    }
+
+    // Qwen4-Exp runs now (the row above), so the refusal that still has
+    // to hold is the one the reference itself validates: the indexer is
+    // MQA and indexer_kv_heads must be 1.  With more than one key stream
+    // the block scores are computed against the wrong keys, which selects
+    // a different 2048 tokens and is fluent.
+    //
+    // The check requires the ENGINE's sentence, not just "it refused": a
+    // loader shape refusal would pass that and would keep passing on the
+    // day this becomes supported.
+    {
+        mini::Arch bad = mini::qwen4_exp();
+        const std::string from = "\"indexer_kv_heads\": 1";
+        const std::string to   = "\"indexer_kv_heads\": 2";
+        const size_t at = bad.config.find(from);
+        if (at == std::string::npos) {
+            ++fails;
+            std::printf("  %-14s fixture no longer declares indexer_kv_heads; "
+                        "this case proves nothing\n", "qsa kv_heads");
+        } else {
+            bad.config.replace(at, from.size(), to);
+            const fs::path dir = root / "refuse-qsa-mqa";
+            mini::write_model(dir, bad);
+            std::string err;
+            Grimoire* e = grimoire_new();
+            bool loaded = false;
+            if (e) {
+                loaded = grimoire_load(*e, dir.string(), Fmt::BF16, 128, err);
+                grimoire_delete(e);
+            }
+            if (loaded) {
+                ++fails;
+                std::printf("  %-14s LOADED -- the indexer would score blocks "
+                            "against one key stream while the config says "
+                            "two, silently\n", "qsa kv_heads");
+            } else if (err.find("indexer_kv_heads != 1") == std::string::npos) {
+                ++fails;
+                std::printf("  %-14s refused, but for the wrong reason: %s\n",
+                            "qsa kv_heads", err.c_str());
+            } else {
+                std::printf("  %-14s refused by name\n", "qsa kv_heads");
             }
         }
     }

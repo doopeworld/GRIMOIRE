@@ -16,9 +16,10 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
 
 - every SYCL source compiles; `bin/grimoire` and `bin/grimoire-server` link
 - the new kernels RUN and match their host references (`test_k2_kernels`)
-- 8 architectures x 7 projection formats all load and generate
+- 9 architectures x 7 projection formats all load and generate
   (`test_model_matrix`) -- dense, moe, hybrid, k2-horizon, muse,
-  parallel-ffn, gemma4, gemma4 at head_dim 512
+  parallel-ffn, gemma4, gemma4 at head_dim 512, **qwen4_exp
+  (Qwen3.8-Flash-Next)**
 - PP and TP produce token-identical output to a single process, in BF16
   and FP8, for dense, MoE, hybrid, gemma-4, gemma-4 at head_dim 512, Muse
   and the parallel-FFN fold (`test_parallel_e2e`) -- **50 matches, 0
@@ -27,6 +28,13 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   projection formats and at head_dim 512 (`test_gemma4_prefill`)
 - speculation (MTP and DFlash) is identical to plain decode, single
   process and under TP and PP, now including Muse (`test_spec_e2e`)
+- **Qwen4-Exp / Qwen3.8-Flash-Next runs** (`test_qwen4_exp_e2e`):
+  HyperConnections, QSA and the PLE n-gram embedding, single process,
+  with its batched prefill token-identical to sequential decode.  Each
+  mechanism is proved LIVE by an A/B against the same weights with one
+  thing switched off in config.json -- because two of the three are
+  fluent when absent.  Details and what is still refused by name (TP, PP,
+  an MTP drafter): `QWEN4-EXP-2026-09-16.md`, bottom section.
 
 **RETRACTION (2026-09-17) of the note added at d8507c9.** That note said
 `test_parallel_e2e`'s k2-horizon bf16 cell "does NOT pass on a CPU device
@@ -552,6 +560,59 @@ every earlier CPU run said `SEQUENTIAL fallback (not a GPU, no matrix
 hardware)`.  That one line located a bug that four red gates and a bisect
 had pointed the wrong way.  It is worth printing what the engine DECIDED
 about the device it found, not just what it is about to do.
+
+**16. A BUFFER THAT IS SHARED BY EVERY ROW MUST NOT BE INDEXED BY ROW,
+AND M == 1 WILL NEVER TELL YOU (learned 2026-09-17).**
+
+Qwen4-Exp's batched prefill disagreed with sequential decode, and both
+causes were the same mistake in two places:
+
+- `launch_qsa_index_logits` read its compressed key cache as
+  `keys[(row * n_blocks + n) * head_dim]`.  That cache belongs to the
+  SEQUENCE, not to the query -- one set of blocks, every row scoring the
+  same ones -- so at M > 1 every row after the first read past the blocks
+  that were actually pooled.
+- the QSA indexer's projection emits `[q | k]` PER TOKEN, so at M > 1 the
+  query heads are strided by the whole projection width.
+  `launch_rmsnorm_heads`, `launch_rope_rows` and the logits kernel all
+  index heads CONTIGUOUSLY, so the norm ran across the key half and into
+  the next token's queries.
+
+**At M == 1 both layouts are identical.** Decode was correct, every
+kernel matched its host reference, and the parity test passed -- because
+the FIXTURE gave each row its own key block set, which is not the shape
+the engine has. A test that hands a kernel a per-row copy of something
+the engine shares cannot see a row-strided read.
+
+Three things follow:
+
+- When a kernel takes a buffer that is per-SEQUENCE, say so in its
+  declaration and shape the fixture that way. "It matched the host
+  reference" means nothing if the reference was called with the same
+  wrong layout.
+- Any batched path whose decode twin is M == 1 has a whole class of
+  stride bugs that only the M > 1 arm can reach. `prefill == decode` is
+  the check that finds them, and it has to be a GATE, not a one-off.
+- The symptom was tokens that agreed for seven steps and then diverged.
+  Wrong-but-plausible numbers produce exactly that, and it reads like a
+  floating-point tie-break. It was not.
+
+**17. THE REFERENCE'S OWN TEST IS PART OF THE REFERENCE (learned
+2026-09-17).** The QSA expansion was implemented from the algorithm
+description and was missing its TAIL: stage 1 ranks only COMPLETE key
+blocks, so the block still being filled -- the one holding the query's
+own token -- is unreachable through the top-k, and vLLM appends it
+unconditionally. Every QSA layer would have attended to everything
+except the most recent few tokens, fluently.
+
+It is in `tests/models/qwen4_exp/test_qsa_reference.py`
+(`_expand_qsa_indices_reference`), not in the module that ships. When a
+reference implementation has a plain-torch test beside it, read the test:
+the shipped path is a fused kernel and the test is the specification.
+
+The check that catches this is not a parity check against a host
+reference written from the same misreading -- it is one property stated
+in the model's own terms: *can the query reach its own token?*
 
 ## Where to look for current status
 

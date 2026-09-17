@@ -147,6 +147,9 @@ inline void hc_combine(const float* hyper, const float* normed,
 //       TOKENS [b*ratio, b*ratio + ratio), truncated to indexer_budget
 //       and masked to < seq_len.  Selecting one token therefore brings
 //       its whole block -- that is the "coarser index" QSA is built on.
+//       THE INCOMPLETE BLOCK IS THEN APPENDED UNCONDITIONALLY: stage 1
+//       can only see complete blocks, so without this a query cannot
+//       attend to its own token.  See stage 3 below.
 //
 //  Attention then runs over the GATHERED token list, not a range:
 //         scores = einsum("hd,khd->hk", q, keys)
@@ -197,11 +200,39 @@ inline void qsa_topk_blocks(const float* logits, int n_blocks, int visible,
     for (int i = 0; i < width; ++i) out[i] = idx[size_t(i)];
 }
 
-// Stage 3.  Block indices -> token indices.  `out` is indexer_budget
-// wide; entries outside the sequence, and holes from stage 2, are -1.
+// Stage 3.  Block indices -> token indices, PLUS THE TAIL.
+//
+// The tail is the part this engine got wrong first and it is not
+// optional: `visible` in stage 1 counts only COMPLETE blocks
+// (min((pos+1)/ratio, seq_len/ratio) in the reference's
+// _qsa_select_paged_reference), so the tokens of the block still being
+// filled -- INCLUDING THE QUERY'S OWN TOKEN -- can never be selected by
+// the indexer.  The reference appends them unconditionally:
+//
+//     tail_start = (pos + 1) / ratio * ratio
+//     tail       = tail_start .. pos            (at most ratio-1 entries)
+//
+// (tests/models/qwen4_exp/test_qsa_reference.py,
+// _expand_qsa_indices_reference).  Drop it and a decode step attends to
+// everything except the most recent few tokens, which is fluent and
+// wrong -- exactly the class this whole file is organised around.  The
+// selected blocks are all below tail_start, so the two never overlap.
+//
+// `out` is therefore token_topk + compress_ratio - 1 wide.
+//
+// ONE DELIBERATE DIFFERENCE FROM THE REFERENCE, and it changes no value:
+// vLLM stable-sorts the valid entries to the front and passes their count
+// as the attention kernel's loop bound.  This engine's QSA attention
+// skips holes inside the loop instead, so the gathered set and the ORDER
+// of the valid entries are identical and the compaction would only move
+// the -1s.  Nothing downstream may treat position as meaningful.
+inline int qsa_expand_width(int token_topk, int compress_ratio) {
+    return token_topk + compress_ratio - 1;
+}
+
 inline void qsa_expand_blocks(const int* blocks, int block_topk,
                               int compress_ratio, int token_topk,
-                              int seq_len, int* out) {
+                              int seq_len, int query_pos, int* out) {
     int w = 0;
     for (int b = 0; b < block_topk && w < token_topk; ++b) {
         for (int r = 0; r < compress_ratio && w < token_topk; ++r, ++w) {
@@ -210,6 +241,13 @@ inline void qsa_expand_blocks(const int* blocks, int block_topk,
         }
     }
     for (; w < token_topk; ++w) out[w] = -1;
+    // the incomplete block the indexer cannot see
+    const int visible    = query_pos + 1;
+    const int tail_start = visible / compress_ratio * compress_ratio;
+    for (int i = 0; i < compress_ratio - 1; ++i, ++w) {
+        const int t = tail_start + i;
+        out[w] = (i < visible - tail_start && t < seq_len) ? t : -1;
+    }
 }
 
 // The attention itself, over the gathered list.  Plain softmax here
@@ -314,21 +352,183 @@ inline void ple_ngram_ids(int token, const int* hist, int hist_len,
     }
 }
 
-// The PLE gate.  `key` and `query` are H long and each is RMS-normalised
-// on its own before the dot; normalising the pair jointly is a different
-// number.  The sqrt-of-magnitude shaping keeps the gate responsive near
-// zero, and the 1e-6 floor is what stops sqrt'(0) blowing up.
-inline float ple_gate(const float* key, const float* query, int H, float eps) {
-    double ks = 0.0, qs = 0.0;
-    for (int i = 0; i < H; ++i) { ks += double(key[i])*key[i]; qs += double(query[i])*query[i]; }
-    const float ki = 1.0f / std::sqrt(float(ks / H) + eps);
-    const float qi = 1.0f / std::sqrt(float(qs / H) + eps);
-    double dot = 0.0;
-    for (int i = 0; i < H; ++i) dot += double(key[i]*ki) * double(query[i]*qi);
-    const float d = float(dot) / std::sqrt(float(H));
-    const float sgn = d < 0.0f ? -1.0f : 1.0f;
-    const float mag = std::fabs(d) > 1e-6f ? std::fabs(d) : 1e-6f;
-    return sigmoid(sgn * std::sqrt(mag));
+// The PLE gate, and the two rows it produces.
+//
+// This is the whole of ops/ple.py's _ple_gate_kernel, and three things in
+// it are easy to lose:
+//
+//  * IT IS PER STREAM.  key, hidden and both outputs are [hc*H] wide and
+//    every quantity below -- the two norms, the dot, the gate -- is
+//    computed independently for each hidden-wide stream.  `value` is only
+//    H wide and the SAME value row is gated into all of them.
+//  * THE NORMS HAVE WEIGHTS.  "d = dot(RMSNorm(key), RMSNorm(query))"
+//    reads like a plain normalisation; Qwen4ExpPLEGroupedNorm applies
+//    (1 + w) after it (ref/qwen4_exp_nvidia_ple_layer.py:63), with a
+//    separate weight for every element of the hc*H row.  Dropping the
+//    affine leaves a gate in (0,1) that still gates.
+//  * THE SECOND OUTPUT IS NORMED FROM THE FIRST.  conv_input is
+//    norm_conv(gated), not norm_conv(value) and not gated itself.
+//
+// `query` is the multi-stream hidden state.  The sqrt-of-magnitude
+// shaping keeps the gate responsive near zero and the 1e-6 floor is what
+// stops sqrt'(0) blowing up.
+inline void ple_gate(const float* key, const float* value, const float* query,
+                     const float* nk, const float* nq, const float* ncw,
+                     float* gated, float* conv_in,
+                     int hc_count, int H, float eps) {
+    for (int c = 0; c < hc_count; ++c) {
+        const float* k = key   + size_t(c) * H;
+        const float* x = query + size_t(c) * H;
+        const float* wk = nk + size_t(c) * H;
+        const float* wq = nq + size_t(c) * H;
+        double ks = 0.0, qs = 0.0;
+        for (int i = 0; i < H; ++i) { ks += double(k[i])*k[i]; qs += double(x[i])*x[i]; }
+        const float ki = 1.0f / std::sqrt(float(ks / H) + eps);
+        const float qi = 1.0f / std::sqrt(float(qs / H) + eps);
+        double dot = 0.0;
+        for (int i = 0; i < H; ++i)
+            dot += double(k[i]*ki*(1.0f+wk[i])) * double(x[i]*qi*(1.0f+wq[i]));
+        const float d   = float(dot) / std::sqrt(float(H));
+        const float sgn = d < 0.0f ? -1.0f : 1.0f;
+        const float mag = std::fabs(d) > 1e-6f ? std::fabs(d) : 1e-6f;
+        const float g   = sigmoid(sgn * std::sqrt(mag));
+
+        float* go = gated + size_t(c) * H;
+        for (int i = 0; i < H; ++i) go[i] = g * value[i];
+        double gs = 0.0;
+        for (int i = 0; i < H; ++i) gs += double(go[i]) * go[i];
+        const float gi = 1.0f / std::sqrt(float(gs / H) + eps);
+        const float* wc = ncw + size_t(c) * H;
+        float* co = conv_in + size_t(c) * H;
+        for (int i = 0; i < H; ++i) co[i] = go[i] * gi * (1.0f + wc[i]);
+    }
+}
+
+// The dilated depthwise short convolution that finishes a PLE layer.
+//
+//     out[t] = hidden[t] + gated[t] + silu( sum_k w[k] * conv_in[t - (K-1-k)*D] )
+//
+// D is ngram_size, K is ple_conv_kernel_size, and the weight is per
+// CHANNEL (the conv is depthwise over all hc*H of them).  Taps before the
+// start of the sequence read zero, which is what an all-zero conv state
+// gives at position 0.  The two residuals are BOTH added: the reference
+// accumulates the convolution into the gated output and then adds the
+// unmodified multi-stream state (ops/ple.py, _ple_conv_kernel tail), so a
+// PLE layer REPLACES the state rather than contributing to it.
+inline void ple_conv(const float* conv_in, const float* gated,
+                     const float* hidden, const float* w, float* out,
+                     int t, int channels, int kernel, int dilation) {
+    for (int c = 0; c < channels; ++c) {
+        float acc = 0.0f;
+        for (int k = 0; k < kernel; ++k) {
+            const int at = t - (kernel - 1 - k) * dilation;
+            if (at < 0) continue;
+            acc += w[size_t(c) * kernel + k] * conv_in[size_t(at) * channels + c];
+        }
+        out[size_t(c)] = hidden[size_t(c)] + gated[size_t(c)] + silu(acc);
+    }
+}
+
+
+// ---------------------------------------------------------------------
+//  The n-gram table's LAYOUT is computed, not stored.
+//
+//  Nothing in the checkpoint says how big each head's slice of the table
+//  is or where it starts: Qwen4ExpNGramEmbedding derives both, and a
+//  reader that guesses "equal slices of ngram_vocab_size_base" lands one
+//  row out on the second head and silently reads a neighbour's rows.
+//
+//  sizes[h]   = the (global_head+1)-th PRIME strictly greater than
+//               ngram_vocab_size_base - 1, where global_head is
+//               ple_dense_layer_id * ngram_heads + h.  Primes, because
+//               the index is a modulus.
+//  offsets[h] = the running sum of the sizes before it.
+//  multipliers[i] = 2 * (splitmix64(seed + 0x9E3779B97F4A7C15*(i+1)
+//                        + 10007*ple_dense_layer_id) % half) + 1,
+//               with half = ((2^63 - 1) / vocab_size) / 2, so every
+//               multiplier is ODD and a token times it cannot overflow
+//               into the sign bit.
+//
+//  Source: ref/qwen4_exp_nvidia_ngram_embedding.py:535-630.
+// ---------------------------------------------------------------------
+inline uint64_t splitmix64(uint64_t v) {
+    v += 0x9E3779B97F4A7C15ull;
+    v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9ull;
+    v = (v ^ (v >> 27)) * 0x94D049BB133111EBull;
+    return v ^ (v >> 31);
+}
+
+inline uint64_t mulmod64(uint64_t a, uint64_t b, uint64_t m) {
+    return uint64_t((unsigned __int128)a * b % m);
+}
+
+inline uint64_t powmod64(uint64_t b, uint64_t e, uint64_t m) {
+    uint64_t r = 1 % m;
+    b %= m;
+    while (e) { if (e & 1) r = mulmod64(r, b, m); b = mulmod64(b, b, m); e >>= 1; }
+    return r;
+}
+
+// Deterministic Miller-Rabin with the reference's own witness set.
+inline bool is_prime_64(uint64_t v) {
+    if (v < 2) return false;
+    for (uint64_t p : {2ull,3ull,5ull,7ull,11ull,13ull,17ull,19ull,23ull,
+                       29ull,31ull,37ull})
+        if (v % p == 0) return v == p;
+    uint64_t d = v - 1; int s = 0;
+    while ((d & 1) == 0) { d >>= 1; ++s; }
+    for (uint64_t a : {2ull,325ull,9375ull,28178ull,450775ull,9780504ull,
+                       1795265022ull}) {
+        if (a % v == 0) continue;
+        uint64_t x = powmod64(a, d, v);
+        if (x == 1 || x == v - 1) continue;
+        bool ok = false;
+        for (int i = 1; i < s; ++i) {
+            x = mulmod64(x, x, v);
+            if (x == v - 1) { ok = true; break; }
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+inline uint64_t nth_prime_after(uint64_t start, int count) {
+    uint64_t prime = start;
+    for (int i = 0; i < count; ++i) {
+        uint64_t c = prime + 1;
+        if (c <= 2) { prime = 2; continue; }
+        if ((c & 1) == 0) ++c;
+        while (!is_prime_64(c)) c += 2;
+        prime = c;
+    }
+    return prime;
+}
+
+inline void ngram_multipliers(int ngram_size, int64_t vocab_size, int64_t seed,
+                              int ple_dense_layer_id, int64_t* out) {
+    const int64_t max_mul = std::numeric_limits<int64_t>::max() / vocab_size;
+    const int64_t half    = max_mul / 2 > 0 ? max_mul / 2 : 1;
+    const uint64_t base   = uint64_t(seed) +
+                            10007ull * uint64_t(ple_dense_layer_id);
+    for (int i = 0; i < ngram_size; ++i) {
+        const uint64_t v = base + 0x9E3779B97F4A7C15ull * uint64_t(i + 1);
+        out[i] = 2 * int64_t(splitmix64(v) % uint64_t(half)) + 1;
+    }
+}
+
+// Returns the total row count; sizes and offsets are ngram_heads long.
+inline int64_t ngram_vocab_layout(int64_t vocab_base, int ngram_heads,
+                                  int ple_dense_layer_id, int64_t* sizes,
+                                  int64_t* offsets) {
+    int64_t off = 0;
+    for (int h = 0; h < ngram_heads; ++h) {
+        const int global_head = ple_dense_layer_id * ngram_heads + h;
+        sizes[h]   = int64_t(nth_prime_after(uint64_t(vocab_base - 1),
+                                             global_head + 1));
+        offsets[h] = off;
+        off += sizes[h];
+    }
+    return off;
 }
 
 } // namespace qwen4_exp

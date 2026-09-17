@@ -27,6 +27,7 @@
 #include "b70/http_request.hpp"
 #include "b70/qwen35.hpp"
 #include "b70/dflash_config.hpp"
+#include "b70/qwen4_exp.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -1971,8 +1972,78 @@ struct Grimoire {
         uint8_t *k_cache = nullptr, *v_cache = nullptr;
         sycl::half *k_cache_f16 = nullptr, *v_cache_f16 = nullptr;
         bool muse_sliding = false;
+
+        // ---- Qwen4-Exp ------------------------------------------------
+        // TWO hyper-connections per layer.  There is no input_layernorm
+        // and no post_attention_layernorm on this architecture: hc_attn's
+        // norm stands where the first would be and hc_mlp's where the
+        // second would.
+        struct HCDev {
+            bf16_t*  norm = nullptr;    // [hc*H], applied as (1 + w)
+            DevQuant down;              // [lowrank][hc*H]
+            DevQuant inject;            // [hc][hc*H]  -- absent on the mixer
+            DevQuant up;                // [hc*H][lowrank]
+        };
+        HCDev hc_attn, hc_mlp;
+
+        // QSA.  The indexer keeps TWO caches: the raw index keys exactly
+        // as projected (no norm, no RoPE -- the pooling averages those),
+        // and the pooled-then-normed-then-roped key of each COMPLETE
+        // block, which is what the block scores are computed against.
+        bool     qsa = false;
+        DevQuant ix_qk;                 // index_qk_proj [(ih+ikv)*ihd][H]
+        bf16_t  *ix_qn = nullptr, *ix_kn = nullptr;
+        float   *ix_kraw = nullptr;     // [max_seq][ihd]
+        float   *ix_kcmp = nullptr;     // [max_seq/ratio + 1][ihd]
+
+        // PLE.  Only on the layers named by ple_layer_ids.  The table is
+        // HOST memory by design (rule: this is the one exception to
+        // VRAM-only, and it is the architecture's own choice).
+        bool     ple = false;
+        int      ple_dense_id = 0;
+        // key and value stay SEPARATE.  Merged into one [hc*H + H][E]
+        // GEMM their rows interleave per token, and the PLE gate reads
+        // key with a stride of hc*H and value with a stride of H -- which
+        // is true at M == 1 and false for every batch.
+        DevQuant ple_key, ple_value;
+        bf16_t  *ple_nk=nullptr, *ple_nq=nullptr, *ple_nc=nullptr, *ple_cw=nullptr;
+        const bf16_t* ple_table = nullptr;
+        int64_t  ple_rows = 0;
+        int64_t *ple_mul=nullptr, *ple_size=nullptr, *ple_off=nullptr;
+        // The dilated conv's carried history: (kernel-1)*dilation rows of
+        // conv_in, oldest first.  Only this window is needed, which is
+        // what keeps a PLE layer's state constant in context length.
+        float   *ple_hist = nullptr;
     };
     std::vector<LayerDev> L;
+
+    // ---- Qwen4-Exp model-level state ---------------------------------
+    // The tail mixer.  It replaces the final norm entirely (this model has
+    // no model.norm), and it is the one hyper-connection built with
+    // use_combine = false, so it has no injection projection.
+    LayerDev::HCDev hc_final;
+    // The multi-stream residual and the buffers the two hyper-connections
+    // pass between them.  q4_pend / q4_pinj carry a DEFERRED combine into
+    // the next layer -- the reference returns the pair rather than
+    // combining at once, and the tail consumes whatever is still pending.
+    float   *q4_hyper=nullptr, *q4_normed=nullptr, *q4_gate=nullptr;
+    float   *q4_lora=nullptr,  *q4_inj=nullptr,   *q4_pinj=nullptr;
+    float   *q4_pend=nullptr;
+    // QSA scratch
+    float   *q4_ixqk=nullptr, *q4_pool=nullptr, *q4_lg=nullptr;
+    int32_t *q4_blk=nullptr, *q4_idx=nullptr, *q4_vis=nullptr;
+    int32_t *q4_seq=nullptr, *q4_qpos=nullptr;
+    // PLE scratch
+    float   *q4_emb=nullptr, *q4_kv=nullptr, *q4_gated=nullptr, *q4_conv=nullptr;
+    int64_t *q4_ids=nullptr;
+    // The token history the n-gram hash walks backwards through.  The
+    // engine never kept one; PLE needs ngram_size-1 predecessors and the
+    // EOS walk needs them in order, so the whole request's tokens live
+    // here.  int32 * max_seq is nothing next to a KV cache.
+    int32_t *q4_tok=nullptr;
+    int      q4_blocks_cap = 0;    // compressed key rows a QSA layer holds
+    int      q4_ix_width = 0;      // index_qk_proj output rows
+    int      q4_expand_w = 0;      // token_topk + compress_ratio - 1
 
     // MoVA scratch, one set reused by every layer: router logits, the
     // top-k table, and one expert output row.  Tiny -- 64 + 4 + 4 + 1024
@@ -2630,6 +2701,7 @@ struct Grimoire {
     const float* forward(int token);      // returns device logits
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
     const float* forward_gemma4(int token); // gemma-4 sandwich + per-layer-type
+    const float* forward_qwen4_exp(int token); // Qwen4-Exp: HC + QSA + PLE
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
     // gemma-4's v_norm is Gemma4RMSNorm(head_dim, eps, with_scale=False):
     // a norm with NO weight parameter, i.e. scale 1.  gemma-4 runs on the
@@ -2646,6 +2718,8 @@ struct Grimoire {
                       std::vector<int32_t>* next_tokens = nullptr);
     bool prefill_gemma4(const std::vector<int32_t>& tokens,
                         std::vector<int32_t>* next_tokens = nullptr);
+    bool prefill_qwen4_exp(const std::vector<int32_t>& tokens,
+                           std::vector<int32_t>* next_tokens);
     void snapshot_recurrent();
     void restore_recurrent(int saved_pos);
     void commit_spec_prefix(int saved_pos, int accepted);
@@ -2948,37 +3022,71 @@ std::string Grimoire::unsupported_reason() const {
     // collapsing the hyper-connection streams to one residual all produce
     // fluent text that is not the model's output.
     if (cfg.is_qwen4_exp) {
-        std::string missing;
-        bool any_qsa = false;
-        for (bool b : cfg.qsa_attention) any_qsa = any_qsa || b;
-        if (any_qsa || cfg.indexer_n_heads > 0)
-            missing += "qwen_sparse_attention (the QSA indexer scores "
-                       "mean-pooled key blocks and attention runs over the "
-                       "top-k gathered blocks; this engine has only dense "
-                       "and sliding-window flash attention)";
-        if (!cfg.ple_layer_ids.empty() || cfg.ngram_vocab_base > 0) {
-            if (!missing.empty()) missing += "; ";
-            missing += "the PLE n-gram embedding (a " +
-                       std::to_string(cfg.ngram_vocab_base) +
-                       "-entry bigram/trigram table read at the ple_layer_ids "
-                       "layers through a short conv; nothing here reads an "
-                       "n-gram table)";
+        // All three mechanisms are implemented now (forward_qwen4_exp,
+        // and their operators in ops.cpp / attention.cpp against the host
+        // references in b70/qwen4_exp.hpp).  What is refused here is what
+        // is NOT built, named individually -- each of these is a wrong
+        // number or a hang rather than an error if it runs anyway.
+        if (tp_enabled() || pp_enabled())
+            return "qwen4_exp under TP or PP.  The multi-stream residual is "
+                   "hc_count * hidden wide and a stage boundary transports ONE "
+                   "tensor, so a pending hyper-connection combine has to be "
+                   "materialised before it is sent and the stages have to agree "
+                   "on hc_count; neither is wired.  Single process works.";
+        if (cfg.hc_count <= 0 || cfg.hc_lowrank <= 0)
+            return "qwen4_exp with no hc_count / hc_lowrank: the residual "
+                   "stream's width and the mix's rank are not optional, and "
+                   "zero would collapse the streams silently.";
+        {
+            bool any_qsa = false;
+            for (bool b : cfg.qsa_attention) any_qsa = any_qsa || b;
+            if (any_qsa) {
+                if (cfg.indexer_n_heads <= 0 || cfg.indexer_head_dim <= 0 ||
+                    cfg.indexer_budget <= 0 || cfg.indexer_compress_ratio <= 0)
+                    return "qwen4_exp has qwen_sparse_attention layers but the "
+                           "indexer_* fields are incomplete.  The reference "
+                           "requires all five together (_validate_qsa_config); "
+                           "running QSA as dense attention is fluent and wrong.";
+                if (cfg.indexer_kv_heads != 1)
+                    return "qwen_sparse_attention with indexer_kv_heads != 1.  "
+                           "The indexer is MQA: one key stream shared by every "
+                           "indexer head, which the reference validates and the "
+                           "scoring assumes.";
+                if (cfg.indexer_budget % cfg.indexer_compress_ratio)
+                    return "qwen_sparse_attention with indexer_budget not a "
+                           "multiple of indexer_compress_ratio: the block top-k "
+                           "is their quotient and the remainder would silently "
+                           "drop tokens off the end of the expansion.";
+            }
         }
-        if (cfg.hc_count > 1) {
-            if (!missing.empty()) missing += "; ";
-            missing += "HyperConnections (the residual stream is " +
-                       std::to_string(cfg.hc_count) +
-                       " streams wide with a rank-" +
-                       std::to_string(cfg.hc_lowrank) +
-                       " mix, not this engine's single residual)";
+        if (!cfg.ple_layer_ids.empty()) {
+            const int nh = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+            if (cfg.ngram_size < 2 || cfg.heads_per_ngram <= 0)
+                return "qwen4_exp PLE with ngram_size < 2 or heads_per_ngram "
+                       "<= 0: there would be no n-gram order to hash.";
+            if (nh <= 0 || cfg.ple_embed_dim % nh)
+                return "qwen4_exp PLE: ple_embed_dim is not divisible by the "
+                       "(ngram_size - 1) * heads_per_ngram n-gram heads, so the "
+                       "table rows do not tile the embedding.";
+            if (cfg.ple_conv_kernel <= 0)
+                return "qwen4_exp PLE with ple_conv_kernel_size <= 0: the short "
+                       "convolution is part of the layer's output, not an "
+                       "optional extra.";
         }
-        if (missing.empty())
-            missing = "its Qwen4-Exp specific layers";
-        return "qwen4_exp (Qwen3.8-Flash-Next) needs " + missing +
-               ".  The Gated-DeltaNet + MoE base underneath IS supported, "
-               "which is why this refuses by name rather than running the "
-               "part it recognises -- each missing piece is fluent when "
-               "faked, not loud.  Reference: ref/qwen4_exp_*.py.  Refusing.";
+        // mtp_enabled(), NOT mtp.ok: this runs before a single byte is
+        // uploaded, which is the whole point of asking here, and the MTP
+        // head is loaded hundreds of lines later.  Reading mtp.ok would
+        // be a refusal that can never fire -- a claim that decays the
+        // moment anyone relies on it (rule 13).
+        if (mtp_enabled() || std::getenv("GRIMOIRE_DFLASH_MODEL"))
+            return "qwen4_exp with speculation requested (GRIMOIRE_MTP or a "
+                   "DFlash drafter).  A drafter here has to be fed the "
+                   "PRE-mixer multi-stream hidden state -- the reference "
+                   "keeps a separate _mtp_hidden_buffer for exactly that -- "
+                   "and not the single stream the output head reads.  Handing "
+                   "it the mixed row drafts from the wrong tensor and shows up "
+                   "only as poor acceptance, never as an error.  Unset it and "
+                   "the model runs.";
     }
 
     // head_dim per lane.  Every flash kernel in attention.cpp and
@@ -3228,6 +3336,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
 
     std::printf("  final_norm    ... ");
     std::fflush(stdout);
+    // Qwen4-Exp has NO model.norm.  Its tail hyper-connection mixer's
+    // grouped norm plus gated mean is the final norm and the thing the
+    // head reads, so asking for model.norm.weight here would report a
+    // missing tensor for something the checkpoint correctly does not
+    // have.  The mixer is use_combine = false: no injection projection.
+    if (cfg.is_qwen4_exp) {
+        if (!pp_enabled() || pp_rank == pp_world-1) {
+            hc_final.norm = dev_copy_t<bf16_t>(q, ck, ck.hc_final.norm,
+                                "hyper_connection_mixer.hc_norm", &ok);
+            hc_final.down = quantize_upload_t(q, ck, ck.hc_final.down, Fmt::BF16,
+                                "hyper_connection_mixer.down", &ok);
+            hc_final.up   = quantize_upload_t(q, ck, ck.hc_final.up, Fmt::BF16,
+                                "hyper_connection_mixer.up", &ok);
+        }
+    } else
     if(!pp_enabled()||pp_rank==pp_world-1)
         fnorm=dev_copy_t<bf16_t>(q,ck,ck.final_norm,"model.norm.weight",&ok);
     if(cfg.is_muse&&(!pp_enabled()||pp_rank==pp_world-1))
@@ -3348,13 +3471,136 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             cfg.muse_sliding_attention[size_t(i)];
         if (pp_enabled() && (i < pp_begin || i >= pp_end)) continue;
 
-        d.in_norm   = dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok);
-        d.post_norm = dev_copy_t<bf16_t>(lq, ck, src.post_attn_norm, "post_attention_layernorm", &ok);
+        // Qwen4-Exp has NEITHER of these: the two hyper-connections'
+        // grouped norms stand where they would be.  Asking for them
+        // reports a missing tensor for something the file correctly does
+        // not contain.
+        if (!cfg.is_qwen4_exp) {
+            d.in_norm   = dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok);
+            d.post_norm = dev_copy_t<bf16_t>(lq, ck, src.post_attn_norm, "post_attention_layernorm", &ok);
+        }
         if(cfg.is_muse){
             d.in_norm_f16=upload_f16_vector_t(lq,ck,src.input_norm,
                                                "input_layernorm.fp16",&ok);
             d.post_norm_f16=upload_f16_vector_t(lq,ck,src.post_attn_norm,
                                                  "post_attention_layernorm.fp16",&ok);
+        }
+
+        // ---- Qwen4-Exp: the residual structure, QSA and PLE ----------
+        // The hyper-connection projections stay BF16 because the
+        // reference builds them with quant_config=None -- they are the
+        // gate that decides how much of every block reaches every stream,
+        // they are tiny next to a single expert, and quantizing them
+        // would be this engine's choice rather than the model's.
+        if (cfg.is_qwen4_exp) {
+            const int HC = cfg.hc_count, WIDE = HC * H;
+            auto up_hc = [&](LayerDev::HCDev& dst,
+                             const Qwen35Layer::HCRef& sref, const char* tag) {
+                dst.norm = dev_copy_t<bf16_t>(lq, ck, sref.norm,
+                                              (std::string(tag)+".hc_norm").c_str(), &ok);
+                dst.down = quantize_upload_t(lq, ck, sref.down, Fmt::BF16,
+                                             (std::string(tag)+".down").c_str(), &ok);
+                if (sref.inject.ok())
+                    dst.inject = quantize_upload_t(lq, ck, sref.inject, Fmt::BF16,
+                                              (std::string(tag)+".inject").c_str(), &ok);
+                dst.up   = quantize_upload_t(lq, ck, sref.up, Fmt::BF16,
+                                             (std::string(tag)+".up").c_str(), &ok);
+            };
+            up_hc(d.hc_attn, src.hc_attn, "attn_hyper_connection");
+            up_hc(d.hc_mlp,  src.hc_mlp,  "mlp_hyper_connection");
+            acct(size_t(d.hc_attn.down.w.bytes() + d.hc_attn.up.w.bytes() +
+                        d.hc_attn.inject.w.bytes() + d.hc_mlp.down.w.bytes() +
+                        d.hc_mlp.up.w.bytes() + d.hc_mlp.inject.w.bytes()));
+
+            d.qsa = src.qsa;
+            if (d.qsa) {
+                const int IHD = cfg.indexer_head_dim;
+                d.ix_qk = quantize_upload_t(lq, ck, src.ix_qk_proj, Fmt::BF16,
+                                            "indexer.index_qk_proj", &ok);
+                d.ix_qn = dev_copy_t<bf16_t>(lq, ck, src.ix_q_norm,
+                                             "indexer.q_layernorm", &ok);
+                d.ix_kn = dev_copy_t<bf16_t>(lq, ck, src.ix_k_norm,
+                                             "indexer.k_layernorm", &ok);
+                d.ix_kraw = sycl::malloc_device<float>(size_t(max_seq)*IHD, lq);
+                const int nb = max_seq / cfg.indexer_compress_ratio + 1;
+                d.ix_kcmp = sycl::malloc_device<float>(size_t(nb)*IHD, lq);
+                if (!d.ix_kraw || !d.ix_kcmp) {
+                    err = "QSA indexer key cache allocation failed"; return false;
+                }
+                acct(size_t(max_seq + nb) * IHD * 4);
+            }
+
+            d.ple = src.ple;
+            d.ple_dense_id = src.ple_dense_id;
+            if (d.ple) {
+                const int NH = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+                d.ple_key   = quantize_upload_t(lq, ck, src.ple_key, PF,
+                                                "ple.key_proj", &ok);
+                d.ple_value = quantize_upload_t(lq, ck, src.ple_value, PF,
+                                                "ple.value_proj", &ok);
+                d.ple_nk = dev_copy_t<bf16_t>(lq, ck, src.ple_norm_key,
+                                              "ple.norm_key", &ok);
+                d.ple_nq = dev_copy_t<bf16_t>(lq, ck, src.ple_norm_query,
+                                              "ple.norm_query", &ok);
+                d.ple_nc = dev_copy_t<bf16_t>(lq, ck, src.ple_norm_conv,
+                                              "ple.norm_conv", &ok);
+                d.ple_cw = dev_copy_t<bf16_t>(lq, ck, src.ple_conv1d,
+                                              "ple.conv1d", &ok);
+                const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+                d.ple_hist = sycl::malloc_device<float>(
+                    size_t(state_len > 0 ? state_len : 1) * WIDE, lq);
+
+                // The n-gram table is the ONE weight in this engine that
+                // does NOT go to the card.  20,000,000 rows per head slice
+                // is the architecture's design and vLLM pins it in host
+                // memory for exactly this reason; the gather touches only
+                // the rows of the current tokens.
+                if (!src.ple_table.ok() || src.ple_table.t.shape.size() != 2) {
+                    err = "ple_embedding.ngram_embedding has an unexpected shape";
+                    return false;
+                }
+                if (src.ple_table.t.dtype != STDtype::BF16) {
+                    err = "the PLE n-gram table is not BF16; this engine reads "
+                          "that table straight out of host memory and has no "
+                          "dequantiser on that path";
+                    return false;
+                }
+                const int64_t rows = int64_t(src.ple_table.t.shape[0]);
+                const int64_t wid  = int64_t(src.ple_table.t.shape[1]);
+                bf16_t* host = sycl::malloc_host<bf16_t>(size_t(rows*wid), lq);
+                if (!host) { err = "PLE host table allocation failed"; return false; }
+                // read_raw, NOT ck.data(): the file mappings were dropped
+                // above (unmap_all), so every read after that point is a
+                // pread and dereferencing the mapping is a segfault.
+                if (!ck.read_raw(src.ple_table, host, err)) {
+                    err = "reading the PLE n-gram table failed: " + err;
+                    return false;
+                }
+                d.ple_table = host;
+                d.ple_rows  = rows;
+
+                // Layout and multipliers are DERIVED, never stored.
+                std::vector<int64_t> mul(size_t(cfg.ngram_size), 0),
+                                     sz(size_t(NH), 0), of(size_t(NH), 0);
+                qwen4_exp::ngram_multipliers(cfg.ngram_size, cfg.vocab,
+                                             cfg.ngram_seed, d.ple_dense_id,
+                                             mul.data());
+                const int64_t total = qwen4_exp::ngram_vocab_layout(
+                    cfg.ngram_vocab_base, NH, d.ple_dense_id, sz.data(), of.data());
+                if (total > rows) {
+                    err = "the PLE table is smaller than the derived n-gram "
+                          "layout needs; ngram_vocab_size_base or the head "
+                          "count does not match this checkpoint";
+                    return false;
+                }
+                d.ple_mul  = sycl::malloc_device<int64_t>(mul.size(), lq);
+                d.ple_size = sycl::malloc_device<int64_t>(sz.size(), lq);
+                d.ple_off  = sycl::malloc_device<int64_t>(of.size(), lq);
+                lq.memcpy(d.ple_mul,  mul.data(), mul.size()*sizeof(int64_t));
+                lq.memcpy(d.ple_size, sz.data(),  sz.size()*sizeof(int64_t));
+                lq.memcpy(d.ple_off,  of.data(),  of.size()*sizeof(int64_t)).wait();
+                acct(size_t(d.ple_key.w.bytes() + d.ple_value.w.bytes()));
+            }
         }
 
         if (d.kind == LayerKind::LINEAR_ATTN) {
@@ -5185,6 +5431,62 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     s.part    = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS * cfg.max_head_dim(), q);
     s.pm      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
     s.pl      = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.n_heads * MAX_SPLITS, q);
+
+    // ---- Qwen4-Exp scratch -------------------------------------------
+    // Everything here is sized for ONE row; the batched prefill allocates
+    // its own wider copies.  q4_pend / q4_pinj are the DEFERRED combine
+    // the reference carries from one layer into the next.
+    if (cfg.is_qwen4_exp) {
+        const int HC = cfg.hc_count, WIDE = HC * H, LR = cfg.hc_lowrank;
+        q4_hyper  = sycl::malloc_device<float>(size_t(WIDE), q);
+        q4_normed = sycl::malloc_device<float>(size_t(WIDE), q);
+        q4_gate   = sycl::malloc_device<float>(size_t(WIDE), q);
+        q4_lora   = sycl::malloc_device<float>(size_t(LR > 0 ? LR : 1), q);
+        q4_inj    = sycl::malloc_device<float>(size_t(HC), q);
+        q4_pinj   = sycl::malloc_device<float>(size_t(HC), q);
+        q4_pend   = sycl::malloc_device<float>(size_t(H), q);
+        q4_tok    = sycl::malloc_device<int32_t>(size_t(max_seq), q);
+        if (!q4_hyper||!q4_normed||!q4_gate||!q4_lora||!q4_inj||!q4_pinj||
+            !q4_pend||!q4_tok) {
+            err = "Qwen4-Exp hyper-connection scratch allocation failed";
+            return false;
+        }
+        bool any_qsa = false, any_ple = false;
+        for (const auto& dl : L) { any_qsa |= dl.qsa; any_ple |= dl.ple; }
+        if (any_qsa) {
+            const int IHD = cfg.indexer_head_dim;
+            const int IH  = cfg.indexer_n_heads, IKV = cfg.indexer_kv_heads;
+            q4_ix_width  = (IH + IKV) * IHD;
+            q4_blocks_cap= max_seq / cfg.indexer_compress_ratio + 1;
+            const int btopk = cfg.indexer_budget / cfg.indexer_compress_ratio;
+            q4_expand_w  = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
+            q4_ixqk = sycl::malloc_device<float>(size_t(q4_ix_width), q);
+            q4_pool = sycl::malloc_device<float>(size_t(IHD), q);
+            q4_lg   = sycl::malloc_device<float>(size_t(q4_blocks_cap), q);
+            q4_blk  = sycl::malloc_device<int32_t>(size_t(btopk > 0 ? btopk : 1), q);
+            q4_idx  = sycl::malloc_device<int32_t>(size_t(q4_expand_w), q);
+            q4_vis  = sycl::malloc_device<int32_t>(1, q);
+            q4_seq  = sycl::malloc_device<int32_t>(1, q);
+            q4_qpos = sycl::malloc_device<int32_t>(1, q);
+            if (!q4_ixqk||!q4_pool||!q4_lg||!q4_blk||!q4_idx||!q4_vis||
+                !q4_seq||!q4_qpos) { err = "QSA scratch allocation failed"; return false; }
+        }
+        if (any_ple) {
+            const int NH = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+            q4_ids   = sycl::malloc_device<int64_t>(size_t(NH), q);
+            q4_emb   = sycl::malloc_device<float>(size_t(cfg.ple_embed_dim), q);
+            q4_kv    = sycl::malloc_device<float>(size_t(WIDE + H), q);
+            q4_gated = sycl::malloc_device<float>(size_t(WIDE), q);
+            // state_len history rows plus this token's row, contiguous,
+            // so the conv reads one array and a tap that falls into the
+            // history needs no special case.
+            const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+            q4_conv  = sycl::malloc_device<float>(size_t(state_len + 1) * WIDE, q);
+            if (!q4_ids||!q4_emb||!q4_kv||!q4_gated||!q4_conv) {
+                err = "PLE scratch allocation failed"; return false;
+            }
+        }
+    }
     q.wait();
 
     if (pp_enabled() || tp_enabled()) {
@@ -5310,6 +5612,16 @@ void Grimoire::reset() {
             q.memset(d.dn_state, 0, size_t(Hv) * Dv * Dk * sizeof(float));
         if (d.conv_ring)
             q.memset(d.conv_ring, 0, size_t(qkv_ch) * (cfg.conv_kernel - 1) * sizeof(float));
+        // A PLE layer's dilated conv reads (kernel-1)*dilation rows of
+        // history.  Zero is what "before the start of the sequence"
+        // means, and a stale window from the previous request is a wrong
+        // number rather than an error.
+        if (d.ple_hist) {
+            const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+            q.memset(d.ple_hist, 0,
+                     size_t(state_len > 0 ? state_len : 1) *
+                     size_t(cfg.hc_count) * cfg.hidden * sizeof(float));
+        }
     }
     // MTP head KV cache. Nothing outside mtp_draft ever writes it: prefill
     // does not touch it and reset() did not clear it, so a long-lived server
@@ -6941,6 +7253,290 @@ const float* Grimoire::forward_gemma4(int token) {
     return s.logits;
 }
 
+// ---------------------------------------------------------------------
+//  Qwen4-Exp (Qwen3.8-Flash-Next).
+//
+//  The BODY is Qwen3-Next -- Gated DeltaNet interleaved with attention,
+//  MoE FFNs -- and every kernel below is the one the generic forward()
+//  uses.  What is different is the RESIDUAL STRUCTURE around them, and
+//  it is different enough that running this checkpoint through forward()
+//  would produce fluent text that is not the model's output:
+//
+//   * There is no input_layernorm and no post_attention_layernorm.  Each
+//     block is wrapped by a HYPER-CONNECTION whose grouped norm stands
+//     where those would be, and the residual stream is hc_count STREAMS
+//     wide.  The embedding is REPEATED into every stream (ref:510), not
+//     projected.
+//   * A combine is DEFERRED.  A layer returns its FFN output and the
+//     injection that belongs with it, and the NEXT hyper-connection
+//     consumes the pair (ref:276-332).  Only PLE, a stage boundary and
+//     the tail force it early.
+//   * A PLE layer ADDS TO the multi-stream state directly, so any
+//     pending combine must be materialised first (ref:290-296).
+//   * There is no model.norm.  The tail mixer's norm plus gated mean is
+//     the final norm and what the head reads (ref:576).
+//
+//  Reference: ref/qwen4_exp_nvidia_model.py and the three modules it
+//  pulls in; the derivation of every operator is in b70/qwen4_exp.hpp.
+// ---------------------------------------------------------------------
+const float* Grimoire::forward_qwen4_exp(int token) {
+    const int H  = cfg.hidden;
+    const int HC = cfg.hc_count, WIDE = HC * H, LR = cfg.hc_lowrank;
+    const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
+    const std::vector<sycl::event> none{};
+
+    launch_embed(q, embed, token, s.h, H, none);
+    // The n-gram hash walks backwards through the request's own tokens,
+    // so the engine has to keep them.  One int per position.
+    {
+        int32_t* tok = q4_tok; const int at = pos; const int32_t tv = token;
+        q.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) { tok[at] = tv; });
+    }
+    // hidden_states = embed(id).repeat(1, hc_count) -- the SAME row in
+    // every stream.  A projection here would be a different model.
+    for (int c = 0; c < HC; ++c)
+        q.memcpy(q4_hyper + size_t(c) * H, s.h, size_t(H) * sizeof(float));
+
+    bool pending = false;          // is a deferred combine outstanding?
+
+    // mix(), fused with a pending combine when there is one.  Returns the
+    // block input in `block_out` and, when this hyper-connection has an
+    // injection projection, the injection logits in `inj_out`.
+    auto hc_mix = [&](const LayerDev::HCDev& hc, const float* pend,
+                      const float* pinj, float* inj_out, float* block_out) {
+        if (pend) launch_hc_combine(q, q4_hyper, pinj, pend, q4_hyper,
+                                    1, HC, H, none);
+        launch_hc_norm(q, q4_hyper, hc.norm, q4_normed, 1, HC, H,
+                       cfg.rms_eps, none);
+        gemv_any(hc.down, q4_normed, q4_lora, none);
+        launch_hc_silu(q, q4_lora, LR, HC, none);
+        gemv_any(hc.up, q4_lora, q4_gate, none);
+        launch_hc_gated_mean(q, q4_gate, q4_normed, block_out, 1, HC, H, none);
+        if (inj_out && hc.inject.w.N)
+            gemv_any(hc.inject, q4_normed, inj_out, none);
+    };
+
+    for (int i = 0; i < cfg.n_layers; ++i) {
+        LayerDev& d = L[i];
+
+        // ---- PLE ------------------------------------------------------
+        if (d.ple) {
+            // PLE adds to the multi-stream state, so a deferred combine
+            // has to land first or it would be added to a state that the
+            // combine then overwrites.
+            if (pending) {
+                launch_hc_combine(q, q4_hyper, q4_pinj, q4_pend, q4_hyper,
+                                  1, HC, H, none);
+                pending = false;
+            }
+            const int NH = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+            const int HD = cfg.ple_embed_dim / NH;
+            const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+            launch_ple_ngram_ids(q, q4_tok, q4_ids, pos, 1, d.ple_mul,
+                                 d.ple_size, d.ple_off, cfg.ngram_size - 1,
+                                 cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
+            launch_ple_embed_gather(q, d.ple_table, q4_ids, q4_emb, 1, NH, HD,
+                                    d.ple_rows, none);
+            gemv_any(d.ple_key,   q4_emb, q4_kv, none);
+            gemv_any(d.ple_value, q4_emb, q4_kv + WIDE, none);
+            // key is the first hc*H rows of the merged projection, value
+            // the H after it.
+            launch_ple_gate(q, q4_kv, q4_kv + WIDE, q4_hyper, d.ple_nk,
+                            d.ple_nq, d.ple_nc, q4_gated,
+                            q4_conv + size_t(state_len) * WIDE, 1, HC, H,
+                            cfg.rms_eps, none);
+            // The history rows sit in front of this token's row, so the
+            // conv reads one contiguous array and a tap that falls before
+            // the start of the sequence lands on a zeroed row.
+            q.memcpy(q4_conv, d.ple_hist, size_t(state_len) * WIDE * sizeof(float));
+            launch_ple_conv(q, q4_conv, q4_gated, q4_hyper, d.ple_cw,
+                            q4_hyper, state_len, 1, WIDE,
+                            cfg.ple_conv_kernel, cfg.ngram_size, none);
+            // roll the window: drop the oldest row, append this one
+            if (state_len > 0) {
+                q.memcpy(d.ple_hist, q4_conv + size_t(WIDE),
+                         size_t(state_len) * WIDE * sizeof(float));
+                q.wait();
+            }
+        }
+
+        // ---- attention hyper-connection -------------------------------
+        hc_mix(d.hc_attn, pending ? q4_pend : nullptr,
+               pending ? q4_pinj : nullptr, q4_inj, s.h2);
+        pending = false;
+
+        if (d.kind == LayerKind::LINEAR_ATTN) {
+            const int qkv_ch = d.la_qkv.output_rows();
+            gemv_any(d.la_qkv, s.h2, s.qkv, none);
+            ConvParams cp{};
+            cp.x = s.qkv; cp.weight = d.la_conv; cp.ring = d.conv_ring;
+            cp.out = s.qkv; cp.channels = qkv_ch; cp.kernel = cfg.conv_kernel;
+            launch_causal_conv1d_l2norm(q, cp, 2 * Hk, Dk, none);
+            float* qv = s.qkv;
+            float* kv = s.qkv + int64_t(Hk) * Dk;
+            float* vv = s.qkv + int64_t(2) * Hk * Dk;
+            gemv_any(d.la_ab, s.h2, s.abuf, none);
+            launch_deltanet_gates(q, s.abuf, s.abuf + Hv, d.la_Alog, d.la_dtb,
+                                  s.alpha, s.beta, Hv, none);
+            DeltaNetParams dp{};
+            dp.q = qv; dp.k = kv; dp.v = vv;
+            dp.a = s.alpha; dp.beta = s.beta;
+            dp.state = d.dn_state; dp.out = s.attn_out;
+            dp.n_heads = Hv; dp.k_dim = Dk; dp.v_dim = Dv;
+            dp.n_k_heads = Hk;
+            launch_deltanet_step(q, dp, none);
+            gemv_any(d.la_z, s.h2, s.zbuf, none);
+            launch_rmsnorm_gate_silu(q, s.attn_out, s.zbuf, d.la_norm,
+                                     Hv, Dv, cfg.rms_eps, none);
+            gemv_any(d.la_out, s.attn_out, s.moe_y, none);
+        } else {
+            const int QD = d.q_proj.output_rows();
+            const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
+            gemv_any(d.q_proj, s.h2, s.qkv, none);
+            if (gated)
+                launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
+                                   cfg.n_heads, d.head_dim, none);
+            float* qvec = gated ? s.qsplit : s.qkv;
+            gemv_any(d.k_proj, s.h2, s.zbuf, none);
+            gemv_any(d.v_proj, s.h2, s.bbuf, none);
+            const int qheads = cfg.n_heads;
+            launch_qk_norm_rope(q, qvec, s.zbuf, d.q_norm, d.k_norm,
+                qheads, d.kv_heads, d.head_dim, s.d_pos,
+                d.rope_theta, d.partial_rope, cfg.rms_eps, none);
+            launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
+                                 s.d_pos, d.kv_heads, d.head_dim, max_seq, none);
+
+            if (d.qsa) {
+                // ---- the indexer --------------------------------------
+                // Its q and k come from the BLOCK INPUT, not from the
+                // attention's own q/k: index_qk_proj is a separate,
+                // narrower projection (ref/qwen4_exp_nvidia_qsa.py:500).
+                const int IH  = cfg.indexer_n_heads;
+                const int IHD = cfg.indexer_head_dim;
+                const int RAT = cfg.indexer_compress_ratio;
+                const int BTK = cfg.indexer_budget / RAT;
+                gemv_any(d.ix_qk, s.h2, q4_ixqk, none);
+                float* iq = q4_ixqk;
+                float* ik = q4_ixqk + int64_t(IH) * IHD;
+                launch_rmsnorm_heads(q, iq, d.ix_qn, IH, IHD, cfg.rms_eps,
+                                     true, none);
+                // launch_rope_rows, not launch_rope_dev: the batched
+                // prefill ropes the indexer query with this kernel and
+                // the two must be the SAME arithmetic, or the two paths
+                // rank blocks differently and disagree on which tokens
+                // the layer attends to.
+                launch_rope_rows(q, iq, 1, IH, IHD, pos, d.rope_theta,
+                                 d.partial_rope, none);
+                // The RAW key is cached exactly as projected: the pooling
+                // averages raw keys and norms and ropes the POOLED result.
+                q.memcpy(d.ix_kraw + int64_t(pos) * IHD, ik,
+                         size_t(IHD) * sizeof(float));
+                if ((pos + 1) % RAT == 0) {
+                    const int b = pos / RAT;
+                    launch_qsa_pool_blocks(q, d.ix_kraw, q4_pool, b, 1, RAT,
+                                           IHD, none);
+                    launch_rmsnorm_heads(q, q4_pool, d.ix_kn, 1, IHD,
+                                         cfg.rms_eps, true, none);
+                    launch_qsa_rope_blocks(q, q4_pool, b, 1, IHD, RAT,
+                                           d.rope_theta, d.partial_rope, none);
+                    q.memcpy(d.ix_kcmp + int64_t(b) * IHD, q4_pool,
+                             size_t(IHD) * sizeof(float));
+                }
+                // Only COMPLETE blocks are rankable; the block still being
+                // filled reaches attention through the expand's tail.
+                const int seq_len = pos + 1;
+                const int visible = seq_len / RAT;
+                {
+                    int32_t* v = q4_vis; int32_t* sq = q4_seq; int32_t* qp = q4_qpos;
+                    const int32_t vv2 = visible, sv = seq_len, pv = pos;
+                    q.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) {
+                        v[0] = vv2; sq[0] = sv; qp[0] = pv;
+                    });
+                }
+                launch_qsa_index_logits(q, iq, d.ix_kcmp, q4_lg, 1, IH, IHD,
+                                        visible > 0 ? visible : 1, q4_vis, none);
+                launch_qsa_topk_blocks(q, q4_lg, q4_blk, 1,
+                                       visible > 0 ? visible : 1, BTK,
+                                       q4_vis, none);
+                launch_qsa_expand_blocks(q, q4_blk, q4_idx, 1, BTK, RAT,
+                                         cfg.indexer_budget, q4_seq, q4_qpos,
+                                         none);
+                launch_qsa_attention(q, qvec, d.k_cache, d.v_cache, q4_idx,
+                                     s.attn_out, 1, qheads, d.kv_heads,
+                                     d.head_dim, max_seq, q4_expand_w,
+                                     cfg.attn_softmax_scale(d.head_dim), none);
+            } else {
+                AttnParams ap{};
+                ap.q = qvec; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
+                ap.out = s.attn_out;
+                ap.seq_len = pos + 1; ap.seq_cap = max_seq;
+                ap.head_dim = d.head_dim; ap.num_heads = qheads;
+                ap.num_kv_heads = d.kv_heads;
+                ap.softmax_scale = cfg.attn_softmax_scale(d.head_dim);
+                ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
+                ap.splits = GRAPH_SPLITS;
+                ap.d_seq_len = s.d_seq_len;
+                launch_flash_decode(q, ap, none);
+                launch_flash_merge(q, ap, none);
+            }
+            if (gated) {
+                const int gn = cfg.n_heads * d.head_dim;
+                launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, gn, none);
+            }
+            gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+        }
+
+        // ---- FFN hyper-connection -------------------------------------
+        // combine_and_mix: this layer's attention output and the
+        // injection its own mix produced, then the next block input.
+        hc_mix(d.hc_mlp, s.moe_y, q4_inj, q4_pinj, s.h2);
+
+        if (d.moe_layer) {
+            const int I = cfg.moe_inter;
+            gemv_any(d.router, s.h2, s.rlogits, none);
+            launch_router_topk(q, s.rlogits, cfg.n_experts, cfg.top_k,
+                               s.d_expert, s.d_weight, true, none);
+            launch_moe_gate_up(q, d.moe, s.d_expert, s.h2, s.moe_h, none);
+            launch_moe_down(q, d.moe, s.d_expert, s.d_weight, s.moe_h,
+                            q4_pend, none);
+            (void)I;
+            if (d.sh_gu.w.N) {
+                const int SI = d.sh_gu.output_rows() / 2;
+                ffn_gemv(d, true, s.h2, s.sh_g, none);
+                launch_swiglu(q, s.sh_g, s.sh_g + SI, s.sh_g, SI, none);
+                ffn_gemv(d, false, s.sh_g, s.sh_out, none);
+                if (d.has_sh_gate) {
+                    gemv_any(d.sh_gate_q, s.h2, s.sh_gate_val, none);
+                    launch_scale_by_sigmoid(q, s.sh_out, s.sh_gate_val, H, none);
+                }
+                launch_add(q, q4_pend, s.sh_out, H, none);
+            }
+        } else {
+            const int FI = d.sh_gu.output_rows() / 2;
+            ffn_gemv(d, true, s.h2, s.sh_g, none);
+            launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, none);
+            ffn_gemv(d, false, s.sh_g, q4_pend, none);
+        }
+        pending = true;    // (q4_pend, q4_pinj) travel to the next layer
+    }
+
+    // ---- the tail mixer ----------------------------------------------
+    // It consumes whatever combine is still pending and produces the
+    // single stream the head reads.  use_combine is false here, so it
+    // emits no injection -- and there is no model.norm after it.
+    hc_mix(hc_final, pending ? q4_pend : nullptr,
+           pending ? q4_pinj : nullptr, nullptr, s.h2);
+    gemv_any(lm_head, s.h2, s.logits, none);
+    if (fusion_mask & 8) launch_incr_pos2(q, s.d_pos, s.d_seq_len, none);
+    else {
+        launch_incr_pos(q, s.d_pos, none);
+        launch_incr_pos(q, s.d_seq_len, none);
+    }
+    ++pos;
+    return s.logits;
+}
+
 const float* Grimoire::forward(int token) {
     check_token(token);
     if(mtp.ok && pos>0 && !recording) {
@@ -6949,6 +7545,7 @@ const float* Grimoire::forward(int token) {
     }
     if (cfg.is_muse) return forward_muse(token);
     if (cfg.is_gemma4) return forward_gemma4(token);
+    if (cfg.is_qwen4_exp) return forward_qwen4_exp(token);
     if (dag && !tp_enabled()) return forward_dag(token);
     const int H  = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
@@ -8632,6 +9229,9 @@ bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
 // of silence rule 12 was written about.  The gate reads this to prove the
 // path it is comparing actually ran.
 long g_gemma4_batched_prefills = 0;
+// Same, for Qwen4-Exp: a prefill-vs-decode gate that cannot see the
+// fallback proves nothing at all.
+long g_qwen4_exp_batched_prefills = 0;
 
 // ---------------------------------------------------------------------
 // gemma-4 batched prefill.
@@ -8909,6 +9509,411 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     return true;
 }
 
+// ---------------------------------------------------------------------
+//  Qwen4-Exp batched prefill.
+//
+//  forward_qwen4_exp()'s graph, M tokens at a time.  It is NOT the
+//  generic prefill with different weights: that one folds each block's
+//  output straight into a single residual and normalises on the way into
+//  the next, and this model's residual is hc_count streams wide with a
+//  gated injection.  Running a prompt through the generic path would
+//  contradict decode token for token and still emit fluent text.
+//
+//  Every line below is a line of forward_qwen4_exp(), in the same order.
+//  What is genuinely different at M > 1:
+//
+//   * the indexer's key rows are STRIDED (the projection emits q|k per
+//     token), so they are gathered rather than memcpy'd;
+//   * a whole RANGE of key blocks completes inside one batch;
+//   * every QSA row has its own visible-block count, so the metadata is
+//     computed on the device instead of passed as a scalar;
+//   * the PLE conv reads this batch's rows plus the carried history in
+//     one contiguous array.
+//
+//  The prefix cache is deliberately NOT used here.  It snapshots the KV
+//  caches and the recurrent state; it knows nothing about the indexer's
+//  two key caches or a PLE layer's conv history, so a hit would restore
+//  a model that is half this request and half the last one -- silently.
+// ---------------------------------------------------------------------
+bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
+                                 std::vector<int32_t>* next_tokens) {
+    const int M = int(tokens.size());
+    if (M <= 0 || pos + M > max_seq) return false;
+    if (next_tokens) return false;              // no speculative verify path
+    if (pp_enabled() || tp_enabled()) return false;
+    const int start_pos = pos;
+
+    const int H = cfg.hidden, QH = cfg.n_heads;
+    const int HC = cfg.hc_count, WIDE = HC * H, LR = cfg.hc_lowrank;
+    const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
+    const int qkv_ch = 2 * Hk * Dk + Hv * Dv;
+    const int HDX = cfg.max_head_dim(), KVHX = cfg.max_kv_heads();
+    int IX = 0, WX = std::max({H, WIDE, QH * HDX, KVHX * HDX, qkv_ch});
+    for (const auto& d : L) {
+        IX = std::max(IX, d.sh_gu.output_rows() / 2);
+        const DevQuant* ws[] = {&d.q_proj, &d.k_proj, &d.v_proj, &d.o_proj,
+            &d.la_qkv, &d.la_z, &d.la_ab, &d.la_out, &d.sh_gu, &d.sh_down,
+            &d.hc_attn.down, &d.hc_attn.up, &d.hc_attn.inject,
+            &d.hc_mlp.down, &d.hc_mlp.up, &d.hc_mlp.inject,
+            &d.ix_qk, &d.ple_key, &d.ple_value};
+        for (const auto* w : ws) {
+            WX = std::max(WX, w->w.N);
+            WX = std::max(WX, w->w.K);
+        }
+    }
+    WX = std::max(WX, 2 * IX);
+    WX = std::max(WX, cfg.moe_inter > 0 ? 2 * cfg.moe_inter : 1);
+
+    const int RAT   = cfg.indexer_compress_ratio > 0 ? cfg.indexer_compress_ratio : 1;
+    const int BTK   = cfg.indexer_budget / RAT;
+    const int IH    = cfg.indexer_n_heads, IHD = cfg.indexer_head_dim;
+    const int IKV   = cfg.indexer_kv_heads;
+    const int NBLK  = q4_blocks_cap > 0 ? q4_blocks_cap : 1;
+    const int EXPW  = q4_expand_w > 0 ? q4_expand_w : 1;
+    const int NH    = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+    const int PHD   = NH > 0 ? cfg.ple_embed_dim / NH : 0;
+    const int SLEN  = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+    const int TK    = std::max(1, cfg.top_k);
+    const int MI    = std::max(1, cfg.moe_inter);
+    const int E     = std::max(1, cfg.n_experts);
+
+    auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
+    float* hyper  = df(size_t(M) * WIDE);
+    float* normed = df(size_t(M) * WIDE);
+    float* gate   = df(size_t(M) * WIDE);
+    float* lora   = df(size_t(M) * std::max(1, LR));
+    float* inj    = df(size_t(M) * HC);
+    float* pinj   = df(size_t(M) * HC);
+    float* pend   = df(size_t(M) * H);
+    float* blk_in = df(size_t(M) * H);
+    float* t0     = df(size_t(M) * WX);
+    float* t1     = df(size_t(M) * WX);
+    float* t2     = df(size_t(M) * WX);
+    float* t3     = df(size_t(M) * WX);
+    float* attn   = df(size_t(M) * std::max(QH * HDX, Hv * Dv));
+    float* gsplit = df(size_t(M) * std::max(1, QH * HDX));
+    float* alpha  = df(size_t(M) * std::max(1, Hv));
+    float* beta   = df(size_t(M) * std::max(1, Hv));
+    float* mh     = df(size_t(M) * TK * MI);
+    float* rlog   = df(size_t(M) * E);
+    float* shout  = df(size_t(M) * H);
+    sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
+    int8_t* a8    = sycl::malloc_device<int8_t>(size_t(M) * WX, q);
+    float*  a8s   = df(size_t(M));
+    int32_t* dtok = sycl::malloc_device<int32_t>(size_t(M), q);
+    int32_t* rex  = sycl::malloc_device<int32_t>(size_t(M) * TK, q);
+    float*   rwt  = df(size_t(M) * TK);
+    // QSA
+    float*   ixqk = df(size_t(M) * std::max(1, (IH + IKV) * IHD));
+    float*   ixq  = df(size_t(M) * std::max(1, IH * IHD));
+    float*   ixk  = df(size_t(M) * std::max(1, IHD));
+    float*   lgt  = df(size_t(M) * NBLK);
+    int32_t* bsel = sycl::malloc_device<int32_t>(size_t(M) * std::max(1, BTK), q);
+    int32_t* idx  = sycl::malloc_device<int32_t>(size_t(M) * EXPW, q);
+    int32_t* vis  = sycl::malloc_device<int32_t>(size_t(M), q);
+    int32_t* sql  = sycl::malloc_device<int32_t>(size_t(M), q);
+    int32_t* qps  = sycl::malloc_device<int32_t>(size_t(M), q);
+    // PLE
+    int64_t* pids = sycl::malloc_device<int64_t>(size_t(M) * std::max(1, NH), q);
+    float*   pemb = df(size_t(M) * std::max(1, cfg.ple_embed_dim));
+    float*   pkey = df(size_t(M) * WIDE);
+    float*   pval = df(size_t(M) * H);
+    float*   pgat = df(size_t(M) * WIDE);
+    float*   pcnv = df(size_t(SLEN + M) * WIDE);
+
+    std::vector<void*> mem = {(void*)hyper,(void*)normed,(void*)gate,(void*)lora,
+        (void*)inj,(void*)pinj,(void*)pend,(void*)blk_in,(void*)t0,(void*)t1,
+        (void*)t2,(void*)t3,(void*)attn,(void*)gsplit,(void*)alpha,(void*)beta,
+        (void*)mh,(void*)rlog,(void*)shout,(void*)xb,(void*)a8,(void*)a8s,
+        (void*)dtok,(void*)rex,(void*)rwt,(void*)ixqk,(void*)ixq,(void*)ixk,
+        (void*)lgt,
+        (void*)bsel,(void*)idx,(void*)vis,(void*)sql,(void*)qps,(void*)pids,
+        (void*)pemb,(void*)pkey,(void*)pval,(void*)pgat,(void*)pcnv};
+    auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
+    for (void* p : mem) if (!p) { cleanup(); return false; }
+
+    const std::vector<sycl::event> none{};
+    const float eps = cfg.rms_eps;
+    const bool noxmx = std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX") != nullptr &&
+                       !device_can_matrix(q);
+
+    Xe2DenseMXFP4 q4_dense_f32 = load_xe2_dense_mxfp4_f32();
+    Xe2DenseW4A8  q4_w4a8 = w4a8_enabled()
+        ? load_xe2_dense_w4a8(M <= 16 ? "grimoire_xe2_dense_w4a8_f32_m16"
+                                      : "grimoire_xe2_dense_w4a8_f32")
+        : nullptr;
+
+    bool ok = true;
+    // The same tuned dispatch prefill_gemma4() uses, and for the same
+    // reasons: rule 1 (a converted weight's MXFP4 payload is FREED, so
+    // the pointer and not the format decides), rule 4 (a W4A8 tile is
+    // 256 wide in N and does not clamp) and rule 5 (a short prompt takes
+    // the 16-row tile, not the 128-row one).
+    auto mm = [&](const DevQuant& w, const float* x, float* y) {
+        if (!ok) return;
+        if (w.w.N <= 0) { ok = false; return; }
+        if (noxmx) { launch_gemm_batched(q, w.w, x, y, M, none); return; }
+        if (w.has_i4() && q4_w4a8 && a8 && a8s && (w.w.N % 256) == 0) {
+            launch_quantize_rows_int8(q, x, a8, a8s, M, w.w.K, none);
+            q4_w4a8(&q, a8, w.i4, w.i4s, a8s, y, M, w.w.N, w.w.K);
+            return;
+        }
+        if (!w.w.payload) {
+            for (int r = 0; r < M; ++r)
+                gemv_any(w, x + size_t(r) * w.w.K, y + size_t(r) * w.w.N, none);
+            return;
+        }
+        launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
+        if (q4_dense_f32 && w.w.fmt == Fmt::MXFP4) {
+            q4_dense_f32(&q, xb, w.w.payload,
+                         static_cast<const unsigned char*>(w.w.scales),
+                         y, M, w.w.N, w.w.K);
+            return;
+        }
+        launch_gemm_xmx(q, w.w, xb, y, M, none);
+    };
+
+    q.memcpy(dtok, tokens.data(), size_t(M) * sizeof(int32_t));
+    // The n-gram hash reads the request's own token history.
+    q.memcpy(q4_tok + start_pos, tokens.data(), size_t(M) * sizeof(int32_t));
+    launch_embed_batched(q, embed, dtok, t0, M, H, none);
+    // hidden = embed(ids).repeat(1, hc_count): the SAME row in every
+    // stream, not a projection.
+    for (int c = 0; c < HC; ++c)
+        launch_copy_rows_strided(q, t0, hyper + int64_t(c) * H, M, H, WIDE,
+                                 H, none);
+
+    bool pending = false;
+    auto hc_mix = [&](const LayerDev::HCDev& hc, const float* pblk,
+                      const float* pin, float* inj_out, float* block_out) {
+        if (!ok) return;
+        if (pblk) launch_hc_combine(q, hyper, pin, pblk, hyper, M, HC, H, none);
+        launch_hc_norm(q, hyper, hc.norm, normed, M, HC, H, eps, none);
+        mm(hc.down, normed, lora);
+        launch_hc_silu(q, lora, M * LR, HC, none);
+        mm(hc.up, lora, gate);
+        launch_hc_gated_mean(q, gate, normed, block_out, M, HC, H, none);
+        if (inj_out && hc.inject.w.N) mm(hc.inject, normed, inj_out);
+    };
+
+    for (int i = 0; i < cfg.n_layers && ok; ++i) {
+        LayerDev& d = L[i];
+
+        if (d.ple) {
+            if (pending) {
+                launch_hc_combine(q, hyper, pinj, pend, hyper, M, HC, H, none);
+                pending = false;
+            }
+            launch_ple_ngram_ids(q, q4_tok, pids, start_pos, M, d.ple_mul,
+                                 d.ple_size, d.ple_off, cfg.ngram_size - 1,
+                                 cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
+            launch_ple_embed_gather(q, d.ple_table, pids, pemb, M, NH, PHD,
+                                    d.ple_rows, none);
+            mm(d.ple_key,   pemb, pkey);
+            mm(d.ple_value, pemb, pval);
+            if (!ok) break;
+            launch_ple_gate(q, pkey, pval, hyper, d.ple_nk, d.ple_nq, d.ple_nc,
+                            pgat, pcnv + int64_t(SLEN) * WIDE, M, HC, H,
+                            eps, none);
+            q.memcpy(pcnv, d.ple_hist, size_t(SLEN) * WIDE * sizeof(float));
+            launch_ple_conv(q, pcnv, pgat, hyper, d.ple_cw, hyper, SLEN, M,
+                            WIDE, cfg.ple_conv_kernel, cfg.ngram_size, none);
+            // Carry the last SLEN rows into the next call.  pcnv is the
+            // old history followed by this batch, contiguously, so the
+            // last SLEN rows of the whole sequence are simply rows
+            // [M, M+SLEN) -- no special case for a batch shorter than the
+            // window, because the rows it did not replace are still in
+            // front of it.
+            if (SLEN > 0) {
+                q.memcpy(d.ple_hist, pcnv + int64_t(M) * WIDE,
+                         size_t(SLEN) * WIDE * sizeof(float));
+                q.wait();
+            }
+        }
+
+        hc_mix(d.hc_attn, pending ? pend : nullptr, pending ? pinj : nullptr,
+               inj, blk_in);
+        pending = false;
+        if (!ok) break;
+
+        if (d.kind == LayerKind::LINEAR_ATTN) {
+            mm(d.la_qkv, blk_in, t0);
+            if (!ok) break;
+            ConvParams cp{t0, d.la_conv, d.conv_ring, nullptr, qkv_ch,
+                          cfg.conv_kernel};
+            launch_causal_conv1d_split_prefill(q, cp, M, t1, t2, t3, nullptr,
+                                               Hk * Dk, Hv * Dv);
+            launch_l2norm_heads(q, t1, M * Hk, Dk, none);
+            launch_l2norm_heads(q, t2, M * Hk, Dk, none);
+            mm(d.la_ab, blk_in, t0);
+            if (!ok) break;
+            launch_deltanet_gates_batched(q, t0, d.la_Alog, d.la_dtb,
+                                          alpha, beta, M, Hv);
+            if (M <= 16) {
+                for (int t = 0; t < M; ++t) {
+                    DeltaNetParams sp{};
+                    sp.q = t1 + size_t(t) * Hk * Dk;
+                    sp.k = t2 + size_t(t) * Hk * Dk;
+                    sp.v = t3 + size_t(t) * Hv * Dv;
+                    sp.a = alpha + size_t(t) * Hv;
+                    sp.beta = beta + size_t(t) * Hv;
+                    sp.state = d.dn_state;
+                    sp.out = attn + size_t(t) * Hv * Dv;
+                    sp.n_heads = Hv; sp.k_dim = Dk; sp.v_dim = Dv;
+                    sp.n_k_heads = Hk;
+                    launch_deltanet_step(q, sp, none);
+                }
+            } else {
+                DeltaNetPrefillParams dp{t1, t2, t3, alpha, beta, d.dn_state,
+                                         attn, Hv, Dk, Dv, M, Hk};
+                launch_deltanet_prefill(q, dp);
+            }
+            mm(d.la_z, blk_in, t3);
+            if (!ok) break;
+            launch_rmsnorm_gate_silu(q, attn, t3, d.la_norm, M * Hv, Dv,
+                                     eps, none);
+            mm(d.la_out, attn, pend);
+        } else {
+            const int HD = d.head_dim, KVH = d.kv_heads;
+            const bool gated = (d.q_proj.output_rows() == 2 * QH * HD);
+            mm(d.q_proj, blk_in, t0);
+            if (!ok) break;
+            float* qv = t0;
+            if (gated) {
+                launch_split_qgate_batched(q, t0, t1, gsplit, M, QH, HD, none);
+                qv = t1;
+            }
+            mm(d.k_proj, blk_in, t2);
+            mm(d.v_proj, blk_in, t3);
+            if (!ok) break;
+            int nconv_groups = 1; float nconv_offset = 1.0f;
+            get_norm_convention(&nconv_groups, &nconv_offset);
+            launch_qk_norm_rope_batched(q, qv, t2, d.q_norm, d.k_norm, M,
+                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps,
+                none, nconv_offset);
+            launch_kv_append_batched(q, t2, t3, d.k_cache, d.v_cache, M,
+                                     start_pos, KVH, HD, max_seq, none);
+
+            if (d.qsa) {
+                const int total = start_pos + M;
+                mm(d.ix_qk, blk_in, ixqk);
+                if (!ok) break;
+                // BOTH halves have to be gathered out first.  The
+                // projection emits [q | k] PER TOKEN, so at M > 1 the
+                // query heads are strided by the whole projection width
+                // -- and launch_rmsnorm_heads, launch_rope_rows and
+                // launch_qsa_index_logits all index their heads
+                // CONTIGUOUSLY.  At M == 1 the two layouts coincide,
+                // which is why decode never saw it.
+                launch_copy_rows_strided(q, ixqk, ixq, M,
+                                         (IH + IKV) * IHD, IH * IHD,
+                                         IH * IHD, none);
+                launch_copy_rows_strided(q, ixqk + int64_t(IH) * IHD, ixk, M,
+                                         (IH + IKV) * IHD, IHD, IHD, none);
+                launch_rmsnorm_heads(q, ixq, d.ix_qn, M * IH, IHD, eps,
+                                     true, none);
+                launch_rope_rows(q, ixq, M, IH, IHD, start_pos, d.rope_theta,
+                                 d.partial_rope, none);
+                q.memcpy(d.ix_kraw + int64_t(start_pos) * IHD, ixk,
+                         size_t(M) * IHD * sizeof(float));
+                // Every block whose LAST token arrived in this batch.
+                const int b0 = start_pos / RAT, b1 = total / RAT;
+                if (b1 > b0) {
+                    float* dst = d.ix_kcmp + int64_t(b0) * IHD;
+                    launch_qsa_pool_blocks(q, d.ix_kraw, dst, b0, b1 - b0,
+                                           RAT, IHD, none);
+                    launch_rmsnorm_heads(q, dst, d.ix_kn, b1 - b0, IHD, eps,
+                                         true, none);
+                    launch_qsa_rope_blocks(q, dst, b0, b1 - b0, IHD, RAT,
+                                           d.rope_theta, d.partial_rope, none);
+                }
+                launch_qsa_row_meta(q, vis, sql, qps, M, start_pos, total,
+                                    RAT, none);
+                const int nb = b1 > 0 ? b1 : 1;
+                launch_qsa_index_logits(q, ixq, d.ix_kcmp, lgt, M, IH, IHD,
+                                        nb, vis, none);
+                launch_qsa_topk_blocks(q, lgt, bsel, M, nb, BTK, vis, none);
+                launch_qsa_expand_blocks(q, bsel, idx, M, BTK, RAT,
+                                         cfg.indexer_budget, sql, qps, none);
+                launch_qsa_attention(q, qv, d.k_cache, d.v_cache, idx, attn,
+                                     M, QH, KVH, HD, max_seq, EXPW,
+                                     cfg.attn_softmax_scale(HD), none);
+            } else {
+                launch_dflash2_block_attention(q, qv, d.k_cache, d.v_cache,
+                    attn, M, start_pos, QH, KVH, HD, max_seq, 0, true,
+                    cfg.attn_softmax_scale(HD), none);
+            }
+            if (gated)
+                launch_gate_sigmoid_mul_batched(q, attn, gsplit, M, QH * HD,
+                                                none);
+            mm(d.o_proj, attn, pend);
+        }
+        if (!ok) break;
+
+        hc_mix(d.hc_mlp, pend, inj, pinj, blk_in);
+        if (!ok) break;
+
+        if (d.moe_layer) {
+            mm(d.router, blk_in, rlog);
+            if (!ok) break;
+            launch_router_topk_batched(q, rlog, M, cfg.n_experts, cfg.top_k,
+                                       rex, rwt, true, none);
+            launch_moe_gate_up_batched(q, d.moe, rex, blk_in, mh, M);
+            launch_moe_down_batched(q, d.moe, rex, rwt, mh, pend, M);
+            if (d.sh_gu.w.N) {
+                const int SI = d.sh_gu.output_rows() / 2;
+                mm(d.sh_gu, blk_in, t0);
+                if (!ok) break;
+                launch_swiglu_batched(q, t0, t1, M, SI);
+                mm(d.sh_down, t1, shout);
+                if (!ok) break;
+                if (d.has_sh_gate) {
+                    mm(d.sh_gate_q, blk_in, t2);
+                    if (!ok) break;
+                    launch_scale_by_sigmoid_batched(q, shout, t2, M, H, none);
+                }
+                launch_add(q, pend, shout, int(size_t(M) * H), none);
+            }
+        } else {
+            const int FI = d.sh_gu.output_rows() / 2;
+            mm(d.sh_gu, blk_in, t0);
+            if (!ok) break;
+            launch_swiglu_batched(q, t0, t1, M, FI);
+            mm(d.sh_down, t1, pend);
+        }
+        pending = true;
+    }
+
+    if (!ok) { q.wait(); cleanup(); return false; }
+
+    // prefill()'s contract includes s.logits for the LAST row: the caller
+    // takes the first generated token from it and does not re-run the
+    // prompt's final token through forward().  The tail mixer therefore
+    // runs on that one row -- consuming the same pending combine decode
+    // would have consumed.
+    {
+        const int64_t off = int64_t(M - 1);
+        float* hl = hyper + off * WIDE;
+        if (pending)
+            launch_hc_combine(q, hl, pinj + off * HC, pend + off * H, hl,
+                              1, HC, H, none);
+        launch_hc_norm(q, hl, hc_final.norm, normed, 1, HC, H, eps, none);
+        gemv_any(hc_final.down, normed, lora, none);
+        launch_hc_silu(q, lora, LR, HC, none);
+        gemv_any(hc_final.up, lora, gate, none);
+        launch_hc_gated_mean(q, gate, normed, s.h2, 1, HC, H, none);
+        gemv_any(lm_head, s.h2, s.logits, none);
+        q.memcpy(s.h, s.h2, size_t(H) * sizeof(float));
+    }
+    q.wait_and_throw();
+    pos += M;
+    set_cursor(pos);
+    cleanup();
+    ++g_qwen4_exp_batched_prefills;
+    return true;
+}
+
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens) {
     if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
@@ -9011,6 +10016,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (cfg.is_gemma4) {
         if (std::getenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL")) return false;
         return prefill_gemma4(tokens, next_tokens);
+    }
+    // Qwen4-Exp: batched prefill below is the Qwen residual graph and
+    // this model's is the hyper-connection one, so running a prompt
+    // through it would contradict forward_qwen4_exp() token for token and
+    // still emit fluent text.  prefill_qwen4_exp() is that graph batched.
+    if (cfg.is_qwen4_exp) {
+        if (std::getenv("GRIMOIRE_QWEN4EXP_SEQUENTIAL_PREFILL")) return false;
+        return prefill_qwen4_exp(tokens, next_tokens);
     }
     const int M = int(tokens.size());
     if (M <= 0 || pos + M > max_seq) return false;

@@ -527,6 +527,144 @@ inline Arch hybrid(int L = 4, bool mtp = false) {
     return a;
 }
 
+// ---- Qwen4-Exp / Qwen3.8-Flash-Next ----------------------------------
+// The whole architecture in miniature: a Gated-DeltaNet / QSA interleave
+// with MoE FFNs, wrapped in hyper-connections, with one PLE layer.
+//
+// Every shape here is chosen so that a mechanism CANNOT be inert:
+//
+//  * hc_count 2, and the two streams start identical (the embedding is
+//    repeated), so if the injection or the gated mean collapsed them the
+//    model would still run -- which is why the matrix's "output depends
+//    on the input" row is not enough on its own and test_qwen4_exp_e2e
+//    exists as well.
+//  * layer_types alternate linear_attention / qwen_sparse_attention, so
+//    ONE model carries both dispatches.
+//  * indexer_compress_ratio 2 with budget 4 gives block_topk 2: short
+//    prompts really do have fewer visible blocks than topk, so the
+//    hole path runs rather than being a theoretical branch.
+//  * ple_layer_ids is [3] -- ONE-BASED, so the PLE lands on layer index
+//    2.  Getting that off by one puts it on a layer whose weights exist
+//    anyway and is silent.
+//  * ngram_size 3 with heads_per_ngram 2 gives four n-gram heads at TWO
+//    different orders (bigram and trigram), so a hash that mixed every
+//    predecessor into every head would differ here.
+//  * ngram_vocab_size_base 1024 keeps the derived prime layout small
+//    (1031 + 1033 + 1039 + 1049 = 4152 rows) while still being derived
+//    the same way the real 20,000,000-row table is.
+inline Arch qwen4_exp(int L = 4) {
+    const int H=64, Q=128, KV=32, V=128;          // Q is 2x: attn_output_gate
+    const int HC=2, LR=16, WIDE=HC*H;
+    const int MI=32, SI=32, E=4;
+    const int LK=2, LV=2, DK=16, DV=16, CONV=4;
+    const int QKV = 2*LK*DK + LV*DV;
+    const int IH=2, IKV=1, IHD=16, RATIO=2, BUDGET=4;
+    const int NGRAM=3, HPN=2, NH=(NGRAM-1)*HPN, PE=32;
+    // PLE weights exist on layers 2 AND 3, but ple_layer_ids names only
+    // one of them.  That is what makes the one-based reading TESTABLE: a
+    // gate can move the id by one and get a checkpoint that still loads,
+    // so the difference in the output is the placement rather than a
+    // missing tensor.  A single PLE layer would make the moved arm fail
+    // to load and prove nothing.
+    const int PLE_LAYER=2;                        // 0-based; config says 3
+    const int PK=2;                               // ple_conv_kernel_size
+    const int TABLE=8192;                         // >= the derived 4152
+    std::ostringstream c;
+    c << R"JSON({
+  "model_type": "qwen4_exp_text", "hidden_size": 64, "num_hidden_layers": )JSON" << L
+      << R"JSON(, "vocab_size": 128,
+  "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+  "intermediate_size": 128, "moe_intermediate_size": 32,
+  "shared_expert_intermediate_size": 32,
+  "num_experts": 4, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
+  "mlp_only_layers": [], "norm_topk_prob": true,
+  "rms_norm_eps": 1e-06, "tie_word_embeddings": false, "rope_theta": 1000000.0,
+  "eos_token_id": 3, "seed": 1234,
+  "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+  "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+  "linear_conv_kernel_dim": 4,
+  "hc_count": 2, "hc_lowrank": 16,
+  "ngram_size": 3, "heads_per_ngram": 2, "ple_conv_kernel_size": 2,
+  "ngram_vocab_size_base": 1024, "ple_embed_dim": 32,
+  "ple_layer_ids": [3],
+  "indexer_n_heads": 2, "indexer_kv_heads": 1, "indexer_head_dim": 16,
+  "indexer_budget": 4, "indexer_compress_ratio": 2,
+  "layer_types": [)JSON";
+    for (int l = 0; l < L; ++l)
+        c << (l ? "," : "") << (l % 2 == 0 ? R"("linear_attention")"
+                                           : R"("qwen_sparse_attention")");
+    c << "]}";
+    Arch a{"qwen4_exp", c.str(), {}, V, L};
+    auto& t = a.tensors;
+    // NO model.norm: the tail hyper-connection mixer replaces it, and it
+    // is the one mixer with no block_inject_weight (use_combine=false).
+    t = { {"model.embed_tokens.weight", {V,H}},
+          {"lm_head.weight", {V,H}},
+          {"model.hyper_connection_mixer.hc_norm.weight",            {WIDE}},
+          {"model.hyper_connection_mixer.input_mix_weight_down.weight", {LR,WIDE}},
+          {"model.hyper_connection_mixer.input_mix_weight_up.weight",   {WIDE,LR}} };
+    for (int l = 0; l < L; ++l) {
+        const std::string b = "model.layers." + std::to_string(l) + ".";
+        // NO input_layernorm and NO post_attention_layernorm.
+        for (const char* which : {"attn_hyper_connection", "mlp_hyper_connection"}) {
+            const std::string h = b + which + ".";
+            t.push_back({h+"hc_norm.weight",                  {WIDE}});
+            t.push_back({h+"input_mix_weight_down.weight",    {LR,WIDE}});
+            t.push_back({h+"block_inject_weight.weight",      {HC,WIDE}});
+            t.push_back({h+"input_mix_weight_up.weight",      {WIDE,LR}});
+        }
+        if (l % 2 == 0) {
+            const std::string la = b + "linear_attn.";
+            t.push_back({la+"in_proj_qkv.weight", {QKV,H}});
+            t.push_back({la+"in_proj_z.weight",   {LV*DV,H}});
+            t.push_back({la+"in_proj_a.weight",   {LV,H}});
+            t.push_back({la+"in_proj_b.weight",   {LV,H}});
+            t.push_back({la+"conv1d.weight",      {QKV,1,CONV}});
+            t.push_back({la+"A_log",              {LV}});
+            t.push_back({la+"dt_bias",            {LV}});
+            t.push_back({la+"norm.weight",        {DV}});
+            t.push_back({la+"out_proj.weight",    {H,LV*DV}});
+        } else {
+            const std::string sa = b + "self_attn.";
+            t.push_back({sa+"q_proj.weight", {Q,H}});
+            t.push_back({sa+"k_proj.weight", {KV,H}});
+            t.push_back({sa+"v_proj.weight", {KV,H}});
+            t.push_back({sa+"o_proj.weight", {H,Q/2}});
+            t.push_back({sa+"q_norm.weight", {16}});
+            t.push_back({sa+"k_norm.weight", {16}});
+            const std::string ix = sa + "indexer.";
+            t.push_back({ix+"index_qk_proj.weight", {(IH+IKV)*IHD, H}});
+            t.push_back({ix+"q_layernorm.weight",   {IHD}});
+            t.push_back({ix+"k_layernorm.weight",   {IHD}});
+        }
+        if (l == PLE_LAYER || l == PLE_LAYER + 1) {
+            const std::string pl = b + "ple.";
+            t.push_back({pl+"key_proj.weight",   {WIDE,PE}});
+            t.push_back({pl+"value_proj.weight", {H,PE}});
+            t.push_back({pl+"conv1d.weight",     {WIDE,1,PK}});
+            t.push_back({pl+"norm_key.weight",   {WIDE}});
+            t.push_back({pl+"norm_query.weight", {WIDE}});
+            t.push_back({pl+"norm_conv.weight",  {WIDE}});
+            t.push_back({pl+"ple_embedding.ngram_embedding.weight",
+                         {TABLE, PE/NH}});
+        }
+        const std::string m = b + "mlp.";
+        t.push_back({m+"gate.weight", {E,H}});
+        for (int e = 0; e < E; ++e) {
+            const std::string x = m+"experts."+std::to_string(e)+".";
+            t.push_back({x+"gate_proj.weight", {MI,H}});
+            t.push_back({x+"up_proj.weight",   {MI,H}});
+            t.push_back({x+"down_proj.weight", {H,MI}});
+        }
+        t.push_back({m+"shared_expert.gate_proj.weight", {SI,H}});
+        t.push_back({m+"shared_expert.up_proj.weight",   {SI,H}});
+        t.push_back({m+"shared_expert.down_proj.weight", {H,SI}});
+        t.push_back({m+"shared_expert_gate.weight",      {1,H}});
+    }
+    (void)BUDGET; (void)RATIO; (void)NH;
+    return a;
+}
+
 // ---- routed MoE with a shared expert (Qwen3-MoE shape) ----------------
 // Exercises the routed path, the shared expert and TP expert sharding.
 inline Arch moe(int L = 4, bool mtp = false) {

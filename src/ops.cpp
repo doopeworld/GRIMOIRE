@@ -1860,7 +1860,13 @@ sycl::event launch_qsa_index_logits(sycl::queue& q, const float* qv,
                             -std::numeric_limits<float>::infinity();
                     return;
                 }
-                const float* kn = keys + (int64_t(row) * n_blocks + n) * head_dim;
+                // ONE key cache, SHARED by every query row.  The blocks
+                // are the sequence's, not the query's: striding this by
+                // row reads past the blocks that were actually pooled and
+                // into whatever the allocation happened to hold, which is
+                // a wrong block ranking at M > 1 and perfectly fluent.
+                // (Decode is M == 1, so it never saw it.)
+                const float* kn = keys + int64_t(n) * head_dim;
                 float acc = 0.0f;
                 for (int hh = 0; hh < n_heads; ++hh) {
                     const float* qh = qv +
@@ -1879,32 +1885,240 @@ sycl::event launch_qsa_index_logits(sycl::queue& q, const float* qv,
     });
 }
 
-// Stage 3.  Selected blocks -> token indices.  A hole (-1) stays a hole:
-// clamping it to 0 would make every short sequence attend to its first
-// block over and over, which is silent.
+// RoPE over [rows][heads][dim] where row r sits at position first + r.
+// The engine's other rope launchers take ONE position (decode) or fuse
+// the norm (the batched qk path); the QSA indexer's query needs neither
+// and must not borrow the fused one, whose norm convention differs.
+sycl::event launch_rope_rows(sycl::queue& q, float* x, int rows, int heads,
+                             int dim, int first, float theta,
+                             float partial_factor,
+                             const std::vector<sycl::event>& deps) {
+    const int rot = int(dim * partial_factor) & ~1;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * heads * (rot / 2)),
+            [=](sycl::id<1> id) {
+                const int per = heads * (rot / 2);
+                const int r   = int(id[0] / per);
+                const int rem = int(id[0] % per);
+                const int hh  = rem / (rot / 2);
+                const int i   = rem % (rot / 2);
+                const float pos = float(first + r);
+                // EXACTLY launch_rope_dev's expression, not an equivalent
+                // one: the QSA indexer's query is roped here in the
+                // batched path and there in decode, and a low-precision
+                // powr would rank blocks slightly differently, which
+                // selects different tokens and is fluent.
+                const float inv = sycl::exp(-float(2 * i) / float(rot)
+                                            * sycl::log(theta));
+                const float ang = pos * inv;
+                const float cs = sycl::cos(ang), sn = sycl::sin(ang);
+                float* v = x + (int64_t(r) * heads + hh) * dim;
+                const float a = v[i], b = v[i + rot / 2];
+                v[i]           = a * cs - b * sn;
+                v[i + rot / 2] = a * sn + b * cs;
+            });
+    });
+}
+
+// Copy `width` floats out of each row of a wider array.  The indexer's
+// projection emits [q | k] per token, so the key rows are strided by the
+// whole projection width and a flat memcpy would interleave them.
+sycl::event launch_copy_rows_strided(sycl::queue& q, const float* src,
+                                     float* dst, int rows, int src_stride,
+                                     int dst_stride, int width,
+                                     const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * width),
+            [=](sycl::id<1> id) {
+                const int r = int(id[0] / width);
+                const int c = int(id[0] % width);
+                dst[int64_t(r) * dst_stride + c] =
+                    src[int64_t(r) * src_stride + c];
+            });
+    });
+}
+
+// Per-row QSA metadata: how many COMPLETE key blocks this row may see,
+// the sequence length its expansion is clipped to, and its own position.
+// Kept in device memory so no host round trip sits inside the layer loop.
+sycl::event launch_qsa_row_meta(sycl::queue& q, int32_t* visible,
+                                int32_t* seq_len, int32_t* query_pos,
+                                int rows, int first, int total,
+                                int compress_ratio,
+                                const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows)), [=](sycl::id<1> id) {
+            const int r = int(id[0]);
+            const int p = first + r;
+            const int a = (p + 1) / compress_ratio;
+            const int b = total / compress_ratio;
+            visible[r]   = a < b ? a : b;
+            seq_len[r]   = total;
+            query_pos[r] = p;
+        });
+    });
+}
+
+// Stage 1b.  Pool the raw index keys of one completed group.
+//
+// A block is COMPLETE when its last token arrives, and the reference
+// pools the ratio raw keys as they were projected -- before any norm and
+// before RoPE (ops/qsa.py, _compress_qsa_groups_kernel: it accumulates
+// raw_keys and divides by COMPRESS_RATIO, and the caller norms and ropes
+// the POOLED result afterwards).  Norming or roping first is a different
+// key and a different block ranking.
+sycl::event launch_qsa_pool_blocks(sycl::queue& q, const float* raw,
+                                   float* pooled, int first_block,
+                                   int n_blocks, int compress_ratio,
+                                   int head_dim,
+                                   const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n_blocks) * head_dim),
+            [=](sycl::id<1> id) {
+                const int b = int(id[0] / head_dim);
+                const int d = int(id[0] % head_dim);
+                const int t0 = (first_block + b) * compress_ratio;
+                float acc = 0.0f;
+                for (int r = 0; r < compress_ratio; ++r)
+                    acc += raw[int64_t(t0 + r) * head_dim + d];
+                pooled[int64_t(b) * head_dim + d] = acc / float(compress_ratio);
+            });
+    });
+}
+
+// Stage 1c.  RoPE the pooled keys at the position of the FIRST token of
+// each group (ops/qsa.py: first_position = end_position - ratio + 1), not
+// the last and not the block index.  NeoX-style halves, matching
+// launch_rope_dev.
+sycl::event launch_qsa_rope_blocks(sycl::queue& q, float* keys,
+                                   int first_block, int n_blocks,
+                                   int head_dim, int compress_ratio,
+                                   float theta, float partial_factor,
+                                   const std::vector<sycl::event>& deps) {
+    const int rot = int(head_dim * partial_factor) & ~1;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n_blocks) * (rot / 2)),
+            [=](sycl::id<1> id) {
+                const int b = int(id[0] / (rot / 2));
+                const int i = int(id[0] % (rot / 2));
+                const float pos = float((first_block + b) * compress_ratio);
+                const float inv = sycl::exp(-float(2 * i) / float(rot)
+                                            * sycl::log(theta));
+                const float ang = pos * inv;
+                const float cs = sycl::cos(ang), sn = sycl::sin(ang);
+                float* k = keys + int64_t(b) * head_dim;
+                const float a = k[i], bb = k[i + rot / 2];
+                k[i]           = a * cs - bb * sn;
+                k[i + rot / 2] = a * sn + bb * cs;
+            });
+    });
+}
+
+// Stage 2.  Top-k blocks per row, DESCENDING, holes left as -1.
+//
+// One work-group per row, one masked max-reduction per output slot.  That
+// is O(topk * n_blocks / WG) and it is not the fastest selection there
+// is; it is the one whose result is the reference's result, which is what
+// the gate compares against.  A cheaper threshold scan can replace it
+// once there is a number to beat (rule 8).
+sycl::event launch_qsa_topk_blocks(sycl::queue& q, const float* logits,
+                                   int32_t* out, int rows, int n_blocks,
+                                   int topk, const int32_t* visible,
+                                   const std::vector<sycl::event>& deps) {
+    constexpr int WG = 128;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1>   bv(WG, h);
+        sycl::local_accessor<int32_t, 1> bi(WG, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG),
+            [=](sycl::nd_item<1> it) {
+                const int row  = int(it.get_group(0));
+                const int lane = int(it.get_local_id(0));
+                const float* lg = logits + int64_t(row) * n_blocks;
+                int32_t* o = out + int64_t(row) * topk;
+                const int vis = visible ? visible[row] : n_blocks;
+                for (int k = lane; k < topk; k += WG) o[k] = -1;
+                sycl::group_barrier(it.get_group());
+                for (int k = 0; k < topk; ++k) {
+                    float best = -std::numeric_limits<float>::infinity();
+                    int32_t at = -1;
+                    for (int n = lane; n < n_blocks; n += WG) {
+                        if (n >= vis) continue;
+                        bool taken = false;
+                        for (int j = 0; j < k; ++j) taken = taken || (o[j] == n);
+                        if (taken) continue;
+                        const float v = lg[n];
+                        // Strict >, scanned in increasing n, reproduces
+                        // torch.topk's stable choice among equal logits.
+                        if (v > best) { best = v; at = n; }
+                    }
+                    bv[lane] = best; bi[lane] = at;
+                    sycl::group_barrier(it.get_group());
+                    for (int s = WG/2; s; s >>= 1) {
+                        if (lane < s) {
+                            const bool take = bv[lane+s] > bv[lane] ||
+                                (bv[lane+s] == bv[lane] && bi[lane+s] >= 0 &&
+                                 (bi[lane] < 0 || bi[lane+s] < bi[lane]));
+                            if (take) { bv[lane] = bv[lane+s]; bi[lane] = bi[lane+s]; }
+                        }
+                        sycl::group_barrier(it.get_group());
+                    }
+                    if (lane == 0) o[k] = bi[0];
+                    sycl::group_barrier(it.get_group());
+                    if (bi[0] < 0) break;      // fewer visible blocks than topk
+                }
+            });
+    });
+}
+
+// Stage 3.  Selected blocks -> token indices, plus the TAIL.
+//
+// A hole (-1) stays a hole: clamping it to 0 would make every short
+// sequence attend to its first block over and over, which is silent.
+//
+// The last compress_ratio-1 columns are the block still being filled.
+// Stage 1 only ranks COMPLETE blocks, so those tokens -- the query's own
+// among them -- are unreachable through the top-k and the reference
+// appends them unconditionally.  Host reference and the citation:
+// b70/qwen4_exp.hpp, qsa_expand_blocks.
 sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
                                      int32_t* out, int rows, int block_topk,
                                      int compress_ratio, int token_topk,
                                      const int32_t* seq_len,
+                                     const int32_t* query_pos,
                                      const std::vector<sycl::event>& deps) {
+    const int width = token_topk + compress_ratio - 1;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::range<1>(size_t(rows) * token_topk),
+        h.parallel_for(sycl::range<1>(size_t(rows) * width),
             [=](sycl::id<1> id) {
-                const int row = int(id[0] / token_topk);
-                const int w   = int(id[0] % token_topk);
-                const int b   = w / compress_ratio;
-                const int r   = w % compress_ratio;
+                const int row = int(id[0] / width);
+                const int w   = int(id[0] % width);
+                const int len = seq_len ? seq_len[row] : 0;
                 int t = -1;
-                if (b < block_topk) {
-                    const int bi = blocks[int64_t(row) * block_topk + b];
-                    if (bi >= 0) {
-                        const int cand = bi * compress_ratio + r;
-                        const int len = seq_len ? seq_len[row] : 0;
-                        if (cand >= 0 && cand < len) t = cand;
+                if (w < token_topk) {
+                    const int b = w / compress_ratio;
+                    const int r = w % compress_ratio;
+                    if (b < block_topk) {
+                        const int bi = blocks[int64_t(row) * block_topk + b];
+                        if (bi >= 0) {
+                            const int cand = bi * compress_ratio + r;
+                            if (cand >= 0 && cand < len) t = cand;
+                        }
                     }
+                } else {
+                    const int i          = w - token_topk;
+                    const int visible    = (query_pos ? query_pos[row] : 0) + 1;
+                    const int tail_start = visible / compress_ratio * compress_ratio;
+                    const int cand       = tail_start + i;
+                    if (i < visible - tail_start && cand < len) t = cand;
                 }
-                out[int64_t(row) * token_topk + w] = t;
+                out[int64_t(row) * width + w] = t;
             });
     });
 }
@@ -1924,7 +2138,7 @@ sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
 // The EOS walk is STICKY: once a predecessor is EOS, every older one is
 // treated as EOS too, which is what keeps an n-gram inside one document.
 sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
-                                 int64_t* out, int n_tokens,
+                                 int64_t* out, int first, int n_tokens,
                                  const int64_t* multipliers,
                                  const int64_t* sizes, const int64_t* offsets,
                                  int ngram_context_len, int heads_per_ngram,
@@ -1934,8 +2148,9 @@ sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(n_tokens) * ngram_heads),
             [=](sycl::id<1> id) {
-                const int t  = int(id[0] / ngram_heads);
+                const int r  = int(id[0] / ngram_heads);
                 const int hh = int(id[0] % ngram_heads);
+                const int t  = first + r;
                 const int order = hh / heads_per_ngram + 2;
                 int64_t mixed = int64_t(tokens[t]) * multipliers[0];
                 bool crossed = false;
@@ -1946,9 +2161,9 @@ sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
                     if (cand == eos_token_id) crossed = true;
                     if (order > shift) mixed ^= cand * multipliers[shift];
                 }
-                int64_t r = sizes[hh] ? (mixed % sizes[hh]) : 0;
-                if (r < 0) r += sizes[hh];      // torch.remainder semantics
-                out[int64_t(t) * ngram_heads + hh] = r + offsets[hh];
+                int64_t rem = sizes[hh] ? (mixed % sizes[hh]) : 0;
+                if (rem < 0) rem += sizes[hh];  // torch.remainder semantics
+                out[int64_t(r) * ngram_heads + hh] = rem + offsets[hh];
             });
     });
 }
@@ -1959,22 +2174,40 @@ sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
 // key and query are normalised SEPARATELY.  Normalising the concatenated
 // pair, or skipping one, changes d's scale and the gate still lands in
 // (0,1) -- nothing downstream would notice.
+// The PLE gate.  One work-group per (token, stream): the norms are
+// GROUPED by hidden, so every stream has its own variance, its own
+// affine weights and its own gate scalar.  `value` is H wide and the
+// same row is gated into every stream.
+//
+// Both outputs are produced here because the second is normed from the
+// first: conv_in = norm_conv(gated), not norm_conv(value).
+//
+// The affine weights are the part that is silent when dropped: the
+// docstring says "d = dot(RMSNorm(key), RMSNorm(query))" and
+// Qwen4ExpPLEGroupedNorm applies (1 + w) inside that RMSNorm.
 sycl::event launch_ple_gate(sycl::queue& q, const float* key,
-                            const float* query, float* out, int rows,
-                            int H, float eps,
+                            const float* value, const float* query,
+                            const bf16_t* nk, const bf16_t* nq,
+                            const bf16_t* ncw, float* gated, float* conv_in,
+                            int rows, int hc_count, int H, float eps,
                             const std::vector<sycl::event>& deps) {
     constexpr int WG = 128;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         sycl::local_accessor<float, 1> rk(WG, h), rq(WG, h), rd(WG, h);
-        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG),
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * hc_count * WG, WG),
             [=](sycl::nd_item<1> it) {
-                const int row  = int(it.get_group(0));
+                const int gid  = int(it.get_group(0));
+                const int row  = gid / hc_count;
+                const int c    = gid % hc_count;
                 const int lane = int(it.get_local_id(0));
-                const float* k = key   + int64_t(row) * H;
-                const float* v = query + int64_t(row) * H;
+                const int64_t base = (int64_t(row) * hc_count + c) * int64_t(H);
+                const int64_t wb   = int64_t(c) * H;
+                const float* k = key   + base;
+                const float* x = query + base;
+                const float* v = value + int64_t(row) * H;
                 float ks = 0.0f, qs = 0.0f;
-                for (int i = lane; i < H; i += WG) { ks += k[i]*k[i]; qs += v[i]*v[i]; }
+                for (int i = lane; i < H; i += WG) { ks += k[i]*k[i]; qs += x[i]*x[i]; }
                 rk[lane] = ks; rq[lane] = qs;
                 sycl::group_barrier(it.get_group());
                 for (int s = WG/2; s; s >>= 1) {
@@ -1984,21 +2217,107 @@ sycl::event launch_ple_gate(sycl::queue& q, const float* key,
                 const float ki = sycl::rsqrt(rk[0]/float(H) + eps);
                 const float qi = sycl::rsqrt(rq[0]/float(H) + eps);
                 float dot = 0.0f;
-                for (int i = lane; i < H; i += WG) dot += (k[i]*ki) * (v[i]*qi);
+                for (int i = lane; i < H; i += WG)
+                    dot += (k[i]*ki*(1.0f + bf16_to_f32(nk[wb+i])))
+                         * (x[i]*qi*(1.0f + bf16_to_f32(nq[wb+i])));
                 rd[lane] = dot;
                 sycl::group_barrier(it.get_group());
                 for (int s = WG/2; s; s >>= 1) {
                     if (lane < s) rd[lane] += rd[lane+s];
                     sycl::group_barrier(it.get_group());
                 }
-                if (lane == 0) {
-                    const float d = rd[0] / sycl::sqrt(float(H));
-                    const float sgn = d < 0.0f ? -1.0f : 1.0f;
-                    const float mag = sycl::fabs(d) > 1e-6f ? sycl::fabs(d) : 1e-6f;
-                    const float z = sgn * sycl::sqrt(mag);
-                    out[row] = 1.0f / (1.0f + sycl::exp(-z));
+                const float d   = rd[0] / sycl::sqrt(float(H));
+                const float sgn = d < 0.0f ? -1.0f : 1.0f;
+                const float mag = sycl::fabs(d) > 1e-6f ? sycl::fabs(d) : 1e-6f;
+                const float g   = 1.0f / (1.0f + sycl::exp(-(sgn * sycl::sqrt(mag))));
+
+                float* go = gated + base;
+                for (int i = lane; i < H; i += WG) go[i] = g * v[i];
+                sycl::group_barrier(it.get_group());
+                float gs = 0.0f;
+                for (int i = lane; i < H; i += WG) gs += go[i]*go[i];
+                rk[lane] = gs;
+                sycl::group_barrier(it.get_group());
+                for (int s = WG/2; s; s >>= 1) {
+                    if (lane < s) rk[lane] += rk[lane+s];
+                    sycl::group_barrier(it.get_group());
                 }
+                const float gi = sycl::rsqrt(rk[0]/float(H) + eps);
+                float* co = conv_in + base;
+                for (int i = lane; i < H; i += WG)
+                    co[i] = go[i] * gi * (1.0f + bf16_to_f32(ncw[wb+i]));
             });
+    });
+}
+
+// The dilated depthwise short convolution that finishes a PLE layer.
+// `conv_in` holds the current request's rows from position 0, so a tap
+// before the start of the sequence is simply skipped -- which is what an
+// all-zero conv state gives.  Both residuals are added: a PLE layer
+// REPLACES the multi-stream state.
+sycl::event launch_ple_conv(sycl::queue& q, const float* conv_in,
+                            const float* gated, const float* hidden,
+                            const bf16_t* w, float* out, int first, int rows,
+                            int channels, int kernel, int dilation,
+                            const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * channels),
+            [=](sycl::id<1> id) {
+                const int r = int(id[0] / channels);
+                const int c = int(id[0] % channels);
+                const int t = first + r;
+                float acc = 0.0f;
+                for (int k = 0; k < kernel; ++k) {
+                    const int at = t - (kernel - 1 - k) * dilation;
+                    if (at < 0) continue;
+                    acc += bf16_to_f32(w[size_t(c) * kernel + k]) *
+                           conv_in[int64_t(at) * channels + c];
+                }
+                const int64_t o = int64_t(r) * channels + c;
+                out[o] = hidden[o] + gated[o] + acc / (1.0f + sycl::exp(-acc));
+            });
+    });
+}
+
+// The n-gram table gather.  `table` is HOST memory on purpose: 20,000,000
+// rows is the architecture's own design (vLLM pins it rather than putting
+// it in VRAM) and only the rows for the current tokens are read.  Every
+// other weight in this engine is device-resident; this one is the
+// exception the model expects.
+sycl::event launch_ple_embed_gather(sycl::queue& q, const bf16_t* table,
+                                    const int64_t* ids, float* out, int rows,
+                                    int ngram_heads, int head_dim,
+                                    int64_t table_rows,
+                                    const std::vector<sycl::event>& deps) {
+    const int width = ngram_heads * head_dim;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows) * width),
+            [=](sycl::id<1> id) {
+                const int r  = int(id[0] / width);
+                const int w  = int(id[0] % width);
+                const int hh = w / head_dim;
+                const int d  = w % head_dim;
+                const int64_t row = ids[int64_t(r) * ngram_heads + hh];
+                out[int64_t(r) * width + w] =
+                    (row >= 0 && row < table_rows)
+                        ? bf16_to_f32(table[row * head_dim + d]) : 0.0f;
+            });
+    });
+}
+
+// mix(): silu(down_out / hc_count).  The divide is INSIDE the
+// nonlinearity; moving it outside changes the gate's operating point and
+// leaves the model fluent.
+sycl::event launch_hc_silu(sycl::queue& q, float* x, int n, int hc_count,
+                           const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+            const float v = x[id[0]] / float(hc_count);
+            x[id[0]] = v / (1.0f + sycl::exp(-v));
+        });
     });
 }
 

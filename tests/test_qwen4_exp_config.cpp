@@ -27,6 +27,7 @@
 //  Run:  ./bin/test_qwen4_exp_config
 // =====================================================================
 #include "b70/qwen35.hpp"
+#include "b70/qwen4_exp.hpp"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -204,8 +205,76 @@ int main() {
     EQ(c.hc_count, 4, "hc_count");
     EQ(c.hc_lowrank, 320, "hc_lowrank");
 
-    // The REFUSAL is asserted in bin/test_model_matrix, not here: this
-    // file is host-only and builds in seconds with g++, while
+    // ---- the n-gram table's layout is DERIVED, not stored -----------
+    // Nothing in the checkpoint says how big each head's slice of the
+    // table is: sizes[h] is the (global_head+1)-th prime strictly greater
+    // than ngram_vocab_size_base - 1 and offsets[h] is their running sum
+    // (ref/qwen4_exp_nvidia_ngram_embedding.py:613-630).  "Equal slices
+    // of the base" is the natural guess, lands one row out on the second
+    // head, and reads a neighbour's rows -- valid floats, wrong n-gram.
+    {
+        std::printf("the derived n-gram table layout\n");
+        std::vector<int64_t> sz(size_t(ngram_heads), 0), of(size_t(ngram_heads), 0);
+        const int64_t total = qwen4_exp::ngram_vocab_layout(
+            c.ngram_vocab_base, ngram_heads, /*ple_dense_layer_id=*/0,
+            sz.data(), of.data());
+        CHECK(sz[0] == 20000003LL,
+              "the first head's slice should be the first prime above "
+              "19999999, got %lld", (long long)sz[0]);
+        int64_t run = 0;
+        bool strictly_bigger = true, offsets_run = true;
+        for (int h = 0; h < ngram_heads; ++h) {
+            if (sz[size_t(h)] <= c.ngram_vocab_base - 1) strictly_bigger = false;
+            if (h && sz[size_t(h)] <= sz[size_t(h) - 1]) strictly_bigger = false;
+            if (of[size_t(h)] != run) offsets_run = false;
+            run += sz[size_t(h)];
+        }
+        CHECK(strictly_bigger,
+              "the per-head sizes must be strictly increasing primes above "
+              "ngram_vocab_size_base - 1");
+        CHECK(offsets_run, "the offsets must be the running sum of the sizes");
+        CHECK(total == run, "the total row count must be the last offset plus "
+                            "the last size");
+        // Equal slices would give exactly ngram_heads * base rows; the
+        // real layout is larger because every slice is a distinct prime.
+        CHECK(total > int64_t(ngram_heads) * c.ngram_vocab_base,
+              "the derived layout is no bigger than equal slices, so this "
+              "check cannot tell the two apart");
+
+        // The multipliers are derived too, from the config's `seed` and
+        // the PLE layer's dense id.  Every one must be ODD (the reference
+        // builds them as 2k+1) and small enough that a token times it
+        // cannot reach the sign bit.
+        std::vector<int64_t> mul(size_t(c.ngram_size), 0);
+        qwen4_exp::ngram_multipliers(c.ngram_size, c.vocab, c.ngram_seed,
+                                     /*ple_dense_layer_id=*/0, mul.data());
+        bool odd = true, bounded = true, distinct = true;
+        for (int i = 0; i < c.ngram_size; ++i) {
+            if ((mul[size_t(i)] & 1) == 0) odd = false;
+            if (mul[size_t(i)] <= 0 ||
+                mul[size_t(i)] > std::numeric_limits<int64_t>::max() / c.vocab)
+                bounded = false;
+            for (int j = 0; j < i; ++j)
+                if (mul[size_t(i)] == mul[size_t(j)]) distinct = false;
+        }
+        CHECK(odd, "every n-gram multiplier must be odd");
+        CHECK(bounded, "a token times its multiplier must not overflow int64");
+        CHECK(distinct, "the multipliers must differ per shift, or every "
+                        "position in an n-gram hashes the same way");
+        // A different layer gets DIFFERENT multipliers -- the layer id is
+        // mixed into the seed.  Sharing them across PLE layers would make
+        // every layer read the same rows and is silent.
+        std::vector<int64_t> mul1(size_t(c.ngram_size), 0);
+        qwen4_exp::ngram_multipliers(c.ngram_size, c.vocab, c.ngram_seed,
+                                     /*ple_dense_layer_id=*/1, mul1.data());
+        CHECK(mul1[0] != mul[0],
+              "two PLE layers derived the same multipliers, so the layer id "
+              "is not reaching the hash");
+    }
+
+    // The REFUSALS that survive -- indexer_kv_heads != 1 and the rest --
+    // are asserted in bin/test_model_matrix, not here: this file is
+    // host-only and builds in seconds with g++, while
     // Grimoire::unsupported_reason() needs the SYCL engine.  Splitting
     // them the way gemma-4 does keeps the parse fast to iterate on --
     // and the parse is what goes out of date when a config changes.

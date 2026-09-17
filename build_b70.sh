@@ -254,6 +254,9 @@ icpx -fsycl -fsycl-targets=spir64 \
 #   bin/test_model_matrix  every architecture x every projection format
 #   bin/test_parallel_e2e  PP and TP must equal one process, token for token
 #   bin/test_spec_e2e      speculation must equal plain decode, incl. TP and PP
+#   bin/test_gemma4_prefill    gemma-4 batched prefill == sequential decode
+#   bin/test_qwen4_exp_e2e     Qwen4-Exp's three mechanisms are LIVE, and
+#                              its batched prefill == sequential decode
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
@@ -269,7 +272,9 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
   for gate in test_k2_e2e_device:test_k2_e2e \
               test_model_matrix:test_model_matrix \
               test_parallel_e2e:test_parallel_e2e \
-              test_spec_e2e:test_spec_e2e ; do
+              test_spec_e2e:test_spec_e2e \
+              test_gemma4_prefill:test_gemma4_prefill \
+              test_qwen4_exp_e2e:test_qwen4_exp_e2e ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"
     icpx -fsycl -fsycl-targets=spir64 \
          -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \

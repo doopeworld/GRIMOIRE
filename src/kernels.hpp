@@ -299,13 +299,27 @@ sycl::event launch_gate_sigmoid_mul_bf16_io(sycl::queue& q,
 // The 20M-row table itself lives in HOST memory (vLLM pins it too); these
 // produce the ids to gather and the gate that scales the result.
 sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
-    int64_t* out, int n_tokens, const int64_t* multipliers,
+    int64_t* out, int first, int n_tokens, const int64_t* multipliers,
     const int64_t* sizes, const int64_t* offsets, int ngram_context_len,
     int heads_per_ngram, int ngram_heads, int eos_token_id,
     const std::vector<sycl::event>& deps = {});
+// Per (token, stream): the two grouped norms have their own (1 + w)
+// affine, and BOTH outputs are produced here because conv_in is normed
+// from `gated`.  `value` is H wide and gates into every stream.
 sycl::event launch_ple_gate(sycl::queue& q, const float* key,
-    const float* query, float* out, int rows, int H, float eps,
+    const float* value, const float* query, const bf16_t* nk,
+    const bf16_t* nq, const bf16_t* ncw, float* gated, float* conv_in,
+    int rows, int hc_count, int H, float eps,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_ple_conv(sycl::queue& q, const float* conv_in,
+    const float* gated, const float* hidden, const bf16_t* w, float* out,
+    int first, int rows, int channels, int kernel, int dilation,
+    const std::vector<sycl::event>& deps = {});
+// `table` is HOST memory: the n-gram table is the one weight in this
+// engine that does not live in VRAM, which is the architecture's design.
+sycl::event launch_ple_embed_gather(sycl::queue& q, const bf16_t* table,
+    const int64_t* ids, float* out, int rows, int ngram_heads, int head_dim,
+    int64_t table_rows, const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
 sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
     const uint8_t* k_cache, const uint8_t* v_cache, const int32_t* idx,
@@ -317,13 +331,40 @@ sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
 // turns the selected blocks into token indices.  Stage 2 (top-k) reuses
 // the engine's existing top-k, and the attention that consumes the index
 // list is launch_qsa_attention in attention.cpp.
+// `keys` is the sequence's compressed key cache, [n_blocks][head_dim],
+// SHARED by every query row; only `qv`, `logits` and `visible` are
+// per-row.  `logits` is [rows][n_blocks].
 sycl::event launch_qsa_index_logits(sycl::queue& q, const float* qv,
     const float* keys, float* logits, int rows, int n_heads, int head_dim,
     int n_blocks, const int32_t* visible,
     const std::vector<sycl::event>& deps = {});
+// Pool a completed group of raw index keys, then norm and RoPE the
+// POOLED key at the position of the group's FIRST token.
+sycl::event launch_rope_rows(sycl::queue& q, float* x, int rows, int heads,
+    int dim, int first, float theta, float partial_factor,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_copy_rows_strided(sycl::queue& q, const float* src,
+    float* dst, int rows, int src_stride, int dst_stride, int width,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_qsa_row_meta(sycl::queue& q, int32_t* visible,
+    int32_t* seq_len, int32_t* query_pos, int rows, int first, int total,
+    int compress_ratio, const std::vector<sycl::event>& deps = {});
+sycl::event launch_qsa_pool_blocks(sycl::queue& q, const float* raw,
+    float* pooled, int first_block, int n_blocks, int compress_ratio,
+    int head_dim, const std::vector<sycl::event>& deps = {});
+sycl::event launch_qsa_rope_blocks(sycl::queue& q, float* keys,
+    int first_block, int n_blocks, int head_dim, int compress_ratio,
+    float theta, float partial_factor,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_qsa_topk_blocks(sycl::queue& q, const float* logits,
+    int32_t* out, int rows, int n_blocks, int topk, const int32_t* visible,
+    const std::vector<sycl::event>& deps = {});
+// `out` is token_topk + compress_ratio - 1 wide: the trailing entries are
+// the INCOMPLETE block, which stage 1 cannot see and which contains the
+// query's own token.  `query_pos` is per row.
 sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
     int32_t* out, int rows, int block_topk, int compress_ratio,
-    int token_topk, const int32_t* seq_len,
+    int token_topk, const int32_t* seq_len, const int32_t* query_pos,
     const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp HyperConnections (host reference: b70/qwen4_exp.hpp) ---
 // The residual stream is hc_count wide; mix() collapses it for the block
@@ -339,6 +380,9 @@ sycl::event launch_hc_gated_mean(sycl::queue& q, const float* up_out,
 sycl::event launch_hc_combine(sycl::queue& q, const float* hyper,
     const float* inj_out, const float* block, float* out, int rows,
     int hc_count, int hidden, const std::vector<sycl::event>& deps = {});
+// silu(down_out / hc_count) -- the divide is INSIDE the nonlinearity.
+sycl::event launch_hc_silu(sycl::queue& q, float* x, int n, int hc_count,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_gemm_batched(sycl::queue& q, const QuantWeight& w,
                                 const float* x, float* y, int M,
                                 const std::vector<sycl::event>& deps = {});

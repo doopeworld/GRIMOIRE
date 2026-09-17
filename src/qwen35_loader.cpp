@@ -4,6 +4,7 @@
 #include "b70/qwen35.hpp"
 #include "b70/k2_horizon.hpp"
 #include <cctype>
+#include <algorithm>
 #include "b70/tensor_layout.hpp"
 #include <cstdio>
 #include <cstring>
@@ -55,6 +56,18 @@ int    cfg_i(const std::string& j, const char* k, int d) {
 }
 float  cfg_f(const std::string& j, const char* k, float d) {
     std::string v; return find_scalar(j, k, v) ? float(std::atof(v.c_str())) : d;
+}
+// eos_token_id is a LIST in several Qwen configs.  find_scalar stops at
+// the '[' and atoi then reads 0 -- which is a VALID token id, so the
+// sticky-EOS walk would silently treat token 0 as the document boundary
+// and never fire on the real one.  Take the first element.
+int    cfg_i_first(const std::string& j, const char* k, int d) {
+    std::string v;
+    if (!find_scalar(j, k, v)) return d;
+    size_t i = 0;
+    while (i < v.size() && (v[i] == '[' || isspace((unsigned char)v[i]))) ++i;
+    if (i >= v.size() || !(isdigit((unsigned char)v[i]) || v[i] == '-')) return d;
+    return std::atoi(v.c_str() + i);
 }
 bool   cfg_b(const std::string& j, const char* k, bool d) {
     std::string v;
@@ -429,6 +442,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         // Defaults are the reference's own (ref/qwen4_exp_config.py:41-49),
         // so a config that omits one resolves the way vLLM would rather
         // than to zero.
+        cfg.ngram_seed       = cfg_i(cj, "seed", 1234);
+        // eos_token_id can be a LIST in a Qwen config; take the first.
+        cfg.eos_token_id     = cfg_i_first(cj, "eos_token_id", 0);
         cfg.hc_count         = cfg_i(cj, "hc_count", 4);
         cfg.hc_lowrank       = cfg_i(cj, "hc_lowrank", 320);
         cfg.ngram_size       = cfg_i(cj, "ngram_size", 3);
@@ -797,6 +813,17 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
 
     embed      = get(prefix + "embed_tokens.weight");
     final_norm = get(prefix + "norm.weight");
+    if (cfg.is_qwen4_exp) {
+        // Qwen4-Exp has no model.norm: the tail hyper-connection mixer's
+        // grouped norm IS the final norm, and its gated mean is what the
+        // head reads (ref/qwen4_exp_nvidia_model.py:576, and the module
+        // has no self.norm at all).  use_combine is false there, so no
+        // block_inject_weight exists -- vLLM skips loading one by name.
+        const std::string m = prefix + "hyper_connection_mixer.";
+        hc_final.norm = get(m + "hc_norm.weight");
+        hc_final.down = get(m + "input_mix_weight_down.weight");
+        hc_final.up   = get(m + "input_mix_weight_up.weight");
+    }
     lm_head    = get("lm_head.weight");
     if (!lm_head.ok()) lm_head = get(prefix + "lm_head.weight");
     if (!embed.ok()) { err = "embed_tokens not found (prefix " + prefix + ")"; return false; }
@@ -810,6 +837,55 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
 
         lay.input_norm     = get(b + "input_layernorm.weight");
         lay.post_attn_norm = get(b + "post_attention_layernorm.weight");
+
+        if (cfg.is_qwen4_exp) {
+            // Neither input_layernorm nor post_attention_layernorm exists
+            // on this architecture: the two hyper-connections' own grouped
+            // norms take both places (the decoder layer's forward calls
+            // mix()/combine_and_mix() where every other Qwen calls a
+            // layernorm).  Resolving them would silently find nothing and
+            // the need() check below would then reject a valid file.
+            auto hc = [&](Qwen35Layer::HCRef& r, const char* which) {
+                const std::string h = b + which + ".";
+                r.norm   = get(h + "hc_norm.weight");
+                r.down   = get(h + "input_mix_weight_down.weight");
+                r.inject = get(h + "block_inject_weight.weight");
+                r.up     = get(h + "input_mix_weight_up.weight");
+            };
+            hc(lay.hc_attn, "attn_hyper_connection");
+            hc(lay.hc_mlp,  "mlp_hyper_connection");
+
+            lay.qsa = L < int(cfg.qsa_attention.size()) && cfg.qsa_attention[size_t(L)];
+            if (lay.qsa) {
+                const std::string ix = b + "self_attn.indexer.";
+                lay.ix_qk_proj = linear(ix + "index_qk_proj");
+                if (!lay.ix_qk_proj.ok()) lay.ix_qk_proj = get(ix + "index_qk_proj.weight");
+                lay.ix_q_norm  = get(ix + "q_layernorm.weight");
+                lay.ix_k_norm  = get(ix + "k_layernorm.weight");
+            }
+
+            // ple_layer_ids is 1-BASED in the config
+            // (ref/qwen4_exp_config.py:127).  It is stored verbatim, so
+            // the +1 belongs HERE, at the point of use, where it is
+            // visible next to the layer index it is compared against.
+            {
+                std::vector<int> ids = cfg.ple_layer_ids;
+                std::sort(ids.begin(), ids.end());
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                for (size_t k = 0; k < ids.size(); ++k)
+                    if (ids[k] == L + 1) { lay.ple = true; lay.ple_dense_id = int(k); }
+            }
+            if (lay.ple) {
+                const std::string pl = b + "ple.";
+                lay.ple_key       = linear(pl + "key_proj");
+                lay.ple_value     = linear(pl + "value_proj");
+                lay.ple_conv1d    = get(pl + "conv1d.weight");
+                lay.ple_norm_key  = get(pl + "norm_key.weight");
+                lay.ple_norm_query= get(pl + "norm_query.weight");
+                lay.ple_norm_conv = get(pl + "norm_conv.weight");
+                lay.ple_table     = get(pl + "ple_embedding.ngram_embedding.weight");
+            }
+        }
 
         if (lay.kind == LayerKind::LINEAR_ATTN) {
             // Agnes names its two attention submodules delta_attn and
@@ -1077,7 +1153,35 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     };
     for (int L = 0; L < cfg.n_layers; ++L) {
         const Qwen35Layer& lay = layers[L];
-        need(lay.input_norm, "input_layernorm", L);
+        if (!cfg.is_qwen4_exp) need(lay.input_norm, "input_layernorm", L);
+        else {
+            // Say which hyper-connection, not just "a tensor is missing":
+            // the two are the same four names under different prefixes and
+            // a checkpoint that ships one and not the other is a real,
+            // confusing case.
+            need(lay.hc_attn.norm, "attn_hyper_connection.hc_norm", L);
+            need(lay.hc_attn.down, "attn_hyper_connection.input_mix_weight_down", L);
+            need(lay.hc_attn.inject, "attn_hyper_connection.block_inject_weight", L);
+            need(lay.hc_attn.up,   "attn_hyper_connection.input_mix_weight_up", L);
+            need(lay.hc_mlp.norm,  "mlp_hyper_connection.hc_norm", L);
+            need(lay.hc_mlp.down,  "mlp_hyper_connection.input_mix_weight_down", L);
+            need(lay.hc_mlp.inject,"mlp_hyper_connection.block_inject_weight", L);
+            need(lay.hc_mlp.up,    "mlp_hyper_connection.input_mix_weight_up", L);
+            if (lay.qsa) {
+                need(lay.ix_qk_proj, "self_attn.indexer.index_qk_proj", L);
+                need(lay.ix_q_norm,  "self_attn.indexer.q_layernorm", L);
+                need(lay.ix_k_norm,  "self_attn.indexer.k_layernorm", L);
+            }
+            if (lay.ple) {
+                need(lay.ple_key,        "ple.key_proj", L);
+                need(lay.ple_value,      "ple.value_proj", L);
+                need(lay.ple_conv1d,     "ple.conv1d", L);
+                need(lay.ple_norm_key,   "ple.norm_key", L);
+                need(lay.ple_norm_query, "ple.norm_query", L);
+                need(lay.ple_norm_conv,  "ple.norm_conv", L);
+                need(lay.ple_table,      "ple.ple_embedding.ngram_embedding", L);
+            }
+        }
         if (lay.kind == LayerKind::LINEAR_ATTN) {
             need(lay.la_in_qkv, "linear_attn.in_proj_qkv", L);
             need(lay.la_out,    "linear_attn.out_proj", L);

@@ -161,6 +161,13 @@ struct Qwen35Config {
     int   indexer_budget  = 0;
     int   indexer_compress_ratio = 0;
     std::vector<bool> qsa_attention;  // per layer: is this a QSA layer
+    // The n-gram hash's multipliers are derived from `seed`, which is an
+    // ordinary config field with a default of 1234
+    // (ref/qwen4_exp_nvidia_ngram_embedding.py:666), and the sticky-EOS
+    // walk needs eos_token_id.  Both are silent when wrong: a different
+    // seed hashes every n-gram into a different, still valid row.
+    int64_t ngram_seed    = 1234;
+    int   eos_token_id    = 0;
 
     bool  is_gemma4       = false;
     int   global_head_dim = 0;      // full-attention head_dim (0 == same)
@@ -318,6 +325,33 @@ struct Qwen35Layer {
     TensorRef v_router, v_router_bias;
     std::vector<TensorRef> v_experts;
     TensorRef router_bias;                  // mlp.gate.bias (moe_gate_bias)
+
+    // --- Qwen4-Exp (Qwen3.8-Flash-Next) ----------------------------
+    // TWO hyper-connections per layer, one around attention and one
+    // around the FFN.  The checkpoint ships the down projection and the
+    // injection projection SEPARATELY; vLLM merges them into one GEMM
+    // (ref/qwen4_exp_nvidia_model.py:145-152) and so does this engine,
+    // but the names on disk are the unmerged ones.
+    struct HCRef {
+        TensorRef norm;            // hc_norm.weight            [hc*H]
+        TensorRef down;            // input_mix_weight_down     [lowrank, hc*H]
+        TensorRef inject;          // block_inject_weight       [hc, hc*H]
+        TensorRef up;              // input_mix_weight_up       [hc*H, lowrank]
+    };
+    HCRef hc_attn, hc_mlp;
+
+    // QSA: the indexer that scores compressed key blocks.  Its q/k norms
+    // are GemmaRMSNorm, i.e. (1 + w) -- unlike the DeltaNet's own norm.
+    bool      qsa = false;
+    TensorRef ix_qk_proj, ix_q_norm, ix_k_norm;
+
+    // PLE: present only on the layers named by ple_layer_ids.  key_proj
+    // and value_proj are one merged GEMM at runtime (ref:153-154).
+    bool      ple = false;
+    int       ple_dense_id = 0;             // index into sorted ple_layer_ids
+    TensorRef ple_key, ple_value, ple_conv1d;
+    TensorRef ple_norm_key, ple_norm_query, ple_norm_conv;
+    TensorRef ple_table;                    // the n-gram rows; HOST resident
 };
 
 struct Qwen35Model {
@@ -331,6 +365,13 @@ struct Qwen35Model {
     std::map<std::string, TensorRef>          index;
 
     TensorRef embed, final_norm, lm_head;
+    // Qwen4-Exp's tail mixer.  It replaces final_norm entirely: the model
+    // has NO model.norm (ref/qwen4_exp_nvidia_model.py has no self.norm,
+    // and compute_logits reads the mixer's output directly), so a
+    // qwen4_exp checkpoint that resolved a final norm would be reading
+    // some other model's tensor.  use_combine is false here, so there is
+    // no injection projection -- vLLM explicitly skips loading one.
+    Qwen35Layer::HCRef hc_final;
     std::vector<Qwen35Layer> layers;
 
     // Open every shard, parse config, resolve all tensor names.

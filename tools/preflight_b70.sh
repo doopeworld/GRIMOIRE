@@ -171,6 +171,12 @@ run_gate bin/test_k2_e2e
 run_gate bin/test_model_matrix
 run_gate bin/test_parallel_e2e
 run_gate bin/test_spec_e2e
+# Both of these compare a BATCHED prefill against sequential decode.  They
+# were built by build_b70.sh and not run here, which is the same shape of
+# gap rule 14 is about: the code existed, the gate existed, and nothing
+# ran it.
+run_gate bin/test_gemma4_prefill
+run_gate bin/test_qwen4_exp_e2e
 
 # ---------------------------------------------------------------------
 say "5. real model"

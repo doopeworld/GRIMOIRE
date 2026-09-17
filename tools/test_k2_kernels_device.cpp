@@ -974,13 +974,20 @@ int main() {
     // and still fluent, so every stage is diffed against
     // b70/qwen4_exp.hpp and the two easiest mistakes get an explicit A/B.
     {
+        // ONE key cache for both rows.  That is the shape QSA actually
+        // has -- the compressed blocks belong to the SEQUENCE -- and
+        // giving each row its own set here is what let the kernel stride
+        // by row undetected: every row read valid numbers, they were just
+        // the wrong blocks once the engine passed a single cache.
+        // Different visible counts per row keep the masking exercised.
         const int rows = 2, ih = 4, ihd = 32, nblk = 24, vis = 17;
         std::mt19937 rng(20260917);
         std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-        std::vector<float> iq(size_t(rows)*ih*ihd), ik(size_t(rows)*nblk*ihd);
+        std::vector<float> iq(size_t(rows)*ih*ihd), ik(size_t(nblk)*ihd);
         for (auto& v : iq) v = d(rng);
         for (auto& v : ik) v = d(rng);
         std::vector<int32_t> visv(size_t(rows), vis);
+        if (rows > 1) visv[1] = vis - 5;
 
         float* d_iq = sycl::malloc_device<float>(iq.size(), q);
         float* d_ik = sycl::malloc_device<float>(ik.size(), q);
@@ -997,9 +1004,9 @@ int main() {
         q.memcpy(lg.data(), d_lg, lg.size()*sizeof(float)).wait();
         for (int r = 0; r < rows; ++r)
             qwen4_exp::qsa_index_logits(iq.data() + size_t(r)*ih*ihd,
-                                        ik.data() + size_t(r)*nblk*ihd,
+                                        ik.data(),
                                         lgw.data() + size_t(r)*nblk,
-                                        ih, ihd, nblk, vis);
+                                        ih, ihd, nblk, visv[size_t(r)]);
         // -inf == -inf compares equal under subtraction only if both are
         // -inf; compare the visible part numerically and the masked part
         // structurally so an accidental finite value is caught.
@@ -1007,7 +1014,9 @@ int main() {
         for (int r = 0; r < rows; ++r)
             for (int n = 0; n < nblk; ++n) {
                 const size_t i = size_t(r)*nblk + n;
-                if (n >= vis) { if (!std::isinf(lg[i]) || lg[i] > 0) ++mask_bad; }
+                if (n >= visv[size_t(r)]) {
+                    if (!std::isinf(lg[i]) || lg[i] > 0) ++mask_bad;
+                }
                 else worst = std::max(worst, std::abs(double(lg[i]) - lgw[i]));
             }
         std::printf("%-16s %-40s %.3e\n", "qsa index",
@@ -1027,7 +1036,7 @@ int main() {
                         float dot = 0.0f;
                         for (int dd = 0; dd < ihd; ++dd)
                             dot += iq[(size_t(r)*ih+hh)*ihd+dd] *
-                                   ik[(size_t(r)*nblk+n)*ihd+dd];
+                                   ik[size_t(n)*ihd+dd];
                         acc += dot;                       // no relu here
                     }
                     alt[size_t(r)*nblk+n] = (acc > 0 ? acc : 0) /
@@ -1035,7 +1044,7 @@ int main() {
                 }
             double apart = 0.0;
             for (int r = 0; r < rows; ++r)
-                for (int n = 0; n < vis; ++n)
+                for (int n = 0; n < visv[size_t(r)]; ++n)
                     apart = std::max(apart,
                         std::abs(double(lg[size_t(r)*nblk+n]) - alt[size_t(r)*nblk+n]));
             std::printf("%-16s %-40s %.3e\n", "qsa index A/B",
@@ -1045,26 +1054,36 @@ int main() {
         }
 
         // --- expand ---------------------------------------------------
+        // seq is deliberately NOT a multiple of ratio and query_pos sits
+        // inside the last, incomplete block: that is the only arrangement
+        // in which the tail carries anything, and the tail is what lets a
+        // query attend to its own token at all.
         const int ratio = 4, btopk = 5, ttopk = btopk * ratio, seq = 34;
+        const int ewidth = qwen4_exp::qsa_expand_width(ttopk, ratio);
         std::vector<int32_t> blocks(size_t(rows)*btopk);
         for (int r = 0; r < rows; ++r)
             for (int b = 0; b < btopk; ++b)
                 blocks[size_t(r)*btopk+b] = (b == btopk-1) ? -1 : (b*3 + r);
         std::vector<int32_t> seqv(size_t(rows), seq);
+        std::vector<int32_t> posv(size_t(rows), 0);
+        for (int r = 0; r < rows; ++r) posv[size_t(r)] = seq - 1 - r;
         int32_t* d_blk = sycl::malloc_device<int32_t>(blocks.size(), q);
-        int32_t* d_exp = sycl::malloc_device<int32_t>(size_t(rows)*ttopk, q);
+        int32_t* d_exp = sycl::malloc_device<int32_t>(size_t(rows)*ewidth, q);
         int32_t* d_seq = sycl::malloc_device<int32_t>(seqv.size(), q);
+        int32_t* d_pos = sycl::malloc_device<int32_t>(posv.size(), q);
         q.memcpy(d_blk, blocks.data(), blocks.size()*sizeof(int32_t));
+        q.memcpy(d_pos, posv.data(), posv.size()*sizeof(int32_t));
         q.memcpy(d_seq, seqv.data(), seqv.size()*sizeof(int32_t)).wait();
         launch_qsa_expand_blocks(q, d_blk, d_exp, rows, btopk, ratio, ttopk,
-                                 d_seq, {});
+                                 d_seq, d_pos, {});
         q.wait();
-        std::vector<int32_t> eg(size_t(rows)*ttopk), ew(size_t(rows)*ttopk);
+        std::vector<int32_t> eg(size_t(rows)*ewidth), ew(size_t(rows)*ewidth);
         q.memcpy(eg.data(), d_exp, eg.size()*sizeof(int32_t)).wait();
         for (int r = 0; r < rows; ++r)
             qwen4_exp::qsa_expand_blocks(blocks.data() + size_t(r)*btopk,
                                          btopk, ratio, ttopk, seq,
-                                         ew.data() + size_t(r)*ttopk);
+                                         posv[size_t(r)],
+                                         ew.data() + size_t(r)*ewidth);
         int diff = 0, holes = 0;
         for (size_t i = 0; i < eg.size(); ++i) {
             if (eg[i] != ew[i]) ++diff;
@@ -1073,10 +1092,21 @@ int main() {
         std::printf("%-16s %-40s %d mismatches, %d holes\n", "qsa expand",
                     "block -> tokens, -1 stays -1", diff, holes);
         CHECK(diff == 0, "qsa_expand_blocks does not match the host reference");
-        // If nothing was a hole this case proves nothing about the -1 path,
-        // which is the one that is silent when clamped to token 0.
-        CHECK(holes > 0, "the expand fixture produced no holes, so the -1 "
-                         "path is untested");
+        // Does the query reach its OWN token?  Every check above is true
+        // of an expand with no tail at all, and a QSA layer that cannot
+        // see the token it is predicting from still emits fluent text.
+        int self_seen = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int me = posv[size_t(r)];
+            for (int w = 0; w < ewidth; ++w)
+                if (eg[size_t(r)*ewidth + w] == me) { ++self_seen; break; }
+        }
+        std::printf("%-16s %-40s %d/%d rows\n", "qsa expand tail",
+                    "query reaches its own token", self_seen, rows);
+        CHECK(self_seen == rows,
+              "the expand dropped the incomplete block, so a QSA query "
+              "cannot attend to its own token");
+
 
         // --- sparse attention over the gathered list -------------------
         const int nh = 4, kvh = 2, hd = 32, cap = 64;
@@ -1095,7 +1125,7 @@ int main() {
         q.memcpy(d_vc, vc.data(), vc.size()).wait();
         const float sms = 1.0f / std::sqrt(float(hd));
         launch_qsa_attention(q, d_aq, d_kc, d_vc, d_exp, d_ao, rows, nh, kvh,
-                             hd, cap, ttopk, sms, {});
+                             hd, cap, ewidth, sms, {});
         q.wait();
         std::vector<float> ag(size_t(rows)*nh*hd), aw(size_t(rows)*nh*hd);
         q.memcpy(ag.data(), d_ao, ag.size()*sizeof(float)).wait();
@@ -1112,9 +1142,9 @@ int main() {
         for (int r = 0; r < rows; ++r)
             qwen4_exp::qsa_attention(aq.data() + size_t(r)*nh*hd,
                                      kT.data(), vf.data(),
-                                     eg.data() + size_t(r)*ttopk,
+                                     eg.data() + size_t(r)*ewidth,
                                      aw.data() + size_t(r)*nh*hd,
-                                     nh, kvh, hd, ttopk, cap, sms);
+                                     nh, kvh, hd, ewidth, cap, sms);
         std::printf("%-16s %-40s %.3e\n", "qsa attention",
                     "gathered index list, holes skipped", worst_abs(aw, ag));
         CHECK(worst_abs(aw, ag) < 2e-4,
@@ -1122,7 +1152,8 @@ int main() {
 
         sycl::free(d_iq,q); sycl::free(d_ik,q); sycl::free(d_lg,q);
         sycl::free(d_vis,q); sycl::free(d_blk,q); sycl::free(d_exp,q);
-        sycl::free(d_seq,q); sycl::free(d_aq,q); sycl::free(d_kc,q);
+        sycl::free(d_seq,q); sycl::free(d_pos,q); sycl::free(d_aq,q);
+        sycl::free(d_kc,q);
         sycl::free(d_vc,q); sycl::free(d_ao,q);
     }
 
@@ -1151,7 +1182,7 @@ int main() {
         q.memcpy(d_m, mul.data(), mul.size()*sizeof(int64_t));
         q.memcpy(d_s, sz.data(), sz.size()*sizeof(int64_t));
         q.memcpy(d_f, off.data(), off.size()*sizeof(int64_t)).wait();
-        launch_ple_ngram_ids(q, d_t, d_o, nt, d_m, d_s, d_f, ctx, hpn,
+        launch_ple_ngram_ids(q, d_t, d_o, 0, nt, d_m, d_s, d_f, ctx, hpn,
                              nheads, eos, {});
         q.wait();
         std::vector<int64_t> got(size_t(nt)*nheads), want(size_t(nt)*nheads);
@@ -1215,29 +1246,143 @@ int main() {
         }
 
         // --- the gate -------------------------------------------------
-        const int grows = 5, GH = 64;
-        std::vector<float> gk(size_t(grows)*GH, 0.0f), gq(size_t(grows)*GH, 0.0f);
+        // Per (token, stream), with the two norms' (1 + w) affine, the
+        // shared H-wide value row, and conv_in normed from the GATED
+        // output rather than from the value.
+        const int grows = 5, GH = 64, GHC = 3;
+        const size_t gw_n = size_t(grows)*GHC*GH;
+        std::vector<float> gk(gw_n, 0.f), gq(gw_n, 0.f);
+        std::vector<float> gv(size_t(grows)*GH, 0.f);
+        std::vector<bf16_t> wk(size_t(GHC)*GH), wq(size_t(GHC)*GH), wc(size_t(GHC)*GH);
+        std::vector<float> wkf(size_t(GHC)*GH), wqf(size_t(GHC)*GH), wcf(size_t(GHC)*GH);
         std::uniform_real_distribution<float> gd(-1.0f, 1.0f);
         for (auto& v : gk) v = gd(rng);
         for (auto& v : gq) v = gd(rng);
+        for (auto& v : gv) v = gd(rng);
+        for (size_t i = 0; i < wkf.size(); ++i) {
+            wkf[i] = gd(rng); wqf[i] = gd(rng); wcf[i] = gd(rng);
+            wk[i] = f32_to_bf16(wkf[i]); wq[i] = f32_to_bf16(wqf[i]);
+            wc[i] = f32_to_bf16(wcf[i]);
+            // the host reference takes f32 weights; use the ROUNDED value
+            // so this compares kernels, not bf16 rounding
+            wkf[i] = bf16_to_f32(wk[i]); wqf[i] = bf16_to_f32(wq[i]);
+            wcf[i] = bf16_to_f32(wc[i]);
+        }
         float* d_gk = sycl::malloc_device<float>(gk.size(), q);
         float* d_gq = sycl::malloc_device<float>(gq.size(), q);
-        float* d_gg = sycl::malloc_device<float>(size_t(grows), q);
+        float* d_gv = sycl::malloc_device<float>(gv.size(), q);
+        float* d_gg = sycl::malloc_device<float>(gw_n, q);
+        float* d_gc = sycl::malloc_device<float>(gw_n, q);
+        bf16_t* d_wk = sycl::malloc_device<bf16_t>(wk.size(), q);
+        bf16_t* d_wq = sycl::malloc_device<bf16_t>(wq.size(), q);
+        bf16_t* d_wc = sycl::malloc_device<bf16_t>(wc.size(), q);
         q.memcpy(d_gk, gk.data(), gk.size()*sizeof(float));
-        q.memcpy(d_gq, gq.data(), gq.size()*sizeof(float)).wait();
-        launch_ple_gate(q, d_gk, d_gq, d_gg, grows, GH, 1e-6f, {});
+        q.memcpy(d_gq, gq.data(), gq.size()*sizeof(float));
+        q.memcpy(d_gv, gv.data(), gv.size()*sizeof(float));
+        q.memcpy(d_wk, wk.data(), wk.size()*sizeof(bf16_t));
+        q.memcpy(d_wq, wq.data(), wq.size()*sizeof(bf16_t));
+        q.memcpy(d_wc, wc.data(), wc.size()*sizeof(bf16_t)).wait();
+        launch_ple_gate(q, d_gk, d_gv, d_gq, d_wk, d_wq, d_wc, d_gg, d_gc,
+                        grows, GHC, GH, 1e-6f, {});
         q.wait();
-        std::vector<float> gg(size_t(grows), 0.0f), gw(size_t(grows), 0.0f);
-        q.memcpy(gg.data(), d_gg, gg.size()*sizeof(float)).wait();
+        std::vector<float> gg(gw_n, 0.f), gc(gw_n, 0.f);
+        std::vector<float> gwant(gw_n, 0.f), cwant(gw_n, 0.f);
+        q.memcpy(gg.data(), d_gg, gg.size()*sizeof(float));
+        q.memcpy(gc.data(), d_gc, gc.size()*sizeof(float)).wait();
         for (int r = 0; r < grows; ++r)
-            gw[size_t(r)] = qwen4_exp::ple_gate(gk.data() + size_t(r)*GH,
-                                                gq.data() + size_t(r)*GH,
-                                                GH, 1e-6f);
-        std::printf("%-16s %-40s %.3e\n", "ple gate",
-                    "sigmoid(sign(d)*sqrt(|d|)), each rms'd", worst_abs(gw, gg));
-        CHECK(worst_abs(gw, gg) < 2e-5,
+            qwen4_exp::ple_gate(gk.data() + size_t(r)*GHC*GH,
+                                gv.data() + size_t(r)*GH,
+                                gq.data() + size_t(r)*GHC*GH,
+                                wkf.data(), wqf.data(), wcf.data(),
+                                gwant.data() + size_t(r)*GHC*GH,
+                                cwant.data() + size_t(r)*GHC*GH,
+                                GHC, GH, 1e-6f);
+        std::printf("%-16s %-40s %.3e / %.3e\n", "ple gate",
+                    "gated and conv_in, both per stream",
+                    worst_abs(gwant, gg), worst_abs(cwant, gc));
+        CHECK(worst_abs(gwant, gg) < 2e-5 && worst_abs(cwant, gc) < 2e-5,
               "launch_ple_gate does not match the host reference");
 
+        // A/B: drop the norms' affine weights, which is what the
+        // docstring's "RMSNorm(key)" reads like on its own.  The gate
+        // stays in (0,1) and the model stays fluent, so only a number
+        // says whether the weights are being applied.
+        {
+            std::vector<float> one(size_t(GHC)*GH, 0.0f);   // (1 + 0) = identity
+            std::vector<float> plain(gw_n, 0.f), pc(gw_n, 0.f);
+            for (int r = 0; r < grows; ++r)
+                qwen4_exp::ple_gate(gk.data() + size_t(r)*GHC*GH,
+                                    gv.data() + size_t(r)*GH,
+                                    gq.data() + size_t(r)*GHC*GH,
+                                    one.data(), one.data(), one.data(),
+                                    plain.data() + size_t(r)*GHC*GH,
+                                    pc.data() + size_t(r)*GHC*GH,
+                                    GHC, GH, 1e-6f);
+            const float sep = worst_abs(plain, gg);
+            std::printf("%-16s %-40s %.3e\n", "ple gate A/B",
+                        "with vs without the (1 + w) affine", sep);
+            CHECK(sep > 1e-3f,
+                  "the weighted and unweighted gates agree, so this fixture "
+                  "cannot tell whether the affine is applied");
+        }
+
+        // --- the dilated short conv -----------------------------------
+        {
+            const int CH = GHC*GH, KS = 4, DIL = 3, CT = 9;
+            std::vector<float> ci(size_t(CT)*CH), hid(size_t(CT)*CH), gat(size_t(CT)*CH);
+            std::vector<bf16_t> cw(size_t(CH)*KS);
+            std::vector<float>  cwf(size_t(CH)*KS);
+            for (auto& v : ci)  v = gd(rng);
+            for (auto& v : hid) v = gd(rng);
+            for (auto& v : gat) v = gd(rng);
+            for (size_t i = 0; i < cwf.size(); ++i) {
+                cw[i] = f32_to_bf16(gd(rng)); cwf[i] = bf16_to_f32(cw[i]);
+            }
+            float* d_ci = sycl::malloc_device<float>(ci.size(), q);
+            float* d_hi = sycl::malloc_device<float>(hid.size(), q);
+            float* d_ga = sycl::malloc_device<float>(gat.size(), q);
+            float* d_co = sycl::malloc_device<float>(size_t(CT)*CH, q);
+            bf16_t* d_cw = sycl::malloc_device<bf16_t>(cw.size(), q);
+            q.memcpy(d_ci, ci.data(), ci.size()*sizeof(float));
+            q.memcpy(d_hi, hid.data(), hid.size()*sizeof(float));
+            q.memcpy(d_ga, gat.data(), gat.size()*sizeof(float));
+            q.memcpy(d_cw, cw.data(), cw.size()*sizeof(bf16_t)).wait();
+            launch_ple_conv(q, d_ci, d_ga, d_hi, d_cw, d_co, 0, CT, CH,
+                            KS, DIL, {});
+            q.wait();
+            std::vector<float> cg(size_t(CT)*CH), cwant2(size_t(CT)*CH);
+            q.memcpy(cg.data(), d_co, cg.size()*sizeof(float)).wait();
+            for (int t = 0; t < CT; ++t)
+                qwen4_exp::ple_conv(ci.data(), gat.data() + size_t(t)*CH,
+                                    hid.data() + size_t(t)*CH, cwf.data(),
+                                    cwant2.data() + size_t(t)*CH,
+                                    t, CH, KS, DIL);
+            std::printf("%-16s %-40s %.3e\n", "ple conv",
+                        "dilated depthwise, both residuals",
+                        worst_abs(cwant2, cg));
+            CHECK(worst_abs(cwant2, cg) < 2e-5,
+                  "launch_ple_conv does not match the host reference");
+            // A/B: dilation 1 is the shape a reader assumes from
+            // "short conv"; with kernel 4 and dilation 3 it reads a
+            // completely different set of taps and is still smooth.
+            {
+                std::vector<float> d1(size_t(CT)*CH);
+                for (int t = 0; t < CT; ++t)
+                    qwen4_exp::ple_conv(ci.data(), gat.data() + size_t(t)*CH,
+                                        hid.data() + size_t(t)*CH, cwf.data(),
+                                        d1.data() + size_t(t)*CH, t, CH, KS, 1);
+                const float sep = worst_abs(d1, cg);
+                std::printf("%-16s %-40s %.3e\n", "ple conv A/B",
+                            "dilation 3 vs dilation 1", sep);
+                CHECK(sep > 1e-3f, "dilated and undilated agree here, so the "
+                                   "dilation is untested");
+            }
+            sycl::free(d_ci,q); sycl::free(d_hi,q); sycl::free(d_ga,q);
+            sycl::free(d_co,q); sycl::free(d_cw,q);
+        }
+
+        sycl::free(d_gv,q); sycl::free(d_gc,q); sycl::free(d_wk,q);
+        sycl::free(d_wq,q); sycl::free(d_wc,q);
         sycl::free(d_t,q); sycl::free(d_o,q); sycl::free(d_m,q);
         sycl::free(d_s,q); sycl::free(d_f,q); sycl::free(d_gk,q);
         sycl::free(d_gq,q); sycl::free(d_gg,q);

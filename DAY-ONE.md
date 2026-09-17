@@ -347,13 +347,37 @@ software recovery. The known causes, all avoidable:
 - **Single-process cross-device.** Rule 7: the original failure was
   measured over USB4 and has not been retried on OCuLink. That is a
   hardware experiment, not a code change.
-- **Everything off-card is green as of 2026-09-17.** All six gates pass
+- **Everything off-card is green as of 2026-09-17.** All SEVEN gates pass
   on an OpenCL CPU device: test_k2_kernels, test_k2_e2e,
-  test_gemma4_prefill (8/8 batched == sequential), test_model_matrix
-  (8 architectures x 7 formats), test_spec_e2e, and test_parallel_e2e
-  (50 matches, 0 failures).  The k2-horizon cell this file previously
-  called a Tower-only Intel-runtime crash was the over-reporting
-  ext_intel_matrix aspect -- see CLAUDE.md rule 15 -- and passes now.
+  test_gemma4_prefill (8/8 batched == sequential), test_qwen4_exp_e2e,
+  test_model_matrix (9 architectures x 7 formats), test_spec_e2e, and
+  test_parallel_e2e (50 matches, 0 failures).  The k2-horizon cell this
+  file previously called a Tower-only Intel-runtime crash was the
+  over-reporting ext_intel_matrix aspect -- see CLAUDE.md rule 15 -- and
+  passes now.
+
+  Two of those gates were BUILT and never RUN by `preflight_b70.sh`:
+  test_gemma4_prefill and test_qwen4_exp_e2e are in its list now.  A gate
+  that nothing runs is the same gap as no gate (rule 14).
+
+- **Qwen4-Exp / Qwen3.8-Flash-Next runs. DONE 2026-09-17, off-card.**
+  HyperConnections (a residual stream hc_count streams wide), QSA (an
+  MQA indexer that scores mean-pooled key blocks and attends to the
+  top-k plus the incomplete block) and the PLE n-gram embedding (a
+  20-million-row table that lives in HOST memory by design -- the one
+  exception to VRAM-only in this engine) all execute, single process,
+  with a batched prefill that is token-identical to sequential decode.
+
+  `bin/test_qwen4_exp_e2e` proves each mechanism is LIVE rather than
+  merely present, by an A/B against the SAME WEIGHTS with one thing
+  turned off in config.json only.  Read `QWEN4-EXP-2026-09-16.md`'s
+  bottom section before touching any of it: three things the first pass
+  got wrong are written down there, and each of them was fluent.
+
+  Still refused BY NAME, not approximated: TP, PP, and an MTP drafter.
+  On the Tower this needs the real checkpoint, which no one here has
+  been able to download (huggingface is blocked from the work
+  container), and it has never produced a number.
 
 - **gemma-4 at its real head_dim. DONE 2026-09-15, off-card.**
   `google/gemma-4-31B-it` loads at head_dim 512.  The four flash kernels
