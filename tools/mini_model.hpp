@@ -22,6 +22,7 @@
 #include "b70/formats.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -37,10 +38,24 @@ namespace fs = std::filesystem;
 // `fill`, when non-empty, gives the tensor its exact values instead of
 // random ones.  Needed for index tables (a DFlash d2t map) where random
 // noise is not a weaker test, it is a different tensor.
+// `dt` picks the on-disk dtype.  BF16 for everything the engine reads as
+// a weight; F8_E4M3 exists because the real Qwen4-Exp n-gram table is
+// FP8 (51 GB of host memory against 102 GB at BF16), and a path that is
+// only ever handed BF16 has not been tested on the format the checkpoint
+// actually ships.  F32 is for a scalar quantisation scale.
+//
+// `e4m3_exact` rounds a tensor's random values through E4M3 while still
+// storing them in `dt`.  That is what makes an FP8-vs-BF16 A/B possible:
+// two checkpoints whose tables differ only in ENCODING hold numerically
+// identical values, so they must generate identical tokens.
+enum class TnType { BF16, F8_E4M3, F32 };
+
 struct Tn {
     std::string name;
     std::vector<int64_t> shape;
     std::vector<float> fill = {};
+    TnType dt = TnType::BF16;
+    bool   e4m3_exact = false;
 };
 
 // A named architecture and the tensors it needs.
@@ -55,32 +70,70 @@ struct Arch {
 inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 20260912) {
     fs::create_directories(dir);
     std::ofstream(dir/"config.json") << a.config;
+
+    auto esz = [](TnType t) -> size_t {
+        return t == TnType::F32 ? 4u : (t == TnType::F8_E4M3 ? 1u : 2u);
+    };
+    auto dname = [](TnType t) -> const char* {
+        return t == TnType::F32 ? "F32" : (t == TnType::F8_E4M3 ? "F8_E4M3" : "BF16");
+    };
+
     std::ostringstream h; h << '{';
     uint64_t off = 0;
+    std::vector<uint64_t> begin(a.tensors.size(), 0);
     for (size_t i = 0; i < a.tensors.size(); ++i) {
         if (i) h << ',';
         size_t n = 1; for (auto d : a.tensors[i].shape) n *= size_t(d);
-        h << '"' << a.tensors[i].name << "\":{\"dtype\":\"BF16\",\"shape\":[";
+        h << '"' << a.tensors[i].name << "\":{\"dtype\":\"" << dname(a.tensors[i].dt)
+          << "\",\"shape\":[";
         for (size_t d = 0; d < a.tensors[i].shape.size(); ++d) {
             if (d) h << ',';
             h << a.tensors[i].shape[d];
         }
-        h << "],\"data_offsets\":[" << off << ','; off += n*2; h << off << "]}";
+        begin[i] = off;
+        h << "],\"data_offsets\":[" << off << ','; off += n * esz(a.tensors[i].dt);
+        h << off << "]}";
     }
     h << '}';
     std::string hs = h.str(); while (hs.size() % 8) hs += ' ';
 
-    std::mt19937 rng(seed);
-    std::normal_distribution<float> nd(0.f, 0.05f);
-    std::vector<bf16_t> data(off/2);
-    for (auto& v : data) v = f32_to_bf16(nd(rng));
-    {   // exact values where a tensor asked for them
-        size_t at = 0;
-        for (const Tn& t : a.tensors) {
-            size_t n = 1; for (auto d : t.shape) n *= size_t(d);
-            for (size_t i = 0; i < t.fill.size() && i < n; ++i)
-                data[at+i] = f32_to_bf16(t.fill[i]);
-            at += n;
+    std::vector<uint8_t> data(size_t(off), 0);
+    // A per-tensor stream seeded from the tensor's NAME, not from one
+    // stream over the whole file and not from its index.  With a single
+    // stream every tensor's values depend on the SIZES of the tensors
+    // before it; seeded by index they depend on how many tensors come
+    // before it.  Either way, adding one scalar scale -- or changing one
+    // dtype -- silently rewrites every weight after it, and an A/B
+    // between two nearly-identical checkpoints then compares two
+    // different models.  By name, a tensor's values depend on nothing
+    // but its own name.
+    auto name_seed = [&](const std::string& nm) {
+        uint32_t hsh = 2166136261u;                       // FNV-1a
+        for (unsigned char ch : nm) { hsh ^= ch; hsh *= 16777619u; }
+        return seed ^ hsh;
+    };
+    for (size_t i = 0; i < a.tensors.size(); ++i) {
+        const Tn& t = a.tensors[i];
+        size_t n = 1; for (auto d : t.shape) n *= size_t(d);
+        std::mt19937 rng(name_seed(t.name));
+        std::normal_distribution<float> nd(0.f, 0.05f);
+        uint8_t* dst = data.data() + begin[i];
+        for (size_t k = 0; k < n; ++k) {
+            float v = k < t.fill.size() ? t.fill[k] : nd(rng);
+            if (t.e4m3_exact) v = e4m3_to_f32(f32_to_e4m3(v));
+            switch (t.dt) {
+                case TnType::F32:
+                    std::memcpy(dst + k * 4, &v, 4);
+                    break;
+                case TnType::F8_E4M3:
+                    dst[k] = f32_to_e4m3(v);
+                    break;
+                case TnType::BF16: {
+                    const bf16_t b = f32_to_bf16(v);
+                    std::memcpy(dst + k * 2, &b, 2);
+                    break;
+                }
+            }
         }
     }
 
@@ -89,7 +142,7 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
     f.write(reinterpret_cast<const char*>(&n), 8);
     f << hs;
     f.write(reinterpret_cast<const char*>(data.data()),
-            std::streamsize(data.size()*sizeof(bf16_t)));
+            std::streamsize(data.size()));
 }
 
 // ---- K2-Horizon: MoVA + grouped norm + softplus gate + sigmoid router --
@@ -552,7 +605,13 @@ inline Arch hybrid(int L = 4, bool mtp = false) {
 //  * ngram_vocab_size_base 1024 keeps the derived prime layout small
 //    (1031 + 1033 + 1039 + 1049 = 4152 rows) while still being derived
 //    the same way the real 20,000,000-row table is.
-inline Arch qwen4_exp(int L = 4) {
+// `fp8_table` writes the n-gram table as FP8-E4M3 with a global scale of
+// 1.0 instead of BF16.  Both arms round the table's values through E4M3
+// (Tn::e4m3_exact), so the two checkpoints hold NUMERICALLY IDENTICAL
+// tables and differ only in encoding -- which is what lets a gate demand
+// that they generate the same tokens.  Without that the FP8 read path
+// could only be checked for "did not crash".
+inline Arch qwen4_exp(int L = 4, bool fp8_table = false) {
     const int H=64, Q=128, KV=32, V=128;          // Q is 2x: attn_output_gate
     const int HC=2, LR=16, WIDE=HC*H;
     const int MI=32, SI=32, E=4;
@@ -594,7 +653,7 @@ inline Arch qwen4_exp(int L = 4) {
         c << (l ? "," : "") << (l % 2 == 0 ? R"("linear_attention")"
                                            : R"("qwen_sparse_attention")");
     c << "]}";
-    Arch a{"qwen4_exp", c.str(), {}, V, L};
+    Arch a{fp8_table ? "qwen4_exp-fp8ple" : "qwen4_exp", c.str(), {}, V, L};
     auto& t = a.tensors;
     // NO model.norm: the tail hyper-connection mixer replaces it, and it
     // is the one mixer with no block_inject_weight (use_combine=false).
@@ -645,8 +704,16 @@ inline Arch qwen4_exp(int L = 4) {
             t.push_back({pl+"norm_key.weight",   {WIDE}});
             t.push_back({pl+"norm_query.weight", {WIDE}});
             t.push_back({pl+"norm_conv.weight",  {WIDE}});
-            t.push_back({pl+"ple_embedding.ngram_embedding.weight",
-                         {TABLE, PE/NH}});
+            Tn tab{pl+"ple_embedding.ngram_embedding.weight", {TABLE, PE/NH}};
+            tab.e4m3_exact = true;
+            if (fp8_table) tab.dt = TnType::F8_E4M3;
+            t.push_back(tab);
+            if (fp8_table) {
+                Tn sc{pl+"ple_embedding.ngram_embedding.weight_scale", {1}};
+                sc.dt = TnType::F32;
+                sc.fill = {1.0f};
+                t.push_back(sc);
+            }
         }
         const std::string m = b + "mlp.";
         t.push_back({m+"gate.weight", {E,H}});

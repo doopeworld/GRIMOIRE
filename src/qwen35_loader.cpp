@@ -884,6 +884,8 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 lay.ple_norm_query= get(pl + "norm_query.weight");
                 lay.ple_norm_conv = get(pl + "norm_conv.weight");
                 lay.ple_table     = get(pl + "ple_embedding.ngram_embedding.weight");
+                lay.ple_table_scale =
+                    get(pl + "ple_embedding.ngram_embedding.weight_scale");
             }
         }
 

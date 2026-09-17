@@ -2285,12 +2285,20 @@ sycl::event launch_ple_conv(sycl::queue& q, const float* conv_in,
 // it in VRAM) and only the rows for the current tokens are read.  Every
 // other weight in this engine is device-resident; this one is the
 // exception the model expects.
-sycl::event launch_ple_embed_gather(sycl::queue& q, const bf16_t* table,
+// The table is BF16 or FP8-E4M3 with ONE global scale, which is what
+// makes the real checkpoint's ~51B table a 51 GB host allocation instead
+// of a 102 GB one.  The reference keeps the same two cases
+// (Qwen4ExpPLEUnquantizedEmbeddingMethod / Qwen4ExpPLEFp8EmbeddingMethod)
+// and rejects an FP8 table with no scale rather than assuming 1.0.
+sycl::event launch_ple_embed_gather(sycl::queue& q, const void* table,
+                                    bool fp8, float scale,
                                     const int64_t* ids, float* out, int rows,
                                     int ngram_heads, int head_dim,
                                     int64_t table_rows,
                                     const std::vector<sycl::event>& deps) {
     const int width = ngram_heads * head_dim;
+    const uint8_t* raw = static_cast<const uint8_t*>(table);
+    const bf16_t*  bf  = static_cast<const bf16_t*>(table);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(rows) * width),
@@ -2300,9 +2308,12 @@ sycl::event launch_ple_embed_gather(sycl::queue& q, const bf16_t* table,
                 const int hh = w / head_dim;
                 const int d  = w % head_dim;
                 const int64_t row = ids[int64_t(r) * ngram_heads + hh];
-                out[int64_t(r) * width + w] =
-                    (row >= 0 && row < table_rows)
-                        ? bf16_to_f32(table[row * head_dim + d]) : 0.0f;
+                float v = 0.0f;
+                if (row >= 0 && row < table_rows) {
+                    const int64_t at = row * head_dim + d;
+                    v = fp8 ? e4m3_to_f32(raw[at]) * scale : bf16_to_f32(bf[at]);
+                }
+                out[int64_t(r) * width + w] = v;
             });
     });
 }

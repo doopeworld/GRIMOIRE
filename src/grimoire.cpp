@@ -897,6 +897,14 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
                               PackedWeight& p, std::string& err);
 
+// One float out of a 1-element tensor.  A global quantisation scale is
+// stored as a tensor like any other, and reading it with the matrix
+// reader would work but says nothing about the expectation that it is
+// scalar -- a per-row scale silently read as "the first row's" is the
+// kind of thing that produces a plausible model.
+bool read_scalar_f32(const Qwen35Model& ck, const TensorRef& r,
+                     float& out, std::string& err);
+
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
     if (r.native) return ck.read_native_f32(r,dst,err);
@@ -950,6 +958,20 @@ bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
     gptq_dequant_4bit(g, dst);
     return true;
 }
+
+bool read_scalar_f32(const Qwen35Model& ck, const TensorRef& r,
+                     float& out, std::string& err) {
+    if (!r.ok()) { err = "scale tensor is absent"; return false; }
+    int64_t n = 1;
+    for (int64_t d : r.t.shape) n *= d;
+    if (n != 1) {
+        err = "expected a single global scale, got a tensor with " +
+              std::to_string(n) + " elements";
+        return false;
+    }
+    return read_matrix_f32(ck, r, &out, err);
+}
+
 
 DevQuant concat_upload_many_bf16_t(sycl::queue& q, const Qwen35Model& ck,
                                     const std::vector<TensorRef>& refs,
@@ -2007,7 +2029,9 @@ struct Grimoire {
         // is true at M == 1 and false for every batch.
         DevQuant ple_key, ple_value;
         bf16_t  *ple_nk=nullptr, *ple_nq=nullptr, *ple_nc=nullptr, *ple_cw=nullptr;
-        const bf16_t* ple_table = nullptr;
+        const void* ple_table = nullptr;
+        bool     ple_fp8 = false;
+        float    ple_scale = 1.0f;
         int64_t  ple_rows = 0;
         int64_t *ple_mul=nullptr, *ple_size=nullptr, *ple_off=nullptr;
         // The dilated conv's carried history: (kernel-1)*dilation rows of
@@ -3559,15 +3583,39 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     err = "ple_embedding.ngram_embedding has an unexpected shape";
                     return false;
                 }
-                if (src.ple_table.t.dtype != STDtype::BF16) {
-                    err = "the PLE n-gram table is not BF16; this engine reads "
-                          "that table straight out of host memory and has no "
-                          "dequantiser on that path";
+                // BF16, or FP8-E4M3 with one global scale.  That second
+                // case is not an optimisation: the published table is
+                // ~51B parameters, which is 51 GB of host memory at FP8
+                // and 102 GB at BF16.
+                const bool tfp8 = src.ple_table.t.dtype == STDtype::F8_E4M3;
+                if (!tfp8 && src.ple_table.t.dtype != STDtype::BF16) {
+                    err = "the PLE n-gram table is neither BF16 nor FP8-E4M3; "
+                          "this engine reads that table straight out of host "
+                          "memory and has a dequantiser for those two only";
                     return false;
+                }
+                float tscale = 1.0f;
+                if (tfp8) {
+                    // The reference REFUSES an FP8 table with no scale
+                    // (process_weights_after_loading) rather than
+                    // defaulting to 1.0, and so does this: an unscaled
+                    // table is a differently-weighted embedding, which is
+                    // fluent.
+                    if (!src.ple_table_scale.ok()) {
+                        err = "the PLE n-gram table is FP8 but ships no "
+                              "weight_scale; reading it unscaled would be a "
+                              "different embedding, not an error";
+                        return false;
+                    }
+                    if (!read_scalar_f32(ck, src.ple_table_scale, tscale, err)) {
+                        err = "reading the PLE table's global scale failed: " + err;
+                        return false;
+                    }
                 }
                 const int64_t rows = int64_t(src.ple_table.t.shape[0]);
                 const int64_t wid  = int64_t(src.ple_table.t.shape[1]);
-                bf16_t* host = sycl::malloc_host<bf16_t>(size_t(rows*wid), lq);
+                const size_t  esz  = tfp8 ? 1 : sizeof(bf16_t);
+                void* host = sycl::malloc_host(size_t(rows*wid) * esz, lq);
                 if (!host) { err = "PLE host table allocation failed"; return false; }
                 // read_raw, NOT ck.data(): the file mappings were dropped
                 // above (unmap_all), so every read after that point is a
@@ -3577,6 +3625,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     return false;
                 }
                 d.ple_table = host;
+                d.ple_fp8   = tfp8;
+                d.ple_scale = tscale;
                 d.ple_rows  = rows;
 
                 // Layout and multipliers are DERIVED, never stored.
@@ -7336,8 +7386,8 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             launch_ple_ngram_ids(q, q4_tok, q4_ids, pos, 1, d.ple_mul,
                                  d.ple_size, d.ple_off, cfg.ngram_size - 1,
                                  cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
-            launch_ple_embed_gather(q, d.ple_table, q4_ids, q4_emb, 1, NH, HD,
-                                    d.ple_rows, none);
+            launch_ple_embed_gather(q, d.ple_table, d.ple_fp8, d.ple_scale,
+                                    q4_ids, q4_emb, 1, NH, HD, d.ple_rows, none);
             gemv_any(d.ple_key,   q4_emb, q4_kv, none);
             gemv_any(d.ple_value, q4_emb, q4_kv + WIDE, none);
             // key is the first hc*H rows of the merged projection, value
@@ -9708,8 +9758,8 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             launch_ple_ngram_ids(q, q4_tok, pids, start_pos, M, d.ple_mul,
                                  d.ple_size, d.ple_off, cfg.ngram_size - 1,
                                  cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
-            launch_ple_embed_gather(q, d.ple_table, pids, pemb, M, NH, PHD,
-                                    d.ple_rows, none);
+            launch_ple_embed_gather(q, d.ple_table, d.ple_fp8, d.ple_scale,
+                                    pids, pemb, M, NH, PHD, d.ple_rows, none);
             mm(d.ple_key,   pemb, pkey);
             mm(d.ple_value, pemb, pval);
             if (!ok) break;

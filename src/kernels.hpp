@@ -317,9 +317,11 @@ sycl::event launch_ple_conv(sycl::queue& q, const float* conv_in,
     const std::vector<sycl::event>& deps = {});
 // `table` is HOST memory: the n-gram table is the one weight in this
 // engine that does not live in VRAM, which is the architecture's design.
-sycl::event launch_ple_embed_gather(sycl::queue& q, const bf16_t* table,
-    const int64_t* ids, float* out, int rows, int ngram_heads, int head_dim,
-    int64_t table_rows, const std::vector<sycl::event>& deps = {});
+// BF16, or FP8-E4M3 with one global `scale`.
+sycl::event launch_ple_embed_gather(sycl::queue& q, const void* table,
+    bool fp8, float scale, const int64_t* ids, float* out, int rows,
+    int ngram_heads, int head_dim, int64_t table_rows,
+    const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
 sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
     const uint8_t* k_cache, const uint8_t* v_cache, const int32_t* idx,

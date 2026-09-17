@@ -295,6 +295,47 @@ int main(int argc, char** argv) {
         }
     }
 
+    // An FP8 n-gram table with NO global scale.  The reference refuses
+    // this (Qwen4ExpPLEFp8EmbeddingMethod.process_weights_after_loading)
+    // rather than defaulting the scale to 1.0, and so must this: an
+    // unscaled table is not an error, it is a differently-weighted
+    // embedding, and the model reads perfectly well with it.
+    {
+        mini::Arch bad = mini::qwen4_exp(4, /*fp8_table=*/true);
+        size_t at = bad.tensors.size();
+        for (size_t i = 0; i < bad.tensors.size(); ++i)
+            if (bad.tensors[i].name.find("ngram_embedding.weight_scale")
+                != std::string::npos) at = i;
+        if (at == bad.tensors.size()) {
+            ++fails;
+            std::printf("  %-14s the FP8 fixture ships no weight_scale to "
+                        "remove; this case proves nothing\n", "ple fp8 scale");
+        } else {
+            bad.tensors.erase(bad.tensors.begin() + long(at));
+            const fs::path dir = root / "refuse-ple-fp8-noscale";
+            mini::write_model(dir, bad);
+            std::string err;
+            Grimoire* e = grimoire_new();
+            bool loaded = false;
+            if (e) {
+                loaded = grimoire_load(*e, dir.string(), Fmt::BF16, 128, err);
+                grimoire_delete(e);
+            }
+            if (loaded) {
+                ++fails;
+                std::printf("  %-14s LOADED -- an unscaled FP8 table is a "
+                            "different embedding, not an error\n",
+                            "ple fp8 scale");
+            } else if (err.find("ships no weight_scale") == std::string::npos) {
+                ++fails;
+                std::printf("  %-14s refused, but for the wrong reason: %s\n",
+                            "ple fp8 scale", err.c_str());
+            } else {
+                std::printf("  %-14s refused by name\n", "ple fp8 scale");
+            }
+        }
+    }
+
     if (!notes.empty()) {
         std::printf("\ndetail:\n");
         for (const auto& n : notes) std::printf("  %s\n", n.c_str());

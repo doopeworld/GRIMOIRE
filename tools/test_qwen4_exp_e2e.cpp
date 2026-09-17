@@ -190,6 +190,34 @@ int main() {
         }
     }
 
+    // ---- the FP8 n-gram table reads the same as the BF16 one ---------
+    // This is the format the real checkpoint ships: ~51 B parameters in
+    // that table, which is 51 GB of host memory at FP8 and 102 GB at
+    // BF16.  A path only ever handed BF16 has not been tested on the
+    // format that matters.
+    //
+    // Both arms round the table's values through E4M3, so the two files
+    // hold numerically identical tables and differ only in ENCODING --
+    // which turns "it loaded" into "it read the right numbers".  The
+    // scale is 1.0 here on purpose: a missing scale is refused rather
+    // than defaulted, and that refusal is checked in the matrix gate.
+    {
+        const fs::path dir = root / "fp8-table";
+        mini::write_model(dir, mini::qwen4_exp(4, /*fp8_table=*/true));
+        std::vector<int32_t> t; std::string err;
+        if (!gen(dir, Fmt::BF16, kPrompt, kWant, t, err)) {
+            ++g_fail;
+            std::printf("    FAIL: the FP8-table arm did not run: %s\n",
+                        err.c_str());
+        } else {
+            std::printf("%-22s %s\n", "FP8 n-gram table", show(t).c_str());
+            CHECK(t == tok_base,
+                  "the FP8 and BF16 n-gram tables hold the same numbers and "
+                  "must generate the same tokens; they do not, so the FP8 "
+                  "read path is wrong");
+        }
+    }
+
     // ---- the batched prefill actually ran ----------------------------
     {
         const long n = b70::g_qwen4_exp_batched_prefills;

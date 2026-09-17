@@ -351,7 +351,11 @@ struct Qwen35Layer {
     int       ple_dense_id = 0;             // index into sorted ple_layer_ids
     TensorRef ple_key, ple_value, ple_conv1d;
     TensorRef ple_norm_key, ple_norm_query, ple_norm_conv;
-    TensorRef ple_table;                    // the n-gram rows; HOST resident
+    // The n-gram rows, HOST resident.  BF16, or FP8-E4M3 with ONE global
+    // scale beside it -- the reference REJECTS an FP8 table whose scale
+    // is missing rather than assuming 1.0, because a silently unscaled
+    // table is just a differently-weighted embedding.
+    TensorRef ple_table, ple_table_scale;
 };
 
 struct Qwen35Model {
