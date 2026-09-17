@@ -705,6 +705,8 @@ extern long g_nvfp4_tensors;
 extern long g_prefix_tokens_reused;
 extern long g_prefix_tokens_reused_calls;
 extern long g_prefix_bytes_copied;
+extern long g_batch_decode_steps;
+extern long g_batch_decode_rows;
 
 // ---------------------------------------------------------------------
 // Upload helpers
@@ -2207,6 +2209,20 @@ struct Grimoire {
         const int v = e && *e ? std::atoi(e) : 1;
         return v < 1 ? 1 : (v > 64 ? 64 : v);
     }
+    // How deep the KV cache is allocated.  Two callers want the same
+    // thing for different reasons -- the prefix cache wants a slot per
+    // resident conversation, a batched decode wants a slot per row in
+    // flight -- so they share one number and take the larger request.
+    // GRIMOIRE_SEQ_SLOTS is the name that means both; the older
+    // GRIMOIRE_PREFIX_SLOTS still works and only counts when the cache
+    // is on, which is what it always meant.
+    static int seq_slots_requested() {
+        const char* e = std::getenv("GRIMOIRE_SEQ_SLOTS");
+        const int v = e && *e ? std::atoi(e) : 1;
+        const int a = v < 1 ? 1 : (v > 64 ? 64 : v);
+        const int b = prefix_cache_enabled() ? prefix_cache_slots() : 1;
+        return a > b ? a : b;
+    }
     // The slot to write this request's snapshot into: the one it resumed
     // from (extend it in place -- a conversation should not consume a
     // second slot every turn), otherwise a free one, otherwise the
@@ -2854,8 +2870,36 @@ struct Grimoire {
     bf16_t* gemma_vnorm = nullptr;
     sycl::half* muse_zero_f16 = nullptr;   // same, for the FP16 activation path
     const float* forward_dag(int token);  // out-of-order queue + true dependencies
+    // ONE TOKEN PER SEQUENCE, several sequences at once.
+    //
+    // Batched decode is a prefill whose M rows belong to M DIFFERENT
+    // conversations rather than to consecutive positions of one.  That
+    // is worth saying plainly, because it is why this is a parameter and
+    // not a second copy of prefill(): every weight in the model is read
+    // once for the whole batch either way, and the only thing that
+    // differs is which cache each row reads and at what position.  Decode
+    // is weight-bound, so eight conversations stepped together cost
+    // about what one costs -- that is the entire point.
+    //
+    // slot[r] names the sequence's KV rows (see bind_seq_slot) and
+    // pos[r] its position in that sequence.  Both are HOST arrays: this
+    // path never records a command graph, so there is nothing to bake.
+    struct SeqBatch { const int* slot; const int* pos; };
     bool prefill(const std::vector<int32_t>& tokens,
-                 std::vector<int32_t>* next_tokens = nullptr);
+                 std::vector<int32_t>* next_tokens = nullptr,
+                 const SeqBatch* batch = nullptr);
+    // Why a batch cannot be run: a sentence naming the feature, or empty
+    // if it can.  Kept apart from prefill() so the caller can refuse
+    // BEFORE it commits sequences to slots, and so the reason reaches a
+    // human instead of a false return.
+    std::string batch_unsupported_reason() const;
+    // Step M resident sequences by one token each.  Returns the token
+    // each row produced.
+    bool decode_batch(const std::vector<int32_t>& toks,
+                      const std::vector<int>& slots,
+                      const std::vector<int>& poss,
+                      std::vector<int32_t>& out);
+    static constexpr int kMaxBatchRows = kSpecBatch;
     bool prefill_muse(const std::vector<int32_t>& tokens,
                       std::vector<int32_t>* next_tokens = nullptr);
     bool prefill_gemma4(const std::vector<int32_t>& tokens,
@@ -3368,7 +3412,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // Resolved HERE, once, because the KV cache is allocated this deep a
     // few hundred lines below.  Without the cache enabled there is one
     // slot and the allocation is byte-for-byte what it always was.
-    n_seq_slots = prefix_cache_enabled() ? prefix_cache_slots() : 1;
+    n_seq_slots = seq_slots_requested();
     seq_slot = 0;
 
     if (pp_enabled() && tp_enabled()) {
@@ -6023,6 +6067,56 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
 // write this conversation's keys into the previous one's rows: correct
 // arithmetic, wrong sequence, and nothing to see in the output but a
 // reply that drifts.
+// What stops a batch, named.  Rule 10: the engine says what it can RUN,
+// and it says which feature is missing rather than returning false.
+//
+// Every entry here is a real coupling, not caution:
+//
+//  * a recurrent layer carries ONE conv ring and ONE DeltaNet state for
+//    the whole engine.  Two conversations stepped together would advance
+//    the same state and each would read the other's history -- fluent
+//    output from a mixture of two chats.  Per-slot recurrent state is
+//    what lifts this, and it is not written yet.
+//  * Muse, gemma-4 and Qwen4-Exp each have their OWN batched path with
+//    their own residual graph.  The loop this parameter modifies is the
+//    Qwen graph; running them through it would contradict their decode
+//    token for token and still read as English.
+//  * TP and PP add collectives whose shape every rank must agree on, and
+//    nothing here negotiates a batch width across ranks.
+//  * a drafter and a batch both want the verify path; combining them is
+//    a scheduling question nobody has answered yet.
+std::string Grimoire::batch_unsupported_reason() const {
+    if (cfg.is_muse)      return "Muse has its own batched path";
+    if (cfg.is_gemma4)    return "gemma-4 has its own batched path";
+    if (cfg.is_qwen4_exp) return "Qwen4-Exp has its own batched path";
+    if (tp_enabled())     return "tensor parallel";
+    if (pp_enabled())     return "pipeline parallel";
+    if (mtp.ok || dflash2.ok)
+        return "a speculative drafter is loaded";
+    for (const auto& d : L)
+        if (d.kind == LayerKind::LINEAR_ATTN)
+            return "linear-attention layers keep one recurrent state per engine, "
+                   "not per sequence";
+    if (n_seq_slots < 2)
+        return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
+    if (!device_can_matrix(q) && !std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX"))
+        return "this device has no matrix hardware "
+               "(GRIMOIRE_BATCHED_PREFILL_NOXMX=1 runs it slowly, for checking)";
+    return {};
+}
+
+// Step M resident sequences by one token each.  The tokens come back in
+// row order; the caller owns each sequence's position and advances it.
+bool Grimoire::decode_batch(const std::vector<int32_t>& toks,
+                            const std::vector<int>& slots,
+                            const std::vector<int>& poss,
+                            std::vector<int32_t>& out) {
+    if (toks.size() != slots.size() || toks.size() != poss.size())
+        throw std::invalid_argument("batch row arrays disagree in length");
+    SeqBatch b{slots.data(), poss.data()};
+    return prefill(toks, &out, &b);
+}
+
 void Grimoire::bind_seq_slot(int j) {
     if (j < 0 || j >= n_seq_slots || j == seq_slot) return;
     for (auto& d : L) {
@@ -9642,6 +9736,12 @@ long g_prefix_tokens_reused_calls = 0;
 // identically -- and the only thing that distinguishes them is that one
 // of them moves bytes proportional to max_seq.
 long g_prefix_bytes_copied = 0;
+// Batched decode steps, and the rows they carried.  The ratio is the
+// only thing that distinguishes a batch from a loop, and an identity
+// test cannot see the difference -- a path that quietly stepped each
+// sequence alone would pass every token comparison there is.
+long g_batch_decode_steps = 0;
+long g_batch_decode_rows = 0;
 long g_gemma4_batched_prefills = 0;
 // Same, for Qwen4-Exp: a prefill-vs-decode gate that cannot see the
 // fallback proves nothing at all.
@@ -10329,7 +10429,35 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
 }
 
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
-                       std::vector<int32_t>* next_tokens) {
+                       std::vector<int32_t>* next_tokens,
+                       const SeqBatch* seqb) {
+    if(seqb){
+        // A batch does not have ONE position, so the engine's cursor says
+        // nothing about whether it fits.  Every row is checked against
+        // its own sequence instead.
+        if(tokens.empty()||int(tokens.size())>kMaxBatchRows)
+            throw std::invalid_argument("batch is empty or wider than the engine allows");
+        for(size_t r=0;r<tokens.size();++r){
+            if(seqb->slot[r]<0||seqb->slot[r]>=n_seq_slots)
+                throw std::invalid_argument("batch row names a sequence slot that does not exist");
+            if(seqb->pos[r]<0||seqb->pos[r]>=max_seq)
+                throw std::out_of_range("batch row is past the context window");
+        }
+        // Two rows in one slot would append two keys to the same
+        // position and then both read the survivor.  Fluent, wrong, and
+        // impossible to see in the output.
+        for(size_t a=0;a+1<tokens.size();++a)
+            for(size_t b=a+1;b<tokens.size();++b)
+                if(seqb->slot[a]==seqb->slot[b])
+                    throw std::invalid_argument("two batch rows share a sequence slot");
+        const std::string why=batch_unsupported_reason();
+        if(!why.empty()){
+            static bool said=false;
+            if(!said){said=true;
+                std::fprintf(stderr,"    batched decode unavailable: %s\n",why.c_str());}
+            return false;
+        }
+    } else
     if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
         throw std::invalid_argument("prefill exceeds context capacity or is empty");
     for(auto t:tokens)if(t<0||t>=cfg.vocab)throw std::invalid_argument("invalid prefill token");
@@ -10442,7 +10570,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const int M = int(tokens.size());
     if (M <= 0 || pos + M > max_seq) return false;
     const int start_pos = pos;
-    if (!next_tokens && start_pos == 0 && restore_prefix(tokens)) return true;
+    if (!seqb && !next_tokens && start_pos == 0 && restore_prefix(tokens)) return true;
 
     const int H = cfg.hidden, Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -11192,7 +11320,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     int raw_gdn_layer_limit=cfg.n_layers;
     if(const char* v=std::getenv("GRIMOIRE_RAW_GDN_LAYER_LIMIT"))
         raw_gdn_layer_limit=std::max(0,std::min(cfg.n_layers,std::atoi(v)));
-    const bool capture_spec = next_tokens && M <= kSpecBatch;
+    // ALLOCATED IS NOT THE SAME AS EXISTING (rule 7b, again).  This used
+    // to read next_tokens && M <= kSpecBatch, on the assumption that a
+    // caller asking for per-row tokens is always a speculative verify and
+    // therefore always has a drafter -- so spec_hidden_steps was always
+    // allocated.  A batched decode asks for per-row tokens with no
+    // drafter at all, and the memcpy below took a null pointer straight
+    // into the runtime.  Test the buffer, not the caller's shape.
+    const bool capture_spec =
+        next_tokens && M <= kSpecBatch && spec_hidden_steps && !seqb;
     const bool spec_route_diag = capture_spec &&
         std::getenv("GRIMOIRE_MTP_ROUTE_DIAG") != nullptr;
     size_t spec_route_total = 0, spec_route_unique = 0;
@@ -11443,6 +11579,39 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
             } else mm(d.v_proj,bn,t4);
             pp_mark("attn kv proj");
+            if(seqb){
+                // ONE ROW AT A TIME, because each row sits at its own
+                // position in its own conversation.  The SAME kernels the
+                // batched arm uses, called with tokens=1: a row rotated by
+                // a different routine from the one the rest of the engine
+                // uses would be wrong in a way that is fluent, and calling
+                // the batched kernel with one row cannot drift from it.
+                //
+                // Only the attention section is per-row.  Everything
+                // before and after -- every projection, the FFN, the
+                // router, the head -- stays batched, and that is where
+                // the weights are read.
+                const int QH=cfg.n_heads*d.head_dim, KH=d.kv_heads*d.head_dim;
+                for(int r=0;r<M;++r){
+                    const int P=seqb->pos[r];
+                    uint8_t* kc=d.k_base+size_t(seqb->slot[r])*d.kv_slot;
+                    uint8_t* vc=d.v_base+size_t(seqb->slot[r])*d.kv_slot;
+                    float* qr=qv+int64_t(r)*QH;
+                    float* kr=t3+int64_t(r)*KH;
+                    float* vr=t4+int64_t(r)*KH;
+                    if(d.rope_proportional)
+                        launch_qk_norm_rope_proportional_batched(q,qr,kr,d.q_norm,
+                            d.k_norm,1,cfg.n_heads,d.kv_heads,d.head_dim,P,
+                            d.rope_theta,d.partial_rope,cfg.rms_eps,{},1.0f,
+                            d.rope_factor);
+                    else
+                        launch_qk_norm_rope_batched(q,qr,kr,d.q_norm,d.k_norm,1,
+                            cfg.n_heads,d.kv_heads,d.head_dim,P,d.rope_theta,
+                            d.partial_rope,cfg.rms_eps);
+                    launch_kv_append_batched(q,kr,vr,kc,vc,1,P,d.kv_heads,
+                        d.head_dim,max_seq);
+                }
+            }else{
             if(d.rope_proportional)
                 launch_qk_norm_rope_proportional_batched(q,qv,t3,d.q_norm,
                     d.k_norm,M,cfg.n_heads,d.kv_heads,d.head_dim,pos,
@@ -11453,9 +11622,50 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     d.kv_heads,d.head_dim,pos,d.rope_theta,d.partial_rope,cfg.rms_eps);
             launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,M,pos,d.kv_heads,
                 d.head_dim,max_seq);
+            }
             pp_mark("attn rope + kv append");
             const sycl_bf16* attention_bf=nullptr;
-            if(xe2_attention && pos==0 && M>=32){
+            if(seqb){
+                // Each row attends to ITS OWN conversation and to nothing
+                // else.  This is the one place a batched decode differs
+                // from a batched prefill in kind rather than in index: a
+                // prefill's rows are consecutive and see each other, these
+                // rows are strangers.  Any kernel that let row r read row
+                // r-1's keys would produce fluent text from the wrong
+                // conversation.
+                //
+                // Attention is per-sequence work: batching cannot make a
+                // row read fewer of its own keys, so looping here costs M
+                // launches and no extra bytes.  The saving this path is
+                // for is in the weights, which the batch already shares.
+                const int QH=cfg.n_heads*d.head_dim;
+                // pos[r] + 1, which is set_cursor()'s convention: the
+                // count INCLUDES the entry this row just appended, so a
+                // token attends to itself exactly as it does in
+                // single-token decode.  Getting this off by one is the
+                // difference between a model that reads its own last
+                // token and one that does not, and both are fluent.
+                {
+                    std::vector<int32_t> lens(size_t(M), 0);
+                    for(int r=0;r<M;++r)lens[size_t(r)]=seqb->pos[r]+1;
+                    q.memcpy(dtok,lens.data(),size_t(M)*sizeof(int32_t)).wait();
+                }
+                for(int r=0;r<M;++r){
+                    AttnParams ap{};
+                    ap.q=qv+int64_t(r)*QH;
+                    ap.k_cache=d.k_base+size_t(seqb->slot[r])*d.kv_slot;
+                    ap.v_cache=d.v_base+size_t(seqb->slot[r])*d.kv_slot;
+                    ap.out=t3+int64_t(r)*QH;
+                    ap.seq_len=seqb->pos[r]+1;ap.seq_cap=max_seq;
+                    ap.head_dim=d.head_dim;ap.num_heads=cfg.n_heads;
+                    ap.num_kv_heads=d.kv_heads;
+                    ap.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
+                    ap.partials=s.part;ap.part_m=s.pm;ap.part_l=s.pl;
+                    ap.splits=GRAPH_SPLITS;ap.d_seq_len=dtok+r;
+                    launch_flash_decode(q,ap,{});
+                    launch_flash_merge(q,ap,{});
+                }
+            }else if(xe2_attention && pos==0 && M>=32){
                 const size_t qe=size_t(M)*cfg.n_heads*d.head_dim;
                 const size_t ke=size_t(M)*d.kv_heads*d.head_dim;
                 sycl_bf16* fq=xperm; sycl_bf16* fk=fq+qe; sycl_bf16* fv=fk+ke;
@@ -11865,8 +12075,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
         spec_hidden_valid = true;
     }
-    q.memcpy(s.h, bh + int64_t(M-1) * H, size_t(H) * sizeof(float));
-    pos+=M; set_cursor(pos);
+    if (seqb) {
+        // NOTHING about the engine's single cursor is meaningful here.
+        // The rows belong to M different conversations, so there is no
+        // "the last token" whose hidden state s.h could hold and no
+        // position to advance to; the caller tracks a position per
+        // sequence.  Writing either would leave a plausible value that
+        // the next single-sequence call would believe.
+        ++g_batch_decode_steps;
+        g_batch_decode_rows += M;
+    } else {
+        q.memcpy(s.h, bh + int64_t(M-1) * H, size_t(H) * sizeof(float));
+        pos+=M; set_cursor(pos);
+    }
     if (next_tokens) {
         next_tokens->resize(M);
         // dtok is only computed where the head runs.  Under PP that is
@@ -12158,6 +12379,128 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
         // request must start clean; never return a successful empty response.
         e.sync();e.reset();throw;
     }
+}
+
+// Several conversations, answered together.
+//
+// The prompts are read one at a time -- prefill is already batched over
+// a prompt's own tokens, and two prompts of different lengths share
+// nothing -- and then every sequence is STEPPED together, one token per
+// sequence per pass.  That second half is the whole point: a decode step
+// reads every active weight to produce one token and reads the same
+// weights to produce eight, so eight conversations cost about what one
+// costs.  Serving them one after another pays that bill eight times.
+//
+// Sequences finish at different times.  A row whose sequence has
+// stopped is simply not in the next batch, so the batch narrows as the
+// easy answers land; it is never padded with dead rows, which would
+// spend real weight traffic on tokens nobody asked for.
+//
+// Falls back to answering the requests one at a time -- by the ordinary
+// serial path -- whenever the engine cannot batch, so a caller never has
+// to ask first.  The reason is printed once, by name.
+int grimoire_serve_generate_batch(Grimoire& e,
+        const std::vector<std::vector<int32_t>>& prompts,
+        int n_predict, int eos_id,
+        std::vector<std::vector<int32_t>>& out_ids, int eot_id) {
+    out_ids.assign(prompts.size(), {});
+    if (prompts.empty()) return 0;
+    const std::string why = e.batch_unsupported_reason();
+    if (!why.empty() || int(prompts.size()) > Grimoire::kMaxBatchRows ||
+        int(prompts.size()) > e.n_seq_slots) {
+        if (!why.empty()) {
+            static bool said = false;
+            if (!said) { said = true;
+                std::fprintf(stderr, "    batched decode unavailable: %s -- "
+                             "answering one at a time\n", why.c_str()); }
+        }
+        int n = 0;
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            FinishReason r{};
+            grimoire_serve_generate(e, prompts[i], n_predict, eos_id,
+                                    out_ids[i], eot_id, {}, &r);
+            ++n;
+        }
+        return n;
+    }
+
+    struct Row {
+        size_t idx;       // which request
+        int slot;         // its KV rows
+        int pos;          // tokens already in the cache
+        int next;         // the token to feed on the coming step
+        bool live;
+    };
+    std::vector<Row> rows;
+    const int budget_cap = e.max_seq;
+    // Read each prompt into its own slot.  reset() is what clears a slot
+    // and claims it; binding after it is what puts this sequence's rows
+    // under the live pointers for the prefill that follows.
+    for (size_t i = 0; i < prompts.size(); ++i) {
+        const int slot = int(i);
+        const int budget = generation_budget(prompts[i], n_predict,
+                                             budget_cap, e.cfg.vocab);
+        if (budget <= 0) continue;
+        e.sync();
+        e.reset();
+        e.bind_seq_slot(slot);
+        e.pos = 0;
+        e.set_cursor(0);
+        if (!e.prefill(prompts[i]))
+            for (int32_t t : prompts[i])
+                if (!e.forward(t))
+                    throw std::runtime_error("batch prompt ingestion failed");
+        e.sync();
+        rows.push_back({i, slot, e.pos, e.argmax_token(), true});
+    }
+
+    auto stop = [&](int t) {
+        return (eos_id >= 0 && t == eos_id) || (eot_id >= 0 && t == eot_id);
+    };
+    // The first token of every reply is already decided by the prompt's
+    // own last row, exactly as it is in the serial path.
+    for (auto& r : rows) {
+        if (stop(r.next)) { r.live = false; continue; }
+        out_ids[r.idx].push_back(r.next);
+    }
+
+    const int cap = n_predict;
+    for (;;) {
+        std::vector<int32_t> toks;
+        std::vector<int>     slots, poss;
+        std::vector<size_t>  which;
+        for (size_t k = 0; k < rows.size(); ++k) {
+            Row& r = rows[k];
+            if (!r.live) continue;
+            if (int(out_ids[r.idx].size()) >= cap || r.pos >= e.max_seq) {
+                r.live = false; continue;
+            }
+            toks.push_back(int32_t(r.next));
+            slots.push_back(r.slot);
+            poss.push_back(r.pos);
+            which.push_back(k);
+        }
+        if (toks.empty()) break;
+        std::vector<int32_t> got;
+        if (!e.decode_batch(toks, slots, poss, got) || got.size() != toks.size())
+            throw std::runtime_error("batched decode step failed");
+        for (size_t j = 0; j < which.size(); ++j) {
+            Row& r = rows[which[j]];
+            ++r.pos;                       // the token it just consumed
+            const int t = got[j];
+            if (t < 0 || t >= e.cfg.vocab)
+                throw std::runtime_error("engine returned an invalid token");
+            if (stop(t)) { r.live = false; continue; }
+            out_ids[r.idx].push_back(t);
+            r.next = t;
+        }
+    }
+    // The engine's single cursor means nothing after a batch (see
+    // prefill).  Leave it empty rather than leave the last row's numbers
+    // looking like a finished single-sequence request.
+    e.sync();
+    e.reset();
+    return int(prompts.size());
 }
 
 void grimoire_delete(Grimoire* e) { if(e){e->release();delete e;} }

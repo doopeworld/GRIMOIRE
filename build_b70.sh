@@ -285,6 +285,8 @@ icpx -fsycl -fsycl-targets=spir64 \
 #                              as a bf16 twin holding them exactly
 #   bin/test_prefix_reuse      resuming a conversation answers identically
 #                              to re-reading it, and does less work
+#   bin/test_batch_decode      several conversations stepped TOGETHER answer
+#                              exactly what each answers alone
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
@@ -304,7 +306,8 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
               test_gemma4_prefill:test_gemma4_prefill \
               test_qwen4_exp_e2e:test_qwen4_exp_e2e \
               test_nvfp4_e2e:test_nvfp4_e2e \
-              test_prefix_reuse:test_prefix_reuse ; do
+              test_prefix_reuse:test_prefix_reuse \
+              test_batch_decode:test_batch_decode ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"
     icpx -fsycl -fsycl-targets=spir64 \
          -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
