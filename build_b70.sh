@@ -271,6 +271,15 @@ icpx -fsycl -fsycl-targets=spir64 \
   && echo "built  : bin/test_k2_kernels" \
   || { echo "=== K2 KERNEL GATE BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
+# Compact recurrent replay must match the full-state rollback oracle.
+icpx -fsycl -fsycl-targets=spir64 \
+     -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -fsycl-device-code-split=per_kernel -Wmisleading-indentation \
+     -I include -I src tools/test_deltanet_replay.cpp src/deltanet.cpp \
+     -o bin/test_deltanet_replay \
+  && echo "built  : bin/test_deltanet_replay" \
+  || { echo "=== REPLAY KERNEL GATE BUILD FAILED ==="; REQUIRED_FAILED=1; }
+
 # Engine gates.  All three write their own synthetic checkpoints, so
 # they need no model, no tokenizer and no network, and they run in
 # seconds:
@@ -301,6 +310,18 @@ ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
 # one-time JIT cost at launch instead, which nobody is timing.
 # GRIMOIRE_SKIP_GATES=1 skips them entirely.
 if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
+  # The state-comparison gate includes grimoire.cpp itself.
+  PAITON_ENGINE_SRC=()
+  for source in "${ENGINE_SRC[@]}"; do
+    [[ "$source" == src/grimoire.cpp ]] || PAITON_ENGINE_SRC+=("$source")
+  done
+  icpx -fsycl -fsycl-targets=spir64 \
+       -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
+       -fsycl-device-code-split=per_kernel -Wmisleading-indentation \
+       -I include -I src tools/test_paiton_e2e.cpp "${PAITON_ENGINE_SRC[@]}" \
+       -ldl -lpthread -o bin/test_paiton_e2e \
+    && echo "built  : bin/test_paiton_e2e" \
+    || { echo "=== PAITON ENGINE GATE BUILD FAILED ==="; REQUIRED_FAILED=1; }
   for gate in test_k2_e2e_device:test_k2_e2e \
               test_model_matrix:test_model_matrix \
               test_parallel_e2e:test_parallel_e2e \

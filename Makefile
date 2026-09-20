@@ -86,6 +86,14 @@ bin/test_dflash_config: tests/test_dflash_config.cpp include/b70/dflash_config.h
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+bin/test_dflash_runtime: tests/test_dflash_runtime.cpp include/b70/dflash_runtime.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+.PHONY: test-paiton-host
+test-paiton-host: bin/test_dflash_runtime
+	./bin/test_dflash_runtime
+
 bin/test_agnes_config: tests/test_agnes_config.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
@@ -102,7 +110,7 @@ bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_dflash_runtime bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
@@ -115,6 +123,7 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/
 	@echo ""; echo "=========== k2-config ==========="; ./bin/test_k2_config
 	@echo ""; echo "=========== dflash2-selector ==========="; ./bin/test_dflash2_selector
 	@echo ""; echo "=========== dflash-config ==========="; ./bin/test_dflash_config
+	./bin/test_dflash_runtime
 	@echo ""; echo "=========== agnes-config ==========="; ./bin/test_agnes_config
 	@echo ""; echo "=========== gemma4-config ==========="; ./bin/test_gemma4_config
 	@echo ""; echo "=========== qwen4-exp-config ==========="; ./bin/test_qwen4_exp_config
@@ -158,5 +167,23 @@ $(NATIVE_DIR)/grimoire: $(NATIVE_OBJ) $(NATIVE_DIR)/cli.o
 
 $(NATIVE_DIR)/grimoire-server: $(NATIVE_OBJ) $(NATIVE_DIR)/server.o
 	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+
+$(NATIVE_DIR)/test_deltanet_replay: tools/test_deltanet_replay.cpp $(NATIVE_DIR)/deltanet.o src/kernels.hpp
+	$(SYCL_CXX) $(NATIVE_FLAGS) $(filter %.cpp %.o,$^) -o $@
+
+# This test includes the engine to compare actual recurrent/conv/hidden
+# state, so do not also link grimoire.o.
+$(NATIVE_DIR)/paiton_e2e.o: tools/test_paiton_e2e.cpp src/grimoire.cpp tools/mini_model.hpp $(wildcard include/b70/*.hpp) src/kernels.hpp
+	@mkdir -p $(NATIVE_DIR)
+	$(SYCL_CXX) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
+
+$(NATIVE_DIR)/test_paiton_e2e: $(NATIVE_DIR)/paiton_e2e.o $(filter-out $(NATIVE_DIR)/grimoire.o,$(NATIVE_OBJ))
+	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+
+.PHONY: test-paiton
+test-paiton: test-paiton-host $(NATIVE_DIR)/test_deltanet_replay $(NATIVE_DIR)/test_paiton_e2e
+	$(NATIVE_DIR)/test_deltanet_replay
+	B70_DN_STEP=0 $(NATIVE_DIR)/test_deltanet_replay
+	GRIMOIRE_DEVICE_ANY=1 $(NATIVE_DIR)/test_paiton_e2e
 
 -include $(wildcard $(NATIVE_DIR)/*.d)

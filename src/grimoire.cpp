@@ -27,6 +27,7 @@
 #include "b70/http_request.hpp"
 #include "b70/qwen35.hpp"
 #include "b70/dflash_config.hpp"
+#include "b70/dflash_runtime.hpp"
 #include "b70/qwen4_exp.hpp"
 #include "b70/nvfp4.hpp"
 #include "b70/tensor_layout.hpp"
@@ -2386,6 +2387,7 @@ struct Grimoire {
         // apply.  See the load site for the numbers.
         bool knorm_layer0=false;
         int ctx_chunk=16;       // rows per draft-context ingest iteration
+        int query_rows=16;      // anchor included; independent of KV page size
         int conv_taps=0, conv_groups=0, conv_block=16;
         // Muse speculative verifier scratch, reused after the draft pass.
         float *verify_logits=nullptr;
@@ -2433,6 +2435,10 @@ struct Grimoire {
     float* spec_dn_state = nullptr;
     float* spec_conv_ring = nullptr;
     float* spec_dn_steps = nullptr;
+    float* spec_dn_updates = nullptr;
+    bool spec_replay = false;
+    size_t spec_update_elems = 0;
+    int spec_recurrent_rows = 0, spec_saved_pos = -1;
     float* spec_conv_inputs = nullptr;
     float* spec_hidden_steps = nullptr;
     // Whether spec_hidden_steps actually HOLDS this round's hidden states.
@@ -4887,16 +4893,27 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // nothing about it.  GRIMOIRE_DFLASH_DRAFT_BF16=1 keeps the draft in
         // BF16 so the first acceptance comparison is against the reference
         // precision rather than against a requantized copy of it.
-        static const bool draft_keep_bf16 =
+        const bool draft_keep_bf16 =
             std::getenv("GRIMOIRE_DFLASH_DRAFT_BF16") != nullptr;
-        const Fmt dflash_fmt=muse_draft_q?Fmt::MXFP4
+        const auto draft_runtime = resolve_dflash_runtime(nullptr,
+            std::getenv("GRIMOIRE_DFLASH_DRAFT_FORMAT"), draft_keep_bf16);
+        if (!draft_runtime.error.empty()) { err = draft_runtime.error; return false; }
+        if (cfg.is_muse && draft_runtime.format == DFlashRuntime::Format::FP8) {
+            err = "GRIMOIRE_DFLASH_DRAFT_FORMAT=fp8 is not supported by the Muse draft path";
+            return false;
+        }
+        const Fmt dflash_fmt=draft_runtime.format==DFlashRuntime::Format::FP8?Fmt::FP8_E4M3
+            :draft_runtime.format==DFlashRuntime::Format::BF16?Fmt::BF16
+            :muse_draft_q?Fmt::MXFP4
             :(cfg.is_muse?Fmt::BF16
               :(dflash2.v2&&!draft_keep_bf16?PF:Fmt::BF16));
         std::printf("\n  dflash2 draft format: %s%s\n",
             dflash_fmt==Fmt::BF16?"bf16":
+            dflash_fmt==Fmt::FP8_E4M3?"fp8":
             dflash_fmt==Fmt::MXFP4?"mxfp4":
             dflash_fmt==Fmt::INT4?"int4":"other",
-            (dflash2.v2&&!draft_keep_bf16&&dflash_fmt!=Fmt::BF16)
+            (draft_runtime.format==DFlashRuntime::Format::Inherit&&
+             dflash2.v2&&!draft_keep_bf16&&dflash_fmt!=Fmt::BF16)
                 ? " (inherited from the target; GRIMOIRE_DFLASH_DRAFT_BF16=1 to keep bf16)"
                 : "");
         auto qload=[&](const std::string& n,const char* what){
@@ -5311,6 +5328,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 }
             }
         }
+        const auto draft_width = resolve_dflash_runtime(
+            std::getenv("GRIMOIRE_DFLASH_M"), nullptr, false,
+            dflash2.draft_head_rows ? 8 : 16);
+        if (!draft_width.error.empty()) { err = draft_width.error; return false; }
+        dflash2.query_rows = draft_width.rows;
+        dflash2.conv_block = draft_width.rows;
+        std::printf("  dflash query rows: %d (%d proposals, no extra query rows)\n",
+                    dflash2.query_rows, dflash2.query_rows - 1);
         dflash2.target_aux=sycl::malloc_device<float>(
             size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden,q);
         if(!dflash2.target_aux)dok=false;
@@ -5543,12 +5568,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // mtp.ok, because mtp.ok is false on the early stages by design -- and
     // pp_connect, which publishes the pipeline's answer, has not run yet.
     // If the last stage then fails to load a head, these go unused.
-    if (mtp.ok || dflash2.ok || (pp_enabled() && mtp_enabled())) {
+    if (mtp.ok || dflash2.ok || (pp_enabled() && (mtp_enabled() || dflash_configured))) {
+        const char* replay_env = std::getenv("GRIMOIRE_SPEC_REPLAY");
+        spec_replay = replay_env && std::strcmp(replay_env, "1") == 0;
         // One exact rollback image for the hybrid recurrent state. This is
-        // about 157 MiB on Qwen3.8-27B and is copied device-to-device.
+        // 144 MiB at 48 layers x 48 heads x 128 x 128 floats.
         for (const auto& d : L) {
-            if (d.dn_state)
+            if (d.dn_state) {
                 spec_dn_elems += size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
+                spec_update_elems += size_t(cfg.lin_v_heads) *
+                    (cfg.lin_k_dim + 1 + cfg.lin_v_dim);
+            }
             if (d.conv_ring)
                 spec_conv_elems += size_t(qkv_ch) * (cfg.conv_kernel - 1);
             if (d.conv_ring)
@@ -5558,8 +5588,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             spec_dn_state = sycl::malloc_device<float>(spec_dn_elems, q);
         if (spec_conv_elems)
             spec_conv_ring = sycl::malloc_device<float>(spec_conv_elems, q);
-        if (spec_dn_elems)
-            spec_dn_steps = sycl::malloc_device<float>(kSpecBatch * spec_dn_elems, q);
+        if (spec_dn_elems) {
+            if (spec_replay)
+                spec_dn_updates = sycl::malloc_device<float>(kSpecBatch * spec_update_elems, q);
+            else
+                spec_dn_steps = sycl::malloc_device<float>(kSpecBatch * spec_dn_elems, q);
+        }
         if (spec_conv_input_elems)
             spec_conv_inputs = sycl::malloc_device<float>(kSpecBatch * spec_conv_input_elems, q);
         spec_hidden_steps = sycl::malloc_device<float>(size_t(kSpecBatch) * cfg.hidden, q);
@@ -5577,14 +5611,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
         if ((spec_dn_elems && !spec_dn_state) ||
             (spec_conv_elems && !spec_conv_ring) ||
-            (spec_dn_elems && !spec_dn_steps) ||
+            (spec_dn_elems && !(spec_replay ? spec_dn_updates : spec_dn_steps)) ||
             (spec_conv_input_elems && !spec_conv_inputs) || !spec_hidden_steps) {
             err = "speculative rollback-state allocation failed";
             return false;
         }
-        acct((spec_dn_elems * (1 + kSpecBatch) + spec_conv_elems +
+        const size_t step_elems = spec_replay ? spec_update_elems : spec_dn_elems;
+        acct((spec_dn_elems + step_elems * kSpecBatch + spec_conv_elems +
               spec_conv_input_elems * kSpecBatch + size_t(kSpecBatch) * cfg.hidden) *
              sizeof(float));
+        std::printf("  speculative recurrent storage: %s, checkpoint %.2f MiB, "
+                    "steps %.2f MiB (full snapshots %.2f MiB)\n",
+                    spec_replay ? "compact replay" : "full snapshots",
+                    double(spec_dn_elems * sizeof(float)) / 1048576.0,
+                    double(step_elems * kSpecBatch * sizeof(float)) / 1048576.0,
+                    double(spec_dn_elems * kSpecBatch * sizeof(float)) / 1048576.0);
     }
 
     // Now the drafter is loaded, so it is known whether it brought its own
@@ -5941,6 +5982,8 @@ void Grimoire::reset() {
 // see it.
 void Grimoire::clear_seq_slot(int j) {
     bind_seq_slot(j);
+    spec_recurrent_rows = 0;
+    spec_saved_pos = -1;
     // A new sequence inherits nothing, this flag included: the buffer
     // still holds the previous request's states, and they describe a
     // different sequence.
@@ -6328,6 +6371,8 @@ bool Grimoire::restore_prefix_upto(int n) {
 }
 
 void Grimoire::snapshot_recurrent() {
+    spec_recurrent_rows = 0;
+    spec_saved_pos = pos;
     // Opens every speculative round, so it is where the hidden-step
     // capture is invalidated: whatever the last round left in the buffer
     // does not describe this one, and only a batched verify will refill it.
@@ -6350,6 +6395,8 @@ void Grimoire::snapshot_recurrent() {
 }
 
 void Grimoire::restore_recurrent(int saved_pos) {
+    spec_recurrent_rows = 0;
+    spec_saved_pos = -1;
     const size_t dn_n = size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
     const size_t cv_n = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
                                cfg.lin_v_heads * cfg.lin_v_dim) *
@@ -6370,19 +6417,33 @@ void Grimoire::restore_recurrent(int saved_pos) {
 }
 
 void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
+    // Validate BEFORE mutating state. Allocated records can be stale, and
+    // committing twice or after a later forward must not consume them.
+    if (accepted < 1 || accepted > kSpecBatch ||
+        (spec_dn_elems && (spec_saved_pos != saved_pos ||
+            pos != saved_pos + spec_recurrent_rows || accepted > spec_recurrent_rows)))
+        throw std::runtime_error("speculative prefix has no matching captured recurrent state");
     const size_t dn_n = size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
     const int channels = 2 * cfg.lin_k_heads * cfg.lin_k_dim +
                          cfg.lin_v_heads * cfg.lin_v_dim;
     const int hist = cfg.conv_kernel - 1;
     const size_t cv_n = size_t(channels) * hist;
     const int step = accepted - 1;
-    size_t doff = 0, coff = 0, xoff = 0;
+    size_t doff = 0, coff = 0, xoff = 0, uoff = 0;
     for (auto& d : L) {
         if (d.dn_state) {
-            q.memcpy(d.dn_state,
-                     spec_dn_steps + size_t(step) * spec_dn_elems + doff,
-                     dn_n * sizeof(float));
+            if (spec_replay) {
+                DeltaNetReplayParams rp{spec_dn_state + doff,
+                    spec_dn_updates + uoff, d.dn_state, cfg.lin_v_heads,
+                    cfg.lin_k_dim, cfg.lin_v_dim, accepted, spec_update_elems};
+                launch_deltanet_replay(q, rp);
+            } else {
+                q.memcpy(d.dn_state,
+                         spec_dn_steps + size_t(step) * spec_dn_elems + doff,
+                         dn_n * sizeof(float));
+            }
             doff += dn_n;
+            uoff += size_t(cfg.lin_v_heads) * (cfg.lin_k_dim + 1 + cfg.lin_v_dim);
         }
         if (d.conv_ring) {
             float* dst = d.conv_ring;
@@ -6419,6 +6480,8 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
                  size_t(cfg.hidden) * sizeof(float));
     pos = saved_pos + accepted;
     set_cursor(pos);
+    spec_recurrent_rows = 0;
+    spec_saved_pos = -1;
 }
 
 void Grimoire::release() {
@@ -6624,6 +6687,7 @@ void Grimoire::release() {
     if (spec_dn_state) sycl::free(spec_dn_state, q);
     if (spec_conv_ring) sycl::free(spec_conv_ring, q);
     if (spec_dn_steps) sycl::free(spec_dn_steps, q);
+    if (spec_dn_updates) sycl::free(spec_dn_updates, q);
     if (spec_conv_inputs) sycl::free(spec_conv_inputs, q);
     if (spec_hidden_steps) sycl::free(spec_hidden_steps, q);
     // Every slot, not just one.  N slots is N full copies of the KV and
@@ -8836,11 +8900,7 @@ int Grimoire::argmax_token() {
 // width be tuned; M is the block INCLUDING the bonus row, so M=4 verifies
 // 3 drafts.
 int Grimoire::dflash_block_rows() const {
-    constexpr int MMAX=16;
-    static const int m_env=[]{const char* v=std::getenv("GRIMOIRE_DFLASH_M");
-        return v&&*v?std::atoi(v):0;}();
-    const int wide=dflash2.draft_head_rows?8:MMAX;
-    return (m_env>=2&&m_env<=MMAX)?m_env:wide;
+    return dflash2.query_rows;
 }
 
 bool Grimoire::dflash_draft(int bonus_token, int position,
@@ -11463,12 +11523,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     size_t spec_route_total = 0, spec_route_unique = 0;
     int spec_route_layers = 0;
     std::vector<size_t> spec_doff(L.size(), size_t(-1));
+    std::vector<size_t> spec_uoff(L.size(), size_t(-1));
     std::vector<size_t> spec_xoff(L.size(), size_t(-1));
     if (capture_spec) {
-        size_t ds = 0, xs = 0;
+        size_t ds = 0, xs = 0, us = 0;
         const size_t dn_n = size_t(Hv) * Dv * Dk;
         for (size_t li = 0; li < L.size(); ++li) {
-            if (L[li].dn_state) { spec_doff[li] = ds; ds += dn_n; }
+            if (L[li].dn_state) {
+                spec_doff[li] = ds; ds += dn_n;
+                spec_uoff[li] = us; us += size_t(Hv) * (Dk + 1 + Dv);
+            }
             if (L[li].conv_ring) {
                 spec_xoff[li] = xs;
                 xs += size_t(kSpecBatch) * qkv_ch;
@@ -11648,8 +11712,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         sp.out   = t0 + size_t(t)*Hv*Dv;
                         sp.n_heads = Hv; sp.k_dim = Dk; sp.v_dim = Dv;
                         sp.n_k_heads = Hk;
+                        if (capture_spec && spec_replay)
+                            sp.replay = spec_dn_updates + size_t(t) * spec_update_elems +
+                                        spec_uoff[li];
                         launch_deltanet_step(q,sp,{});
-                        if (capture_spec)
+                        if (capture_spec && !spec_replay)
                             q.memcpy(spec_dn_steps + size_t(t) * spec_dn_elems +
                                      spec_doff[li], d.dn_state,
                                      size_t(Hv) * Dv * Dk * sizeof(float));
@@ -12252,6 +12319,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (capture_spec) {
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
         spec_hidden_valid = true;
+        spec_recurrent_rows = M;
     }
     if (seqb) {
         // NOTHING about the engine's single cursor is meaningful here.

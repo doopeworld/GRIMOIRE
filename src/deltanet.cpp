@@ -26,6 +26,7 @@
 // =====================================================================
 #include "kernels.hpp"
 #include <cmath>
+#include <stdexcept>
 
 namespace b70 {
 
@@ -95,6 +96,14 @@ static sycl::event deltanet_step_rowwise(sycl::queue& q_, const DeltaNetParams& 
                 // sweep means the row is touched once, which is the
                 // whole point when the kernel is bandwidth bound.
                 const float corr = bv * (vi - av * w);
+                if (pp.replay) {
+                    float* log = pp.replay + int64_t(head) * (KD + 1 + VD);
+                    if (row == 0) {
+                        for (int j = 0; j < KD; ++j) log[j] = ksp[j];
+                        log[KD] = av;
+                    }
+                    log[KD + 1 + row] = corr;
+                }
                 float o = 0.0f;
                 for (int j = 0; j < KD; ++j) {
                     const float s = sycl::fma(av, S[j], corr * ksp[j]);
@@ -185,6 +194,14 @@ static sycl::event dn_step_sg(sycl::queue& q_, const DeltaNetParams& p,
                 w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
 
                 const float corr = bv * (vi - av * w);
+                if (pp.replay) {
+                    float* log = pp.replay + int64_t(head) * (KD + 1 + VD);
+                    if (row == 0) {
+                        for (int j = lane; j < KD; j += SG_SIZE) log[j] = ksp[j];
+                        if (lane == 0) log[KD] = av;
+                    }
+                    if (lane == 0) log[KD + 1 + row] = corr;
+                }
                 float o = 0.0f;
                 #pragma unroll
                 for (int u = 0; u < PL; ++u) {
@@ -197,6 +214,38 @@ static sycl::event dn_step_sg(sycl::queue& q_, const DeltaNetParams& p,
                 if (lane == 0)
                     pp.out[int64_t(head) * VD + row] = o * sycl::rsqrt(float(KD));
             });
+    });
+}
+
+// Replay the exact rounded corrections from verify, preserving each
+// state's sequence of FMAs. Each element is read/written once, regardless
+// of prefix length. Rejected records are never read. No model re-entry or
+// dot-product reduction can change the accepted state.
+sycl::event launch_deltanet_replay(sycl::queue& q_, const DeltaNetReplayParams& p,
+                                  const std::vector<sycl::event>& deps) {
+    if (!p.checkpoint || !p.state || p.n_heads <= 0 || p.k_dim <= 0 ||
+        p.v_dim <= 0 || p.tokens < 0 || p.tokens > 16 ||
+        (p.tokens && (!p.updates || p.token_stride <
+            size_t(p.n_heads) * (size_t(p.k_dim) + 1 + p.v_dim))))
+        throw std::invalid_argument("invalid DeltaNet replay geometry or prefix");
+    const size_t count = size_t(p.n_heads) * p.v_dim * p.k_dim;
+    return q_.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetReplayParams pp = p;
+        h.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const size_t k = i % pp.k_dim;
+            const size_t v = (i / pp.k_dim) % pp.v_dim;
+            const size_t head = i / (size_t(pp.k_dim) * pp.v_dim);
+            float value = pp.checkpoint[i];
+            for (int t = 0; t < pp.tokens; ++t) {
+                const float* log = pp.updates + size_t(t) * pp.token_stride +
+                    head * (size_t(pp.k_dim) + 1 + pp.v_dim);
+                value = sycl::fma(log[pp.k_dim], value,
+                                  log[pp.k_dim + 1 + v] * log[k]);
+            }
+            pp.state[i] = value;
+        });
     });
 }
 

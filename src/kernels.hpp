@@ -254,7 +254,22 @@ struct DeltaNetParams {
     float*       out;      // [n_v_heads][v_dim]
     int n_heads, k_dim, v_dim;
     int n_k_heads = 0;      // 0 means same as n_heads
+    // Optional compact rollback record: [n_heads][k_dim + 1 + v_dim].
+    // Stores normalized k, decay a, and the correction actually computed
+    // by this step: beta * (v - a * dot(S, k)). No reduction is replayed.
+    float* replay = nullptr;
 };
+
+struct DeltaNetReplayParams {
+    const float* checkpoint;   // [n_heads][v_dim][k_dim]
+    const float* updates;      // tokens records, separated by token_stride
+    float* state;              // may alias checkpoint
+    int n_heads, k_dim, v_dim, tokens;
+    size_t token_stride;       // floats; permits interleaved layer records
+};
+
+sycl::event launch_deltanet_replay(sycl::queue& q, const DeltaNetReplayParams& p,
+                                  const std::vector<sycl::event>& deps = {});
 
 struct ConvParams {
     const float* x;         // [channels]      this token's projection
