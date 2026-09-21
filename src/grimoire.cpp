@@ -1988,6 +1988,12 @@ struct Grimoire {
     bool pp_send_hidden(const float* dev,size_t elems);
     bool pp_recv_hidden(float* dev,size_t elems);
     bool prefix_cache_usable() const;
+    // Single source of the refusal reason, shared by prefix_cache_usable()
+    // and the startup banner (external audit finding 2, 2026-09-21) --
+    // the banner used to reconstruct this list on its own and drifted:
+    // it still named MTP after MTP was deliberately allowed, and never
+    // learned about the Qwen4-Exp exclusion at all.  Empty means usable.
+    std::string prefix_cache_unusable_reason() const;
     bool pp_send_taps(int first,int rows);
     bool pp_recv_taps(int first,int rows);
     int  pp_sync_token(int token);
@@ -5921,23 +5927,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // and then never uses one.  That is worth a line rather than a
         // silent multiple of VRAM.
         if (n_seq_slots > 1 || prefix_cache_enabled()) {
-            // Name the REAL reason.  This printed "not usable with a
-            // speculative drafter" whenever the cache was simply switched
-            // off, because the reason was chosen by elimination from a
-            // list the actual cause was not on.  A status line that can
-            // only give reasons from a fixed set will give the wrong one,
-            // and this is the instrument someone reads when a slot count
-            // does not do what they expected.
-            const char* why =
-                  !prefix_cache_enabled() ? "GRIMOIRE_PREFIX_CACHE is not set"
-                : cfg.is_muse             ? "not usable with Muse"
-                : pp_enabled()            ? "not usable under pipeline parallel"
-                : (mtp.ok || dflash2.ok)  ? "not usable with a speculative drafter"
-                                          : nullptr;
-            if (why)
+            // Name the REAL reason -- from prefix_cache_usable()'s OWN
+            // list, not a second copy of it (external audit finding 2,
+            // 2026-09-21).  This used to reconstruct the reasons here
+            // independently and drifted: it kept naming MTP after MTP
+            // was deliberately allowed, and never learned about the
+            // Qwen4-Exp exclusion at all.  One function, read here and
+            // by prefix_cache_usable() itself, cannot drift from itself.
+            const std::string why = prefix_cache_unusable_reason();
+            if (!why.empty())
                 std::printf("    prefix cache  off (%d sequence slot%s "
                             "reserved) -- %s\n", n_seq_slots,
-                            n_seq_slots == 1 ? "" : "s", why);
+                            n_seq_slots == 1 ? "" : "s", why.c_str());
             else
                 std::printf("    prefix cache  %d conversation%s resident\n",
                             n_seq_slots, n_seq_slots == 1 ? "" : "s");
@@ -6092,7 +6093,12 @@ void Grimoire::clear_seq_slot(int j) {
 // stage then makes the same decision, which is what made caching safe
 // there in the first place.
 bool Grimoire::prefix_cache_usable() const {
-    if (!prefix_cache_enabled() || cfg.is_muse) return false;
+    return prefix_cache_unusable_reason().empty();
+}
+
+std::string Grimoire::prefix_cache_unusable_reason() const {
+    if (!prefix_cache_enabled()) return "GRIMOIRE_PREFIX_CACHE is not set";
+    if (cfg.is_muse) return "not usable with Muse";
     // Qwen4-Exp (external audit, 2026-09-21).  prefill_qwen4_exp()'s own
     // comment already explains why it never calls save_prefix()/
     // restore_prefix() itself: the snapshot covers ordinary KV and
@@ -6106,7 +6112,7 @@ bool Grimoire::prefix_cache_usable() const {
     // prefill() -- that never routes through prefill_qwen4_exp() at all
     // and so never saw that exclusion.  Nothing here re-checked it for
     // the new path; this does.
-    if (cfg.is_qwen4_exp) return false;
+    if (cfg.is_qwen4_exp) return "not usable with Qwen4-Exp";
     // MTP IS ALLOWED, AND WAS REFUSED FOR A REASON THAT WAS NOT ABOUT IT
     // (rule 13).  The refusal arrived with the F2 fix at 4cdcba8, whose
     // subject was a PP DEADLOCK: an earlier stage cached a prompt the
@@ -6130,7 +6136,7 @@ bool Grimoire::prefix_cache_usable() const {
     // leave it pointing into a span whose taps were never captured.
     // Lifting that needs the tap buffer in the snapshot; nobody has
     // done it, so it says so rather than being quietly allowed.
-    if (dflash2.ok) return false;
+    if (dflash2.ok) return "not usable with a DFlash drafter";
     // Under PP, refuse outright.
     //
     // A cache HIT makes prefill() return before it sends the hidden state,
@@ -6147,8 +6153,8 @@ bool Grimoire::prefix_cache_usable() const {
     // Until that exists, single-process and TP keep the cache and PP does
     // not.  Losing a prefix cache costs one prefill; a deadlocked pipeline
     // costs the request and the process.
-    if (pp_enabled()) return false;
-    return true;
+    if (pp_enabled()) return "not usable under pipeline parallel";
+    return {};
 }
 
 bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {

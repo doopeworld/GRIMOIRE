@@ -32,6 +32,7 @@
 #include "b70/formats.hpp"
 #include "mini_model.hpp"
 
+#include <sycl/sycl.hpp>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -131,6 +132,24 @@ static std::string join(const std::vector<int32_t>& v) {
     return s;
 }
 
+// How many real GPUs are visible (external audit follow-up, 2026-09-21).
+// grimoire.cpp's own device selector maps rank N to pick[N] and THROWS
+// if rank N has no device once ANY real GPU is visible -- correct there
+// (rule: never silently share one card between ranks), fatal here if
+// this harness asks for more ranks than exist. The Tower has exactly
+// two B70s; PP3/PP4/TP3/TP4 need up to four. Off the card
+// get_devices(gpu) returns empty and every rank falls back to the CPU
+// device uniformly instead (same query grimoire.cpp itself makes at
+// device-selection time), so this returns 0 there and nothing below
+// changes -- full coverage stays intact off the card, which is what
+// found the bugs rules 15-20 record. Only a REAL, PARTIAL GPU count
+// changes behavior.
+static int visible_gpu_count() {
+    try {
+        return int(sycl::device::get_devices(sycl::info::device_type::gpu).size());
+    } catch (...) { return 0; }
+}
+
 // ---------------------------------------------------------------------
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -146,6 +165,15 @@ int main(int argc, char** argv) {
     }
 
     std::printf("=== pipeline / tensor parallel vs a single process ===\n\n");
+
+    // 0 off the card (see visible_gpu_count()); a real, finite count on
+    // real hardware. Only used to decide whether the WIDE (3/4-rank)
+    // cases below have enough physical devices -- PP2/TP2 always run.
+    const int n_gpu = visible_gpu_count();
+    if (n_gpu > 0 && n_gpu < 4)
+        std::printf("  %d real GPU(s) visible -- PP3/PP4/TP3/TP4 need 4, "
+                     "skipping (not a failure; see CLAUDE.md rule 21 "
+                     "follow-up, external audit finding 1)\n\n", n_gpu);
 
     char tmpl[] = "/tmp/grimoire-par-XXXXXX";
     if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
@@ -317,7 +345,16 @@ int main(int argc, char** argv) {
         const bool wide = c.arch.name == std::string("dense") ||
                           c.arch.name == std::string("hybrid") ||
                           c.arch.name == std::string("gemma4");
-        if (wide) {
+        // n_gpu > 0 means REAL hardware is visible (the Tower); n_gpu==0
+        // means the uniform CPU fallback (this container), which has
+        // always covered every rank count and must keep doing so.  Only
+        // skip when real GPUs exist but there are fewer than 4 of them
+        // (external audit finding 1, 2026-09-21) -- rank 2/3 would
+        // otherwise hit grimoire.cpp's "rank has no device" throw, which
+        // is a real 2-card setup correctly refusing to share one card
+        // between ranks, not a PP/TP defect.  Reported as skipped, not
+        // silently dropped and not counted as a pass.
+        if (wide && !(n_gpu > 0 && n_gpu < 4)) {
             // At 3 ranks the derived split is uneven on every model here
             // (4 layers -> 1,1,2; 6 -> 2,2,2 with 4 ranks giving 1,2,1,2),
             // and any count above 2 exercises a MIDDLE stage -- one that
@@ -326,6 +363,9 @@ int main(int argc, char** argv) {
             run_pp(4, split(4).c_str());
             run_tp(3);
             run_tp(4);
+        } else if (wide) {
+            std::printf("   PP3/PP4/TP3/TP4 SKIPPED (%d real GPU(s), need 4)",
+                        n_gpu);
         }
         std::printf("\n");
     }
