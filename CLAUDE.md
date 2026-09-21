@@ -40,6 +40,18 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   number exists and none can be taken here** -- the saving is XMX-shaped
   and off-card the batched GEMM runs on a plain-SYCL fallback.  See rule
   19 and `DAY-ONE.md` section 2d.
+- **the server runs across TWO cards** (`test_pp_server`).  Pipeline
+  parallel was CLI-only: `pp2run.sh` runs one prompt and exits, and
+  `serve.sh` opens one render node -- so a model needing two cards
+  (Ornith at fp8, anything at bf16) could be RUN but not SERVED, which
+  is the configuration agentic work uses.  What was missing was small:
+  every stage already ran the same loop and stayed in step per token,
+  but the PROMPT only ever reached rank 0, and the CLI never noticed
+  because every rank reads the same `-p` off its own command line.  The
+  front end forwards each request now and the workers follow it.
+  `tools/serve_pp2.sh`.  Concurrency does NOT apply there -- the
+  scheduler is one-at-a-time under PP and the prefix cache is off, both
+  printed in the banner.
 - **NVFP4 checkpoints load** (`test_nvfp4_e2e`).  NVIDIA's Blackwell 4-bit
   format -- E2M1 with E4M3 scales per 16 and one FP32 global scale per
   tensor -- is decoded at load and handed to the ordinary quantizer, so

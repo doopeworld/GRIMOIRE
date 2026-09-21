@@ -181,6 +181,7 @@ run_gate bin/test_nvfp4_e2e
 run_gate bin/test_prefix_reuse
 run_gate bin/test_batch_decode
 run_gate bin/test_scheduler
+run_gate bin/test_pp_server
 
 # ---------------------------------------------------------------------
 say "5. real model"

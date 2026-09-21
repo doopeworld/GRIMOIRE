@@ -289,6 +289,8 @@ icpx -fsycl -fsycl-targets=spir64 \
 #                              exactly what each answers alone
 #   bin/test_scheduler         requests issued from several threads at once
 #                              answer what they answer one at a time
+#   bin/test_pp_server         a RESIDENT pipeline answers several requests
+#                              in a row, and rank 0 gets the tokens back
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
@@ -310,7 +312,8 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
               test_nvfp4_e2e:test_nvfp4_e2e \
               test_prefix_reuse:test_prefix_reuse \
               test_batch_decode:test_batch_decode \
-              test_scheduler:test_scheduler ; do
+              test_scheduler:test_scheduler \
+              test_pp_server:test_pp_server ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"
     icpx -fsycl -fsycl-targets=spir64 \
          -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \

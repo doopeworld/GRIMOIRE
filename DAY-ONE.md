@@ -45,6 +45,7 @@ order, and stops at the first required failure:
 | `bin/test_prefix_reuse` | resuming a conversation answers what re-reading it answers, and copies no cache |
 | `bin/test_batch_decode` | conversations stepped TOGETHER answer what each answers alone |
 | `bin/test_scheduler` | requests from several threads at once answer what they answer one at a time |
+| `bin/test_pp_server` | a resident pipeline answers several requests in a row, and rank 0 gets the tokens |
 | generate | real model, real prompt — **you read the output** |
 
 **Read the `hybrid` rows of `test_spec_e2e` first.** Off the card they say
@@ -287,6 +288,42 @@ turns batching off (the banner says so) and the server falls back to one
 request at a time, which is what it did before. MTP or DFlash versus
 eight-way batching is a real trade nobody has measured -- that is a
 Tower measurement and it is in the open list below.
+
+## 2e. Serving on TWO cards
+
+New on 2026-09-18. Until now pipeline parallel was CLI-only —
+`pp2run.sh` runs `bin/grimoire` with one prompt and exits — while
+`serve.sh` opens exactly one render node. So a model that needs two
+cards (Ornith at fp8, anything at bf16) could be RUN but not SERVED,
+which is the configuration agentic work actually uses.
+
+```bash
+tools/serve_pp2.sh /models/<dir> 8099 24     # model, port, layers on rank 0
+PROJ=fp8 CTX=8192 tools/serve_pp2.sh /models/<dir>
+```
+
+Rank 0 binds the HTTP port and forwards each request down the pipe; rank
+1 loads its layers and follows. Give the SLOWER card fewer layers —
+pipeline throughput is set by the slowest stage.
+
+**What was missing was small**: every stage already ran the same
+generation loop and stayed in step by exchanging a message per token,
+but the PROMPT only ever reached rank 0. The CLI never noticed, because
+every rank is launched with the same `-p` and reads it off its own
+command line.
+
+**Concurrency does NOT apply here.** Under pipeline parallel the
+scheduler falls back to one request at a time, and the prefix cache is
+off. Both say so in the banner. On ONE card at int4/mxfp4 you get
+batching and resuming; this is the two-card path and it is serial. That
+is still the difference between serving the model and not.
+
+Checked by `bin/test_pp_server`: three requests of different lengths
+down one resident pipeline, at 2 and 3 stages, answered at RANK 0, must
+equal the same three from a single process. The second and third
+requests are the point — a byte stream cannot be resynchronised, so a
+header written but not read is invisible on the request that causes it
+and fatal to the next.
 
 ## 2c. More than two cards, or cards that are not the same
 

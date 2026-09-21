@@ -120,6 +120,28 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ready. listening on %s:%d\n", host.c_str(), port);
 
     std::unique_ptr<b70::Grimoire,void(*)(b70::Grimoire*)> owner(e,b70::grimoire_delete);
+
+    // A PIPELINE STAGE THAT IS NOT THE FRONT END DOES NOT SERVE HTTP.
+    //
+    // This is what makes a two-card server possible at all, and the
+    // reason there was not one before is smaller than it looks: under PP
+    // every stage runs the same generation loop and they stay in step by
+    // exchanging a message per token, but the PROMPT only ever reached
+    // rank 0. The CLI never noticed -- every rank is launched with the
+    // same -p and reads it off its own command line -- so the gap only
+    // existed for a server.
+    //
+    // The front end forwards each request down the pipe; the workers run
+    // it and answer nothing. Both ends of that were added together, and
+    // neither is reachable from the CLI, which is untouched.
+    if (b70::grimoire_is_pp_worker(*e)) {
+        std::fprintf(stderr, "this is pipeline stage %d, not the front end: "
+                             "serving nothing, following rank 0\n",
+                     std::atoi(std::getenv("GRIMOIRE_PP_RANK") ?
+                               std::getenv("GRIMOIRE_PP_RANK") : "0"));
+        b70::grimoire_pp_worker_loop(*e);
+        return 0;
+    }
     // How many requests may be in flight together.  The engine caps it at
     // what the KV cache was allocated for (GRIMOIRE_SEQ_SLOTS) and at its
     // own row limit, so asking for more than the box can hold is not an

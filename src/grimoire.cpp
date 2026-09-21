@@ -1894,6 +1894,22 @@ struct Grimoire {
             if(n<0&&errno==EINTR)continue;return false;} return true;
     }
     bool pp_connect(std::string& err);
+    // A whole REQUEST, forwarded down the pipeline.
+    //
+    // Under PP every stage runs the SAME generation loop and they stay in
+    // step by exchanging one message per token.  The CLI gets away with
+    // never sending the request itself, because every rank was launched
+    // with the same -p and reads the same prompt off its own command
+    // line.  A SERVER has no such luck: the prompt arrives on rank 0's
+    // HTTP socket and the other stages have never seen it.  That, and
+    // nothing deeper, is why there has never been a two-card server.
+    struct PPRequest {
+        std::vector<int32_t> prompt;
+        int budget = 0, eos = -1, eot = -1;
+        bool shutdown = false;      // the last message a worker gets
+    };
+    bool pp_send_request(const PPRequest& r);
+    bool pp_recv_request(PPRequest& r);
     // Whether speculation is live for the WHOLE pipeline.  Under PP only
     // the last stage owns the MTP head, so the ranks cannot each decide
     // for themselves: they would take different branches of the decode
@@ -3110,6 +3126,39 @@ bool Grimoire::pp_recv_taps(int first, int rows) {
     const size_t elems = size_t(rows) * size_t(pp_taps) * size_t(cfg.hidden);
     return pp_recv_hidden(dflash2.target_aux +
                           int64_t(first) * pp_taps * cfg.hidden, elems);
+}
+
+// Header first, then the tokens.  Fixed-width int32 throughout: these
+// stages are separate PROCESSES and the only thing keeping them in step
+// is that both sides agree, byte for byte, on every message.
+bool Grimoire::pp_send_request(const PPRequest& r) {
+    if (pp_next_fd < 0) return true;              // last stage: nothing downstream
+    int32_t head[5] = { r.shutdown ? 1 : 0, int32_t(r.prompt.size()),
+                        int32_t(r.budget), int32_t(r.eos), int32_t(r.eot) };
+    if (!fd_write_all(pp_next_fd, head, sizeof head)) return false;
+    if (r.prompt.empty()) return true;
+    return fd_write_all(pp_next_fd, r.prompt.data(),
+                        r.prompt.size() * sizeof(int32_t));
+}
+
+bool Grimoire::pp_recv_request(PPRequest& r) {
+    if (pp_prev_fd < 0) return false;             // rank 0 has no upstream
+    int32_t head[5] = {0,0,0,0,0};
+    if (!fd_read_all(pp_prev_fd, head, sizeof head)) return false;
+    r.shutdown = head[0] != 0;
+    const int32_t n = head[1];
+    // A length off the wire sizes an allocation, so it is checked before
+    // it is trusted: a desynchronised pipe would otherwise turn into a
+    // multi-gigabyte resize rather than a clean failure.
+    if (n < 0 || n > max_seq) return false;
+    r.budget = head[2]; r.eos = head[3]; r.eot = head[4];
+    r.prompt.assign(size_t(n), 0);
+    if (n && !fd_read_all(pp_prev_fd, r.prompt.data(),
+                          size_t(n) * sizeof(int32_t))) return false;
+    // Pass it on BEFORE running it, so every stage downstream starts its
+    // own prefill while this one is still working.  Forwarding after
+    // would serialise the pipeline on its own control messages.
+    return pp_send_request(r);
 }
 
 bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
@@ -12808,6 +12857,19 @@ void GrimoireScheduler::run() {
                     // One at a time, by the ordinary path.  Speculation,
                     // the prefix cache and the graph all still apply --
                     // this is the server exactly as it was.
+                    //
+                    // Under PP this is also where the other stages learn
+                    // what to run.  They are sitting in
+                    // grimoire_pp_worker_loop waiting for a request; send
+                    // it BEFORE generating, because the moment this stage
+                    // starts its prefill it will try to hand them a
+                    // hidden state they are not yet expecting.
+                    if (!grimoire_pp_broadcast_request(e, j->prompt, j->budget,
+                                                       j->eos, j->eot)) {
+                        finish(j, FinishReason::Length,
+                               "pipeline request broadcast failed");
+                        continue;
+                    }
                     std::vector<int32_t> out;
                     FinishReason r = FinishReason::Length;
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
@@ -12971,6 +13033,82 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
     if (!err.empty()) throw std::runtime_error(err);
     if (finish) *finish = r;
     return int(out.size());
+}
+
+// What every pipeline stage except the first runs instead of listening.
+//
+// It is deliberately the SAME call the first stage makes: identical
+// arguments produce identical control flow, and the per-token messages
+// the stages already exchange then line up by construction.  A worker
+// that ran its own loop would have to re-derive every branch rank 0
+// takes -- whether speculation is on, how wide a draft is, when a stop
+// token ends the request -- and one disagreement deadlocks the pipe.
+//
+// Returns when rank 0 closes the socket or sends a shutdown, which is
+// what makes `docker stop` on the front end bring the workers down too
+// instead of leaving them holding a card.
+bool grimoire_is_pp_worker(Grimoire& e) {
+    return e.pp_enabled() && e.pp_rank > 0;
+}
+
+// The front end tells the rest of the pipeline what it is about to run.
+//
+// Exposed rather than inlined in the scheduler so the gate drives THIS
+// function and not a copy of it: a protocol whose two ends are written
+// twice is a protocol with two chances to disagree, and a disagreement
+// here is a deadlock, not an error.
+//
+// A no-op when there is no pipeline, so a caller does not have to ask.
+bool grimoire_pp_broadcast_request(Grimoire& e,
+        const std::vector<int32_t>& prompt, int n_predict,
+        int eos_id, int eot_id) {
+    if (!e.pp_enabled() || e.pp_rank != 0) return true;
+    Grimoire::PPRequest req;
+    req.prompt = prompt; req.budget = n_predict;
+    req.eos = eos_id; req.eot = eot_id;
+    return e.pp_send_request(req);
+}
+
+// Bring the workers down with the front end.  Without it they sit on a
+// read() holding a card until something kills them, which on a box where
+// the next run wants that card is the difference between a restart and a
+// power cycle.
+void grimoire_pp_shutdown(Grimoire& e) {
+    if (!e.pp_enabled() || e.pp_rank != 0) return;
+    Grimoire::PPRequest req;
+    req.shutdown = true;
+    (void)e.pp_send_request(req);
+}
+
+void grimoire_pp_worker_loop(Grimoire& e) {
+    std::fprintf(stderr, "  PP rank %d: worker ready, waiting for requests\n",
+                 e.pp_rank);
+    for (;;) {
+        Grimoire::PPRequest req;
+        if (!e.pp_recv_request(req)) {
+            std::fprintf(stderr, "  PP rank %d: front end closed the pipe\n",
+                         e.pp_rank);
+            return;
+        }
+        if (req.shutdown) {
+            std::fprintf(stderr, "  PP rank %d: shutdown\n", e.pp_rank);
+            return;
+        }
+        std::vector<int32_t> out;
+        FinishReason r = FinishReason::Length;
+        try {
+            grimoire_serve_generate(e, req.prompt, req.budget, req.eos, out,
+                                    req.eot, {}, &r);
+        } catch (const std::exception& ex) {
+            // A stage that threw has left the pipe mid-message; there is
+            // no way to resynchronise a byte stream after that, so say so
+            // and stop rather than answer the next request from the
+            // middle of this one's data.
+            std::fprintf(stderr, "  PP rank %d: request failed: %s\n",
+                         e.pp_rank, ex.what());
+            return;
+        }
+    }
 }
 
 void grimoire_delete(Grimoire* e) { if(e){e->release();delete e;} }
