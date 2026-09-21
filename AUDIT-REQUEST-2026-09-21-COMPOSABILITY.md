@@ -11,6 +11,61 @@ commit `dd04198` at time of writing.
 
 ---
 
+## 0. Found while re-checking my own fixes -- fixed, and worth reading
+
+The question "is there anything else to audit" prompted grepping every
+call site of what F3, F2, F4, F5 and F7 touched, per the project's own
+standard (rules 15/18/20: a guard found in one place is usually needed
+in more than one, and the grep IS the check). One real gap turned up:
+
+**F3's `allow_exact_restore` guard did not reach `prefill_muse()` or
+`prefill_gemma4()`.** `prefill()` dispatches to both BEFORE its own
+guarded `restore_prefix()` line is ever reached, and neither function
+took the parameter -- each has its own independent
+`restore_prefix(tokens)` call. Today this is **latent, not live**:
+`batch_unsupported_reason()` unconditionally refuses batching for both
+architectures, which forces the scheduler's `width` to 1 and blocks
+the multi-slot batch driver entirely, so no two concurrent requests
+can ever collide on a slot for these models right now. But the day
+someone adds batching for Muse or gemma-4 (already on
+`CONCURRENCY.md`'s "not done" list), this reopens the exact F3 race
+silently, because nothing in either function's signature would remind
+the next person to thread the guard through.
+
+Fixed by adding `allow_exact_restore = true` to both signatures and
+gating both `restore_prefix()` calls on it, same as the shared
+`prefill()`. Zero behavior change today (the parameter defaults to
+`true` and both call sites that pass `false` are structurally
+unreachable for these architectures) -- this closes the landmine
+rather than documenting it and hoping the note survives.
+
+Checked and cleared while at it, so this doesn't need re-auditing:
+- **F2** (PP cancellation): all four callers of `grimoire_serve_generate`
+  checked. Only the scheduler's admission path (already fixed) is
+  exposed to a live, cancellable client under PP. The batch driver's
+  fallback loop and the PP worker loop both pass an empty callback --
+  nothing to cancel through them. The CLI's own single-shot call
+  (`bin/grimoire`) is structurally different: it exits right after one
+  request, so there is no "next request" for a desync to corrupt even
+  in principle -- worth noting, not worth fixing.
+- **F4** (prefix snapshot): the fix lives in one RAII destructor,
+  reached through one template, called from one place
+  (`grimoire_serve_generate`). No duplication possible.
+- **F5** (Qwen4-Exp prefix exclusion): enforced one level down, inside
+  `restore_prefix()` itself, so all three of its callers (including
+  `prefill_muse`'s and `prefill_gemma4`'s own) are automatically
+  covered. This is why F5 didn't have F3's problem.
+- **F7** (batch capacity check): only the shared `prefill()` takes a
+  `seqb` parameter at all; `prefill_muse`/`prefill_gemma4`/
+  `prefill_qwen4_exp` don't accept batched rows, so F7's bug class
+  cannot reach them.
+
+Rebuilt and re-ran `test_model_matrix`, `test_gemma4_prefill`,
+`test_scheduler`, `test_batch_decode`, `test_prefix_reuse` against this
+change -- see the repo's commit log for the result at push time.
+
+---
+
 ## 1. Missing features — not bugs, just not built
 
 These are refused BY NAME in the engine (`batch_unsupported_reason()`

@@ -2975,9 +2975,11 @@ struct Grimoire {
                       std::vector<int32_t>& out);
     static constexpr int kMaxBatchRows = kSpecBatch;
     bool prefill_muse(const std::vector<int32_t>& tokens,
-                      std::vector<int32_t>* next_tokens = nullptr);
+                      std::vector<int32_t>* next_tokens = nullptr,
+                      bool allow_exact_restore = true);
     bool prefill_gemma4(const std::vector<int32_t>& tokens,
-                        std::vector<int32_t>* next_tokens = nullptr);
+                        std::vector<int32_t>* next_tokens = nullptr,
+                        bool allow_exact_restore = true);
     bool prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                            std::vector<int32_t>* next_tokens);
     void snapshot_recurrent();
@@ -9607,11 +9609,20 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
 // together; routing it through the Qwen/DeltaNet prefill allocates irrelevant
 // recurrent buffers and computes the wrong residual graph.
 bool Grimoire::prefill_muse(const std::vector<int32_t>& tokens,
-                            std::vector<int32_t>* next_tokens) {
+                            std::vector<int32_t>* next_tokens,
+                            bool allow_exact_restore) {
     const int M=int(tokens.size());
     if(M<=0||pos+M>max_seq)return false;
     const int start_pos=pos;
-    if(!next_tokens&&start_pos==0&&restore_prefix(tokens))return true;
+    // allow_exact_restore threaded through from prefill() (external audit
+    // follow-up, 2026-09-21): this function has its own restore_prefix()
+    // shortcut, bypassed by prefill()'s dispatch BEFORE its own guarded
+    // one is ever reached, so the F3 fix there did not cover it. Latent
+    // today only because batch_unsupported_reason() always refuses Muse,
+    // which keeps a caller with its own slot-ownership model from ever
+    // reaching this function concurrently -- must not go stale the day
+    // Muse gets a batched path.
+    if(!next_tokens&&start_pos==0&&allow_exact_restore&&restore_prefix(tokens))return true;
     const int H=cfg.hidden,HD=cfg.head_dim,QH=cfg.n_heads,KVH=cfg.n_kv_heads;
     const int QW=QH*HD,KVW=KVH*HD,I=cfg.dense_inter;
     int W=std::max({H,QW,KVW,2*I});
@@ -9999,13 +10010,17 @@ long g_qwen4_exp_batched_prefills = 0;
 // than none.  PP and TP return false for the same reason: unwired, not
 // broken.  Each falls back to sequential decode, which is correct.
 bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
-                              std::vector<int32_t>* next_tokens) {
+                              std::vector<int32_t>* next_tokens,
+                              bool allow_exact_restore) {
     const int M = int(tokens.size());
     if (M <= 0 || pos + M > max_seq) return false;
     if (next_tokens) return false;
     if (pp_enabled() || tp_enabled()) return false;
     const int start_pos = pos;
-    if (start_pos == 0 && restore_prefix(tokens)) return true;
+    // allow_exact_restore threaded through from prefill() -- see the
+    // matching note in prefill_muse(); same gap, same reason it is
+    // latent rather than live today.
+    if (start_pos == 0 && allow_exact_restore && restore_prefix(tokens)) return true;
 
     const int H = cfg.hidden, QH = cfg.n_heads;
     const int HDX = cfg.max_head_dim(), KVHX = cfg.max_kv_heads();
@@ -10762,7 +10777,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     }
     if (cfg.is_muse) {
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
-        return prefill_muse(tokens,next_tokens);
+        return prefill_muse(tokens,next_tokens,allow_exact_restore);
     }
     // gemma-4 has its own batched prefill: the loop below is the Qwen
     // residual graph -- attention output added raw, normalised on the way
@@ -10781,7 +10796,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // forces the sequential path for an A/B on the card.
     if (cfg.is_gemma4) {
         if (std::getenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL")) return false;
-        return prefill_gemma4(tokens, next_tokens);
+        return prefill_gemma4(tokens, next_tokens, allow_exact_restore);
     }
     // Qwen4-Exp: batched prefill below is the Qwen residual graph and
     // this model's is the hyper-connection one, so running a prompt
