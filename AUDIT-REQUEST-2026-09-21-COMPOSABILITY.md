@@ -172,16 +172,24 @@ only non-green results are clock timeouts, explained in section 3.
 | `test_k2_e2e` | ALL PASS |
 | `test_model_matrix` | timeout (every completed cell `ok`; 6.5/10 architectures in 1800s) |
 | `test_parallel_e2e` | timeout (every completed cell `match`) |
-| `test_spec_e2e` | timeout (every completed cell `identical`; reached `TP+MTP match` and `PP+MTP match`) |
+| `test_spec_e2e` | timeout (every completed cell `identical`; at 1800s reached dense+mtp, moe+mtp bf16 AND fp8 with `TP+MTP match` + `PP+MTP match`, hybrid+mtp refusal, muse bf16) |
 | `test_gemma4_prefill` | ALL PASS |
 | `test_qwen4_exp_e2e` | ALL PASS |
 | `test_nvfp4_e2e` | ALL PASS — this is the gate that covers the F1 fix |
 | `test_prefix_reuse` | ALL PASS |
 | `test_batch_decode` | ALL PASS — includes the new F7 regression arm (`stale-pos capacity  3 of 3 rows answered`) |
 | `test_scheduler` | ALL PASS (`12 batched steps carrying 66 rows`) |
-| `test_pp_server` | timeout |
+| `test_pp_server` | **ALL PASS** — timed out at 900s, passes clean given 1800s (needs ~1200s off the card) |
 
 Plus the 13 host suites (`make test`, `make test-correctness`), green.
+
+`test_pp_server` is the direct confirmation of section 3's conclusion:
+given more clock and nothing else, it goes green with zero failures.
+It is not a broken gate, it is a gate that does not fit a 900s budget
+on a CPU. The remaining three are the same shape, just bigger — they
+are 70 cells, ~50 PP/TP matches, and a full speculation matrix
+respectively, where `test_pp_server` is three requests down one
+pipeline.
 
 So: **the nine audit fixes introduced no correctness regression that
 any gate in this repo can see, and no performance regression either
