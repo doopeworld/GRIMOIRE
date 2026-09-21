@@ -174,12 +174,28 @@ inline void write_model(const fs::path& dir, const Arch& a, uint32_t seed = 2026
 // also what a real checkpoint does (its `ignore` list names them).
 //
 // The values are chosen to be EXACTLY representable: a code from the
-// E2M1 grid times an E4M3 scale times a power-of-two global scale is
-// exact in bf16 as well, so the twin is not an approximation of the
-// NVFP4 arm -- it is the same number. See b70/nvfp4.hpp.
+// E2M1 grid times an E4M3 scale divided by a power-of-two global scale
+// is exact in bf16 as well (dividing by a power of two is multiplying
+// by its reciprocal, itself a power of two), so the twin is not an
+// approximation of the NVFP4 arm -- it is the same number. See
+// b70/nvfp4.hpp for the dequant formula this must match: DIVIDE by the
+// global scale, not multiply (fixed 2026-09-21, external audit -- see
+// that file's header for why the old "* gscale" twin could not have
+// caught the engine using the same wrong direction).
+//
+// gscale VARIES PER TENSOR, not a single value shared by the whole
+// model.  A merged linear (gate_up_proj) carries one global scale PER
+// PARTITION and the engine must dequantize each with its own before
+// concatenating (see the merged-linear trap in b70/nvfp4.hpp) -- a
+// fixture where gate_proj and up_proj happen to share one scale value
+// cannot distinguish "used the right TensorRef's scale" from "used
+// literally any scale", because they would agree either way. Deriving
+// gscale from the same per-tensor hash already used for the payload
+// bytes gives gate_proj and up_proj DIFFERENT non-unit values with high
+// probability, without needing every caller to plumb one through.
 struct NvfpPair { Arch nvfp4; Arch bf16; };
 
-inline NvfpPair to_nvfp4(const Arch& src, float gscale = 0.5f) {
+inline NvfpPair to_nvfp4(const Arch& src) {
     NvfpPair out{src, src};
     out.nvfp4.name = "nvfp4";
     out.bf16.name  = "nvfp4-twin";
@@ -196,6 +212,14 @@ inline NvfpPair to_nvfp4(const Arch& src, float gscale = 0.5f) {
         const std::string base = t.name.substr(0, t.name.size() - 7);  // drop ".weight"
         uint32_t h = 2166136261u;
         for (unsigned char ch : t.name) { h ^= ch; h *= 16777619u; }
+        // Four distinct power-of-two global scales, none of them 1 --
+        // gscale == 1 makes multiply and divide agree on every value,
+        // which would silently un-test the direction this fixture
+        // exists to pin.  Picked by the same hash as the payload RNG
+        // below, so it is a pure function of the tensor's name and
+        // reproducible without threading extra state through.
+        static const float kScales[4] = {0.5f, 0.25f, 2.0f, 4.0f};
+        const float gscale = kScales[h % 4];
         std::mt19937 rng(h);
 
         std::vector<float> bytes(size_t(N) * (K / 2), 0.f);
@@ -204,7 +228,7 @@ inline NvfpPair to_nvfp4(const Arch& src, float gscale = 0.5f) {
         for (int n = 0; n < N; ++n) {
             for (int g = 0; g < K / 16; ++g) {
                 // An E4M3 value, taken through the encoder so the scale
-                // the twin multiplies by is the one the reader will
+                // the twin divides by is the one the reader will
                 // decode -- not a nearby float.
                 const uint8_t se = f32_to_e4m3(0.25f + float(rng() % 16) * 0.125f);
                 scal[size_t(n) * (K / 16) + g] = float(se);
@@ -215,7 +239,9 @@ inline NvfpPair to_nvfp4(const Arch& src, float gscale = 0.5f) {
                     if ((k & 1) == 0) bytes[size_t(n) * (K / 2) + k / 2] = float(lo);
                     else bytes[size_t(n) * (K / 2) + k / 2] =
                              float(uint8_t(int(bytes[size_t(n) * (K / 2) + k / 2]) | (lo << 4)));
-                    deq[size_t(n) * K + k] = e2m1_to_f32(lo) * sv * gscale;
+                    // DIVIDE, matching nvfp4_dequant_row -- see the
+                    // derivation comment above this function.
+                    deq[size_t(n) * K + k] = e2m1_to_f32(lo) * sv / gscale;
                 }
             }
         }

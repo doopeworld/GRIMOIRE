@@ -967,6 +967,16 @@ bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
             err = "NVFP4 weight_global_scale could not be read: " + err;
             return false;
         }
+        // The dequant formula DIVIDES by this (see nvfp4.hpp).  A stored
+        // zero used to silently zero the weight under the old multiply
+        // convention; under divide it would produce inf/nan that
+        // propagates through the whole model instead.  Refuse rather
+        // than load a checkpoint that cannot mean this.
+        if (g == 0.0f) {
+            err = "NVFP4 weight_global_scale is zero, which cannot be a "
+                  "valid quantization scale";
+            return false;
+        }
         nvfp4_dequant(pk.data(), sc.data(), g, N, K, dst);
         return true;
     }
@@ -2928,9 +2938,30 @@ struct Grimoire {
     // pos[r] its position in that sequence.  Both are HOST arrays: this
     // path never records a command graph, so there is nothing to bake.
     struct SeqBatch { const int* slot; const int* pos; };
+    // allow_exact_restore: whether an exact-match cache hit may REBIND
+    // the live slot out from under the caller (external audit,
+    // 2026-09-21).  The serial single-conversation path
+    // (generate_tokens()) wants this on: there is only ever one active
+    // conversation, so "some other slot already has this exact prompt"
+    // can only mean an earlier turn of the SAME conversation, and taking
+    // it is correct. The scheduler is different -- it has ALREADY chosen
+    // and cleared a specific slot for THIS request via clear_seq_slot()
+    // before calling prefill(), as one entry in a table of several
+    // SIMULTANEOUSLY active requests. If two admitted requests carry an
+    // identical prompt (the ordinary case for agents sharing a system
+    // prompt), an exact-match hit would silently rebind this request
+    // onto WHICHEVER slot holds that prompt -- possibly a different,
+    // currently-live request's slot -- while the scheduler's own
+    // bookkeeping (j->slot, slot_busy) still names the slot it started
+    // with. Two live requests then read and write the same physical KV
+    // rows, and restoring an in-flight request's own snapshot back onto
+    // itself can rewind its recurrent state to an earlier turn. The
+    // scheduler passes false and lives with a fresh ingestion on every
+    // admission; nothing else changes for it.
     bool prefill(const std::vector<int32_t>& tokens,
                  std::vector<int32_t>* next_tokens = nullptr,
-                 const SeqBatch* batch = nullptr);
+                 const SeqBatch* batch = nullptr,
+                 bool allow_exact_restore = true);
     // Why a batch cannot be run: a sentence naming the feature, or empty
     // if it can.  Kept apart from prefill() so the caller can refuse
     // BEFORE it commits sequences to slots, and so the reason reaches a
@@ -6060,6 +6091,20 @@ void Grimoire::clear_seq_slot(int j) {
 // there in the first place.
 bool Grimoire::prefix_cache_usable() const {
     if (!prefix_cache_enabled() || cfg.is_muse) return false;
+    // Qwen4-Exp (external audit, 2026-09-21).  prefill_qwen4_exp()'s own
+    // comment already explains why it never calls save_prefix()/
+    // restore_prefix() itself: the snapshot covers ordinary KV and
+    // DeltaNet state, and knows nothing about the QSA indexer's two key
+    // caches, a PLE layer's conv history, or the q4_tok n-gram history --
+    // so a restored snapshot would be half this conversation and half
+    // whichever one saved it, silently.  That exclusion was deliberate
+    // and specific to prefill_qwen4_exp()'s own call path.  Lifting the
+    // MTP refusal above opened a GENERIC path -- the end-of-request
+    // snapshot in generation.hpp and the growing-prefix restore in
+    // prefill() -- that never routes through prefill_qwen4_exp() at all
+    // and so never saw that exclusion.  Nothing here re-checked it for
+    // the new path; this does.
+    if (cfg.is_qwen4_exp) return false;
     // MTP IS ALLOWED, AND WAS REFUSED FOR A REASON THAT WAS NOT ABOUT IT
     // (rule 13).  The refusal arrived with the F2 fix at 4cdcba8, whose
     // subject was a PP DEADLOCK: an earlier stage cached a prompt the
@@ -10608,7 +10653,8 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
 
 bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens,
-                       const SeqBatch* seqb) {
+                       const SeqBatch* seqb,
+                       bool allow_exact_restore) {
     if(seqb){
         // A batch does not have ONE position, so the engine's cursor says
         // nothing about whether it fits.  Every row is checked against
@@ -10746,9 +10792,22 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         return prefill_qwen4_exp(tokens, next_tokens);
     }
     const int M = int(tokens.size());
-    if (M <= 0 || pos + M > max_seq) return false;
+    if (M <= 0) return false;
+    // NOT under seqb (external audit, 2026-09-21).  Every row's own
+    // position was already checked against max_seq individually at the
+    // top of this function -- that is what a batch HAS instead of one
+    // cursor.  This check compares the engine's single scalar `pos`
+    // (which a batched call does not advance and may be stale from
+    // whatever single-sequence prefill last ran) plus M, where M here
+    // counts ROWS -- one token each, from DIFFERENT conversations -- not
+    // consecutive tokens appended to that scalar's conversation.  Four
+    // rows sitting at position 126 of a 128-token window each have one
+    // token of room; `pos + 4 > 128` refused all of them anyway,
+    // whatever `pos` happened to be.
+    if (!seqb && pos + M > max_seq) return false;
     const int start_pos = pos;
-    if (!seqb && !next_tokens && start_pos == 0 && restore_prefix(tokens)) return true;
+    if (!seqb && !next_tokens && start_pos == 0 && allow_exact_restore &&
+        restore_prefix(tokens)) return true;
 
     const int H = cfg.hidden, Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -12670,7 +12729,13 @@ int grimoire_serve_generate_batch(Grimoire& e,
         if (budget <= 0) continue;
         e.sync();
         e.clear_seq_slot(slot);
-        if (!e.prefill(prompts[i]))
+        // allow_exact_restore=false (external audit, 2026-09-21): this
+        // slot was JUST chosen and cleared for this row specifically.
+        // An exact-prompt cache hit must not silently rebind it onto
+        // whichever slot happens to hold a matching earlier snapshot --
+        // two rows of this same batch could then end up sharing one
+        // physical slot. See the note on prefill()'s declaration.
+        if (!e.prefill(prompts[i], nullptr, nullptr, false))
             for (int32_t t : prompts[i])
                 if (!e.forward(t))
                     throw std::runtime_error("batch prompt ingestion failed");
@@ -12872,14 +12937,53 @@ void GrimoireScheduler::run() {
                     }
                     std::vector<int32_t> out;
                     FinishReason r = FinishReason::Length;
+                    // UNDER PP, RANK 0 MUST NOT STOP EARLY (external
+                    // audit F2, 2026-09-21).  Every rank runs this same
+                    // generate_tokens() loop in lockstep -- every step
+                    // is a forward()/argmax_token() round trip over the
+                    // PP sockets, matched call for call across ranks --
+                    // and that lockstep IS the whole protocol.  A
+                    // disconnected streaming client is known only to
+                    // rank 0; the other ranks have no channel to learn
+                    // "stop here too" mid-flight, so if rank 0's own
+                    // emit() returns false on cancellation and breaks
+                    // its loop early, the other ranks keep decoding
+                    // toward the ORIGINAL budget/EOS.  Rank 0 then moves
+                    // on to the NEXT request and broadcasts a fresh
+                    // PPRequest header down a pipe whose other end is
+                    // still mid-token-exchange for this one -- the
+                    // header lands in the wrong protocol phase and can
+                    // be read as model data, block, or corrupt the next
+                    // request.
+                    //
+                    // So under PP, ignore push()'s "keep going" answer
+                    // for the purpose of continuing this loop -- EOS and
+                    // budget exhaustion are unaffected (they are
+                    // identical on every rank by construction, since
+                    // every rank was broadcast the same request) and
+                    // still stop the loop normally, in lockstep, exactly
+                    // where every other rank also stops. push() itself
+                    // is still called and still suppresses delivery once
+                    // j->cancelled is set -- the disconnected client
+                    // receives nothing further -- this only keeps rank
+                    // 0's STEP COUNT matched to its peers. Off PP,
+                    // cancellation still frees the card immediately,
+                    // which is correct and unchanged there.
+                    const bool pp = e.pp_enabled();
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
-                        j->eot, [&](int32_t t){ return push(j, t); }, &r);
+                        j->eot, [&](int32_t t){
+                            const bool kept = push(j, t);
+                            return pp ? true : kept;
+                        }, &r);
                     finish(j, r);
                     continue;
                 }
                 e.sync();
                 e.clear_seq_slot(slot);
-                if (!e.prefill(j->prompt))
+                // allow_exact_restore=false, same reasoning as the direct
+                // batch driver above: this slot is THIS job's, just
+                // chosen and cleared, and nothing may silently move it.
+                if (!e.prefill(j->prompt, nullptr, nullptr, false))
                     for (int32_t t : j->prompt)
                         if (!e.forward(t))
                             throw std::runtime_error("prompt ingestion failed");

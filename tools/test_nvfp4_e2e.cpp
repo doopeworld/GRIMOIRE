@@ -85,14 +85,22 @@ int main() {
 
     // The host reference, on one block, before anything else runs.  If
     // this disagrees the engine's answer cannot be judged against it.
+    //
+    // DIVIDES by the global scale (fixed 2026-09-21, external audit).
+    // compressed-tensors' own NVFP4 dequantizer computes
+    // local_scale / global_scale and passes the stored scale through
+    // unchanged -- verified directly against that source, not inferred.
+    // The old "* 0.5f" here was not an independent check: it re-derived
+    // the same wrong direction the engine used, so the two could only
+    // ever agree with each other, never with a real checkpoint.
     {
         // 0x21 = codes 1 (0.5) then 2 (1.0), low nibble first.
         const uint8_t packed[8] = {0x21, 0x43, 0x65, 0x87, 0x21, 0x43, 0x65, 0x87};
         const uint8_t scale[1]  = { f32_to_e4m3(1.5f) };
         float got[16] = {0};
         nvfp4_dequant_row(packed, scale, 0.5f, 16, got);
-        const float want0 = e2m1_to_f32(1) * e4m3_to_f32(scale[0]) * 0.5f;
-        const float want1 = e2m1_to_f32(2) * e4m3_to_f32(scale[0]) * 0.5f;
+        const float want0 = e2m1_to_f32(1) * e4m3_to_f32(scale[0]) / 0.5f;
+        const float want1 = e2m1_to_f32(2) * e4m3_to_f32(scale[0]) / 0.5f;
         std::printf("%-22s low nibble first: %.4f %.4f\n", "host reference",
                     got[0], got[1]);
         CHECK(got[0] == want0 && got[1] == want1,

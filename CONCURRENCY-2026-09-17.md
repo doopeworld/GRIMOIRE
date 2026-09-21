@@ -110,6 +110,16 @@ If it says `one at a time` it names the reason. Read that line before
 concluding the flags did nothing — that banner has located more bugs in
 this project than any assertion (rule 15).
 
+**CORRECTION (2026-09-21, external audit F8): the three flags above do
+NOT yet compose.** The batchable scheduler path never calls
+`prefix_reuse()`/`restore_prefix_upto()` on admission and never snapshots
+on completion, so `GRIMOIRE_PREFIX_CACHE=1` has no effect once batching
+is actually engaged — a growing conversation is read in full every turn
+regardless. See `DAY-ONE.md` section 2c for the full account and
+CLAUDE.md rule 21. This file is kept as the design rationale for the
+work below it, not as the current claim of what is composed.
+this project than any assertion (rule 15).
+
 ## How it is checked
 
 `bin/test_batch_decode` — four conversations of DIFFERENT lengths

@@ -5,6 +5,54 @@ Read this first if you are picking up GRIMOIRE now. It supersedes
 correct, just no longer current — read it for the full concurrency design
 rationale, this file for what shipped after it and what to do next).
 
+**UPDATE, same day: this handoff was audited, and the audit was right.**
+An external review of exactly the commit this file describes found NINE
+real defects, five P1 — correctness bugs in code that was each
+individually gated and green. All nine are fixed, independently
+re-verified (against the audit's own reproductions where given, and
+against the upstream compressed-tensors source directly for NVFP4, not
+against this repo's own fixture), and every device gate + host suite
+rebuilt and rerun clean afterward. **Read `CLAUDE.md` rule 21** — it is
+the fuller account, including the pattern behind all nine (features
+tested separately, never tested interrupting each other) and is worth
+reading before extending any of this further. The short version of what
+changed, so this file's earlier claims below are read correctly:
+
+- NVFP4's dequant formula was inverted (multiplied by the global scale,
+  where the format's own convention divides) — fixed, verified against
+  the upstream source line by line, not against this repo's own twin.
+- Two concurrently-admitted requests sharing a prompt could be silently
+  routed onto the same physical KV slot, or rewind a live request's own
+  recurrent state — fixed by giving the scheduler a way to refuse the
+  cache's exact-match rebind, at the cost of: **`GRIMOIRE_PREFIX_CACHE`
+  does NOT yet compose with batching** — the batchable path never
+  resumed a growing conversation to begin with, and now provably cannot
+  by accident either. See `DAY-ONE.md` section 2c for the corrected
+  claim.
+- A cancelled streaming request under PP could desynchronise the
+  resident pipeline for the NEXT request — fixed by keeping every rank's
+  step count matched even after a client disconnects.
+- A speculative round that hit EOS or was cancelled PARTWAY through an
+  accepted block could save a prefix snapshot whose token list didn't
+  match the recurrent state it actually held — fixed by declining to
+  save in that specific case, now a permanent arm in
+  `tests/test_generation.cpp`, not a one-off script.
+- A stale, unrelated scalar could refuse a batch every row of which had
+  real room — fixed, now a permanent arm in `tools/test_batch_decode.cpp`.
+- `tools/b70run.sh` swallowed a failed container's exit status — fixed;
+  every Tower gate and real-model run goes through this launcher.
+- `tools/preflight_b70.sh`'s multi-rank gates (test_parallel_e2e,
+  test_spec_e2e, the new test_pp_server) were wired through a
+  single-device launcher, so they would throw on rank 1 the moment real
+  GPUs are visible — off the card this was invisible, since no GPU at
+  all falls back uniformly for every rank. Given a dedicated multi-device
+  runner reusing `pp2run.sh`'s own proven container flags. **This one
+  could not be tested here — there is no GPU in this container — verify
+  it on the actual first Tower run, not just trust the diff.**
+
+Everything else below this point is as it was, current and correct as
+of the fixes above.
+
 Ian is expected back at the Tower around now. **The job stated in
 `CLAUDE.md`'s current priority is: the box works the day he powers it
 on.** Everything below was built and verified off the card, in a

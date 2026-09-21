@@ -307,6 +307,63 @@ int main() {
         }
     }
 
+    // ---- A STALE SCALAR CURSOR MUST NOT REFUSE A VALID BATCH ---------
+    // (external audit F7, 2026-09-21). Batched decode never advances the
+    // engine's single `pos` scalar -- there is no one position for a
+    // batch of DIFFERENT conversations to share -- so that scalar can
+    // sit wherever an EARLIER, unrelated single-sequence call left it.
+    // prefill()'s capacity check used to compare pos + M (M = ROW COUNT,
+    // not a token position) against max_seq unconditionally, so a
+    // single-sequence call that happened to leave pos near max_seq could
+    // make every SUBSEQUENT batched call fail outright -- even though
+    // every row's own position, checked individually a few lines above,
+    // had room.
+    //
+    // Reproduced directly: one single-sequence generation on a SMALL
+    // max_seq, advancing pos close to it, on the SAME engine a batch is
+    // then run on. The old check used pos (now ~max_seq) plus M (the
+    // batch's row count) against max_seq -- comfortably over, for any
+    // M > 0 -- and refused every row despite each having tokens of room.
+    {
+        const fs::path dir = root / "capacity";
+        mini::write_model(dir, mini::dense());
+        std::string err;
+        Grimoire* e = grimoire_new();
+        const int kCtx = 20;
+        bool ok = e && grimoire_load(*e, dir.string(), Fmt::BF16, kCtx, err);
+        if (!ok) {
+            ++g_fail;
+            std::printf("    FAIL: capacity fixture load: %s\n", err.c_str());
+        } else {
+            // Push the engine's scalar pos up near max_seq with an
+            // ordinary single-sequence call -- unrelated to the batch
+            // that follows, except for sharing this same engine.
+            std::vector<int32_t> single_out; FinishReason r{};
+            grimoire_serve_generate(*e, {5, 6, 7}, kCtx - 5, -1, single_out,
+                                    -1, {}, &r);
+            // Now a batch of short, FRESH prompts on the same engine.
+            // Each row individually has plenty of room in a 20-token
+            // window; only the STALE scalar (now near kCtx from the call
+            // above) made the old check refuse them.
+            const std::vector<std::vector<int32_t>> prompts = {
+                {1, 2}, {3, 4}, {8, 9},
+            };
+            std::vector<std::vector<int32_t>> out;
+            const int n = grimoire_serve_generate_batch(*e, prompts, 3, -1, out, -1);
+            std::printf("%-22s %d of %zu rows answered", "stale-pos capacity",
+                        n, prompts.size());
+            for (auto& o : out) std::printf("  [%zu tok]", o.size());
+            std::printf("\n");
+            bool all_answered = n == int(prompts.size());
+            for (auto& o : out) all_answered = all_answered && !o.empty();
+            CHECK(all_answered,
+                  "a batch of rows with room individually was refused because "
+                  "the engine's UNRELATED single-sequence cursor was stale, "
+                  "which is not a capacity problem any of these rows has");
+        }
+        grimoire_delete(e);
+    }
+
     if (!g_fail) fs::remove_all(root);
     else std::printf("\nfixtures kept in %s\n", root.c_str());
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

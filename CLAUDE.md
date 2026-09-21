@@ -6,6 +6,16 @@
 to a Tower with two B70s on OCuLink. The job is that the box WORKS the
 day he powers it on — dual GPU, FP8, pipeline parallel.**
 
+**2026-09-21: an external audit of everything below found NINE real
+defects, five of them P1 -- correctness bugs in code that was each
+individually gated and green.  All nine are fixed, independently
+verified against the audit's own reproductions (or against the actual
+upstream source, for NVFP4), and rule 21 records what kind of gap let
+each one through.  Read rule 21 before extending ANY of the concurrency
+or NVFP4 work further -- the pattern it names ("two features that share
+a call site, tested separately, never tested interrupting each other")
+is exactly the shape to watch for in whatever gets built next.**
+
 Start at `DAY-ONE.md`, and run `tools/preflight_b70.sh /models/<dir>`
 before anything else. It builds in the right order (bridges first, rule
 3), runs every gate, and finishes by generating text for a human to read
@@ -39,7 +49,9 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   `GRIMOIRE_MAX_BATCH=8`; the banner says what it decided.  **No speed
   number exists and none can be taken here** -- the saving is XMX-shaped
   and off-card the batched GEMM runs on a plain-SYCL fallback.  See rule
-  19 and `DAY-ONE.md` section 2c.
+  19 and `DAY-ONE.md` section 2c.  **`GRIMOIRE_PREFIX_CACHE=1` does NOT
+  yet compose with this** (rule 21) -- the batchable path never resumes
+  a growing conversation, it reads it in full every turn.
 - **the server runs across TWO cards** (`test_pp_server`).  Pipeline
   parallel was CLI-only: `pp2run.sh` runs one prompt and exits, and
   `serve.sh` opens one render node -- so a model needing two cards
@@ -59,7 +71,11 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   No NVFP4 kernel and none needed.  Same move AMD's ROCm blog makes for
   CDNA4 and GGZ14/vllm-mxfp4 for RDNA4, except going through f32 means
   the destination is not one hardcoded pair.  See `b70/nvfp4.hpp` and
-  rule 18.
+  rule 18.  **The dequant formula was inverted until 2026-09-21** (rule
+  21) -- it multiplied by the global scale where compressed-tensors'
+  own convention divides, silently wrong by the scale squared on every
+  weight.  Fixed and verified directly against the upstream source, not
+  against the fixture's own (previously matching) formula.
 - speculation (MTP and DFlash) is identical to plain decode, single
   process and under TP and PP, now including Muse (`test_spec_e2e`)
 - **Qwen4-Exp / Qwen3.8-Flash-Next runs** (`test_qwen4_exp_e2e`):
@@ -773,6 +789,126 @@ And the honest limit: off the card M >= 32 now takes the plain-SYCL
 pair, while the card takes the grouped/XMX path.  The MoE batched
 prefill is RUNNABLE here now; it is not the same code, and a green run
 here says nothing about the tile.
+
+**21. FEATURES GATED SEPARATELY CAN STILL BE BROKEN TOGETHER, AND A
+NUMBER VERIFIED AGAINST ITSELF IS NOT VERIFIED (external audit,
+2026-09-21).**  An outside review of the concurrency work (rules 19-20)
+found NINE real defects across the prefix cache, the scheduler, PP
+framing, the generation template, NVFP4, and a shell launcher -- five
+of them P1.  Every one of them was in code that had its OWN gate,
+green.  What the gates missed, and why, is the thing worth keeping.
+
+- **A number checked only against itself is not checked.**  NVFP4's
+  dequant formula multiplied by the global scale where the format's own
+  upstream convention (compressed-tensors) divides by it -- verified
+  directly against that source, not inferred.  For a nonzero scale the
+  error is the scale SQUARED, silent, and the checkpoint still loads and
+  generates fluent text.  It survived because the fixture's "independent"
+  bf16 twin was built with the SAME wrong formula: an equality gate
+  between two copies of one mistake proves the two copies agree, nothing
+  about the checkpoint's real convention.  Rule 18 already said a format
+  needs its discriminator checked at every fast path; this is the same
+  lesson at the level of the FORMULA, not the branch -- a self-referential
+  reference is not a reference.  The fixture also used ONE global scale
+  for the whole model, so a bug that read the wrong TensorRef's scale
+  (exactly what a merged linear like gate_up risks) would have been
+  invisible too, since every tensor's scale was the same value.  Fixed
+  by pinning the formula against the upstream source directly and by
+  deriving a different non-unit scale per tensor from the same hash that
+  already seeds its payload bytes.
+
+- **Two features can each be correct alone and unsafe together, and nobody
+  tests the together.**  The scheduler picks a slot, clears it, and calls
+  prefill() -- and prefill() has its OWN, older, independent mechanism
+  for reusing an exact-prompt cache hit, which REBINDS the live slot to
+  wherever that prompt happens to be cached, ignoring which slot the
+  caller just chose. Two concurrent requests sharing an opening (the
+  ordinary case for agents on the same system prompt) could be silently
+  routed onto the SAME physical KV storage, and restoring a live
+  request's own earlier snapshot back onto itself could rewind its
+  recurrent state mid-generation. The prefix-cache gate used distinct
+  prompts; the scheduler gate used prompts that never matched, on purpose,
+  to isolate what each was testing -- and each was right to, but neither
+  ever ran with the OTHER feature's exact conditions turned on. Fixed by
+  giving prefill() a way for a caller with its own slot-ownership model
+  to say "do not let anything rebind me," and having the scheduler use it
+  -- which also means growing-conversation resume does not currently
+  reach the batched path at all; that is now stated plainly rather than
+  implied, in `DAY-ONE.md` and here.
+
+- **A protocol's happy path and its abort path are different protocols,
+  and only one of them was tested.**  Every PP rank runs the same decode
+  loop in lockstep, matched call for call over the sockets -- that
+  lockstep IS the protocol. A streaming client disconnecting is known
+  only to rank 0, which used to let its OWN early-return stop its OWN
+  loop -- leaving the other ranks decoding toward the original budget
+  while rank 0 moved on to broadcast the NEXT request into a pipe still
+  mid-exchange for this one. The existing PP gate drives cancellation
+  under a single process and drives multi-rank PP to completion; it
+  never drove multi-rank PP INTO a cancellation, because those were two
+  different test files. Fixed by having rank 0 keep stepping the SAME
+  number of times its peers do even after a client vanishes -- EOS and
+  budget exhaustion are identical across every rank by construction and
+  still stop the loop normally, in lockstep; only the "a human hung up"
+  signal is now absorbed locally rather than shortening rank 0's own
+  step count.
+
+- **An RAII snapshot's truncation logic handled being SHORT by one and
+  had no idea it could also be LONG.**  Speculative verification commits
+  a whole accepted block to the recurrent state in one call, before the
+  loop that delivers those tokens to the caller one at a time even runs.
+  EOS or a cancelled callback stopping that delivery loop partway leaves
+  the engine's position ahead of what the emitted list names -- the
+  OPPOSITE of the case rule 19-era code already handled (a token emitted
+  but not yet fed back in, engine position BEHIND the list). Nothing
+  repairs that direction by resizing; the only honest move is to decline
+  the snapshot rather than save a label that lies about the state it
+  names. The repository's OWN existing test assertion
+  (`ids.size()==history.size()` in `tests/test_generation.cpp`) already
+  fires on this -- it was simply never exercised with speculation and a
+  mid-block stop at the same time, in either the EOS or cancellation
+  direction.  Both are now a permanent arm in that file, not a one-off
+  script: an assertion nobody runs finds nothing.
+
+- **A guard checked against `M >= 32`-adjacent code, not against the
+  actual mode a caller was in.**  prefill()'s capacity check compared the
+  engine's single scalar position against `max_seq`, unconditionally --
+  correct for one conversation's consecutive tokens, meaningless for a
+  batch of M DIFFERENT conversations each contributing one token, where
+  every row was already checked individually a few lines above. Four
+  valid rows sitting at position 126 of a 128-token window were refused
+  because `126 + 4 > 128`, regardless of what `pos` actually was for any
+  of them. Fixed by scoping the scalar check to the non-batch path only.
+
+- **An inherited shell bug, still worth naming because it decides what
+  "the Tower is green" means.**  `b70run.sh` captured `docker wait`'s
+  status in a variable and then never returned it -- the script's own
+  final command in the failure branch was `echo`, which always succeeds,
+  so a container that failed reported the WRAPPER as passing. Every
+  Tower gate and every real-model generation goes through this launcher.
+  Fixed to actually exit with the container's status.
+
+- **A new multi-rank gate inherited an old single-device assumption.**
+  `preflight_b70.sh`'s gate runner exposes exactly one render node,
+  correct for the single-process binaries it was built for. A gate that
+  forks its OWN ranks (test_parallel_e2e, test_spec_e2e, the new
+  test_pp_server) needs every rank's device visible, or Grimoire's own
+  selector throws for any rank beyond the first the moment real GPUs are
+  present -- invisible off the card, where NO GPU being visible at all
+  takes a different, uniform fallback for every rank. Given a dedicated
+  multi-device runner, reusing the exact container flags `pp2run.sh`
+  already uses successfully for real Tower launches, rather than
+  inventing new ones nothing here can test against real hardware.
+
+The pattern under all nine: **a gate is a claim about the paths it
+actually drives, and "this feature has a gate" says nothing about a
+DIFFERENT feature admitted through the same code at the same time.**
+When two mechanisms share a call site -- a scheduler and a cache, a
+front end and a worker mid-decode, a delivery loop and the state commit
+that ran ahead of it -- the dangerous case is usually not either one
+alone, it is one interrupting the other partway through. Test the
+interruption, not just the two features separately positioned not to
+interrupt each other.
 
 ## Where to look for current status
 

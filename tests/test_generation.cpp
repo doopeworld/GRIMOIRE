@@ -259,6 +259,44 @@ int main(){
         generate_tokens(w,{9,9,9,9,9},go,o2,{},r2);
         assert(w.reuses==before);
     }
+    {   // ---- SPECULATIVE EOS/CANCEL INSIDE AN ACCEPTED BLOCK -------
+        // (external audit F4, 2026-09-21).  commit_spec_prefix commits
+        // the WHOLE accepted draft block to the recurrent state in one
+        // call, BEFORE the loop that delivers those tokens to the
+        // caller one at a time even runs.  If EOS or a cancelled
+        // callback stops that delivery loop partway, the engine's
+        // position already reflects tokens the emitted list does not
+        // name -- and save_prefix_now's own assertion
+        // (ids.size()==history.size(), just above) is exactly what
+        // catches a snapshot saved with that mismatch.  It used to fire
+        // here; the fix in generation.hpp is to decline the snapshot
+        // entirely rather than save a mislabeled one.
+        //
+        // reject_at is left at -1 (never rejects) so the drafted block
+        // is always fully accepted and commit_spec_prefix always
+        // commits more than one token at once -- the shape the mismatch
+        // needs. depth 4 with a 4-token prompt is enough for an
+        // early stop to land inside the block rather than at its edge.
+        auto stops_inside_block=[&](int eos,bool cancel_after_first){
+            Engine w;w.recurrent=true;w.snap_enabled=true;
+            GenerationOptions go{40,eos,-1,4,false,true,false};
+            std::vector<int32_t> o2;FinishReason r2;int seen=0;
+            std::function<bool(int32_t)> cb;
+            if(cancel_after_first)cb=[&](int32_t){return ++seen<2;};
+            generate_tokens(w,{3,4,5,6},go,o2,cb,r2);   // must not abort
+            return w;
+        };
+        Engine eos_stop=stops_inside_block(9,false);
+        Engine cancel_stop=stops_inside_block(-1,true);
+        // Both must have DECLINED to save: the mismatched state was
+        // real, not repaired by shrinking. snap stays whatever it was
+        // before this turn (empty -- this was each engine's first and
+        // only turn), so a resumed NEXT turn would fall back to a full
+        // re-read instead of restoring a state that lies about what it
+        // holds.
+        assert(eos_stop.snap.empty());
+        assert(cancel_stop.snap.empty());
+    }
     throws([&]{generate_tokens(e,{},o,out,{},reason);});
     throws([&]{generate_tokens(e,{-1},o,out,{},reason);});
     throws([&]{generate_tokens(e,{64},o,out,{},reason);});

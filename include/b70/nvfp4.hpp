@@ -59,18 +59,38 @@ constexpr int kNVFP4Block = 16;
 //
 //   packed  [K/2]        E2M1 nibbles, LOW nibble is element 2i
 //   scales  [K/16]       E4M3, one per 16 consecutive elements
-//   gscale               the tensor's single FP32 scale
+//   gscale               the tensor's single FP32 scale, AS STORED in the
+//                        checkpoint -- read raw, no inversion applied
+//                        before it reaches here
 //
 // The low-nibble-first order is compressed-tensors' own
 // (break_fp4_bytes); getting it backwards transposes every pair of
 // weights inside a block and still produces a model that runs.
+//
+// DIVIDE by gscale, not multiply (fixed 2026-09-21, external audit).
+// compressed-tensors' own dequantizer -- the format this reader targets
+// -- computes `scale = local_scale / global_scale` and passes the stored
+// weight_global_scale straight through with no inversion first
+// (compressors/nvfp4/base.py -> quantization/lifecycle/forward_helpers.py,
+// revision 525a7a7b84ebccdbc0db07956338b6f8c851d58f). Verified against
+// that source directly, not inferred. Multiplying instead is not a
+// nearby approximation: the error is `global_scale^2` on every weight,
+// silent, and the checkpoint still loads and generates fluent text.
+//
+// It survived because the "independent" host reference this file's own
+// gate compared against used the SAME wrong direction to build its
+// expected value -- an equality test between two copies of one mistake
+// proves the two copies agree, nothing about the checkpoint's actual
+// convention. See rule 18: a format that shares another's on-disk shape
+// still needs the discriminator checked against an OUTSIDE source, not
+// a reference derived from the same misreading.
 inline void nvfp4_dequant_row(const uint8_t* packed, const uint8_t* scales,
                               float gscale, int K, float* out) {
     for (int k = 0; k < K; ++k) {
         const uint8_t byte = packed[k >> 1];
         const uint8_t nib  = (k & 1) ? uint8_t(byte >> 4) : uint8_t(byte & 0x0F);
         const float   blk  = e4m3_to_f32(scales[k / kNVFP4Block]);
-        out[k] = e2m1_to_f32(nib) * blk * gscale;
+        out[k] = e2m1_to_f32(nib) * blk / gscale;
     }
 }
 

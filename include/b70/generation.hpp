@@ -81,7 +81,44 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             //
             // e.pos is the count the engine will stand behind, so deriving
             // the length from it cannot drift from the loop's shape again.
-            if(e.pos>=0&&size_t(e.pos)<all.size())all.resize(size_t(e.pos));
+            if(e.pos>=0&&size_t(e.pos)<all.size()){
+                all.resize(size_t(e.pos));
+            } else if(e.pos>=0&&size_t(e.pos)>all.size()){
+                // THE OTHER DIRECTION (external audit F4, 2026-09-21).
+                // Speculative verification commits a WHOLE accepted
+                // block to the recurrent state in one call
+                // (commit_spec_prefix) BEFORE the loop that delivers
+                // those tokens to `out` one at a time even runs -- so if
+                // that delivery loop stops partway (EOS inside the
+                // accepted block, or a cancelled callback), e.pos
+                // already reflects tokens this snapshot's own token list
+                // does not name. That is the OPPOSITE of the case above:
+                // here the cache holds MORE than this list admits to,
+                // not fewer, and there is no direction to resize `all`
+                // that fixes it -- shrinking would lose real,
+                // already-committed tokens from the label, and there is
+                // nothing to grow it WITH, since what actually got
+                // emitted to the caller is exactly `all` already.
+                //
+                // A restore later would set pos = all.size() (the
+                // label) while the copied recurrent state is however
+                // many extra tokens further along -- invisible for a
+                // plain KV cache (rows past the labeled position are
+                // simply never read) but real corruption for a
+                // hybrid/DeltaNet model, whose recurrent state is a
+                // single rolling summary with no per-position rollback.
+                // Restore-and-replay to repair it is not an option: it
+                // is documented elsewhere in this engine as corrupting
+                // memory on exactly these models.
+                //
+                // So: decline to cache this termination rather than
+                // cache a label that lies about what state it names.
+                // Losing one turn's resume is a re-read next time;
+                // saving a mislabeled snapshot is silent wrong output on
+                // every turn after that, on the one architecture family
+                // where nothing else would catch it.
+                return;
+            }
             e.save_prefix_now(all);
         }
     } prefix_snapshot{e,prompt,out};

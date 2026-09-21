@@ -272,7 +272,7 @@ leaves you. The banner prints what it decided —
 — and if it says `one at a time` it names the reason. Read that line
 before concluding the flags did nothing.
 
-Also worth setting, and independent of batching:
+Also worth setting:
 
 ```bash
 GRIMOIRE_PREFIX_CACHE=1   # a chat turn resumes instead of re-reading
@@ -282,6 +282,26 @@ Without it every turn of a conversation re-reads the whole history. With
 it the turn processes only the new tokens. For agentic work, where the
 prompt is long and the reply is short, that is the larger of the two
 wins on a single card.
+
+**CORRECTION (2026-09-21, external audit F8): this does NOT compose
+with batching yet, and an earlier version of this doc said it did.**
+When the scheduler admits a request into the batchable path (multiple
+sequence slots, a matrix-capable device, no drafter), it always clears
+the chosen slot and prefills the WHOLE prompt from scratch -- it never
+calls `prefix_reuse()`/`restore_prefix_upto()` first, and its completion
+path never performs the end-of-request snapshot save either. So with
+both flags set, a growing conversation served through the batchable
+path is read in full every turn regardless of `GRIMOIRE_PREFIX_CACHE`;
+the resume only happens on the SERIAL path (a drafter loaded, one slot,
+or a device that cannot batch). This was found, not assumed: fixing a
+worse bug in the same admission code (two concurrently-admitted
+requests with an identical prompt could be silently rebound onto the
+SAME physical slot -- see CLAUDE.md rule 21) required disabling the one
+mechanism that could have made batched requests resume at all, and nothing
+in the existing gates exercised the combination to notice it was already
+broken. Making both compose safely needs cache reuse to participate in
+the scheduler's OWN slot ownership, not just the engine's -- real work,
+not done here.
 
 **What is NOT covered by any of this**: speculation. A loaded drafter
 turns batching off (the banner says so) and the server falls back to one

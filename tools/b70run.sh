@@ -75,8 +75,18 @@ RC=$(docker wait "$CNAME" 2>/dev/null || echo "wait-failed")
 docker logs "$CNAME" > "/tmp/$CNAME.log" 2>&1
 echo "exit=$RC  log=/tmp/$CNAME.log"
 
+# THIS SCRIPT'S OWN EXIT STATUS (external audit, 2026-09-21).  The last
+# command run in either branch below used to be `echo` or a swallowed
+# `docker rm`, and echo always succeeds -- so this script exited 0
+# whatever RC actually was.  preflight_b70.sh trusts that status to mark
+# a Tower stage PASS/FAIL, and the same wrapper runs real-model
+# generation. A container that failed, or whose status could not be
+# read at all ("wait-failed"), must make THIS script fail too, or a
+# broken run reports itself as green.
 if [ "$RC" = "0" ]; then
     docker rm "$CNAME" >/dev/null 2>&1
+    exit 0
 else
     echo "NON-ZERO EXIT -- container $CNAME kept for inspection (docker rm when done)" >&2
+    exit 1
 fi

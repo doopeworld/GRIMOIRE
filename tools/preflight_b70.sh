@@ -166,11 +166,83 @@ run_gate() {
   stage "$name" env GPU="$GPU" LIM=900 bash tools/tune.sh \
         "pf-${name//_/-}" "/grimoire/${bin}" "$@"
 }
+# MULTI-RANK GATES NEED MULTI-DEVICE VISIBILITY (external audit F9,
+# 2026-09-21).  test_parallel_e2e, test_spec_e2e and test_pp_server each
+# fork their OWN child processes and give each one a DIFFERENT
+# GRIMOIRE_PP_RANK/GRIMOIRE_TP_RANK -- and Grimoire's own device
+# selector explicitly THROWS when a requested rank has no visible GPU
+# (src/grimoire.cpp: "rank_requested && !pick.empty()"), rather than
+# silently reusing rank 0's card.  run_gate() above exposes exactly ONE
+# render node (tune.sh -> b70run.sh --device /dev/dri/$NODE), which is
+# correct for a single-process binary but means rank 1 of any of these
+# three gates throws immediately once real GPUs are visible in the
+# container -- a container with only ONE node exposed is not "no GPU at
+# all", so GRIMOIRE_DEVICE_ANY's fallback does not rescue it either.
+# Off the card this was never visible: with NO GPU present at all,
+# every rank falls back the same way, uniformly, and the gate reports
+# green -- which is a real, useful correctness check, but not a check
+# that this gate's actual multi-device launch path works.
+#
+# This wrapper reuses pp2run.sh's OWN device-exposure flags -- full
+# /dev/dri, not one node, the exact shape a real Tower run already uses
+# successfully for bin/grimoire -- rather than inventing new container
+# flags untested against real hardware. It runs the gate binary ONCE
+# (not pp2worker.sh's double-launch): these binaries fork their own
+# children internally, so doubling the outer launch would run each rank
+# twice over.
+run_multigpu_gate() {
+  local bin="$1"; shift
+  local name="${bin##*/}"
+  if [[ ! -x "$bin" ]]; then
+    bad "$bin was not built -- the build dropped a required gate"
+    return
+  fi
+  if ! command -v docker >/dev/null; then
+    skip "$name (no docker here -- this stage only runs from the Tower)"
+    return
+  fi
+  local cname="pf-mgpu-${name//_/-}"
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+  local log="$LOGDIR/${name//[^A-Za-z0-9]/_}.log"
+  {
+    echo "== devices visible to this container =="
+    ls -la /dev/dri/ 2>&1
+    echo "== running $name =="
+  } >"$log" 2>&1
+  local cid
+  cid=$(docker run -d --name "$cname" -w /grimoire --init --stop-timeout 300 \
+      --ipc=host --privileged --shm-size=10g \
+      --device /dev/dri:/dev/dri \
+      -v /dev/dri/by-path:/dev/dri/by-path \
+      -v "$REPO:/grimoire" \
+      -e ZE_AFFINITY_MASK=0,1 \
+      --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-my-vllm-xpu:latest}" \
+      --signal=TERM --kill-after=60 900 \
+      "/grimoire/${bin}" "$@" 2>>"$log")
+  if [[ -z "$cid" ]]; then
+    bad "$name (container launch failed, see $log)"
+    return
+  fi
+  {
+    echo "== devices as seen INSIDE the running container =="
+    docker exec "$cname" ls -la /dev/dri/ 2>&1
+  } >>"$log" 2>&1
+  local rc
+  rc=$(docker wait "$cname" 2>/dev/null || echo "wait-failed")
+  docker logs "$cname" >>"$log" 2>&1
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+  if [[ "$rc" == "0" ]]; then
+    ok "$name"
+  else
+    bad "$name  (log: $log)"
+    tail -20 "$log" | sed 's/^/        /'
+  fi
+}
 run_gate bin/test_k2_kernels
 run_gate bin/test_k2_e2e
 run_gate bin/test_model_matrix
-run_gate bin/test_parallel_e2e
-run_gate bin/test_spec_e2e
+run_multigpu_gate bin/test_parallel_e2e
+run_multigpu_gate bin/test_spec_e2e
 # Both of these compare a BATCHED prefill against sequential decode.  They
 # were built by build_b70.sh and not run here, which is the same shape of
 # gap rule 14 is about: the code existed, the gate existed, and nothing
@@ -181,7 +253,7 @@ run_gate bin/test_nvfp4_e2e
 run_gate bin/test_prefix_reuse
 run_gate bin/test_batch_decode
 run_gate bin/test_scheduler
-run_gate bin/test_pp_server
+run_multigpu_gate bin/test_pp_server
 
 # ---------------------------------------------------------------------
 say "5. real model"
