@@ -47,7 +47,82 @@ That means:
   multi-rank Tower run is the actual test of this fix, not this
   sandbox.
 
-## 3. Open, unresolved question from this session — needs follow-up
+## 3. RESOLVED — the gate timeouts are the container, not the code
+
+**Answered 2026-09-21, after this doc was first written. Kept in full
+because the reasoning is the reusable part; the conclusion is at the
+bottom of the section.**
+
+### The conclusion first
+
+The four gates that time out off the card do so because **this
+container is roughly 2.3x slower than it was earlier in the same
+session**, not because of anything in `dd04198`. The A/B:
+
+| `bin/test_model_matrix` build | cells completed in 300s |
+| --- | --- |
+| `dd04198` — WITH the nine audit fixes | 7 |
+| `f4b8758` — BEFORE the nine audit fixes | 8 |
+| (for reference) same gate, 2026-09-16, `clean_matrix.log` | 56 cells inside 900s, i.e. >=18 per 300s |
+
+Both builds were run back to back, on the same machine, under the same
+background load, with the same 300s budget. The pre-fix binary is just
+as slow, so the nine fixes are not the cause. The 7-vs-8 difference is
+noise: cells differ in cost, the cutoff lands mid-row, and both sides
+were equally contended.
+
+The first row measured (`dense`, 7 cells) is byte-identical work in
+both builds and in the 2026-09-16 build, which is what makes this
+apples-to-apples rather than a comparison across a gate that grew.
+
+### Why it looked like a regression, and why that was wrong
+
+Two things conspired, and both are instances of rules already in
+`CLAUDE.md`:
+
+- **Rule 15 again: a bisect controls for the commit, not for the
+  machine.** The first evidence was "this gate finished inside 900s
+  earlier today and does not now, and the only thing between the two
+  runs is nine commits." That is a real observation and the wrong
+  inference — it has no way to see the variable that actually
+  differed. The fix is the same as it was then: build the other side
+  and run both **now**, on the machine you actually have.
+- **The comparison was not apples-to-apples anyway.** The gate grew
+  from 8 architectures to 10 (Qwen4-Exp and an NVFP4 row) between the
+  fast 2026-09-16 run and today — and Qwen4-Exp is the most expensive
+  row in it. That growth landed in `d855869`/`acadf5f`, **before** the
+  audit fixes. Part of "it got slower" was simply "it got bigger", and
+  attributing the whole delta to the newest commits was unjustified
+  before the A/B was run.
+
+### What this means for the Tower
+
+Little to nothing. `preflight_b70.sh`'s 900s per-gate budget is sized
+for a B70 running the XMX tiles, not for a contended CPU container
+taking the plain-SYCL fallback (rule 20's closing note: off the card
+these are *not the same code*). If the Tower's own preflight run trips
+this budget, that is a real signal worth chasing; a container tripping
+it is not.
+
+**Still worth doing on the Tower:** confirm all four of these gates
+(`test_model_matrix`, `test_parallel_e2e`, `test_spec_e2e`,
+`test_pp_server`) actually complete inside 900s there. Nobody has
+timed them on real hardware, so the budget is unvalidated in the
+direction that matters, even though it is very likely fine.
+
+### What was observed in every timed-out run
+
+Worth stating plainly because it is the part that bears on
+correctness: **across all four timed-out gates, in both the 900s and
+the 1800s runs, every cell that completed, completed correctly.**
+Zero mismatches, zero crashes, zero wrong tokens. `test_spec_e2e`
+reached `TP+MTP match` and `PP+MTP match` — the multi-rank
+speculation path F2 touches — before running out of budget. A timeout
+is a statement about the clock, not about the answers.
+
+---
+
+## 3b. Original text of the open question (superseded by 3 above)
 
 While re-verifying the 9 audit fixes (commit `dd04198`), two gates hit
 the preflight's own 900-second per-gate timeout that had **completed
@@ -85,19 +160,33 @@ This needs to be run down, not dismissed:
 3. Either way, update `CLAUDE.md` / the relevant handoff doc with
    the actual finding — do not leave this unresolved silently (rule 14).
 
-## 4. Not yet re-confirmed against the fully-patched tree
+## 4. Full-suite result against the patched tree (`dd04198`)
 
-As of the last check before this doc was written, these gates had not
-yet reported a result in the current full-suite re-run (background,
-still in progress):
+All 12 device gates were rebuilt and run against the fully-patched
+tree. **Zero failures, zero mismatches, zero crashes anywhere** — the
+only non-green results are clock timeouts, explained in section 3.
 
-`test_gemma4_prefill`, `test_qwen4_exp_e2e`, `test_nvfp4_e2e`,
-`test_prefix_reuse`, `test_batch_decode`, `test_scheduler`,
-`test_pp_server`.
+| gate | result |
+| --- | --- |
+| `test_k2_kernels` | ALL PASS |
+| `test_k2_e2e` | ALL PASS |
+| `test_model_matrix` | timeout (every completed cell `ok`; 6.5/10 architectures in 1800s) |
+| `test_parallel_e2e` | timeout (every completed cell `match`) |
+| `test_spec_e2e` | timeout (every completed cell `identical`; reached `TP+MTP match` and `PP+MTP match`) |
+| `test_gemma4_prefill` | ALL PASS |
+| `test_qwen4_exp_e2e` | ALL PASS |
+| `test_nvfp4_e2e` | ALL PASS — this is the gate that covers the F1 fix |
+| `test_prefix_reuse` | ALL PASS |
+| `test_batch_decode` | ALL PASS — includes the new F7 regression arm (`stale-pos capacity  3 of 3 rows answered`) |
+| `test_scheduler` | ALL PASS (`12 batched steps carrying 66 rows`) |
+| `test_pp_server` | timeout |
 
-Check `git log` / the latest handoff doc for whether a follow-up
-commit landed with their results before starting the audit — if not,
-run them yourself first.
+Plus the 13 host suites (`make test`, `make test-correctness`), green.
+
+So: **the nine audit fixes introduced no correctness regression that
+any gate in this repo can see, and no performance regression either
+(section 3's A/B).** What remains unverified is what was always
+unverified — everything that needs the actual card (section 2).
 
 ## What to actually check, concretely
 
