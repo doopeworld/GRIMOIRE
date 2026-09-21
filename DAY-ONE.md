@@ -247,7 +247,7 @@ slice — it is routed through the full all-gathered projection instead.
 Correct, but the draft-vocab speedup is not available there. Another
 reason PP is the default choice for two cards.
 
-## 2d. Several agents at once
+## 2c. Several agents at once
 
 New on 2026-09-17. The server used to hold one lock for the whole of a
 request, so the second caller waited for the first to FINISH. It now
@@ -289,7 +289,7 @@ request at a time, which is what it did before. MTP or DFlash versus
 eight-way batching is a real trade nobody has measured -- that is a
 Tower measurement and it is in the open list below.
 
-## 2e. Serving on TWO cards
+## 2d. Serving on TWO cards
 
 New on 2026-09-18. Until now pipeline parallel was CLI-only —
 `pp2run.sh` runs `bin/grimoire` with one prompt and exits — while
@@ -325,7 +325,7 @@ requests are the point — a byte stream cannot be resynchronised, so a
 header written but not read is invisible on the request that causes it
 and fatal to the next.
 
-## 2c. More than two cards, or cards that are not the same
+## 2e. More than two cards, or cards that are not the same
 
 GRIMOIRE runs on any Battlemage part, and a box can mix them. Two things
 make that work:

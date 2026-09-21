@@ -39,7 +39,7 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   `GRIMOIRE_MAX_BATCH=8`; the banner says what it decided.  **No speed
   number exists and none can be taken here** -- the saving is XMX-shaped
   and off-card the batched GEMM runs on a plain-SYCL fallback.  See rule
-  19 and `DAY-ONE.md` section 2d.
+  19 and `DAY-ONE.md` section 2c.
 - **the server runs across TWO cards** (`test_pp_server`).  Pipeline
   parallel was CLI-only: `pp2run.sh` runs one prompt and exits, and
   `serve.sh` opens one render node -- so a model needing two cards
@@ -794,19 +794,27 @@ per session, most recent state and next-steps at the bottom of each file:
   win (split-K decode, dynamic verify width) buys nothing until continuous
   batching exists. Also the launch count, what is worth copying and what is
   not, and two settled results from that stack that are free to take.
-- `CONCURRENCY-2026-09-17.md` — **newest.** Serving several agents at
-  once: what was wrong (the server was serial AND every turn re-read its
-  history), what changed, what it refuses by name, the flags, how each
-  claim is checked, and the six ways the gates were verified to
-  discriminate. Ends with what only the Tower can measure — in order.
+- `CONCURRENCY-2026-09-17.md` — Serving several agents at once: what was
+  wrong (the server was serial AND every turn re-read its history), what
+  changed, what it refuses by name, the flags, how each claim is
+  checked, and the six ways the gates were verified to discriminate.
   Read this with `PERF-2026-09-17.md`, which is the measurement that
   started it.
+- `HANDOFF-2026-09-21-DAY-ONE-READY.md` — **newest, read this one
+  first.** Everything that shipped after the concurrency work above:
+  conversation resume made cheap (a pointer move, not a copy), MoE and
+  hybrid batched decode, the server mutex removed, a pre-existing MoE
+  crash found and fixed (not caused by anything here — verified against
+  a commit from before this session), and the server now runs across
+  TWO cards instead of CLI-only. 11 device gates + 13 host suites green
+  off the card as of the commit it names. Lists exactly what is NOT
+  verified (every speed number, without exception) and what to send an
+  auditor.
 - `QWEN4-EXP-2026-09-16.md` — Qwen3.8-Flash-Next: the
   architecture, the three mechanisms, and (bottom section, which
   supersedes the rest of that file) what the forward path actually does,
   the three things the first pass got wrong, and what is verified versus
-  what only the Tower can settle. Read this one first if you are picking
-  the project up.
+  what only the Tower can settle.
 
 `ref/` holds extracted vLLM reference implementations (DFlash2, Muse Glimmer
 and Qwen4-Exp modeling code) — pulled from the vLLM nightly image, and for
