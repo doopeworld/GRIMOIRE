@@ -21,12 +21,13 @@
 # launched with the same -p.  The front end now forwards each request
 # down the pipe and the workers follow it (grimoire_pp_worker_loop).
 #
-# CONCURRENCY: the scheduler falls back to ONE REQUEST AT A TIME under
-# pipeline parallel -- batching across sequences is not implemented for
-# PP (batch_unsupported_reason says so, and the banner prints it).  The
-# prefix cache is off under PP too.  On one card, int4/mxfp4, you get
-# both; this is the two-card path and it is serial.  That is still the
-# difference between serving the model and not.
+# CONCURRENCY (updated 2026-09-22): PP batches across sequences now --
+# rank 0's scheduler drives the workers step by step (admit / batch-step
+# control messages) -- but only with more than one sequence slot, so export
+# GRIMOIRE_SEQ_SLOTS (and GRIMOIRE_MAX_BATCH) before launching.  Without it,
+# or with a drafter loaded (PP + speculation does not batch), it is one
+# request at a time.  The prefix cache stays OFF under PP.  The banner says
+# which of these it decided.  For tensor parallel see serve_tp2.sh.
 set -u
 
 MODEL="${1:?model dir, e.g. /models/Ornith-1.5-35B-A3B}"
