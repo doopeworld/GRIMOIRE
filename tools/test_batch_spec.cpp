@@ -31,18 +31,30 @@ int main() {
     for(int k=0;k<3;++k) for(int i=0;i<17+k*7;++i)
         prompts[k].push_back((i*17+k*13+7)%120);
     try {
-        for(bool hybrid:{false,true}) for(bool dflash:{false,true}) {
-            const auto dir=std::filesystem::path(tmp)/((hybrid?"hybrid":"dense")+std::string(dflash?"-dflash":"-mtp"));
+        for(bool hybrid:{false,true}) for(int draft_kind:{0,1,2}) {
+            const bool dflash=draft_kind!=0, forced=draft_kind==2;
+            const auto dir=std::filesystem::path(tmp)/((hybrid?"hybrid":"dense")+std::string(forced?"-forced":dflash?"-dflash":"-mtp"));
             mini::write_model(dir,hybrid?mini::hybrid(4,!dflash):mini::dense(4,!dflash));
             ::unsetenv("GRIMOIRE_MTP"); ::unsetenv("GRIMOIRE_DFLASH_MODEL");
             auto* baseline=load(dir);
             Replies reference(3);
             for(int k=0;k<3;++k)
                 grimoire_serve_generate(*baseline,prompts[k],12,-1,reference[k],-1);
+            Replies near_prompts(3), near_reference(3);
+            for(int k=0;k<3;++k) {
+                for(int i=0;i<124+k;++i) near_prompts[k].push_back((i*17+k*13+7)%120);
+                grimoire_serve_generate(*baseline,near_prompts[k],6,-1,near_reference[k],-1);
+            }
             grimoire_delete(baseline);
             if(dflash) {
                 const auto draft=dir/"draft";
-                mini::write_model(draft,mini::dflash_draft(),20260913);
+                int best=-1, best_n=0;
+                if(forced) for(const auto& reply:reference) for(int token:reply) {
+                    int count=0;
+                    for(const auto& other:reference) for(int t:other) count+=t==token;
+                    if(count>best_n) { best=token; best_n=count; }
+                }
+                mini::write_model(draft,mini::dflash_draft(2,false,false,best),20260913);
                 ::setenv("GRIMOIRE_DFLASH_MODEL",draft.c_str(),1);
             } else ::setenv("GRIMOIRE_MTP","1",1);
             auto* e=load(dir);
@@ -74,7 +86,12 @@ int main() {
                 }
             }
             grimoire_scheduler_delete(scheduler);
+            grimoire_serve_generate_batch(*e,near_prompts,6,-1,actual,-1);
+            if(actual!=near_reference)
+                throw std::runtime_error("near-context speculative batch differs");
             grimoire_delete(e);
+            if(forced && g_spec_batch_accepted==accepted0)
+                throw std::runtime_error("forced draft never exercised acceptance");
             std::printf("%s: steps=%ld sequences=%ld proposals=%ld accepted=%ld\n",
                 dir.filename().c_str(),g_spec_batch_steps-step0,g_spec_batch_sequences-seq0,
                 g_spec_batch_proposals-proposed0,g_spec_batch_accepted-accepted0);

@@ -313,6 +313,8 @@ if [[ -z "${GRIMOIRE_SKIP_GATES:-}" ]]; then
               test_prefix_reuse:test_prefix_reuse \
               test_batch_prefix:test_batch_prefix \
               test_batch_decode:test_batch_decode \
+              test_batch_parallel:test_batch_parallel \
+              test_batch_spec:test_batch_spec \
               test_scheduler:test_scheduler \
               test_pp_server:test_pp_server ; do
     gsrc="${gate%%:*}"; gbin="${gate##*:}"

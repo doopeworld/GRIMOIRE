@@ -225,7 +225,11 @@ int main(int argc, char** argv) {
         { mini::gemma4(4), "fp8" },
     };
 
+    int selected=0;
     for (auto& c : cases) {
+        const char* filter=std::getenv("GRIMOIRE_BATCH_PARALLEL_CASE");
+        if(filter && std::string(filter)!=std::string(c.arch.name)+"-"+c.fmt) continue;
+        ++selected;
         const fs::path dir = root / (std::string(c.arch.name) + "-" + c.fmt);
         mini::write_model(dir, c.arch);
         std::printf("%-8s %-5s ", c.arch.name, c.fmt);
@@ -246,7 +250,7 @@ int main(int argc, char** argv) {
         for (const std::string mode : {"PP","TP"}) for (int world : {2, 3}) {
             const auto devices=sycl::device::get_devices(sycl::info::device_type::gpu);
             if(!devices.empty() && int(devices.size())<world) {
-                std::printf("PP%d SKIPPED: insufficient GPUs ",world); continue;
+                std::printf("%s%d SKIPPED: insufficient GPUs ",mode.c_str(),world); continue;
             }
             const std::string sock = (dir/(mode+std::to_string(world)+".sock")).string();
             const std::string out  = (dir/(mode+std::to_string(world)+".txt")).string();
@@ -266,7 +270,7 @@ int main(int argc, char** argv) {
             }
             const std::string what = mode + std::to_string(world);
             if (!wait_ok(pids, what.c_str())) {
-                ++g_fail; std::printf("PP%d FAILED ", world); continue;
+                ++g_fail; std::printf("%s%d FAILED ", mode.c_str(),world); continue;
             }
             const auto got = read_tokens(out);
             const bool match = (got == ref);
@@ -287,6 +291,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
+    CHECK(selected>0,"case filter did not select any test");
     if (!g_fail) fs::remove_all(root);
     else std::printf("\nfixtures kept in %s\n", root.c_str());
     std::printf("\n%s (%d failures)\n", g_fail ? "FAILURES" : "ALL PASS", g_fail);

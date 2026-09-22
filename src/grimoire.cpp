@@ -6432,12 +6432,18 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     init_draft_slots();
     std::vector<int32_t> candidates;
     std::vector<int> candidate_slots, candidate_positions, begin, lengths;
-    const int max_depth=std::max(0,std::min(3,kSpecBatch/n-1));
+    const char* configured=std::getenv("GRIMOIRE_MTP_K");
+    const int requested=dflash2.ok?dflash_block_rows()-1:
+        std::clamp(configured?std::atoi(configured):3,0,15);
+    const int max_depth=std::max(0,std::min(requested,kSpecBatch/n-1));
     for(int row=0;row<n;++row) {
         sync(); bind_seq_slot(slots[size_t(row)]);
         pos=positions[size_t(row)]; set_cursor(pos);
         q.memcpy(s.h,draft_slots[size_t(seq_slot)].hidden,size_t(cfg.hidden)*sizeof(float));
-        const int depth=std::min({max_depth,max_seq-pos-1,remaining[size_t(row)]-1});
+        int depth=std::max(0,std::min({max_depth,max_seq-pos-1,remaining[size_t(row)]-1}));
+        // DFlash always executes its full block, even when only a shorter
+        // prefix will be verified. At the context boundary verify the anchor.
+        if(dflash2.ok && pos+dflash_block_rows()>max_seq) depth=0;
         std::vector<int32_t> block{tokens[size_t(row)]};
         if(depth>0) {
             if(dflash2.ok) {

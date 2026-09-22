@@ -8,7 +8,13 @@ permissions:
 jobs:
   cpu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, dense-bf16, dense-fp8, moe-fp8, hybrid-fp8, muse-fp8, gemma4-fp8]
+    env:
+      GRIMOIRE_BATCH_PARALLEL_CASE: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
       - name: Install CPU build dependencies
@@ -77,31 +83,37 @@ jobs:
             icpx "${flags[@]}" "tools/$gate.cpp" cpu-obj/*.o -lpthread -ldl -o "bin/$gate" > "cpu-logs/$gate.build.log" 2>&1 || { cat "cpu-logs/$gate.build.log"; exit 1; }
           done
       - name: test_batch_spec
+        if: matrix.shard == 'core'
         run: |
           timeout 1200 bin/test_batch_spec > cpu-logs/test_batch_spec.log 2>&1 || { tail -100 cpu-logs/test_batch_spec.log; exit 1; }
           tail -8 cpu-logs/test_batch_spec.log
       - name: test_batch_prefix
+        if: matrix.shard == 'core'
         run: |
           timeout 1200 bin/test_batch_prefix > cpu-logs/test_batch_prefix.log 2>&1 || { tail -100 cpu-logs/test_batch_prefix.log; exit 1; }
           tail -5 cpu-logs/test_batch_prefix.log
       - name: test_batch_decode
+        if: matrix.shard == 'core'
         run: |
           timeout 1200 bin/test_batch_decode > cpu-logs/test_batch_decode.log 2>&1 || { tail -100 cpu-logs/test_batch_decode.log; exit 1; }
           tail -5 cpu-logs/test_batch_decode.log
       - name: test_batch_parallel
+        if: matrix.shard != 'core'
         run: |
-          timeout 2700 bin/test_batch_parallel > cpu-logs/test_batch_parallel.log 2>&1 || { tail -100 cpu-logs/test_batch_parallel.log; exit 1; }
+          timeout 1200 bin/test_batch_parallel > cpu-logs/test_batch_parallel.log 2>&1 || { tail -100 cpu-logs/test_batch_parallel.log; exit 1; }
           tail -5 cpu-logs/test_batch_parallel.log
       - name: test_scheduler
+        if: matrix.shard == 'core'
         run: |
           timeout 1200 bin/test_scheduler > cpu-logs/test_scheduler.log 2>&1 || { tail -100 cpu-logs/test_scheduler.log; exit 1; }
           tail -5 cpu-logs/test_scheduler.log
       - name: test_prefix_reuse
+        if: matrix.shard == 'core'
         run: |
           timeout 1200 bin/test_prefix_reuse > cpu-logs/test_prefix_reuse.log 2>&1 || { tail -100 cpu-logs/test_prefix_reuse.log; exit 1; }
           tail -5 cpu-logs/test_prefix_reuse.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cpu-correctness-logs
+          name: cpu-correctness-logs-${{ matrix.shard }}
           path: cpu-logs/
