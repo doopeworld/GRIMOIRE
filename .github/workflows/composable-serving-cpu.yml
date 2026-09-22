@@ -53,7 +53,7 @@ jobs:
                           tar.extractall(root, filter=writable)
           PY
           printf '%s\n' "$RUNNER_TEMP/dpcpp/lib/intel-ocl-cpu/libintelocl.so" > "$RUNNER_TEMP/dpcpp/etc/OpenCL/vendors/intel-ocl-cpu.icd"
-      - name: Compile and run correctness gates
+      - name: Compile correctness gates
         shell: bash
         run: |
           set -euo pipefail
@@ -63,6 +63,7 @@ jobs:
           export GRIMOIRE_DEVICE_ANY=1
           export ONEAPI_DEVICE_SELECTOR=opencl:cpu
           export CL_CONFIG_CPU_MAX_COMPUTE_UNITS=2
+          env | grep -E "^(PATH|LD_LIBRARY_PATH|OCL_ICD_VENDORS|GRIMOIRE_DEVICE_ANY|ONEAPI_DEVICE_SELECTOR|CL_CONFIG_CPU_MAX_COMPUTE_UNITS|GRIMOIRE_BATCHED_PREFILL_NOXMX)=" >> "$GITHUB_ENV"
           export GRIMOIRE_BATCHED_PREFILL_NOXMX=1
           mkdir -p cpu-obj cpu-logs bin
           icpx --version
@@ -73,9 +74,27 @@ jobs:
           done
           for gate in test_batch_prefix test_batch_decode test_batch_parallel test_scheduler test_prefix_reuse; do
             icpx "${flags[@]}" "tools/$gate.cpp" cpu-obj/*.o -lpthread -ldl -o "bin/$gate" > "cpu-logs/$gate.build.log" 2>&1 || { cat "cpu-logs/$gate.build.log"; exit 1; }
-            timeout 900 "bin/$gate" > "cpu-logs/$gate.log" 2>&1 || { tail -100 "cpu-logs/$gate.log"; exit 1; }
-            tail -5 "cpu-logs/$gate.log"
           done
+      - name: test_batch_prefix
+        run: |
+          timeout 1200 bin/test_batch_prefix > cpu-logs/test_batch_prefix.log 2>&1 || { tail -100 cpu-logs/test_batch_prefix.log; exit 1; }
+          tail -5 cpu-logs/test_batch_prefix.log
+      - name: test_batch_decode
+        run: |
+          timeout 1200 bin/test_batch_decode > cpu-logs/test_batch_decode.log 2>&1 || { tail -100 cpu-logs/test_batch_decode.log; exit 1; }
+          tail -5 cpu-logs/test_batch_decode.log
+      - name: test_batch_parallel
+        run: |
+          timeout 1200 bin/test_batch_parallel > cpu-logs/test_batch_parallel.log 2>&1 || { tail -100 cpu-logs/test_batch_parallel.log; exit 1; }
+          tail -5 cpu-logs/test_batch_parallel.log
+      - name: test_scheduler
+        run: |
+          timeout 1200 bin/test_scheduler > cpu-logs/test_scheduler.log 2>&1 || { tail -100 cpu-logs/test_scheduler.log; exit 1; }
+          tail -5 cpu-logs/test_scheduler.log
+      - name: test_prefix_reuse
+        run: |
+          timeout 1200 bin/test_prefix_reuse > cpu-logs/test_prefix_reuse.log 2>&1 || { tail -100 cpu-logs/test_prefix_reuse.log; exit 1; }
+          tail -5 cpu-logs/test_prefix_reuse.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

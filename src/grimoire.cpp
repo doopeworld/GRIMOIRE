@@ -1920,6 +1920,7 @@ struct Grimoire {
         int kind = 0; // 0: generate, 1: shutdown, 2: admit slot, 3: batch step
         std::vector<int32_t> slots, positions;
     };
+    bool serving_control = false; // rank 0 scheduler owns the control stream
     bool pp_send_request(const PPRequest& r);
     bool pp_recv_request(PPRequest& r);
     // Whether speculation is live for the WHOLE pipeline.  Under PP only
@@ -2717,6 +2718,8 @@ struct Grimoire {
         return last;
     }
 
+    void gemm_tp(const DevQuant& w, const float* x, float* y, int rows);
+
     sycl::event gemv_any(const DevQuant& dq, const float* x, float* y,
                          const std::vector<sycl::event>& deps) {
         if (tp_enabled() && dq.tp_sharded()) {
@@ -3179,26 +3182,31 @@ bool Grimoire::pp_recv_taps(int first, int rows) {
 // stages are separate PROCESSES and the only thing keeping them in step
 // is that both sides agree, byte for byte, on every message.
 bool Grimoire::pp_send_request(const PPRequest& r) {
-    if (pp_next_fd < 0) return true;              // last stage: nothing downstream
-    int32_t head[5] = { r.shutdown ? 1 : r.kind, int32_t(r.prompt.size()),
-                        int32_t(r.budget), int32_t(r.eos), int32_t(r.eot) };
-    if (!fd_write_all(pp_next_fd, head, sizeof head)) return false;
-    const size_t bytes = r.prompt.size()*sizeof(int32_t);
-    if (bytes && !fd_write_all(pp_next_fd,r.prompt.data(),bytes)) return false;
-    if (r.kind == 3) {
-        if (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size())
-            return false;
-        if (!fd_write_all(pp_next_fd,r.slots.data(),bytes) ||
-            !fd_write_all(pp_next_fd,r.positions.data(),bytes)) return false;
+    std::vector<int> peers;
+    if(tp_enabled()) {
+        if(tp_rank!=0) return true;
+        for(int i=1;i<tp_world;++i) peers.push_back(tp_peer_fd[size_t(i)]);
+    } else if(pp_next_fd>=0) peers.push_back(pp_next_fd);
+    if(r.kind==3 && (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size()))
+        return false;
+    const int32_t head[5]={r.shutdown?1:r.kind,int32_t(r.prompt.size()),
+                          int32_t(r.budget),int32_t(r.eos),int32_t(r.eot)};
+    const size_t bytes=r.prompt.size()*sizeof(int32_t);
+    for(int fd:peers) {
+        if(!fd_write_all(fd,head,sizeof head)) return false;
+        if(bytes && !fd_write_all(fd,r.prompt.data(),bytes)) return false;
+        if(r.kind==3 && (!fd_write_all(fd,r.slots.data(),bytes) ||
+                       !fd_write_all(fd,r.positions.data(),bytes))) return false;
     }
     return true;
 }
 
 bool Grimoire::pp_recv_request(PPRequest& r) {
-    if (pp_prev_fd < 0) return false;             // rank 0 has no upstream
+    const int upstream=tp_enabled()?(tp_rank>0?tp_peer_fd[0]:-1):pp_prev_fd;
+    if (upstream < 0) return false;             // rank 0 has no upstream
     int32_t head[5] = {0,0,0,0,0};
-    if (!fd_read_all(pp_prev_fd, head, sizeof head)) return false;
-    if (head[0]<0 || head[0]>3) return false;
+    if (!fd_read_all(upstream, head, sizeof head)) return false;
+    if (head[0]<0 || head[0]>4) return false;
     r.kind=head[0];
     r.shutdown = r.kind == 1;
     const int32_t n = head[1];
@@ -3208,14 +3216,15 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
     if (n < 0 || n > (r.kind==3?kMaxBatchRows:max_seq)) return false;
     if ((r.kind==2 || r.kind==3) && n==0) return false;
     if (r.kind==2 && (head[2]<0 || head[2]>=n_seq_slots)) return false;
+    if(r.kind==4 && (head[2]<0 || head[2]>=n_seq_slots || head[3]!=n)) return false;
     r.budget = head[2]; r.eos = head[3]; r.eot = head[4];
     r.prompt.assign(size_t(n), 0);
-    if (n && !fd_read_all(pp_prev_fd, r.prompt.data(),
+    if (n && !fd_read_all(upstream, r.prompt.data(),
                           size_t(n) * sizeof(int32_t))) return false;
     if (r.kind==3) {
         r.slots.resize(size_t(n)); r.positions.resize(size_t(n));
-        if (!fd_read_all(pp_prev_fd,r.slots.data(),size_t(n)*sizeof(int32_t)) ||
-            !fd_read_all(pp_prev_fd,r.positions.data(),size_t(n)*sizeof(int32_t)))
+        if (!fd_read_all(upstream,r.slots.data(),size_t(n)*sizeof(int32_t)) ||
+            !fd_read_all(upstream,r.positions.data(),size_t(n)*sizeof(int32_t)))
             return false;
         for (int i=0;i<n;++i) {
             if (r.slots[size_t(i)]<0 || r.slots[size_t(i)]>=n_seq_slots ||
@@ -3261,6 +3270,40 @@ int Grimoire::pp_sync_token(int token) {
         if(pp_rank>0&&!fd_write_all(pp_prev_fd,&wire,sizeof(wire)))return -1;
     }
     return int(wire);
+}
+
+// Each rank projects all active rows with its local weight shard before
+// gathering each full output row. Weights remain matrix-batched under TP.
+void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
+    float* local=sycl::malloc_device<float>(size_t(rows)*std::max(1,w.w.N),q);
+    sycl_bf16* activation=sycl::malloc_device<sycl_bf16>(size_t(rows)*w.w.K,q);
+    if(!local || !activation) {
+        if(local) sycl::free(local,q);
+        if(activation) sycl::free(activation,q);
+        throw std::bad_alloc();
+    }
+    try {
+        if(w.w.N>0) {
+            if(w.has_i4())
+                launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,local,w.w.N,w.w.K,rows,{});
+            else if(device_can_matrix(q)) {
+                launch_f32_to_bf16(q,x,activation,size_t(rows)*w.w.K,{});
+                launch_gemm_xmx(q,w.w,activation,local,rows);
+            } else launch_gemm_batched(q,w.w,x,local,rows);
+        }
+        const int width=w.output_rows();
+        for(int r=0;r<rows;++r) {
+            if(w.w.N>0)
+                q.memcpy(y+int64_t(r)*width+w.row_begin,local+int64_t(r)*w.w.N,
+                         size_t(w.w.N)*sizeof(float));
+            if(!tp_allgather(y+int64_t(r)*width,width,w.row_begin,w.w.N))
+                throw std::runtime_error("TP batched projection all-gather failed");
+        }
+        q.wait_and_throw();
+    } catch(...) {
+        q.wait(); sycl::free(local,q); sycl::free(activation,q); throw;
+    }
+    sycl::free(local,q); sycl::free(activation,q);
 }
 
 bool Grimoire::tp_allgather(float* dev, int elems, int begin, int count) {
@@ -6325,7 +6368,6 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
     if (cfg.is_qwen4_exp) return "Qwen4-Exp has its own batched path";
-    if (tp_enabled())     return "tensor parallel";
     if (pp_spec || pp_dflash || mtp.ok || dflash2.ok)
         return "a speculative drafter is loaded";
     if (n_seq_slots < 2)
@@ -6485,6 +6527,12 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         }
     }
     if (slot < 0) throw std::runtime_error("no idle sequence slot");
+    if(serving_control && (pp_enabled() || tp_enabled()) && comm_rank()==0) {
+        PPRequest request;
+        request.kind=2; request.budget=slot; request.prompt=prompt;
+        if(!pp_send_request(request))
+            throw std::runtime_error("parallel admission broadcast failed");
+    }
     try {
         auto restore = [&] {
             if (reused) {
@@ -6522,6 +6570,12 @@ void Grimoire::cache_sequence(int slot, int position,
         return;
     }
     processed.resize(size_t(position));
+    if(serving_control && tp_enabled() && tp_rank==0) {
+        PPRequest request;
+        request.kind=4; request.budget=slot; request.eos=position; request.prompt=processed;
+        if(!pp_send_request(request))
+            throw std::runtime_error("TP prefix commit broadcast failed");
+    }
     sync(); bind_seq_slot(slot); pos=position;
     if (!save_prefix(processed, false) && size_t(slot)<prefix_slots.size())
         prefix_slots[size_t(slot)].valid=false;
@@ -10119,7 +10173,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     const int M = int(tokens.size());
     if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
     if (next_tokens && !seqb) return false;
-    if (tp_enabled() || (pp_enabled() && !seqb)) return false;
+    if ((tp_enabled() || pp_enabled()) && !seqb) return false;
     const int start_pos = pos;
     // allow_exact_restore threaded through from prefill() -- see the
     // matching note in prefill_muse(); same gap, same reason it is
@@ -10200,6 +10254,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
 
     bool ok = true;
     auto mmg = [&](const DevQuant& w, const float* x, float* y) {
+        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
         if (!ok) return;
         if (w.w.N <= 0) { ok = false; return; }
         // Correctness-only path for a device with no matrix hardware.
@@ -10239,7 +10294,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     const bool first = !pp_enabled() || pp_rank==0;
     const bool last = !pp_enabled() || pp_rank==pp_world-1;
     if (first) {
-        launch_embed_batched(q, embed, dtok, h, M, H, none);
+        if(!embed_rows(embed,dtok,h,M)) { cleanup(); throw std::runtime_error("batch embedding failed"); }
         if (cfg.is_muse) {
             launch_rmsnorm_residual_batched(q,h,nullptr,nullptr,muse_zero,
                                             h2,M,H,eps,nullptr,none);
@@ -10862,7 +10917,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if(tokens.empty() || pos<0 || pos>max_seq || tokens.size()>size_t(max_seq-pos))
         throw std::invalid_argument("prefill exceeds context capacity or is empty");
     for(auto t:tokens)if(t<0||t>=cfg.vocab)throw std::invalid_argument("invalid prefill token");
-    if(tp_enabled())return false;
+    if(tp_enabled() && !seqb)return false;
     // GRIMOIRE_BATCHED_PREFILL_NOXMX: run the batched path on a device with
     // NO matrix hardware, by routing every mm() through the plain-SYCL
     // launch_gemm_batched() instead of the joint_matrix GEMM (see mm()).
@@ -10994,7 +11049,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     for (const auto& d : L) {
         const DevQuant* ws[] = {&d.la_qkv,&d.la_z,&d.la_out,&d.la_ab,&d.la_all,&d.q_proj,&d.k_proj,
             &d.v_proj,&d.o_proj,&d.router,&d.sh_gu,&d.sh_down,&d.sh_gate_q};
-        for (auto* w : ws) { W = std::max(W, w->w.N); W = std::max(W, w->w.K); }
+        for (auto* w : ws) { W = std::max(W, w->output_rows()); W = std::max(W, w->w.K); }
     }
     auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
     float *bh=df(size_t(M)*H), *bn=df(size_t(M)*H), *r0=df(size_t(M)*H), *r1=df(size_t(M)*H);
@@ -11103,10 +11158,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     Xe2ChunkGdn xe2_gdn=load_xe2_chunk_gdn();
     Xe2ChunkGdnRaw xe2_gdn_raw=load_xe2_chunk_gdn_raw();
     OneDnnW4Api od=load_onednn_w4();
-    const bool parallel_prefill=std::getenv("GRIMOIRE_PARALLEL_PREFILL") && xe2_dense_mxfp4;
-    const bool parallel_shared=std::getenv("GRIMOIRE_PARALLEL_SHARED") && xe2_dense_mxfp4;
+    const bool parallel_prefill=!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_PREFILL") && xe2_dense_mxfp4;
+    const bool parallel_shared=!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_SHARED") && xe2_dense_mxfp4;
     const bool need_aux=parallel_prefill||parallel_shared;
-    const bool norm_bf_only=M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
+    const bool norm_bf_only=!tp_enabled() && M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
         (!cfg.is_moe()||xe2_grouped_mxfp4)&&!need_aux;
     // Deferred gathering leaves the routed result permuted in moe_res and
     // makes the NEXT layer's input norm un-permute it
@@ -11223,7 +11278,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             return false;
         }
     } else {
-        launch_embed_batched(q,embed,dtok,bh,M,H);
+        if(!embed_rows(embed,dtok,bh,M)) throw std::runtime_error("batch embedding failed");
     }
     const int hcu[2]={0,M};
     if((xe2_attention||xe2_gdn||xe2_gdn_raw) && M>=2)q.memcpy(dtok,hcu,sizeof(hcu));
@@ -11306,8 +11361,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // mm() through the tuned BF16 kernel plus an explicit convert so the two
     // epilogues can be compared on the full model.
     const bool no_f32_dense=std::getenv("GRIMOIRE_NO_F32_DENSE")!=nullptr;
-    const bool exact_verify = next_tokens &&
-        std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") != nullptr;
+    const bool exact_verify = tp_enabled() || (next_tokens &&
+        std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") != nullptr);
     const float* a8_cached_src = nullptr;
     const sycl_bf16* a8_cached_bf = nullptr;
     int a8_cached_k = 0;
@@ -11363,6 +11418,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const bool verify_a16 = exact_verify &&
         !std::getenv("GRIMOIRE_VERIFY_EXACT_GEMV") && bool(load_onednn_s4());
     auto mm=[&](const DevQuant& w,const float* x,float* y){
+        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
         if(exact_verify && M<=4 && !verify_a16){
             if(std::getenv("GRIMOIRE_VERIFY_MAP")){
                 static std::set<std::pair<int,int>> seen;
@@ -11796,7 +11852,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
         }
         if(d.kind==LayerKind::LINEAR_ATTN){
-            const int qs=Hk*Dk, vs=Hv*Dv, ch=d.la_qkv.w.N;
+            const int qs=Hk*Dk, vs=Hv*Dv, ch=d.la_qkv.output_rows();
             // The fused projection is a separately quantized concat of qkv,
             // z and gates. It is fast for prompt prefill but is not numerically
             // identical to decode's three projection weights; repeated M=1
@@ -11960,7 +12016,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             pp_mark("DN norm + output projection");
         }else{
-            const int QD=d.q_proj.w.N;
+            const int QD=d.q_proj.output_rows();
             const bool gated=QD==2*cfg.n_heads*d.head_dim;
             const bool bfqkv=std::getenv("GRIMOIRE_BF16_QKV")&&xe2_attention&&
                 xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&pos==0&&M>=32&&
@@ -12221,7 +12277,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             // the bf16 router kernel softmaxes the top-k and has no bias
             // input, so it cannot express K2's routing.
-            const bool bf16_router=!cfg.is_k2&&std::getenv("GRIMOIRE_BF16_ROUTER")&&
+            const bool bf16_router=!tp_enabled() && !cfg.is_k2&&std::getenv("GRIMOIRE_BF16_ROUTER")&&
                 xe2_dense_mxfp4&&d.router.w.fmt==Fmt::MXFP4&&d.router.payload;
             if(bf16_router){
                 xe2_dense_mxfp4(&q,bn_bf,d.router.w.payload,
@@ -12426,14 +12482,25 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     }
                 }
             }else{
+                if(tp_enabled()) {
+                    const int begin=d.expert_begin, end=begin+d.expert_count;
+                    q.parallel_for(sycl::range<1>(size_t(R)),[=](sycl::id<1> ix) {
+                        const int g=rex[ix[0]];
+                        const bool own=g>=begin && g<end;
+                        rex[ix[0]]=own?g-begin:-1;
+                        if(!own) rwt[ix[0]]=0.0f;
+                    });
+                }
                 launch_moe_gate_up_batched(q,d.moe,rex,bn,mh,M);
                 launch_moe_down_batched(q,d.moe,rex,rwt,mh,r0,M);
             }
+            if(tp_enabled() && !tp_allreduce_sum(r0,M*H))
+                throw std::runtime_error("TP batched MoE reduction failed");
             pp_mark("routed MoE");
             if(shared_aux) wait_on(q,shared_ready);
             else {
                 if(!mlp_bf16(d.sh_gu,d.sh_down,r1,li)){
-                    const int SI=d.sh_gu.w.N/2;
+                    const int SI=d.sh_gu.output_rows()/2;
                     mm(d.sh_gu,bn,t0);launch_swiglu_batched(q,t0,t1,M,SI);mm(d.sh_down,t1,r1);
                 }
                 if(d.has_sh_gate){mm(d.sh_gate_q,bn,t2);launch_scale_by_sigmoid_batched(q,r1,t2,M,H);}
@@ -12441,7 +12508,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             pp_mark("shared expert");
         }else{
             if(!mlp_bf16(d.sh_gu,d.sh_down,r0,li)){
-                const int FI=d.sh_gu.w.N/2;
+                const int FI=d.sh_gu.output_rows()/2;
                 mm(d.sh_gu,bn,t0); launch_swiglu_batched(q,t0,t1,M,FI); mm(d.sh_down,t1,r0);
             }
             pp_mark("dense FFN");
@@ -12484,7 +12551,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // Verification needs the main-model choice after every candidate,
         // not only after the last row. Keep the reductions and copies on the
         // in-order queue, then return all token ids in one host transfer.
-        if (lm_head.has_i4()) {
+        if (tp_enabled()) {
+            mm(lm_head,bn,batch_logits);
+        } else if (lm_head.has_i4()) {
             if (!exact_verify && xe2_w4a8_f32 && a8 && a8s) {
                 launch_quantize_rows_int8(q, bn, a8, a8s, M, H, {});
                 xe2_w4a8_f32(&q, a8, lm_head.i4, lm_head.i4s, a8s,
@@ -12500,7 +12569,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
-            if (!lm_head.has_i4() && lm_head.w.fmt != Fmt::MXFP4)
+            if (!tp_enabled() && !lm_head.has_i4() && lm_head.w.fmt != Fmt::MXFP4)
                 launch_gemv(q, lm_head.w, bn + int64_t(r) * H, row, {});
             launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
@@ -13170,7 +13239,7 @@ void GrimoireScheduler::run() {
                     // 0's STEP COUNT matched to its peers. Off PP,
                     // cancellation still frees the card immediately,
                     // which is correct and unchanged there.
-                    const bool pp = e.pp_enabled();
+                    const bool pp = e.pp_enabled() || e.tp_enabled();
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
                         j->eot, [&](int32_t t){
                             const bool kept = push(j, t);
@@ -13178,12 +13247,6 @@ void GrimoireScheduler::run() {
                         }, &r);
                     finish(j, r);
                     continue;
-                }
-                if (e.pp_enabled()) {
-                    Grimoire::PPRequest request;
-                    request.kind=2; request.budget=slot; request.prompt=j->prompt;
-                    if (!e.pp_send_request(request))
-                        throw std::runtime_error("pipeline admission broadcast failed");
                 }
                 slot = e.admit_sequence(j->prompt, slot_busy);
                 j->slot = slot;
@@ -13222,7 +13285,7 @@ void GrimoireScheduler::run() {
         bool failed = false; std::string err;
         if (!toks.empty()) {
             try {
-                if (e.pp_enabled()) {
+                if (e.pp_enabled() || e.tp_enabled()) {
                     Grimoire::PPRequest request;
                     request.kind=3; request.prompt=toks;
                     request.slots.assign(slots.begin(),slots.end());
@@ -13270,6 +13333,7 @@ void GrimoireScheduler::run() {
 }
 
 GrimoireScheduler* grimoire_scheduler_new(Grimoire& e, int width) {
+    e.serving_control = true;
     const int cap = std::min({width > 0 ? width : 1,
                               Grimoire::kMaxBatchRows,
                               std::max(1, e.n_seq_slots)});
@@ -13350,7 +13414,7 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
 // what makes `docker stop` on the front end bring the workers down too
 // instead of leaving them holding a card.
 bool grimoire_is_pp_worker(Grimoire& e) {
-    return e.pp_enabled() && e.pp_rank > 0;
+    return (e.pp_enabled() && e.pp_rank > 0) || (e.tp_enabled() && e.tp_rank > 0);
 }
 
 // The front end tells the rest of the pipeline what it is about to run.
@@ -13364,7 +13428,7 @@ bool grimoire_is_pp_worker(Grimoire& e) {
 bool grimoire_pp_broadcast_request(Grimoire& e,
         const std::vector<int32_t>& prompt, int n_predict,
         int eos_id, int eot_id) {
-    if (!e.pp_enabled() || e.pp_rank != 0) return true;
+    if ((!e.pp_enabled() && !e.tp_enabled()) || e.comm_rank()!=0) return true;
     Grimoire::PPRequest req;
     req.prompt = prompt; req.budget = n_predict;
     req.eos = eos_id; req.eot = eot_id;
@@ -13376,7 +13440,7 @@ bool grimoire_pp_broadcast_request(Grimoire& e,
 // the next run wants that card is the difference between a restart and a
 // power cycle.
 void grimoire_pp_shutdown(Grimoire& e) {
-    if (!e.pp_enabled() || e.pp_rank != 0) return;
+    if ((!e.pp_enabled() && !e.tp_enabled()) || e.comm_rank()!=0) return;
     Grimoire::PPRequest req;
     req.shutdown = true;
     (void)e.pp_send_request(req);
@@ -13399,6 +13463,10 @@ void grimoire_pp_worker_loop(Grimoire& e) {
         std::vector<int32_t> out;
         FinishReason r = FinishReason::Length;
         try {
+            if (req.kind==4) {
+                e.cache_sequence(req.budget,req.eos,req.prompt,{});
+                continue;
+            }
             if (req.kind==2) {
                 // Rank 0 is the sole owner of live request membership.
                 // The selected slot is explicit; workers never select a cache hit.

@@ -90,7 +90,7 @@ static int run_rank(const std::string& dir, const std::string& out, Fmt fmt) {
         grimoire_delete(e);
         return 0;
     }
-    const bool parallel=std::getenv("GRIMOIRE_PP_WORLD_SIZE")!=nullptr;
+    const bool parallel=(std::getenv("GRIMOIRE_PP_WORLD_SIZE") || std::getenv("GRIMOIRE_TP_WORLD_SIZE"));
     GrimoireScheduler* sc=parallel?grimoire_scheduler_new(*e,3):nullptr;
     if(sc && grimoire_scheduler_width(*sc)<3) {
         std::fprintf(stderr,"pipeline did not enable batching\n");
@@ -243,34 +243,34 @@ int main(int argc, char** argv) {
         // shape with a MIDDLE stage, which both receives a request and
         // forwards it, and that is the half of the protocol a two-stage
         // chain never runs.
-        for (int world : {2, 3}) {
+        for (const std::string mode : {"PP","TP"}) for (int world : {2, 3}) {
             const auto devices=sycl::device::get_devices(sycl::info::device_type::gpu);
             if(!devices.empty() && int(devices.size())<world) {
                 std::printf("PP%d SKIPPED: insufficient GPUs ",world); continue;
             }
-            const std::string sock = (dir/("s"+std::to_string(world)+".sock")).string();
-            const std::string out  = (dir/("s"+std::to_string(world)+".txt")).string();
+            const std::string sock = (dir/(mode+std::to_string(world)+".sock")).string();
+            const std::string out  = (dir/(mode+std::to_string(world)+".txt")).string();
             const char* layers = world == 2 ? "2,2" : "2,1,1";
             std::vector<pid_t> pids;
             for (int r = world - 1; r >= 0; --r) {
                 std::vector<std::string> env{
-                    "GRIMOIRE_PP_RANK=" + std::to_string(r),
-                    "GRIMOIRE_PP_WORLD_SIZE=" + std::to_string(world),
+                    "GRIMOIRE_"+mode+"_RANK=" + std::to_string(r),
+                    "GRIMOIRE_"+mode+"_WORLD_SIZE=" + std::to_string(world),
                     "GRIMOIRE_PP_LAYERS=" + std::string(layers),
-                    "GRIMOIRE_PP_SOCKET=" + sock,
+                    "GRIMOIRE_"+mode+"_SOCKET=" + sock,
                     "GRIMOIRE_DEVICE_ANY=1"};
                 // RANK 0's tokens, not the last stage's: rank 0 is the
                 // one that would be holding an HTTP connection.
                 pids.push_back(spawn(self, dir.string(), r == 0 ? out : "-",
                                      c.fmt, env));
             }
-            const std::string what = "pp" + std::to_string(world);
+            const std::string what = mode + std::to_string(world);
             if (!wait_ok(pids, what.c_str())) {
                 ++g_fail; std::printf("PP%d FAILED ", world); continue;
             }
             const auto got = read_tokens(out);
             const bool match = (got == ref);
-            std::printf("PP%d %s ", world, match ? "match" : "DIFFERS");
+            std::printf("%s%d %s ", mode.c_str(), world, match ? "match" : "DIFFERS");
             if (!match)
                 std::printf("\n    single %s\n    pp%d    %s\n",
                             join(ref).c_str(), world, join(got).c_str());
