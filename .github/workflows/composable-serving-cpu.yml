@@ -1,0 +1,77 @@
+name: Composable serving CPU correctness
+on:
+  pull_request:
+    branches: [claude/new-session-pro26b]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-zstandard opencl-headers libhwloc15
+      - name: Install pinned oneAPI compiler and CPU runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dpcpp" "$RUNNER_TEMP/pkgs"
+          cd "$RUNNER_TEMP/pkgs"
+          for pkg in \
+            dpcpp_impl_linux-64-2026.1.1-h2a08c78_328 \
+            dpcpp_linux-64-2026.1.1-hf83752f_328 \
+            intel-cmplr-lib-rt-2026.1.1-h04fd95a_328 \
+            intel-cmplr-lib-ur-2026.1.1-h04fd95a_328 \
+            intel-cmplr-lic-rt-2026.1.1-ha770c72_328 \
+            intel-sycl-rt-2026.1.1-h7a4b287_328 \
+            intel-opencl-rt-2026.1.1-he68e48a_328 \
+            ocl-icd-2.3.4-hb03c661_1 \
+            umf-1.1.0-h7d1de2b_343 \
+            tbb-2022.3.0-hb700be7_2; do
+            curl --fail --location --retry 3 -o "$pkg.conda" "https://conda.anaconda.org/conda-forge/linux-64/$pkg.conda"
+          done
+          /usr/bin/python3 - <<'PY'
+          import glob, io, os, tarfile, zipfile, zstandard
+          root = os.path.join(os.environ["RUNNER_TEMP"], "dpcpp")
+          for path in sorted(glob.glob("*.conda")):
+              with zipfile.ZipFile(path) as archive:
+                  for name in archive.namelist():
+                      if not name.startswith("pkg-") or not name.endswith(".tar.zst"):
+                          continue
+                      data = zstandard.ZstdDecompressor().decompress(archive.read(name), max_output_size=4*1024**3)
+                      with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+                          tar.extractall(root, filter="tar")
+          PY
+          printf '%s\n' "$RUNNER_TEMP/dpcpp/lib/intel-ocl-cpu/libintelocl.so" > "$RUNNER_TEMP/dpcpp/etc/OpenCL/vendors/intel-ocl-cpu.icd"
+      - name: Compile and run correctness gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$RUNNER_TEMP/dpcpp/bin:$PATH"
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/dpcpp/lib:$RUNNER_TEMP/dpcpp/lib/x86_64-unknown-linux-gnu:$RUNNER_TEMP/dpcpp/lib/intel-ocl-cpu"
+          export OCL_ICD_VENDORS="$RUNNER_TEMP/dpcpp/etc/OpenCL/vendors"
+          export GRIMOIRE_DEVICE_ANY=1
+          export ONEAPI_DEVICE_SELECTOR=opencl:cpu
+          export CL_CONFIG_CPU_MAX_COMPUTE_UNITS=2
+          export GRIMOIRE_BATCHED_PREFILL_NOXMX=1
+          mkdir -p cpu-obj cpu-logs bin
+          icpx --version
+          sycl-ls
+          flags=(-fsycl -fsycl-targets=spir64 -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno -fsycl-device-code-split=per_kernel -Wmisleading-indentation -Iinclude -Isrc -Itools)
+          for src in grimoire qwen35_loader native_model safetensors quantize gptq gemv_decode gemm_xmx attention deltanet moe_kernels moe_ref ops prefill tokenizer; do
+            icpx "${flags[@]}" -c "src/$src.cpp" -o "cpu-obj/$src.o" > "cpu-logs/$src.build.log" 2>&1 || { cat "cpu-logs/$src.build.log"; exit 1; }
+          done
+          for gate in test_batch_decode test_scheduler test_prefix_reuse; do
+            icpx "${flags[@]}" "tools/$gate.cpp" cpu-obj/*.o -lpthread -ldl -o "bin/$gate" > "cpu-logs/$gate.build.log" 2>&1 || { cat "cpu-logs/$gate.build.log"; exit 1; }
+            timeout 900 "bin/$gate" > "cpu-logs/$gate.log" 2>&1 || { tail -100 "cpu-logs/$gate.log"; exit 1; }
+            tail -5 "cpu-logs/$gate.log"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-correctness-logs
+          path: cpu-logs/
