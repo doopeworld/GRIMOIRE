@@ -135,10 +135,13 @@ int main(int argc, char** argv) {
     // it and answer nothing. Both ends of that were added together, and
     // neither is reachable from the CLI, which is untouched.
     if (b70::grimoire_is_pp_worker(*e)) {
-        std::fprintf(stderr, "this is pipeline stage %d, not the front end: "
+        // TP workers follow rank 0 through the same loop now, so say which.
+        const char* pp = std::getenv("GRIMOIRE_PP_RANK");
+        const char* tp = std::getenv("GRIMOIRE_TP_RANK");
+        std::fprintf(stderr, "this is %s rank %d, not the front end: "
                              "serving nothing, following rank 0\n",
-                     std::atoi(std::getenv("GRIMOIRE_PP_RANK") ?
-                               std::getenv("GRIMOIRE_PP_RANK") : "0"));
+                     pp ? "pipeline" : "tensor-parallel",
+                     std::atoi(pp ? pp : (tp ? tp : "0")));
         b70::grimoire_pp_worker_loop(*e);
         return 0;
     }

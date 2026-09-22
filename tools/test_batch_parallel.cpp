@@ -45,7 +45,8 @@
 #include <barrier>
 #include <exception>
 #include <sycl/sycl.hpp>
-namespace b70 { extern long g_batch_decode_steps, g_batch_decode_rows; }
+namespace b70 { extern long g_batch_decode_steps, g_batch_decode_rows;
+                extern long g_prefix_tokens_reused_calls; }
 
 namespace fs = std::filesystem;
 using namespace b70;
@@ -74,6 +75,68 @@ static std::vector<std::vector<int32_t>> requests() {
 }
 static const int kWant = 6;
 
+static void write_tokens(const std::string& out, const std::vector<int32_t>& all);
+
+// CONVERSATIONS THAT GROW, under the prefix cache (2026-09-22).  Every turn
+// resends the whole history plus two new tokens, so admission resumes it
+// from a snapshot instead of re-reading it.  Under TP each rank resumes from
+// its OWN snapshot and they stay in step only if all of them reuse the same
+// number of tokens -- admission and the end-of-request commit are the two
+// places the ranks agree on that (tp_agree).  A single-round request never
+// reaches either, which is why the rest of this gate could not see them.
+static int run_turns(Grimoire* e, const std::string& out) {
+    const bool parallel=(std::getenv("GRIMOIRE_PP_WORLD_SIZE") || std::getenv("GRIMOIRE_TP_WORLD_SIZE"));
+    GrimoireScheduler* sc=parallel?grimoire_scheduler_new(*e,3):nullptr;
+    auto prompts=requests();
+    std::vector<std::vector<std::vector<int32_t>>> replies(3,std::vector<std::vector<int32_t>>(3));
+    std::vector<std::exception_ptr> errors(3);
+    std::barrier start(3);
+    const long reuse0=g_prefix_tokens_reused_calls;
+    auto client=[&](int k) {
+        for(int turn=0;turn<3;++turn) {
+            if(parallel) start.arrive_and_wait();
+            if(errors[k]) continue;            // still meet the next barrier
+            try {
+                auto& reply=replies[k][turn];
+                auto keep=[](int32_t) { return true; };
+                if(sc) grimoire_scheduler_generate(*sc,prompts[k],kWant,-1,-1,reply,keep);
+                else grimoire_serve_generate(*e,prompts[k],kWant,-1,reply,-1,keep);
+                prompts[k].insert(prompts[k].end(),reply.begin(),reply.end());
+                prompts[k].push_back(40+k);
+                prompts[k].push_back(70+turn);
+            } catch(...) { errors[k]=std::current_exception(); }
+        }
+    };
+    if(parallel) {
+        std::vector<std::thread> threads;
+        for(int k=0;k<3;++k) threads.emplace_back(client,k);
+        for(auto& thread:threads) thread.join();
+    } else for(int k=0;k<3;++k) client(k);
+    if(sc) grimoire_scheduler_delete(sc);
+    const long reused=g_prefix_tokens_reused_calls-reuse0;
+    int rc=0;
+    for(const auto& err:errors) if(err && !rc) {
+        try { std::rethrow_exception(err); }
+        catch(const std::exception& ex) { std::fprintf(stderr,"%s\n",ex.what()); }
+        rc=4;
+    }
+    // The count is rank 0's.  A rank that disagreed would have made EVERY
+    // rank fall back to re-reading, so a silent disagreement shows up here
+    // as no resume at all.
+    if(!rc && std::getenv("GRIMOIRE_EXPECT_REUSE") && reused<=0) {
+        std::fprintf(stderr,"prefix cache on, but no conversation was resumed\n");
+        rc=9;
+    }
+    grimoire_pp_shutdown(*e);
+    grimoire_delete(e);
+    if(rc) return rc;
+    std::vector<int32_t> all;
+    for(const auto& turns:replies) for(const auto& reply:turns)
+        all.insert(all.end(),reply.begin(),reply.end());
+    write_tokens(out,all);
+    return 0;
+}
+
 // One process of the pipeline.  Rank 0 is the front end: it forwards
 // each request and then serves it, exactly as the scheduler does inside
 // grimoire-server.  Every other rank follows.
@@ -90,6 +153,7 @@ static int run_rank(const std::string& dir, const std::string& out, Fmt fmt) {
         grimoire_delete(e);
         return 0;
     }
+    if (std::getenv("GRIMOIRE_BATCH_PARALLEL_TURNS")) return run_turns(e, out);
     const bool parallel=(std::getenv("GRIMOIRE_PP_WORLD_SIZE") || std::getenv("GRIMOIRE_TP_WORLD_SIZE"));
     GrimoireScheduler* sc=parallel?grimoire_scheduler_new(*e,3):nullptr;
     if(sc && grimoire_scheduler_width(*sc)<3) {
@@ -136,13 +200,16 @@ static int run_rank(const std::string& dir, const std::string& out, Fmt fmt) {
     }
     grimoire_pp_shutdown(*e);
     grimoire_delete(e);
-    if (!out.empty()) {
-        std::FILE* f = std::fopen(out.c_str(), "w");
-        if (!f) return 5;
-        for (int32_t t : all) std::fprintf(f, "%d\n", t);
-        std::fclose(f);
-    }
+    write_tokens(out, all);
     return 0;
+}
+
+static void write_tokens(const std::string& out, const std::vector<int32_t>& all) {
+    if (out.empty()) return;
+    std::FILE* f = std::fopen(out.c_str(), "w");
+    if (!f) return;                     // an empty file reads as "no tokens"
+    for (int32_t t : all) std::fprintf(f, "%d\n", t);
+    std::fclose(f);
 }
 
 static std::vector<int32_t> read_tokens(const std::string& path) {
@@ -287,6 +354,52 @@ int main(int argc, char** argv) {
             CHECK(got.size() == ref.size(),
                   "the pipeline answered fewer tokens than it was asked for, "
                   "so a later request did not survive the one before it");
+        }
+
+        // TP + prefix cache, over growing conversations (run_turns).  The
+        // reference is one process with the cache OFF: resuming must answer
+        // exactly what re-reading answers.  Muse refuses the cache, so its
+        // row checks the tokens and does not demand a resume.
+        {
+            const std::string ref_turns = (dir/"single-turns.txt").string();
+            const std::string out_turns = (dir/"TP2-turns.txt").string();
+            const std::string sock = (dir/"TP2-turns.sock").string();
+            const bool expect_reuse = std::string(c.arch.name) != "muse";
+            const auto devices=sycl::device::get_devices(sycl::info::device_type::gpu);
+            if(!devices.empty() && devices.size()<2) {
+                std::printf("TP2+cache SKIPPED: insufficient GPUs ");
+            } else if (!wait_ok({spawn(self, dir.string(), ref_turns, c.fmt,
+                            {"GRIMOIRE_DEVICE_ANY=1",
+                             "GRIMOIRE_BATCH_PARALLEL_TURNS=1"})}, "single turns")) {
+                ++g_fail; std::printf("single-process turns FAILED ");
+            } else {
+                std::vector<pid_t> pids;
+                for (int r = 1; r >= 0; --r) {
+                    std::vector<std::string> env{
+                        "GRIMOIRE_TP_RANK=" + std::to_string(r),
+                        "GRIMOIRE_TP_WORLD_SIZE=2",
+                        "GRIMOIRE_TP_SOCKET=" + sock,
+                        "GRIMOIRE_DEVICE_ANY=1",
+                        "GRIMOIRE_PREFIX_CACHE=1",
+                        "GRIMOIRE_BATCH_PARALLEL_TURNS=1"};
+                    if (expect_reuse) env.push_back("GRIMOIRE_EXPECT_REUSE=1");
+                    pids.push_back(spawn(self, dir.string(), r == 0 ? out_turns : "-",
+                                         c.fmt, env));
+                }
+                const auto want = read_tokens(ref_turns);
+                if (!wait_ok(pids, "TP2+cache")) {
+                    ++g_fail; std::printf("TP2+cache FAILED ");
+                } else {
+                    const auto got = read_tokens(out_turns);
+                    const bool match = !want.empty() && got == want;
+                    std::printf("TP2+cache %s ", match ? "match" : "DIFFERS");
+                    if (!match)
+                        std::printf("\n    single %s\n    tp2    %s\n",
+                                    join(want).c_str(), join(got).c_str());
+                    CHECK(match, "a TP conversation resumed from the prefix cache "
+                                 "answered differently from re-reading it");
+                }
+            }
         }
         std::printf("\n");
     }

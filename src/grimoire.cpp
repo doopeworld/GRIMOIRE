@@ -1851,6 +1851,10 @@ struct Grimoire {
     int  pipe_split = 0;
     std::unique_ptr<sycl::queue> q1;      // device-1 queue when pipeline
     float* pipe_host = nullptr;           // pinned staging for the boundary
+    float* tp_scratch = nullptr;          // gemm_tp: this rank's [rows][N_r]
+    size_t tp_scratch_elems = 0;
+    sycl_bf16* tp_act = nullptr;          // gemm_tp: bf16 activations for XMX
+    size_t tp_act_elems = 0;
     size_t pipe_host_elems = 0;
     static bool pipeline_enabled() {
         const char* e = std::getenv("GRIMOIRE_PIPELINE");
@@ -1921,6 +1925,12 @@ struct Grimoire {
         std::vector<int32_t> slots, positions;
     };
     bool serving_control = false; // rank 0 scheduler owns the control stream
+    bool following_control = false; // a worker inside grimoire_pp_worker_loop
+    // Rank 0 driving the TP workers, or a TP worker obeying it.  Both ends
+    // of every tp_agree() must test the same thing, or one side blocks.
+    bool tp_coordinated() const {
+        return tp_enabled() && (tp_rank == 0 ? serving_control : following_control);
+    }
     bool pp_send_request(const PPRequest& r);
     bool pp_recv_request(PPRequest& r);
     // Whether speculation is live for the WHOLE pipeline.  Under PP only
@@ -2002,6 +2012,10 @@ struct Grimoire {
     int  pp_sync_token(int token);
     bool tp_allgather(float* dev, int elems, int begin, int count);
     bool tp_allreduce_sum(float* dev, int elems);
+    // Every TP rank contributes `value`; every rank gets back the common
+    // value if all were equal, else -1.  One int each way, on the control
+    // sockets, so it is only safe where every rank reaches it in step.
+    bool tp_agree(int& value);
     bool tp_shard_rows(DevQuant& dq, sycl::queue& owner, std::string& err);
     Qwen35Model   ck;              // mmapped checkpoint, host side
     Qwen35Config  cfg;
@@ -3295,38 +3309,79 @@ int Grimoire::pp_sync_token(int token) {
     return int(wire);
 }
 
-// Each rank projects all active rows with its local weight shard before
-// gathering each full output row. Weights remain matrix-batched under TP.
+// Each rank projects all active rows with its local weight shard, then the
+// ranks exchange every row's shard in ONE round trip.  Weights stay
+// matrix-batched under TP.
+//
+// This used to malloc_device + free two buffers and run one all-gather per
+// ROW, for every sharded projection of every layer, every step -- a few
+// hundred allocations and socket round trips per decode step.  The scratch
+// now lives on the engine (grown on demand, freed in release()), and the
+// exchange carries [rows][N_r] from each rank at once.  The wire layout is
+// rank r's block of rows*N_r floats, with N_r from the same (width*r)/world
+// partition tp_shard_rows() cuts and tp_allgather() assumes.
 void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
-    float* local=sycl::malloc_device<float>(size_t(rows)*std::max(1,w.w.N),q);
-    sycl_bf16* activation=sycl::malloc_device<sycl_bf16>(size_t(rows)*w.w.K,q);
-    if(!local || !activation) {
-        if(local) sycl::free(local,q);
-        if(activation) sycl::free(activation,q);
-        throw std::bad_alloc();
+    const int width=w.output_rows(), N=w.w.N, K=w.w.K;
+    if(rows<=0) return;
+    if(w.row_begin!=(width*tp_rank)/tp_world || N!=(width*(tp_rank+1))/tp_world-w.row_begin)
+        throw std::runtime_error("TP shard does not follow the (width*r)/world partition");
+    const size_t local_elems=size_t(rows)*size_t(std::max(1,N));
+    if(!tp_scratch || local_elems>tp_scratch_elems) {
+        if(tp_scratch) sycl::free(tp_scratch,q);
+        tp_scratch=sycl::malloc_device<float>(local_elems,q);
+        tp_scratch_elems=tp_scratch?local_elems:0;
+        if(!tp_scratch) throw std::bad_alloc();
     }
-    try {
-        if(w.w.N>0) {
-            if(w.has_i4())
-                launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,local,w.w.N,w.w.K,rows,{});
-            else if(device_can_matrix(q)) {
-                launch_f32_to_bf16(q,x,activation,size_t(rows)*w.w.K,{});
-                launch_gemm_xmx(q,w.w,activation,local,rows);
-            } else launch_gemm_batched(q,w.w,x,local,rows);
-        }
-        const int width=w.output_rows();
-        for(int r=0;r<rows;++r) {
-            if(w.w.N>0)
-                q.memcpy(y+int64_t(r)*width+w.row_begin,local+int64_t(r)*w.w.N,
-                         size_t(w.w.N)*sizeof(float));
-            if(!tp_allgather(y+int64_t(r)*width,width,w.row_begin,w.w.N))
-                throw std::runtime_error("TP batched projection all-gather failed");
-        }
-        q.wait_and_throw();
-    } catch(...) {
-        q.wait(); sycl::free(local,q); sycl::free(activation,q); throw;
+    if(N>0) {
+        if(w.has_i4())
+            launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,tp_scratch,N,K,rows,{});
+        else if(device_can_matrix(q)) {
+            const size_t act_elems=size_t(rows)*size_t(K);
+            if(!tp_act || act_elems>tp_act_elems) {
+                if(tp_act) sycl::free(tp_act,q);
+                tp_act=sycl::malloc_device<sycl_bf16>(act_elems,q);
+                tp_act_elems=tp_act?act_elems:0;
+                if(!tp_act) throw std::bad_alloc();
+            }
+            launch_f32_to_bf16(q,x,tp_act,act_elems,{});
+            launch_gemm_xmx(q,w.w,tp_act,tp_scratch,rows);
+        } else launch_gemm_batched(q,w.w,x,tp_scratch,rows);
     }
-    sycl::free(local,q); sycl::free(activation,q);
+    const size_t full=size_t(rows)*size_t(width);
+    if(!pipe_host || full+local_elems>pipe_host_elems) {
+        if(pipe_host) sycl::free(pipe_host,q);
+        pipe_host=sycl::malloc_host<float>(full+local_elems,q);
+        pipe_host_elems=pipe_host?full+local_elems:0;
+        if(!pipe_host) throw std::bad_alloc();
+    }
+    float* assembled=pipe_host;                  // [rows][width]
+    float* mine=pipe_host+full;                  // [rows][N]
+    if(N>0) q.memcpy(mine,tp_scratch,size_t(rows)*N*sizeof(float));
+    q.wait_and_throw();
+    auto place=[&](const float* block,int r) {
+        const int b=(width*r)/tp_world, n=(width*(r+1))/tp_world-b;
+        for(int i=0;i<rows;++i)
+            std::memcpy(assembled+size_t(i)*width+b,block+size_t(i)*n,size_t(n)*sizeof(float));
+    };
+    bool ok=true;
+    if(tp_rank==0) {
+        place(mine,0);
+        std::vector<float> peer;
+        for(int r=1;r<tp_world && ok;++r) {
+            const int n=(width*(r+1))/tp_world-(width*r)/tp_world;
+            peer.resize(size_t(rows)*size_t(n));
+            ok=fd_read_all(tp_peer_fd[size_t(r)],peer.data(),peer.size()*sizeof(float));
+            if(ok) place(peer.data(),r);
+        }
+        for(int r=1;r<tp_world && ok;++r)
+            ok=fd_write_all(tp_peer_fd[size_t(r)],assembled,full*sizeof(float));
+    } else {
+        const int fd=tp_peer_fd[0];
+        ok=fd_write_all(fd,mine,size_t(rows)*size_t(N)*sizeof(float)) &&
+           fd_read_all(fd,assembled,full*sizeof(float));
+    }
+    if(!ok) throw std::runtime_error("TP batched projection all-gather failed");
+    q.memcpy(y,assembled,full*sizeof(float)).wait();
 }
 
 bool Grimoire::tp_allgather(float* dev, int elems, int begin, int count) {
@@ -3367,6 +3422,27 @@ bool Grimoire::tp_allreduce_sum(float* dev,int elems){
         for(int r=1;r<tp_world;++r)if(!fd_write_all(tp_peer_fd[size_t(r)],pipe_host,n*sizeof(float)))return false;
     }else{const int fd=tp_peer_fd[0];if(!fd_write_all(fd,pipe_host,n*sizeof(float))||!fd_read_all(fd,pipe_host,n*sizeof(float)))return false;}
     q.memcpy(dev,pipe_host,n*sizeof(float)).wait();return true;
+}
+
+bool Grimoire::tp_agree(int& value) {
+    if (!tp_enabled() || tp_peer_fd.empty()) return true;
+    int32_t mine = int32_t(value), common = mine;
+    if (tp_rank == 0) {
+        bool same = true;
+        for (int r = 1; r < tp_world; ++r) {
+            int32_t peer = 0;
+            if (!fd_read_all(tp_peer_fd[size_t(r)], &peer, sizeof peer)) return false;
+            same = same && peer == mine;
+        }
+        common = same ? mine : -1;
+        for (int r = 1; r < tp_world; ++r)
+            if (!fd_write_all(tp_peer_fd[size_t(r)], &common, sizeof common)) return false;
+    } else {
+        if (!fd_write_all(tp_peer_fd[0], &mine, sizeof mine) ||
+            !fd_read_all(tp_peer_fd[0], &common, sizeof common)) return false;
+    }
+    value = int(common);
+    return true;
 }
 
 bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
@@ -6726,7 +6802,7 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
     if (busy.size() != size_t(n_seq_slots))
         throw std::invalid_argument("sequence ownership size mismatch");
     sync();
-    const int reused = prefix_reuse(prompt, &busy);
+    int reused = prefix_reuse(prompt, &busy);
     int slot = reused ? prefix_hit : -1;
     if (slot < 0) {
         for (int i=0; i<n_seq_slots; ++i) {
@@ -6745,6 +6821,23 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         request.kind=2; request.budget=slot; request.prompt=prompt;
         if(!pp_send_request(request))
             throw std::runtime_error("parallel admission broadcast failed");
+    }
+    // Under TP every rank resumes from its OWN snapshot, and they only stay
+    // in step if all of them reuse the same number of tokens: a rank that
+    // re-read more of the prompt would run more collectives than its peers
+    // and the pipe would wait forever.  The snapshots are identical by
+    // construction (cache_sequence() agrees on every save), so this should
+    // never disagree -- and if it ever does, every rank re-reads the whole
+    // prompt, which is always possible and always correct.
+    if (tp_coordinated()) {
+        int common = reused;
+        if (!tp_agree(common))
+            throw std::runtime_error("TP admission agreement failed");
+        if (common < 0) {
+            std::fprintf(stderr, "  TP ranks disagreed on prefix reuse (%d tokens here)"
+                         " -- re-reading the prompt on every rank\n", reused);
+            reused = 0;
+        }
     }
     try {
         auto restore = [&] {
@@ -6791,7 +6884,14 @@ void Grimoire::cache_sequence(int slot, int position,
             throw std::runtime_error("TP prefix commit broadcast failed");
     }
     sync(); bind_seq_slot(slot); pos=position;
-    if (!save_prefix(processed, false) && size_t(slot)<prefix_slots.size())
+    // Under TP the save must succeed on EVERY rank or on none: a snapshot
+    // one rank holds and another does not makes their next admission reuse
+    // different lengths (see admit_sequence).  save_prefix() can fail on
+    // one card alone -- an allocation -- so agree on the outcome.
+    int saved = save_prefix(processed, false) ? 1 : 0;
+    if (tp_coordinated() && !tp_agree(saved))
+        throw std::runtime_error("TP prefix commit agreement failed");
+    if (saved != 1 && size_t(slot)<prefix_slots.size())
         prefix_slots[size_t(slot)].valid=false;
 }
 
@@ -6924,6 +7024,8 @@ void Grimoire::release() {
         ::unlink((pp_socket+"-"+std::to_string(pp_rank)).c_str());
     if(tp_enabled()&&tp_rank==0&&!pp_socket.empty())::unlink(pp_socket.c_str());
     if (pipe_host) { sycl::free(pipe_host, q); pipe_host = nullptr; }
+    if (tp_scratch) { sycl::free(tp_scratch, q); tp_scratch = nullptr; tp_scratch_elems = 0; }
+    if (tp_act) { sycl::free(tp_act, q); tp_act = nullptr; tp_act_elems = 0; }
     if(tp_expert){sycl::free(tp_expert,q);tp_expert=nullptr;}
     if(tp_weight){sycl::free(tp_weight,q);tp_weight=nullptr;}
     if (g_argmax_pv) { sycl::free(g_argmax_pv, q); g_argmax_pv = nullptr; }
@@ -12643,7 +12745,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // tile, the plain-SYCL launch_moe_*_batched pair does the
             // same arithmetic and runs anywhere.  A B70 can, so the
             // Tower path is unchanged.
-            if(M>=32 && device_can_matrix(q)){
+            //
+            // TENSOR PARALLEL ALWAYS TAKES THE PLAIN PAIR.  Under TP a rank
+            // holds only [expert_begin, expert_begin+expert_count), and only
+            // the plain branch below remaps the router's GLOBAL expert ids
+            // onto that local range.  The grouped paths index experts
+            // globally, so a TP rank would read experts it does not hold --
+            // an out-of-bounds weight read, a DEVICE_LOST on the card.
+            // Unreachable today (TP only batches decode rows, M <= 16); this
+            // keeps it unreachable when TP prompt prefill arrives.
+            if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);
@@ -13760,17 +13871,19 @@ void grimoire_pp_shutdown(Grimoire& e) {
 }
 
 void grimoire_pp_worker_loop(Grimoire& e) {
-    std::fprintf(stderr, "  PP rank %d: worker ready, waiting for requests\n",
-                 e.pp_rank);
+    e.following_control = true;
+    const char* mode = e.tp_enabled() ? "TP" : "PP";
+    std::fprintf(stderr, "  %s rank %d: worker ready, waiting for requests\n",
+                 mode, e.comm_rank());
     for (;;) {
         Grimoire::PPRequest req;
         if (!e.pp_recv_request(req)) {
-            std::fprintf(stderr, "  PP rank %d: front end closed the pipe\n",
-                         e.pp_rank);
+            std::fprintf(stderr, "  %s rank %d: front end closed the pipe\n",
+                         mode, e.comm_rank());
             return;
         }
         if (req.shutdown) {
-            std::fprintf(stderr, "  PP rank %d: shutdown\n", e.pp_rank);
+            std::fprintf(stderr, "  %s rank %d: shutdown\n", mode, e.comm_rank());
             return;
         }
         std::vector<int32_t> out;
@@ -13804,8 +13917,8 @@ void grimoire_pp_worker_loop(Grimoire& e) {
             // no way to resynchronise a byte stream after that, so say so
             // and stop rather than answer the next request from the
             // middle of this one's data.
-            std::fprintf(stderr, "  PP rank %d: request failed: %s\n",
-                         e.pp_rank, ex.what());
+            std::fprintf(stderr, "  %s rank %d: request failed: %s\n",
+                         mode, e.comm_rank(), ex.what());
             return;
         }
     }
