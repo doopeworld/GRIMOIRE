@@ -37,6 +37,12 @@ jobs:
           /usr/bin/python3 - <<'PY'
           import glob, io, os, tarfile, zipfile, zstandard
           root = os.path.join(os.environ["RUNNER_TEMP"], "dpcpp")
+          def writable(member, destination):
+              member = tarfile.tar_filter(member, destination)
+              member.mode |= 0o200
+              if member.isdir():
+                  member.mode |= 0o700
+              return member
           for path in sorted(glob.glob("*.conda")):
               with zipfile.ZipFile(path) as archive:
                   for name in archive.namelist():
@@ -44,7 +50,7 @@ jobs:
                           continue
                       data = zstandard.ZstdDecompressor().decompress(archive.read(name), max_output_size=4*1024**3)
                       with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-                          tar.extractall(root, filter="tar")
+                          tar.extractall(root, filter=writable)
           PY
           printf '%s\n' "$RUNNER_TEMP/dpcpp/lib/intel-ocl-cpu/libintelocl.so" > "$RUNNER_TEMP/dpcpp/etc/OpenCL/vendors/intel-ocl-cpu.icd"
       - name: Compile and run correctness gates
