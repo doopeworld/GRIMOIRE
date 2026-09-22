@@ -2467,6 +2467,28 @@ struct Grimoire {
         std::vector<Layer> layers;
         std::vector<int> target_layers;
     } dflash2;
+
+    // Pointer views switch the drafter with the target sequence. Only slot
+    // zero uses the original build allocations; later slots own new caches.
+    struct DraftSlot {
+        uint8_t *mk=nullptr,*mv=nullptr;
+        float *aux=nullptr,*hidden=nullptr;
+        std::vector<uint8_t*> k,v;
+        std::vector<sycl::half*> k16,v16;
+        std::vector<void*> owned;
+        int context=0;
+    };
+    std::vector<DraftSlot> draft_slots;
+    float* batch_conv_steps=nullptr;
+    void init_draft_slots();
+    bool speculative_batch() const {
+        return !pp_enabled() && !tp_enabled() && (mtp.ok || dflash2.ok);
+    }
+    bool decode_spec_batch(const std::vector<int32_t>& tokens,
+        const std::vector<int>& slots, const std::vector<int>& positions,
+        const std::vector<int>& remaining, std::vector<std::vector<int32_t>>& replies,
+        std::vector<int>& consumed);
+
     // Speculative verification advances every recurrent layer optimistically.
     // Keep one device-side checkpoint so a rejection can restore the exact
     // pre-verify state and replay only the accepted prefix. Attention KV
@@ -2954,7 +2976,7 @@ struct Grimoire {
     // slot[r] names the sequence's KV rows (see bind_seq_slot) and
     // pos[r] its position in that sequence.  Both are HOST arrays: this
     // path never records a command graph, so there is nothing to bake.
-    struct SeqBatch { const int* slot; const int* pos; };
+    struct SeqBatch { const int* slot; const int* pos; bool verify=false; };
     // allow_exact_restore: whether an exact-match cache hit may REBIND
     // the live slot out from under the caller (external audit,
     // 2026-09-21).  The serial single-conversation path
@@ -6369,8 +6391,8 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //  * a drafter and a batch both want the verify path; combining them is
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
-    if (pp_spec || pp_dflash || mtp.ok || dflash2.ok)
-        return "a speculative drafter is loaded";
+    if ((pp_enabled() || tp_enabled()) && (pp_spec || pp_dflash || mtp.ok || dflash2.ok))
+        return "distributed speculative batching is not implemented";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
     if (!device_can_matrix(q) && !std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX"))
@@ -6397,6 +6419,93 @@ bool Grimoire::decode_batch(const std::vector<int32_t>& toks,
 // rejected -- but it would have the head attending to another chat, and
 // acceptance is the one thing a drafter is for.  Zeroing is exactly the
 // condition reset() already gives every request today.
+long g_spec_batch_steps=0, g_spec_batch_proposals=0, g_spec_batch_accepted=0, g_spec_batch_sequences=0;
+
+bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
+        const std::vector<int>& slots, const std::vector<int>& positions,
+        const std::vector<int>& remaining, std::vector<std::vector<int32_t>>& replies,
+        std::vector<int>& consumed) {
+    const int n=int(tokens.size());
+    if(n==0 || n>kSpecBatch || slots.size()!=tokens.size() ||
+       positions.size()!=tokens.size() || remaining.size()!=tokens.size())
+        throw std::invalid_argument("invalid speculative batch shape");
+    init_draft_slots();
+    std::vector<int32_t> candidates;
+    std::vector<int> candidate_slots, candidate_positions, begin, lengths;
+    const int max_depth=std::max(0,std::min(3,kSpecBatch/n-1));
+    for(int row=0;row<n;++row) {
+        sync(); bind_seq_slot(slots[size_t(row)]);
+        pos=positions[size_t(row)]; set_cursor(pos);
+        q.memcpy(s.h,draft_slots[size_t(seq_slot)].hidden,size_t(cfg.hidden)*sizeof(float));
+        const int depth=std::min({max_depth,max_seq-pos-1,remaining[size_t(row)]-1});
+        std::vector<int32_t> block{tokens[size_t(row)]};
+        if(depth>0) {
+            if(dflash2.ok) {
+                std::vector<int32_t> draft;
+                if(!dflash_draft(block[0],pos,draft) || draft.empty())
+                    throw std::runtime_error("batched DFlash proposal failed");
+                block.insert(block.end(),draft.begin(),draft.begin()+std::min(depth,int(draft.size())));
+            } else {
+                int token=block[0];
+                for(int k=0;k<depth;++k) {
+                    token=mtp_draft(token,pos+k,k>0);
+                    if(token<0 || token>=cfg.vocab)
+                        throw std::runtime_error("batched MTP proposal failed");
+                    block.push_back(token);
+                }
+            }
+        }
+        begin.push_back(int(candidates.size()));
+        lengths.push_back(int(block.size()));
+        for(size_t k=0;k<block.size();++k) {
+            candidates.push_back(block[k]); candidate_slots.push_back(seq_slot);
+            candidate_positions.push_back(pos+int(k));
+        }
+    }
+    SeqBatch batch{candidate_slots.data(),candidate_positions.data(),true};
+    std::vector<int32_t> verified;
+    spec_hidden_valid=false;
+    if(!prefill(candidates,&verified,&batch,false) ||
+       verified.size()!=candidates.size() || !spec_hidden_valid)
+        throw std::runtime_error("batched speculative target verification failed");
+    replies.assign(size_t(n),{}); consumed.assign(size_t(n),0);
+    const size_t dn_n=size_t(cfg.lin_v_heads)*cfg.lin_v_dim*cfg.lin_k_dim;
+    ++g_spec_batch_steps; g_spec_batch_sequences+=n;
+    for(int row=0;row<n;++row) {
+        const int first=begin[size_t(row)], count=lengths[size_t(row)];
+        int accepted=1;
+        while(accepted<count && candidates[size_t(first+accepted)]==verified[size_t(first+accepted-1)])
+            ++accepted;
+        g_spec_batch_proposals+=count-1; g_spec_batch_accepted+=accepted-1;
+        bind_seq_slot(slots[size_t(row)]);
+        const int last=first+accepted-1;
+        size_t doff=0,coff=0;
+        for(auto& layer:L) {
+            if(layer.dn_state) {
+                q.memcpy(layer.dn_state,spec_dn_steps+size_t(last)*spec_dn_elems+doff,
+                         dn_n*sizeof(float)); doff+=dn_n;
+            }
+            if(layer.conv_ring) {
+                q.memcpy(layer.conv_ring,batch_conv_steps+size_t(last)*spec_conv_elems+coff,
+                         layer.conv_slot*sizeof(float)); coff+=layer.conv_slot;
+            }
+        }
+        if(mtp.ok && !dflash2.ok) for(int k=0;k<accepted;++k)
+            mtp_warm(spec_hidden_steps+int64_t(first+k)*cfg.hidden,
+                     verified[size_t(first+k)],positions[size_t(row)]+k);
+        q.memcpy(draft_slots[size_t(seq_slot)].hidden,
+                 spec_hidden_steps+int64_t(last)*cfg.hidden,size_t(cfg.hidden)*sizeof(float));
+        q.memcpy(s.h,spec_hidden_steps+int64_t(last)*cfg.hidden,size_t(cfg.hidden)*sizeof(float));
+        pos=positions[size_t(row)]+accepted; set_cursor(pos);
+        // Accepted candidate outputs followed by the verifier's bonus.
+        for(int k=1;k<accepted;++k) replies[size_t(row)].push_back(candidates[size_t(first+k)]);
+        replies[size_t(row)].push_back(verified[size_t(last)]);
+        consumed[size_t(row)]=accepted;
+    }
+    sync();
+    return true;
+}
+
 void Grimoire::clear_drafter_cache() {
     if (!mtp.ok || !mtp.L.k_cache || !mtp.L.v_cache) return;
     const size_t kv_bytes = size_t(mtp.L.kv_heads) * mtp.L.head_dim * max_seq;
@@ -6404,7 +6513,44 @@ void Grimoire::clear_drafter_cache() {
     q.memset(mtp.L.v_cache, 0, kv_bytes);
 }
 
+void Grimoire::init_draft_slots() {
+    if(!draft_slots.empty() || !(mtp.ok || dflash2.ok)) return;
+    draft_slots.resize(size_t(n_seq_slots));
+    const size_t mkbytes=size_t(mtp.L.kv_heads)*mtp.L.head_dim*max_seq;
+    const size_t dkbytes=size_t(dflash2.kv_heads)*dflash2.head_dim*max_seq;
+    const size_t halfbytes=size_t(dflash2.num_blocks)*dflash2.block_size*
+                           dflash2.kv_heads*dflash2.head_dim*sizeof(sycl::half);
+    for(int j=0;j<n_seq_slots;++j) {
+        auto& slot=draft_slots[size_t(j)];
+        auto allocate=[&](size_t bytes)->void* {
+            auto* ptr=sycl::malloc_device<uint8_t>(std::max<size_t>(1,bytes),q);
+            if(!ptr) throw std::bad_alloc();
+            slot.owned.push_back(ptr); q.memset(ptr,0,bytes);
+            return ptr;
+        };
+        slot.hidden=static_cast<float*>(allocate(size_t(cfg.hidden)*sizeof(float)));
+        if(mtp.ok) {
+            slot.mk=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.k_cache;
+            slot.mv=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.v_cache;
+        }
+        if(dflash2.target_aux) slot.aux=j?static_cast<float*>(allocate(
+            size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float))):dflash2.target_aux;
+        for(auto& layer:dflash2.layers) {
+            slot.k.push_back(layer.k_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.k_cache):nullptr);
+            slot.v.push_back(layer.v_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.v_cache):nullptr);
+            slot.k16.push_back(layer.k_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.k_cache_f16):nullptr);
+            slot.v16.push_back(layer.v_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.v_cache_f16):nullptr);
+        }
+    }
+    if(spec_conv_elems) {
+        batch_conv_steps=sycl::malloc_device<float>(size_t(kSpecBatch)*spec_conv_elems,q);
+        if(!batch_conv_steps) throw std::bad_alloc();
+    }
+    q.wait_and_throw();
+}
+
 void Grimoire::bind_seq_slot(int j) {
+    init_draft_slots();
     if (j < 0 || j >= n_seq_slots || j == seq_slot) return;
     for (auto& d : L) {
         if (d.k_base) d.k_cache = d.k_base + size_t(j) * d.kv_slot;
@@ -6418,6 +6564,17 @@ void Grimoire::bind_seq_slot(int j) {
             std::max(1,(cfg.ple_conv_kernel-1)*cfg.ngram_size)*cfg.hc_count*cfg.hidden;
     }
     if(q4_tok_base) q4_tok=q4_tok_base+size_t(j)*max_seq;
+    if(!draft_slots.empty()) {
+        draft_slots[size_t(seq_slot)].context=dflash2.context_pos;
+        auto& slot=draft_slots[size_t(j)];
+        mtp.L.k_cache=slot.mk; mtp.L.v_cache=slot.mv;
+        dflash2.target_aux=slot.aux; dflash2.context_pos=slot.context;
+        for(size_t i=0;i<dflash2.layers.size();++i) {
+            auto& layer=dflash2.layers[i];
+            layer.k_cache=slot.k[i]; layer.v_cache=slot.v[i];
+            layer.k_cache_f16=slot.k16[i]; layer.v_cache_f16=slot.v16[i];
+        }
+    }
     seq_slot = j;
     graph_ok = false;
 }
@@ -6557,6 +6714,7 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
                 if (!forward(t)) throw std::runtime_error("prompt ingestion failed");
         }
         sync();
+        if(!draft_slots.empty()) q.memcpy(draft_slots[size_t(slot)].hidden,s.h,size_t(cfg.hidden)*sizeof(float)).wait();
         return slot;
     } catch (...) {
         if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
@@ -6683,6 +6841,13 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
 }
 
 void Grimoire::release() {
+    if(!draft_slots.empty()) {
+        q.wait();
+        bind_seq_slot(0);
+        for(auto& slot:draft_slots) for(void* ptr:slot.owned) sycl::free(ptr,q);
+        draft_slots.clear();
+        if(batch_conv_steps) { sycl::free(batch_conv_steps,q); batch_conv_steps=nullptr; }
+    }
     // DRAIN BEFORE FREEING.  Everything below hands device pointers to
     // sycl::free while the queue may still hold work that reads them --
     // undefined, and on this runtime it surfaces as a SIGSEGV inside the
@@ -10321,6 +10486,15 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
         const int HD = d.head_dim, KVH = d.kv_heads, QW = QH * HD;
         const int KVW = KVH * HD;
 
+        if(seqb && dflash2.target_aux) {
+            for(size_t tap=0;tap<dflash2.target_layers.size();++tap)
+                if(dflash2.target_layers[tap]+1==i)
+                    for(int r=0;r<M;++r)
+                        launch_dflash_store_tap(q,h+int64_t(r)*H,
+                            draft_slots[size_t(seqb->slot[r])].aux,1,H,
+                            int(dflash2.target_layers.size()),seqb->pos[r],int(tap),{},
+                            cfg.is_muse);
+        }
         // ---- attention (sandwich: in_norm -> attn -> post_norm -> add) --
         launch_rmsnorm_residual_batched(q, h, nullptr, nullptr, d.in_norm,
                                         h2, M, H, eps, nullptr, none);
@@ -10449,6 +10623,10 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
                 launch_argmax(q,s.logits,cfg.vocab,s.d_tok,s.d_val,none);
                 q.memcpy(next_tokens->data()+r,s.d_tok,sizeof(int32_t));
             }
+        }
+        if(seqb->verify && spec_hidden_steps) {
+            q.memcpy(spec_hidden_steps,h,size_t(M)*H*sizeof(float));
+            spec_hidden_valid=true;
         }
         q.wait_and_throw();
         if (pp_enabled() && !pp_sync_tokens(*next_tokens)) {
@@ -10945,8 +11123,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // impossible to see in the output.
         for(size_t a=0;a+1<tokens.size();++a)
             for(size_t b=a+1;b<tokens.size();++b)
-                if(seqb->slot[a]==seqb->slot[b])
-                    throw std::invalid_argument("two batch rows share a sequence slot");
+                if(seqb->slot[a]==seqb->slot[b]) {
+                    if(!seqb->verify || seqb->pos[b]-seqb->pos[a]!=int(b-a))
+                        throw std::invalid_argument("batch rows share a slot without a contiguous verify block");
+                }
         const std::string why=batch_unsupported_reason();
         if(!why.empty()){
             static bool said=false;
@@ -11840,19 +12020,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // drafter at all, and the memcpy below took a null pointer straight
     // into the runtime.  Test the buffer, not the caller's shape.
     const bool capture_spec =
-        next_tokens && M <= kSpecBatch && spec_hidden_steps && !seqb;
+        next_tokens && M <= kSpecBatch && spec_hidden_steps && (!seqb || seqb->verify);
     const bool spec_route_diag = capture_spec &&
         std::getenv("GRIMOIRE_MTP_ROUTE_DIAG") != nullptr;
     size_t spec_route_total = 0, spec_route_unique = 0;
     int spec_route_layers = 0;
     std::vector<size_t> spec_doff(L.size(), size_t(-1));
     std::vector<size_t> spec_xoff(L.size(), size_t(-1));
+    std::vector<size_t> spec_coff(L.size(), size_t(-1));
     if (capture_spec) {
-        size_t ds = 0, xs = 0;
+        size_t ds = 0, xs = 0, cs = 0;
         const size_t dn_n = size_t(Hv) * Dv * Dk;
         for (size_t li = 0; li < L.size(); ++li) {
             if (L[li].dn_state) { spec_doff[li] = ds; ds += dn_n; }
             if (L[li].conv_ring) {
+                spec_coff[li] = cs; cs += size_t(qkv_ch)*(cfg.conv_kernel-1);
                 spec_xoff[li] = xs;
                 xs += size_t(kSpecBatch) * qkv_ch;
             }
@@ -11885,9 +12067,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(dflash2.target_aux){
             for(size_t tap=0;tap<dflash2.target_layers.size();++tap){
                 if(dflash2.target_layers[tap]+1==li){
-                    launch_dflash_store_tap(q,bh,dflash2.target_aux,M,H,
-                        int(dflash2.target_layers.size()),start_pos,int(tap),{},
-                        cfg.is_muse);
+                    if(seqb) {
+                        for(int r=0;r<M;++r)
+                            launch_dflash_store_tap(q,bh+int64_t(r)*H,
+                                draft_slots[size_t(seqb->slot[r])].aux,1,H,
+                                int(dflash2.target_layers.size()),seqb->pos[r],int(tap),{},
+                                cfg.is_muse);
+                    } else launch_dflash_store_tap(q,bh,dflash2.target_aux,M,H,
+                        int(dflash2.target_layers.size()),start_pos,int(tap),{},cfg.is_muse);
                     break;
                 }
             }
@@ -11959,6 +12146,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_causal_conv1d_split_prefill(q,cp,1,
                         t1+int64_t(r)*qs,t2+int64_t(r)*qs,t3+int64_t(r)*vs,
                         nullptr,qs,vs);
+                    if(capture_spec) q.memcpy(batch_conv_steps+size_t(r)*spec_conv_elems+
+                        spec_coff[li],ring,d.conv_slot*sizeof(float));
                 }
             }else if(bf_dn_qkv)
                 launch_causal_conv1d_split_bf16_prefill(q,grouped_out,d.la_conv,
@@ -12034,7 +12223,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         launch_deltanet_step(q,sp,{});
                         if (capture_spec)
                             q.memcpy(spec_dn_steps + size_t(t) * spec_dn_elems +
-                                     spec_doff[li], d.dn_state,
+                                     spec_doff[li], sp.state,
                                      size_t(Hv) * Dv * Dk * sizeof(float));
                     }
                 }else{
@@ -12681,7 +12870,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // path as target prefill. Verification replaces draft-conditioned K/V with
     // target-conditioned K/V, including after partial acceptance. Rejected
     // future rows are outside the cursor and will be overwritten next round.
-    if(mtp.ok) {
+    if(mtp.ok && !seqb) {
         std::vector<int32_t> shifted(size_t(M),0);
         for(int i=0;i<M;++i)
             shifted[i]=next_tokens?(*next_tokens)[i]:(i+1<M?tokens[size_t(i)+1]:0);
@@ -13057,29 +13246,28 @@ int grimoire_serve_generate_batch(Grimoire& e,
             which.push_back(k);
         }
         if (toks.empty()) break;
-        std::vector<int32_t> got;
-        if (!e.decode_batch(toks, slots, poss, got) || got.size() != toks.size())
-            throw std::runtime_error("batched decode step failed");
-        for (size_t j = 0; j < which.size(); ++j) {
-            Row& r = rows[which[j]];
-            ++r.pos;                       // the token it just consumed
-            const int t = got[j];
-            if (t < 0 || t >= e.cfg.vocab) {
-                // Say WHICH row, and say it differently from the serial
-                // path's identical-sounding message.  The two share a
-                // process, and a message that cannot tell you which one
-                // produced it turns a five-minute diagnosis into an
-                // afternoon of bisecting by deletion.
-                char buf[192];
-                std::snprintf(buf, sizeof buf,
-                    "batched decode returned a token outside the vocabulary: "
-                    "row %zu of %zu, slot %d, position %d, token %d",
-                    j, which.size(), r.slot, r.pos - 1, t);
-                throw std::runtime_error(buf);
+        std::vector<std::vector<int32_t>> blocks;
+        std::vector<int> consumed(toks.size(),1);
+        if(e.speculative_batch()) {
+            std::vector<int> remaining;
+            for(size_t k:which) remaining.push_back(cap-int(out_ids[rows[k].idx].size()));
+            e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
+        } else {
+            std::vector<int32_t> got;
+            if(!e.decode_batch(toks,slots,poss,got) || got.size()!=toks.size())
+                throw std::runtime_error("batched decode step failed");
+            for(int32_t token:got) blocks.push_back({token});
+        }
+        for(size_t j=0;j<which.size();++j) {
+            Row& r=rows[which[j]];
+            r.pos+=consumed[j];
+            for(int32_t token:blocks[j]) {
+                if(token<0 || token>=e.cfg.vocab)
+                    throw std::runtime_error("batched decode returned invalid token");
+                if(stop(token)) { r.live=false; break; }
+                out_ids[r.idx].push_back(token); r.next=token;
+                if(int(out_ids[r.idx].size())>=cap) { r.live=false; break; }
             }
-            if (stop(t)) { r.live = false; continue; }
-            out_ids[r.idx].push_back(t);
-            r.next = t;
         }
     }
     // The engine's single cursor means nothing after a batch (see
@@ -13323,6 +13511,8 @@ void GrimoireScheduler::run() {
             which.push_back(k);
         }
         std::vector<int32_t> got;
+        std::vector<std::vector<int32_t>> blocks;
+        std::vector<int> consumed(toks.size(),1);
         bool failed = false; std::string err;
         if (!toks.empty()) {
             try {
@@ -13334,9 +13524,18 @@ void GrimoireScheduler::run() {
                     if (!e.pp_send_request(request))
                         throw std::runtime_error("pipeline batch broadcast failed");
                 }
-                if (!e.decode_batch(toks, slots, poss, got) ||
-                    got.size() != toks.size()) {
-                    failed = true; err = "batched decode step failed";
+                if(e.speculative_batch()) {
+                    std::vector<int> remaining;
+                    for(size_t k:which) {
+                        const auto& job=active[k];
+                        std::lock_guard<std::mutex> lock(job->mu);
+                        remaining.push_back(job->budget-int(job->ready.size()));
+                    }
+                    e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
+                } else {
+                    if(!e.decode_batch(toks,slots,poss,got) || got.size()!=toks.size()) {
+                        failed=true; err="batched decode step failed";
+                    } else for(int32_t token:got) blocks.push_back({token});
                 }
             } catch (const std::exception& ex) { failed = true; err = ex.what(); }
         }
@@ -13352,22 +13551,23 @@ void GrimoireScheduler::run() {
                                        : FinishReason::Length, !failed, err);
                 continue;
             }
-            ++j->pos;
-            const int t = got[at];
-            const bool stop = (j->eos >= 0 && t == j->eos) ||
-                              (j->eot >= 0 && t == j->eot);
-            size_t n = 0;
-            { std::lock_guard<std::mutex> l(j->mu); n = j->ready.size(); }
-            if (stop) {
-                retire(j, FinishReason::Stop);
-            } else if (!push(j, int32_t(t))) {
-                retire(j, FinishReason::Cancelled);
-            } else if (int(n) + 1 >= j->budget || j->pos >= e.max_seq) {
-                retire(j, FinishReason::Length);
-            } else {
-                j->next = t;
-                keep.push_back(j);
+            j->pos+=consumed[at];
+            bool done=false;
+            for(int32_t token:blocks[at]) {
+                const bool stop=(j->eos>=0 && token==j->eos) || (j->eot>=0 && token==j->eot);
+                size_t n=0;
+                { std::lock_guard<std::mutex> lock(j->mu); n=j->ready.size(); }
+                if(token<0 || token>=e.cfg.vocab) {
+                    retire(j,FinishReason::Length,false,"batched decode returned invalid token");
+                    done=true;
+                } else if(stop) { retire(j,FinishReason::Stop); done=true; }
+                else if(!push(j,token)) { retire(j,FinishReason::Cancelled); done=true; }
+                else if(int(n)+1>=j->budget) { retire(j,FinishReason::Length); done=true; }
+                else j->next=token;
+                if(done) break;
             }
+            if(!done && j->pos>=e.max_seq) { retire(j,FinishReason::Length); done=true; }
+            if(!done) keep.push_back(j);
         }
         active.swap(keep);
     }
