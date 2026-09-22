@@ -51,3 +51,20 @@ exactly three call sites (3725 probe, 6759 definition, 7101 CLI).
 - Note the comment at src/grimoire.cpp:6851 says "Speculative paths call
   forward() directly and are unaffected" -- so the graph helps plain decode
   first; making the verify forward use it is a separate, later question.
+
+## Status, 2026-09-22
+
+**Wired since.** `generate_tokens()` (`include/b70/generation.hpp`) builds
+the graph when `GRIMOIRE_DECODE_GRAPH=1` and no drafter is loaded, and
+replays it with `e.step()`. So the server path this document describes
+now has it, but still opt-in. The 12.20 t/s baseline above has not been
+re-measured with it on. That is a Tower measurement: plain decode, graph
+off vs on, same prompt, and read the text (rule 8).
+
+Scope: the graph serves the one-request-at-a-time path. A batched
+scheduler step (`decode_batch`) does not replay it, and `bind_seq_slot()`
+invalidates it (`graph_ok = false`), so with `GRIMOIRE_SEQ_SLOTS > 1` it
+is rebuilt whenever the live slot changes.
+
+The launchers now forward `GRIMOIRE_DECODE_GRAPH` from the host when it is
+exported there (`serve.sh`, `serve_pp2.sh`, `serve_tp2.sh`).

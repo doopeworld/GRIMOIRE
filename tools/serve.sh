@@ -40,6 +40,7 @@ docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -e GRIMOIRE_DFLASH_MODEL \
   -e GRIMOIRE_DFLASH_M \
   -e GRIMOIRE_SPEC_STATS \
+  -e GRIMOIRE_DECODE_GRAPH \
   -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
   --entrypoint /grimoire/bin/grimoire-server \
   "$IMAGE" \

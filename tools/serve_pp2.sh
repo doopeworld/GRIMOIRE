@@ -79,6 +79,7 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -e GRIMOIRE_DFLASH_MODEL \
     -e GRIMOIRE_DFLASH_M \
     -e GRIMOIRE_SPEC_STATS \
+    -e GRIMOIRE_DECODE_GRAPH \
     -e LD_LIBRARY_PATH=/grimoire/src:/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/usr/local/lib \
     --entrypoint /grimoire/tools/serve_pp2_worker.sh "$IMAGE" \
     "$MODEL" "$PORT" "$PROJ" "$CTX")
