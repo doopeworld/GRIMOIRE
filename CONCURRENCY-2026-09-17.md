@@ -77,6 +77,14 @@ its slot immediately. `/v1/models` reports the real width.
 
 ## What it refuses, by name
 
+> **Superseded 2026-09-22.** The composable-serving commits
+> (`e344cf2..bf961c3`) lifted the first three rows below: Muse, gemma-4
+> and Qwen4-Exp batch; TP and PP batch (rank 0 drives the workers); a
+> drafter batches on one card.  What `batch_unsupported_reason()` refuses
+> today is a drafter under TP/PP, one slot, and no matrix hardware.  The
+> prefix cache composes with batching too.  See
+> `AUDIT-2026-09-22-TOWER-READINESS.md`; the table is kept as history.
+
 `batch_unsupported_reason()` answers in a sentence, and the server falls
 back to one request at a time with speculation intact — byte for byte
 what it did before.

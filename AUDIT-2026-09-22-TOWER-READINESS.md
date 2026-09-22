@@ -17,9 +17,10 @@ Tower and the B70s.*
   card** (CPU OpenCL device; table in section 3).
 - **"Finished": no.** It has never run on a B70. No kernel has run on XMX
   hardware, no AOT image or bridge build has been tested, OCuLink has not
-  been exercised, and there is no speed number anywhere. The docs also
-  describe the code as it was *before* the 9 newest commits (finding F1).
-  The Tower run is the first real test, not a formality.
+  been exercised, and there is no speed number anywhere. The Tower run
+  is the first real test, not a formality. Everything that CAN be done
+  off the card is done (section 4b): every finding below that code can
+  fix is fixed, and the docs match the code again.
 - **Use this branch on the Tower** (`claude/grimoire-audit-testing-qa0v98`
   = `bf961c3` + the fixes below), or `codex/composable-serving` if you
   want the fixes left out. **Do not use `main`.** It is at `dcc549c`
@@ -167,8 +168,26 @@ and re-verified as stated. None of these came from a failing gate: every
 gate passes. They came from reading the diff, the launchers and the
 coverage.
 
-**F1. The docs describe the code before the 9 commits. (docs, not fixed
-beyond a pointer)** `CLAUDE.md` (the "does NOT yet compose" and "Concurrency does NOT apply
+Status after the second round (section 4b):
+
+| finding | status |
+| --- | --- |
+| F1 stale docs | **fixed**: DAY-ONE, CLAUDE.md (plus rule 22), and banners on the three superseded docs |
+| F2 drafter VRAM per slot | banner added; the size itself is a design choice (bf16 taps would halve it), left for after the Tower measures real VRAM |
+| F3 half-built allocations | **fixed** |
+| F4 PP-serve worker script | **fixed**; now also serves TP |
+| F5 launcher env | **fixed**, plus `GRIMOIRE_DECODE_GRAPH` |
+| F6 TP GEMM allocation + per-row exchange | **fixed**: pooled scratch, one exchange per projection |
+| F7 spec depth vs batch width | open: needs a measurement, not a guess |
+| F8 batched MTP never accepted | **fixed**: forced-acceptance MTP rows + MoE/Muse rows, negative control |
+| F9a TP on the grouped MoE path | **fixed** (guarded) |
+| F9b TP ranks could disagree on prefix reuse | **fixed** (`tp_agree`), negative control |
+| F9c batch driver under PP/TP | **withdrawn**: called by every rank with the same inputs (SPMD) it stays in lockstep; only the server needs the scheduler, and uses it |
+| F9d no TP launcher | **fixed**: `tools/serve_tp2.sh` |
+| F10 XMX vs GEMV on the card | expectation, nothing to fix off the card |
+
+**F1. The docs describe the code before the 9 commits. (docs; fixed in
+round two, see 4b)** `CLAUDE.md` (the "does NOT yet compose" and "Concurrency does NOT apply
 there" bullets),
 `HANDOFF-2026-09-21-DAY-ONE-READY.md` (lines 28, 172-179), `DAY-ONE.md`
 (286, 336, 472-478), `CONCURRENCY-2026-09-17.md` (81-86, 165, 182) and
@@ -232,7 +251,8 @@ value only when it is exported, so a default launch is unchanged. Also
 corrected `serve_pp2.sh`'s closing message, which quoted a refusal the
 engine no longer prints.
 
-**F6. TP batched decode will be slow as written. (performance, not fixed)**
+**F6. TP batched decode will be slow as written. (performance; fixed in
+round two)**
 `gemm_tp()` calls `malloc_device` + `free` for two buffers, a full
 `wait_and_throw`, and one socket all-gather per row, for every sharded
 projection of every layer, every step. Treat the first TP-batching
@@ -277,6 +297,45 @@ Off the card, both sides used plain SYCL. They are exactness claims and
 should hold. If one fails on the Tower, first check whether the diverging
 step was a near-tie in the logits, then look for a logic bug.
 
+## 4b. Second round: everything that could be done off the card
+
+Commits on `claude/grimoire-audit-testing-qa0v98` after the first
+round, each verified as its message says:
+
+- `dbe5387` **TP serving**: `tp_agree()` makes TP ranks agree on the
+  prefix-snapshot save outcome and on the admission reuse length (F9b).
+  `gemm_tp()` uses pooled scratch and one exchange for all rows (F6). TP
+  never takes the grouped MoE path (F9a). Worker logs name TP vs PP.
+  `test_batch_parallel` gained a TP2 + prefix-cache arm over growing
+  conversations, the first gate to reach the TP resume or the TP commit.
+  **Negative control**, one rank's save forced to fail: the old code
+  desynchronises (`TP projection all-gather failed`), the new code
+  completes all 9 requests and the gate flags the lost resume.
+- `0bde126` **batched MTP acceptance**: `forced_mtp()` builds a head
+  whose answer is known (the target's own prediction), accepted 34x on
+  dense and 35x on MoE. New MoE and Muse rows (Muse accepts 3 by chance).
+  **Negative control**, each row's draft state zeroed: the old gate
+  passes it, the new one fails. The hybrid and Muse fixtures never repeat
+  a token back to back, so a repeat-guessing head cannot be accepted
+  there; hybrid acceptance stays covered by the forced-DFlash row.
+- `cae4f07` **`serve_tp2.sh`**, the TP server launcher, and the worker
+  script in PP or TP mode (tested with a stand-in in both).
+- `9587389` merged the two doc-only branches, and `b1ed424` marked the
+  2026-09-04 decode-graph finding as wired (the server builds the graph
+  under `GRIMOIRE_DECODE_GRAPH=1`; still unmeasured).
+
+The two remaining unmerged branches, decided on evidence:
+
+- `tp-weight-sharding` (6c959e0): **superseded**. 318 of its 340
+  non-trivial added lines are already in the tree, via `c771464`
+  (2026-09-11); the rest were reworked since. Nothing to merge.
+- `research/paiton-b70-optimizations` (f02e9c4): **held on purpose**. It
+  calls itself "separate from the Tower-ready branch". It is opt-in
+  (`GRIMOIRE_SPEC_REPLAY=1`), its own two-stage tests never ran, and it
+  conflicts with the new batched-speculation state capture in
+  `grimoire.cpp` and `preflight_b70.sh`. Merge it after the Tower has a
+  baseline, so its effect can be measured against one.
+
 ## 5. What only the Tower can settle
 
 Unchanged from the day-one handoff, plus what the 9 commits added:
@@ -313,6 +372,11 @@ Then, one step at a time, reading the banner each time (rule 15):
    `batching up to 4 requests per step`.
 3. Add `GRIMOIRE_PREFIX_CACHE=1`: multi-turn resume.
 4. `tools/serve_pp2.sh`, first without slots, then with
-   `GRIMOIRE_SEQ_SLOTS`.
+   `GRIMOIRE_SEQ_SLOTS`. Then `tools/serve_tp2.sh`, the same way, plus
+   `GRIMOIRE_PREFIX_CACHE=1` (TP keeps the cache; PP does not).
 5. Only then a drafter with slots. Watch the new `drafter:
    per-sequence caches ... GiB` line against free VRAM (F2).
+6. The first measurements, none of which exist yet: tok/s at 1/2/4/8
+   concurrent; batching vs drafter vs both (F7); plain decode with
+   `GRIMOIRE_DECODE_GRAPH=1` vs without; PP vs TP on OCuLink; how many
+   slots fit at the `--ctx` you actually use.

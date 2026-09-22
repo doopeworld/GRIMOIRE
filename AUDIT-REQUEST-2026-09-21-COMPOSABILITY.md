@@ -68,6 +68,13 @@ change -- see the repo's commit log for the result at push time.
 
 ## 1. Missing features — not bugs, just not built
 
+> **All four rows below were built on 2026-09-22** by the
+> composable-serving commits `e344cf2..bf961c3` (prefix cache + batching:
+> `e344cf2`; Muse/gemma-4 batching: `96fc373`; Qwen4-Exp: `5e421ef`; TP/PP
+> batching: `96fc373`, `0f0ae7d`; batching + speculation: `5fc8af4`), and
+> audited in `AUDIT-2026-09-22-TOWER-READINESS.md`.  The table is kept as
+> the record of what was missing on 2026-09-21.
+
 These are refused BY NAME in the engine (`batch_unsupported_reason()`
 in `src/grimoire.cpp`), not silent gaps — but they are real limits on
 "does everything work everywhere."

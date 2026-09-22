@@ -60,9 +60,12 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   `GRIMOIRE_MAX_BATCH=8`; the banner says what it decided.  **No speed
   number exists and none can be taken here** -- the saving is XMX-shaped
   and off-card the batched GEMM runs on a plain-SYCL fallback.  See rule
-  19 and `DAY-ONE.md` section 2c.  **`GRIMOIRE_PREFIX_CACHE=1` does NOT
-  yet compose with this** (rule 21) -- the batchable path never resumes
-  a growing conversation, it reads it in full every turn.
+  19 and `DAY-ONE.md` section 2c.  **Since 2026-09-22 it composes with
+  `GRIMOIRE_PREFIX_CACHE=1`** (admission resumes from an idle slot's
+  snapshot, `test_batch_prefix`), **with a drafter** on one card
+  (`test_batch_spec`), and with Muse, gemma-4 and Qwen4-Exp
+  (`test_batch_decode`).  The note that stood here saying it did not
+  compose was true at `dd04198` and fixed by `e344cf2..bf961c3`.
 - **the server runs across TWO cards** (`test_pp_server`).  Pipeline
   parallel was CLI-only: `pp2run.sh` runs one prompt and exits, and
   `serve.sh` opens one render node -- so a model needing two cards
@@ -72,9 +75,12 @@ oneAPI toolchain (`TOOLCHAIN-IN-A-CONTAINER.md`, and rule 9 below):
   but the PROMPT only ever reached rank 0, and the CLI never noticed
   because every rank reads the same `-p` off its own command line.  The
   front end forwards each request now and the workers follow it.
-  `tools/serve_pp2.sh`.  Concurrency does NOT apply there -- the
-  scheduler is one-at-a-time under PP and the prefix cache is off, both
-  printed in the banner.
+  `tools/serve_pp2.sh`.  Since 2026-09-22 it batches across
+  conversations too, given `GRIMOIRE_SEQ_SLOTS > 1` (rank 0 drives the
+  workers step by step, `test_batch_parallel`); the prefix cache stays
+  off under PP, and a drafter under PP/TP stays one at a time.  Tensor
+  parallel serves too: `tools/serve_tp2.sh`, where the prefix cache
+  works and the ranks agree on every resume (`tp_agree`).
 - **NVFP4 checkpoints load** (`test_nvfp4_e2e`).  NVIDIA's Blackwell 4-bit
   format -- E2M1 with E4M3 scales per 16 and one FP32 global scale per
   tensor -- is decoded at load and handed to the ordinary quantizer, so
@@ -921,6 +927,42 @@ alone, it is one interrupting the other partway through. Test the
 interruption, not just the two features separately positioned not to
 interrupt each other.
 
+**22. WHEN CODE LIFTS A REFUSAL, THE DOCS THAT QUOTE IT ARE NOW WRONG --
+AND "EVERY GATE PASSES" CAN HIDE A BRANCH THAT NEVER RUNS (audit,
+2026-09-22).**  The nine composable-serving commits lifted five refusals
+("no batching under TP/PP", "a drafter turns batching off", "Muse/gemma-4/
+Qwen4-Exp have their own path", "the prefix cache does not compose") and
+touched no `.md` at all, so CLAUDE.md, DAY-ONE and three handoffs went on
+telling the next reader the opposite of the code.  Rule 15's grep applies
+to prose too: when a commit changes `batch_unsupported_reason()` or any
+other refusal, `grep -rn` the docs for the sentence it used to print.
+
+Three smaller things the same audit found, each cheap to check:
+
+- **CI that runs a subset is a claim about the subset.**  The workflow ran
+  6 of the 15 device gates; the other 9 had not been run against a 1,000
+  line engine change until someone built them.  They passed -- but that
+  was found out, not known.
+- **Replicated state needs agreement wherever it decides how much work is
+  done.**  Under TP each rank resumes from its OWN prefix snapshot, so a
+  save that failed on one card made that rank re-read more of the prompt
+  than its peers: more collectives on one side of the socket.  Same shape
+  as the PP `pp_spec` handshake (rule 7).  `tp_agree()` now settles the
+  save outcome and the reuse length, and a negative control with one
+  rank's save forced to fail shows the old code desynchronising.
+- **An equality gate cannot see a draft-state bug; a zero cannot see a
+  branch.**  Speculation is exact by construction, so every MTP row of the
+  batched-speculation gate passed with `accepted=0` -- and the code that
+  commits an accepted MTP block had never run.  Zeroing each row's draft
+  state still passed.  The fix was a head whose answer is KNOWN
+  (`forced_mtp()` in `tools/test_batch_spec.cpp`) and a required
+  `accepted > 0`.
+
+And one about the container, not the code: four multi-rank gates at once
+got a `test_spec_e2e` rank SIGKILLed by the memory cgroup, which the gate
+prints as `TP+DFlash FAILED (rank0 -9, ...)` -- indistinguishable from a
+real failure.  A `-9` is `dmesg` first, debugger second.
+
 ## Where to look for current status
 
 Read the newest-dated `.md` at the repo root first (sort by date in the
@@ -947,7 +989,12 @@ per session, most recent state and next-steps at the bottom of each file:
   checked, and the six ways the gates were verified to discriminate.
   Read this with `PERF-2026-09-17.md`, which is the measurement that
   started it.
-- `HANDOFF-2026-09-21-DAY-ONE-READY.md` — **newest, read this one
+- `AUDIT-2026-09-22-TOWER-READINESS.md` — **newest, read this one
+  first.**  Audit of the composable-serving commits (`e344cf2..bf961c3`),
+  what changed after it, the full gate results off the card (15 device
+  gates + 17 host suites), which branch the Tower runs, and the day-one
+  order.  Supersedes the concurrency limits the files below describe.
+- `HANDOFF-2026-09-21-DAY-ONE-READY.md` — **previous newest, read this one
   first.** Everything that shipped after the concurrency work above:
   conversation resume made cheap (a pointer move, not a copy), MoE and
   hybrid batched decode, the server mutex removed, a pre-existing MoE

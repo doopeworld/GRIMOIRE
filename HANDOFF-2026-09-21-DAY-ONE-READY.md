@@ -1,5 +1,12 @@
 # Handoff: everything off-card is done. Day one starts at the Tower.
 
+> **Superseded 2026-09-22 by `AUDIT-2026-09-22-TOWER-READINESS.md`.**
+> Nine later commits made batching compose with the prefix cache, TP, PP,
+> MTP/DFlash (one card) and Muse/gemma-4/Qwen4-Exp, so this file's "what is
+> refused" section and its "11 device gates" are out of date (there are 15).
+> The Tower should run branch `claude/grimoire-audit-testing-qa0v98`, not
+> `main`.  The rest of this file is still an accurate history.
+
 Read this first if you are picking up GRIMOIRE now. It supersedes
 `CONCURRENCY-2026-09-17.md` as the newest status doc (that file is still
 correct, just no longer current — read it for the full concurrency design

@@ -11,8 +11,17 @@ ls /mnt/storage/isos/grimoire-fuse    # if this is missing, the Unraid
                                       # ARRAY did not auto-start.  Start it.
                                       # It is NOT data loss.
 cd /mnt/storage/isos/grimoire-fuse
+git fetch origin
+git checkout claude/grimoire-audit-testing-qa0v98   # NOT main -- see below
 git pull
+git log -1 --oneline                                # confirm the tip
 ```
+
+**Which branch (2026-09-22).** `main` stopped at 2026-08-29 and is more
+than 230 commits behind; a bare `git pull` updates whichever branch the
+checkout happens to be on.  Everything in this file is on
+`claude/grimoire-audit-testing-qa0v98` (= `codex/composable-serving` plus
+the audit fixes in `AUDIT-2026-09-22-TOWER-READINESS.md`).
 
 ## 1. One command
 
@@ -26,14 +35,16 @@ yours is elsewhere, `KERNELS=/path/to/it tools/preflight_b70.sh ...`.
 `SKIP_BUILD=1` re-runs only the gates against the build you already have
 -- use it to re-check, never to skip past a broken build.
 
-That builds in the right order (bridges first — rule 3), then runs, in
-order, and stops at the first required failure:
+That builds in the right order (bridges first — rule 3), then runs every
+stage below.  A failed BUILD stops it (everything after would test a stale
+binary); a failed gate is reported and the rest still run, and the summary
+lists every failure and exits non-zero:
 
 | stage | what it proves |
 | --- | --- |
 | build | bridges + engine actually compile on this box |
 | no-Torch check | the bridges are still pure SYCL/Level Zero |
-| `make test`, `make test-correctness` | 13 host suites |
+| `make test`, `make test-correctness` | 17 host suites |
 | `bin/test_k2_kernels` | every new kernel matches its host reference |
 | `bin/test_k2_e2e` | the K2 engine path loads and generates |
 | `bin/test_model_matrix` | 10 architectures × 7 projection formats, plus the refusals |
@@ -43,7 +54,10 @@ order, and stops at the first required failure:
 | `bin/test_qwen4_exp_e2e` | Qwen3.8-Flash-Next: each mechanism is LIVE, and batched prefill == sequential decode |
 | `bin/test_nvfp4_e2e` | an NVFP4 checkpoint decodes to the same numbers as a bf16 twin |
 | `bin/test_prefix_reuse` | resuming a conversation answers what re-reading it answers, and copies no cache |
-| `bin/test_batch_decode` | conversations stepped TOGETHER answer what each answers alone |
+| `bin/test_batch_prefix` | batched requests that RESUME from the prefix cache answer what re-reading answers |
+| `bin/test_batch_decode` | conversations stepped TOGETHER answer what each answers alone (all 7 architectures) |
+| `bin/test_batch_spec` | MTP / DFlash drafts verified for several conversations in ONE batch == plain decode, with drafts really accepted |
+| `bin/test_batch_parallel` | batching under PP and TP (2 and 3 ranks), and TP + prefix cache over growing conversations, == one process |
 | `bin/test_scheduler` | requests from several threads at once answer what they answer one at a time |
 | `bin/test_pp_server` | a resident pipeline answers several requests in a row, and rank 0 gets the tokens |
 | generate | real model, real prompt — **you read the output** |
@@ -283,31 +297,40 @@ it the turn processes only the new tokens. For agentic work, where the
 prompt is long and the reply is short, that is the larger of the two
 wins on a single card.
 
-**CORRECTION (2026-09-21, external audit F8): this does NOT compose
-with batching yet, and an earlier version of this doc said it did.**
-When the scheduler admits a request into the batchable path (multiple
-sequence slots, a matrix-capable device, no drafter), it always clears
-the chosen slot and prefills the WHOLE prompt from scratch -- it never
-calls `prefix_reuse()`/`restore_prefix_upto()` first, and its completion
-path never performs the end-of-request snapshot save either. So with
-both flags set, a growing conversation served through the batchable
-path is read in full every turn regardless of `GRIMOIRE_PREFIX_CACHE`;
-the resume only happens on the SERIAL path (a drafter loaded, one slot,
-or a device that cannot batch). This was found, not assumed: fixing a
-worse bug in the same admission code (two concurrently-admitted
-requests with an identical prompt could be silently rebound onto the
-SAME physical slot -- see CLAUDE.md rule 21) required disabling the one
-mechanism that could have made batched requests resume at all, and nothing
-in the existing gates exercised the combination to notice it was already
-broken. Making both compose safely needs cache reuse to participate in
-the scheduler's OWN slot ownership, not just the engine's -- real work,
-not done here.
+**The prefix cache composes with batching (2026-09-22).** The 2026-09-21
+correction that stood here -- "this does NOT compose with batching" -- was
+fixed by the composable-serving commits (`e344cf2`).  The scheduler now
+admits every request through `admit_sequence()`: it resumes the longest
+cached prefix held by an IDLE slot (never a live one, which is what the
+2026-09-21 fix was protecting), and every finished request is snapshotted
+(`cache_sequence()`).  `bin/test_batch_prefix` drives exactly that
+combination -- three conversations growing over three turns, batched,
+with a cancellation -- against a serial run with the cache off.
 
-**What is NOT covered by any of this**: speculation. A loaded drafter
-turns batching off (the banner says so) and the server falls back to one
-request at a time, which is what it did before. MTP or DFlash versus
-eight-way batching is a real trade nobody has measured -- that is a
-Tower measurement and it is in the open list below.
+**Speculation composes with batching too, on ONE card.** A loaded drafter
+no longer turns batching off: each step drafts per conversation and
+verifies every conversation's drafts in one target batch
+(`decode_spec_batch()`, `bin/test_batch_spec`).  Three things to know
+before turning both on:
+
+- the draft depth shrinks as the batch grows (at most 16 rows per step:
+  3 rows allow depth 4, 8 rows allow depth 1), and DFlash still runs its
+  full 16-token block per row -- so at high concurrency batching plus
+  DFlash may well be slower than batching alone.  Measure it.
+- every sequence slot gets its own copy of the drafter's caches.  For a
+  DFlash drafter that is dominated by the fp32 tap buffer, max_seq x taps
+  x hidden x 4 bytes PER SLOT (64 KiB per token of `--ctx` per slot for
+  Ornith's drafter).  It is not in the load-time "GiB resident" figure;
+  the engine prints it on its own line: `drafter: per-sequence caches for
+  N slots, X GiB beyond the load-time budget`.
+- under PP or TP a drafter still means one request at a time (the banner
+  says `distributed speculative batching is not implemented`).
+
+**Launching.** `tools/serve.sh`, `serve_pp2.sh` and `serve_tp2.sh` forward
+these from your shell when they are EXPORTED (and add nothing when they
+are not), so `GRIMOIRE_SEQ_SLOTS=4 GRIMOIRE_MAX_BATCH=4 tools/serve.sh ...`
+works.  `tools/tune.sh` does NOT -- it builds its own environment; use
+`EXTRA_ENV` there, as section 1b says.
 
 ## 2d. Serving on TWO cards
 
@@ -332,11 +355,20 @@ but the PROMPT only ever reached rank 0. The CLI never noticed, because
 every rank is launched with the same `-p` and reads it off its own
 command line.
 
-**Concurrency does NOT apply here.** Under pipeline parallel the
-scheduler falls back to one request at a time, and the prefix cache is
-off. Both say so in the banner. On ONE card at int4/mxfp4 you get
-batching and resuming; this is the two-card path and it is serial. That
-is still the difference between serving the model and not.
+**Concurrency applies here now (2026-09-22)** -- with slots.  Rank 0's
+scheduler drives the other stage step by step (admit and batch-step
+control messages), so `GRIMOIRE_SEQ_SLOTS=4 tools/serve_pp2.sh ...` batches
+across conversations.  Still NOT under PP: the prefix cache (refused
+outright, and the banner says why) and a drafter together with batching
+(one request at a time).  `bin/test_batch_parallel` checks PP batching at
+2 and 3 stages against a single process, with a cancellation.
+
+**Tensor parallel serving: `tools/serve_tp2.sh`** (new 2026-09-22), same
+shape as `serve_pp2.sh` without the split.  Under TP the prefix cache DOES
+work, and the ranks agree on every resume.  Read its header before
+choosing it over PP: every sharded projection is all-gathered through
+host memory once per step, and prompt processing is token at a time.
+Nobody has measured TP against PP on OCuLink.
 
 Checked by `bin/test_pp_server`: three requests of different lengths
 down one resident pipeline, at 2 and 3 stages, answered at RANK 0, must
@@ -469,19 +501,20 @@ software recovery. The known causes, all avoidable:
     bottleneck before the weights are.
   * where that breaks down. Find the width at which aggregate tok/s
     stops rising; that is the real `GRIMOIRE_MAX_BATCH` for this box.
-  * **batching versus speculation.** A drafter turns batching off today.
-    MTP at ~2 accepted/step against 8-way batching is a genuine trade and
-    the repo holds no measurement either way. Do not assume; run both.
+  * **batching versus speculation.** They compose now (single card), so
+    the question is which mix wins: batching alone, a drafter alone, or
+    both at the concurrency Ian actually runs.  The depth shrinks as the
+    batch grows (section 2c).  The repo holds no measurement either way.
   * VRAM. Eight slots is eight KV caches. Check what `--ctx` actually
     fits alongside the model before recommending a slot count.
 
-- **Batching plus speculation, together.** They are mutually exclusive
-  right now and the refusal is explicit. A verify batch and a
-  multi-sequence batch both want the same M rows of the same prefill
-  path, so combining them is a scheduling question -- how many draft
-  tokens for how many sequences -- not a kernel one. Worth doing only if
-  the measurement above says speculation wins at the concurrency Ian
-  actually runs.
+- **Batching plus speculation, together -- DONE on one card
+  (2026-09-22).** `decode_spec_batch()` verifies every conversation's
+  drafts in one target batch; `bin/test_batch_spec` checks it against
+  plain decode for dense, hybrid, MoE and Muse, MTP and DFlash, with
+  drafts actually accepted.  Still open: the same under PP/TP, and a
+  depth policy better than "split 16 rows evenly" -- both worth doing only
+  if the measurement above says speculation earns its rows.
 
 - **Coverage, 2026-09-16.** `bin/test_model_matrix` now drives EIGHT
   architectures x 7 formats: dense, moe, hybrid, k2-horizon, **muse**,
