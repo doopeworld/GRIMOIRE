@@ -2,6 +2,17 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-09-22: READ `AUDIT-2026-09-22-TOWER-READINESS.md` FIRST.** Nine
+commits (`e344cf2..bf961c3`, from `codex/composable-serving`) made
+batching compose with the prefix cache, with TP and PP, with MTP/DFlash
+(single process), and with Muse, gemma-4 and Qwen4-Exp.  **Every
+"batching is refused under X" / "does NOT compose" statement below and in
+the 2026-09-17..21 handoffs predates that and is no longer true** --
+`batch_unsupported_reason()` now refuses only TP/PP together with a
+drafter, and a single sequence slot (the default,
+`GRIMOIRE_SEQ_SLOTS=1`).  The audit says what was verified off the card,
+what was fixed, and which branch the Tower should run (NOT `main`).
+
 **As of 2026-09-12: Ian is away until roughly 2026-09-19 and comes back
 to a Tower with two B70s on OCuLink. The job is that the box WORKS the
 day he powers it on — dual GPU, FP8, pipeline parallel.**
