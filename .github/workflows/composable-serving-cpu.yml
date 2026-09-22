@@ -71,7 +71,7 @@ jobs:
           for src in grimoire qwen35_loader native_model safetensors quantize gptq gemv_decode gemm_xmx attention deltanet moe_kernels moe_ref ops prefill tokenizer; do
             icpx "${flags[@]}" -c "src/$src.cpp" -o "cpu-obj/$src.o" > "cpu-logs/$src.build.log" 2>&1 || { cat "cpu-logs/$src.build.log"; exit 1; }
           done
-          for gate in test_batch_prefix test_batch_decode test_scheduler test_prefix_reuse; do
+          for gate in test_batch_prefix test_batch_decode test_batch_parallel test_scheduler test_prefix_reuse; do
             icpx "${flags[@]}" "tools/$gate.cpp" cpu-obj/*.o -lpthread -ldl -o "bin/$gate" > "cpu-logs/$gate.build.log" 2>&1 || { cat "cpu-logs/$gate.build.log"; exit 1; }
             timeout 900 "bin/$gate" > "cpu-logs/$gate.log" 2>&1 || { tail -100 "cpu-logs/$gate.log"; exit 1; }
             tail -5 "cpu-logs/$gate.log"

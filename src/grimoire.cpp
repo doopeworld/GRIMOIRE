@@ -1917,6 +1917,8 @@ struct Grimoire {
         std::vector<int32_t> prompt;
         int budget = 0, eos = -1, eot = -1;
         bool shutdown = false;      // the last message a worker gets
+        int kind = 0; // 0: generate, 1: shutdown, 2: admit slot, 3: batch step
+        std::vector<int32_t> slots, positions;
     };
     bool pp_send_request(const PPRequest& r);
     bool pp_recv_request(PPRequest& r);
@@ -2988,9 +2990,10 @@ struct Grimoire {
     bool prefill_muse(const std::vector<int32_t>& tokens,
                       std::vector<int32_t>* next_tokens = nullptr,
                       bool allow_exact_restore = true);
-    bool prefill_gemma4(const std::vector<int32_t>& tokens,
+    bool prefill_sandwich(const std::vector<int32_t>& tokens,
                         std::vector<int32_t>* next_tokens = nullptr,
-                        bool allow_exact_restore = true);
+                        bool allow_exact_restore = true,
+                        const SeqBatch* seqb = nullptr);
     bool prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                            std::vector<int32_t>* next_tokens);
     void snapshot_recurrent();
@@ -3177,28 +3180,50 @@ bool Grimoire::pp_recv_taps(int first, int rows) {
 // is that both sides agree, byte for byte, on every message.
 bool Grimoire::pp_send_request(const PPRequest& r) {
     if (pp_next_fd < 0) return true;              // last stage: nothing downstream
-    int32_t head[5] = { r.shutdown ? 1 : 0, int32_t(r.prompt.size()),
+    int32_t head[5] = { r.shutdown ? 1 : r.kind, int32_t(r.prompt.size()),
                         int32_t(r.budget), int32_t(r.eos), int32_t(r.eot) };
     if (!fd_write_all(pp_next_fd, head, sizeof head)) return false;
-    if (r.prompt.empty()) return true;
-    return fd_write_all(pp_next_fd, r.prompt.data(),
-                        r.prompt.size() * sizeof(int32_t));
+    const size_t bytes = r.prompt.size()*sizeof(int32_t);
+    if (bytes && !fd_write_all(pp_next_fd,r.prompt.data(),bytes)) return false;
+    if (r.kind == 3) {
+        if (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size())
+            return false;
+        if (!fd_write_all(pp_next_fd,r.slots.data(),bytes) ||
+            !fd_write_all(pp_next_fd,r.positions.data(),bytes)) return false;
+    }
+    return true;
 }
 
 bool Grimoire::pp_recv_request(PPRequest& r) {
     if (pp_prev_fd < 0) return false;             // rank 0 has no upstream
     int32_t head[5] = {0,0,0,0,0};
     if (!fd_read_all(pp_prev_fd, head, sizeof head)) return false;
-    r.shutdown = head[0] != 0;
+    if (head[0]<0 || head[0]>3) return false;
+    r.kind=head[0];
+    r.shutdown = r.kind == 1;
     const int32_t n = head[1];
     // A length off the wire sizes an allocation, so it is checked before
     // it is trusted: a desynchronised pipe would otherwise turn into a
     // multi-gigabyte resize rather than a clean failure.
-    if (n < 0 || n > max_seq) return false;
+    if (n < 0 || n > (r.kind==3?kMaxBatchRows:max_seq)) return false;
+    if ((r.kind==2 || r.kind==3) && n==0) return false;
+    if (r.kind==2 && (head[2]<0 || head[2]>=n_seq_slots)) return false;
     r.budget = head[2]; r.eos = head[3]; r.eot = head[4];
     r.prompt.assign(size_t(n), 0);
     if (n && !fd_read_all(pp_prev_fd, r.prompt.data(),
                           size_t(n) * sizeof(int32_t))) return false;
+    if (r.kind==3) {
+        r.slots.resize(size_t(n)); r.positions.resize(size_t(n));
+        if (!fd_read_all(pp_prev_fd,r.slots.data(),size_t(n)*sizeof(int32_t)) ||
+            !fd_read_all(pp_prev_fd,r.positions.data(),size_t(n)*sizeof(int32_t)))
+            return false;
+        for (int i=0;i<n;++i) {
+            if (r.slots[size_t(i)]<0 || r.slots[size_t(i)]>=n_seq_slots ||
+                r.positions[size_t(i)]<0 || r.positions[size_t(i)]>=max_seq)
+                return false;
+            for(int j=0;j<i;++j) if(r.slots[size_t(i)]==r.slots[size_t(j)]) return false;
+        }
+    }
     // Pass it on BEFORE running it, so every stage downstream starts its
     // own prefill while this one is still working.  Forwarding after
     // would serialise the pipeline on its own control messages.
@@ -6299,12 +6324,9 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //  * a drafter and a batch both want the verify path; combining them is
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
-    if (cfg.is_muse)      return "Muse has its own batched path";
-    if (cfg.is_gemma4)    return "gemma-4 has its own batched path";
     if (cfg.is_qwen4_exp) return "Qwen4-Exp has its own batched path";
     if (tp_enabled())     return "tensor parallel";
-    if (pp_enabled())     return "pipeline parallel";
-    if (mtp.ok || dflash2.ok)
+    if (pp_spec || pp_dflash || mtp.ok || dflash2.ok)
         return "a speculative drafter is loaded";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
@@ -10091,18 +10113,18 @@ long g_qwen4_exp_batched_prefills = 0;
 // so there is nothing to verify for yet, and a wrong verify path is worse
 // than none.  PP and TP return false for the same reason: unwired, not
 // broken.  Each falls back to sequential decode, which is correct.
-bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
+bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
                               std::vector<int32_t>* next_tokens,
-                              bool allow_exact_restore) {
+                              bool allow_exact_restore, const SeqBatch* seqb) {
     const int M = int(tokens.size());
-    if (M <= 0 || pos + M > max_seq) return false;
-    if (next_tokens) return false;
-    if (pp_enabled() || tp_enabled()) return false;
+    if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
+    if (next_tokens && !seqb) return false;
+    if (tp_enabled() || (pp_enabled() && !seqb)) return false;
     const int start_pos = pos;
     // allow_exact_restore threaded through from prefill() -- see the
     // matching note in prefill_muse(); same gap, same reason it is
     // latent rather than live today.
-    if (start_pos == 0 && allow_exact_restore && restore_prefix(tokens)) return true;
+    if (!seqb && start_pos == 0 && allow_exact_restore && restore_prefix(tokens)) return true;
 
     const int H = cfg.hidden, QH = cfg.n_heads;
     const int HDX = cfg.max_head_dim(), KVHX = cfg.max_kv_heads();
@@ -10126,6 +10148,7 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     float* kv   = df(size_t(M) * KVWX);
     float* vv   = df(size_t(M) * KVWX);
     float* attn = df(size_t(M) * QWX);
+    float* gate = df(size_t(M) * QWX);
     float* proj = df(size_t(M) * H);
     float* sh   = df(size_t(M) * H);
     float* ff   = df(size_t(M) * 2 * size_t(IX ? IX : 1));
@@ -10143,7 +10166,7 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     int8_t* a8  = sycl::malloc_device<int8_t>(size_t(M) * WX, q);
     float*  a8s = df(size_t(M));
     std::vector<void*> mem = {(void*)h, (void*)h2, (void*)qv, (void*)kv,
-        (void*)vv, (void*)attn, (void*)proj, (void*)sh, (void*)ff,
+        (void*)vv, (void*)attn, (void*)gate, (void*)proj, (void*)sh, (void*)ff,
         (void*)ffo, (void*)dtok, (void*)xb, (void*)a8, (void*)a8s};
     auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
     for (void* p : mem) if (!p) { cleanup(); return false; }
@@ -10213,14 +10236,25 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
     };
 
     q.memcpy(dtok, tokens.data(), size_t(M) * sizeof(int32_t));
-    launch_embed_batched(q, embed, dtok, h, M, H, none);
+    const bool first = !pp_enabled() || pp_rank==0;
+    const bool last = !pp_enabled() || pp_rank==pp_world-1;
+    if (first) {
+        launch_embed_batched(q, embed, dtok, h, M, H, none);
+        if (cfg.is_muse) {
+            launch_rmsnorm_residual_batched(q,h,nullptr,nullptr,muse_zero,
+                                            h2,M,H,eps,nullptr,none);
+            q.memcpy(h,h2,size_t(M)*H*sizeof(float));
+        }
+    } else if (!pp_recv_hidden(h,size_t(M)*H)) {
+        cleanup(); throw std::runtime_error("batch hidden receive failed");
+    }
     // Gemma4TextScaledWordEmbedding: the lookup is multiplied by
     // sqrt(hidden) BEFORE the first norm.  Omitting it changes the scale
     // every later RMSNorm sees.
-    if (cfg.embed_scale != 1.0f)
+    if (first && cfg.embed_scale != 1.0f)
         launch_scale(q, h, cfg.embed_scale, int(size_t(M) * H), none);
 
-    for (int i = 0; i < cfg.n_layers && ok; ++i) {
+    for (int i = pp_enabled()?pp_begin:0; i < (pp_enabled()?pp_end:cfg.n_layers) && ok; ++i) {
         LayerDev& d = L[i];
         const int HD = d.head_dim, KVH = d.kv_heads, QW = QH * HD;
         const int KVW = KVH * HD;
@@ -10260,33 +10294,53 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
         // so the convention stays owned by one place.
         int nconv_groups = 1; float nconv_offset = 1.0f;
         get_norm_convention(&nconv_groups, &nconv_offset);
-        if (d.rope_proportional)
-            launch_qk_norm_rope_proportional_batched(q, qv, kv, d.q_norm,
-                d.k_norm, M, QH, KVH, HD, start_pos, d.rope_theta,
-                d.partial_rope, eps, none, nconv_offset, d.rope_factor);
-        else
-            launch_qk_norm_rope_batched(q, qv, kv, d.q_norm, d.k_norm, M,
-                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps,
-                none, nconv_offset);
-
-        // v_norm on EVERY layer, scaleless, after the value source was
-        // chosen -- not only where V came from k_proj.  The rows are
-        // contiguous [M][KVH][HD], so M*KVH heads is one call.
-        if (gemma_vnorm)
-            launch_rmsnorm_heads(q, vv, gemma_vnorm, M * KVH, HD, eps,
-                                 false, none);
-
-        launch_kv_append_batched(q, kv, vv, d.k_cache, d.v_cache, M,
-                                 start_pos, KVH, HD, max_seq, none);
-
-        // Only the SLIDING layers have a window; the full-attention ones
-        // see the whole history.  Identical until the context passes the
-        // window, then quietly wrong.
-        const int window = cfg.layer_global(i) ? 0 : cfg.sliding_window;
-        launch_dflash2_block_attention(q, qv, d.k_cache, d.v_cache, attn,
-            M, start_pos, QH, KVH, HD, max_seq, window, true,
-            cfg.attn_softmax_scale(HD), none);
-        (void)QW;
+        if (cfg.is_muse) {
+            launch_rmsnorm_heads(q,qv,muse_zero,M*QH,HD,eps,true,none);
+            launch_rmsnorm_heads(q,kv,muse_zero,M*KVH,HD,eps,true,none);
+        }
+        // Rows can belong to different conversations and positions.
+        // Weight projections stay M-wide; position-dependent work is per row.
+        for (int r=0; r<(seqb?M:1); ++r) {
+            const int count=seqb?1:M, position=seqb?seqb->pos[r]:start_pos;
+            float* qr=qv+int64_t(r)*QW;
+            float* kr=kv+int64_t(r)*KVW;
+            if (cfg.is_muse) {
+                if (d.muse_sliding) {
+                    launch_rope_rows(q,qr,count,QH,HD,position,
+                                     cfg.rope_theta,cfg.partial_rope,none);
+                    launch_rope_rows(q,kr,count,KVH,HD,position,
+                                     cfg.rope_theta,cfg.partial_rope,none);
+                }
+            } else if (d.rope_proportional)
+                launch_qk_norm_rope_proportional_batched(q,qr,kr,d.q_norm,d.k_norm,
+                    count,QH,KVH,HD,position,d.rope_theta,d.partial_rope,eps,
+                    none,nconv_offset,d.rope_factor);
+            else
+                launch_qk_norm_rope_batched(q,qr,kr,d.q_norm,d.k_norm,count,
+                    QH,KVH,HD,position,d.rope_theta,d.partial_rope,eps,
+                    none,nconv_offset);
+        }
+        if (!cfg.is_muse && gemma_vnorm)
+            launch_rmsnorm_heads(q,vv,gemma_vnorm,M*KVH,HD,eps,false,none);
+        const int window=cfg.is_muse ? (d.muse_sliding?cfg.sliding_window:0)
+                                    : (cfg.layer_global(i)?0:cfg.sliding_window);
+        const float scale=cfg.is_muse ? cfg.query_prescale/std::sqrt(float(HD))
+                                     : cfg.attn_softmax_scale(HD);
+        for (int r=0; r<(seqb?M:1); ++r) {
+            const int count=seqb?1:M, position=seqb?seqb->pos[r]:start_pos;
+            auto* kc=seqb?d.k_base+size_t(seqb->slot[r])*d.kv_slot:d.k_cache;
+            auto* vc=seqb?d.v_base+size_t(seqb->slot[r])*d.kv_slot:d.v_cache;
+            launch_kv_append_batched(q,kv+int64_t(r)*KVW,vv+int64_t(r)*KVW,
+                                    kc,vc,count,position,KVH,HD,max_seq,none);
+            launch_dflash2_block_attention(q,qv+int64_t(r)*QW,kc,vc,
+                attn+int64_t(r)*QW,count,position,QH,KVH,HD,max_seq,window,true,scale,none);
+        }
+        if (cfg.is_muse) {
+            mmg(d.o_gate,h2,gate);
+            if (cfg.attn_gate==2)
+                launch_softplus_gate(q,attn,gate,attn,M*QW,kK2GateBeta,none);
+            else launch_gate_sigmoid_mul(q,attn,gate,M*QW,none);
+        }
 
         mmg(d.o_proj, attn, proj);
         if (!ok) break;
@@ -10302,7 +10356,8 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
         if (!ok) break;
         // gelu_pytorch_tanh, not silu.  The two differ by up to 0.77 on the
         // same input and nothing downstream would notice the substitution.
-        launch_geglu_batched(q, ff, ffo, M, I, none);
+        if (cfg.is_muse) launch_swiglu_batched(q,ff,ffo,M,I,none);
+        else launch_geglu_batched(q, ff, ffo, M, I, none);
         mmg(d.sh_down, ffo, proj);
         if (!ok) break;
         launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
@@ -10316,6 +10371,31 @@ bool Grimoire::prefill_gemma4(const std::vector<int32_t>& tokens,
 
     if (!ok) { q.wait(); cleanup(); return false; }
 
+    if (seqb) {
+        next_tokens->resize(size_t(M));
+        if (!last) {
+            if (!pp_send_hidden(h,size_t(M)*H)) {
+                cleanup(); throw std::runtime_error("batch hidden send failed");
+            }
+        } else {
+            launch_rmsnorm_residual_batched(q,h,nullptr,nullptr,fnorm,h2,
+                                            M,H,eps,nullptr,none);
+            for (int r=0; r<M; ++r) {
+                gemv_any(lm_head,h2+int64_t(r)*H,s.logits,none);
+                if (cfg.logit_softcap>0)
+                    launch_logit_softcap(q,s.logits,cfg.logit_softcap,cfg.vocab,none);
+                launch_argmax(q,s.logits,cfg.vocab,s.d_tok,s.d_val,none);
+                q.memcpy(next_tokens->data()+r,s.d_tok,sizeof(int32_t));
+            }
+        }
+        q.wait_and_throw();
+        if (pp_enabled() && !pp_sync_tokens(*next_tokens)) {
+            cleanup(); throw std::runtime_error("batch token sync failed");
+        }
+        ++g_batch_decode_steps; g_batch_decode_rows+=M;
+        cleanup();
+        return true;
+    }
     // prefill()'s contract includes s.logits for the LAST row: the caller
     // takes the first generated token from it and does NOT re-run the
     // prompt's final token through forward().  Leaving it stale is silent
@@ -10479,7 +10559,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         : nullptr;
 
     bool ok = true;
-    // The same tuned dispatch prefill_gemma4() uses, and for the same
+    // The same tuned dispatch prefill_sandwich() uses, and for the same
     // reasons: rule 1 (a converted weight's MXFP4 payload is FREED, so
     // the pointer and not the format decides), rule 4 (a W4A8 tile is
     // 256 wide in N and does not clamp) and rule 5 (a short prompt takes
@@ -10858,6 +10938,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
     }
     if (cfg.is_muse) {
+        if (seqb) return prefill_sandwich(tokens, next_tokens, false, seqb);
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
         return prefill_muse(tokens,next_tokens,allow_exact_restore);
     }
@@ -10865,7 +10946,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // residual graph -- attention output added raw, normalised on the way
     // INTO the FFN -- and gemma-4 is a sandwich, so running a prompt
     // through it would contradict forward_gemma4() token for token while
-    // still producing fluent text.  prefill_gemma4() is that graph
+    // still producing fluent text.  prefill_sandwich() is that graph
     // batched; it declines a verify batch and PP/TP, each of which falls
     // back to sequential decode.
     // ON by default since bin/test_gemma4_prefill went green: batched
@@ -10878,7 +10959,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // forces the sequential path for an A/B on the card.
     if (cfg.is_gemma4) {
         if (std::getenv("GRIMOIRE_GEMMA4_SEQUENTIAL_PREFILL")) return false;
-        return prefill_gemma4(tokens, next_tokens, allow_exact_restore);
+        return prefill_sandwich(tokens, next_tokens, allow_exact_restore, seqb);
     }
     // Qwen4-Exp: batched prefill below is the Qwen residual graph and
     // this model's is the hyper-connection one, so running a prompt
@@ -13098,6 +13179,12 @@ void GrimoireScheduler::run() {
                     finish(j, r);
                     continue;
                 }
+                if (e.pp_enabled()) {
+                    Grimoire::PPRequest request;
+                    request.kind=2; request.budget=slot; request.prompt=j->prompt;
+                    if (!e.pp_send_request(request))
+                        throw std::runtime_error("pipeline admission broadcast failed");
+                }
                 slot = e.admit_sequence(j->prompt, slot_busy);
                 j->slot = slot;
                 j->pos  = e.pos;
@@ -13135,6 +13222,14 @@ void GrimoireScheduler::run() {
         bool failed = false; std::string err;
         if (!toks.empty()) {
             try {
+                if (e.pp_enabled()) {
+                    Grimoire::PPRequest request;
+                    request.kind=3; request.prompt=toks;
+                    request.slots.assign(slots.begin(),slots.end());
+                    request.positions.assign(poss.begin(),poss.end());
+                    if (!e.pp_send_request(request))
+                        throw std::runtime_error("pipeline batch broadcast failed");
+                }
                 if (!e.decode_batch(toks, slots, poss, got) ||
                     got.size() != toks.size()) {
                     failed = true; err = "batched decode step failed";
@@ -13304,6 +13399,23 @@ void grimoire_pp_worker_loop(Grimoire& e) {
         std::vector<int32_t> out;
         FinishReason r = FinishReason::Length;
         try {
+            if (req.kind==2) {
+                // Rank 0 is the sole owner of live request membership.
+                // The selected slot is explicit; workers never select a cache hit.
+                std::vector<bool> busy(size_t(e.n_seq_slots),true);
+                busy[size_t(req.budget)]=false;
+                if(e.admit_sequence(req.prompt,busy)!=req.budget)
+                    throw std::runtime_error("pipeline admission slot mismatch");
+                (void)e.argmax_token(); // match rank 0's backward token hop
+                continue;
+            }
+            if (req.kind==3) {
+                const std::vector<int> slots(req.slots.begin(),req.slots.end());
+                const std::vector<int> positions(req.positions.begin(),req.positions.end());
+                if(!e.decode_batch(req.prompt,slots,positions,out))
+                    throw std::runtime_error("pipeline batch step failed");
+                continue;
+            }
             grimoire_serve_generate(e, req.prompt, req.budget, req.eos, out,
                                     req.eot, {}, &r);
         } catch (const std::exception& ex) {
