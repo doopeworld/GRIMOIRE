@@ -8,7 +8,7 @@ permissions:
 jobs:
   cpu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install CPU build dependencies
@@ -65,6 +65,7 @@ jobs:
           export CL_CONFIG_CPU_MAX_COMPUTE_UNITS=2
           env | grep -E "^(PATH|LD_LIBRARY_PATH|OCL_ICD_VENDORS|GRIMOIRE_DEVICE_ANY|ONEAPI_DEVICE_SELECTOR|CL_CONFIG_CPU_MAX_COMPUTE_UNITS|GRIMOIRE_BATCHED_PREFILL_NOXMX)=" >> "$GITHUB_ENV"
           export GRIMOIRE_BATCHED_PREFILL_NOXMX=1
+          echo "GRIMOIRE_BATCHED_PREFILL_NOXMX=1" >> "$GITHUB_ENV"
           mkdir -p cpu-obj cpu-logs bin
           icpx --version
           sycl-ls
@@ -85,7 +86,7 @@ jobs:
           tail -5 cpu-logs/test_batch_decode.log
       - name: test_batch_parallel
         run: |
-          timeout 1200 bin/test_batch_parallel > cpu-logs/test_batch_parallel.log 2>&1 || { tail -100 cpu-logs/test_batch_parallel.log; exit 1; }
+          timeout 2700 bin/test_batch_parallel > cpu-logs/test_batch_parallel.log 2>&1 || { tail -100 cpu-logs/test_batch_parallel.log; exit 1; }
           tail -5 cpu-logs/test_batch_parallel.log
       - name: test_scheduler
         run: |

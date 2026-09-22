@@ -2126,6 +2126,7 @@ struct Grimoire {
         bool     qsa = false;
         DevQuant ix_qk;                 // index_qk_proj [(ih+ikv)*ihd][H]
         bf16_t  *ix_qn = nullptr, *ix_kn = nullptr;
+        float   *ix_raw_base = nullptr, *ix_cmp_base = nullptr;
         float   *ix_kraw = nullptr;     // [max_seq][ihd]
         float   *ix_kcmp = nullptr;     // [max_seq/ratio + 1][ihd]
 
@@ -2148,7 +2149,7 @@ struct Grimoire {
         // The dilated conv's carried history: (kernel-1)*dilation rows of
         // conv_in, oldest first.  Only this window is needed, which is
         // what keeps a PLE layer's state constant in context length.
-        float   *ple_hist = nullptr;
+        float   *ple_hist = nullptr, *ple_hist_base = nullptr;
     };
     std::vector<LayerDev> L;
 
@@ -2175,7 +2176,7 @@ struct Grimoire {
     // engine never kept one; PLE needs ngram_size-1 predecessors and the
     // EOS walk needs them in order, so the whole request's tokens live
     // here.  int32 * max_seq is nothing next to a KV cache.
-    int32_t *q4_tok=nullptr;
+    int32_t *q4_tok=nullptr, *q4_tok_base=nullptr;
     int      q4_blocks_cap = 0;    // compressed key rows a QSA layer holds
     int      q4_ix_width = 0;      // index_qk_proj output rows
     int      q4_expand_w = 0;      // token_topk + compress_ratio - 1
@@ -2998,7 +2999,7 @@ struct Grimoire {
                         bool allow_exact_restore = true,
                         const SeqBatch* seqb = nullptr);
     bool prefill_qwen4_exp(const std::vector<int32_t>& tokens,
-                           std::vector<int32_t>* next_tokens);
+                           std::vector<int32_t>* next_tokens, const SeqBatch* seqb=nullptr);
     void snapshot_recurrent();
     void restore_recurrent(int saved_pos);
     void commit_spec_prefix(int saved_pos, int accepted);
@@ -3900,9 +3901,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                              "indexer.q_layernorm", &ok);
                 d.ix_kn = dev_copy_t<bf16_t>(lq, ck, src.ix_k_norm,
                                              "indexer.k_layernorm", &ok);
-                d.ix_kraw = sycl::malloc_device<float>(size_t(max_seq)*IHD, lq);
+                d.ix_raw_base = d.ix_kraw = sycl::malloc_device<float>(size_t(n_seq_slots)*max_seq*IHD, lq);
                 const int nb = max_seq / cfg.indexer_compress_ratio + 1;
-                d.ix_kcmp = sycl::malloc_device<float>(size_t(nb)*IHD, lq);
+                d.ix_cmp_base = d.ix_kcmp = sycl::malloc_device<float>(size_t(n_seq_slots)*nb*IHD, lq);
                 if (!d.ix_kraw || !d.ix_kcmp) {
                     err = "QSA indexer key cache allocation failed"; return false;
                 }
@@ -3926,8 +3927,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 d.ple_cw = dev_copy_t<bf16_t>(lq, ck, src.ple_conv1d,
                                               "ple.conv1d", &ok);
                 const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
-                d.ple_hist = sycl::malloc_device<float>(
-                    size_t(state_len > 0 ? state_len : 1) * WIDE, lq);
+                d.ple_hist_base = d.ple_hist = sycl::malloc_device<float>(
+                    size_t(n_seq_slots) * (state_len > 0 ? state_len : 1) * WIDE, lq);
+                if (!d.ple_hist) { err="PLE history allocation failed"; return false; }
 
                 // The n-gram table is the ONE weight in this engine that
                 // does NOT go to the card.  20,000,000 rows per head slice
@@ -5869,7 +5871,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         q4_inj    = sycl::malloc_device<float>(size_t(HC), q);
         q4_pinj   = sycl::malloc_device<float>(size_t(HC), q);
         q4_pend   = sycl::malloc_device<float>(size_t(H), q);
-        q4_tok    = sycl::malloc_device<int32_t>(size_t(max_seq), q);
+        q4_tok_base = q4_tok = sycl::malloc_device<int32_t>(size_t(n_seq_slots)*max_seq, q);
         if (!q4_hyper||!q4_normed||!q4_gate||!q4_lora||!q4_inj||!q4_pinj||
             !q4_pend||!q4_tok) {
             err = "Qwen4-Exp hyper-connection scratch allocation failed";
@@ -6367,7 +6369,6 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //  * a drafter and a batch both want the verify path; combining them is
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
-    if (cfg.is_qwen4_exp) return "Qwen4-Exp has its own batched path";
     if (pp_spec || pp_dflash || mtp.ok || dflash2.ok)
         return "a speculative drafter is loaded";
     if (n_seq_slots < 2)
@@ -6410,7 +6411,13 @@ void Grimoire::bind_seq_slot(int j) {
         if (d.v_base) d.v_cache = d.v_base + size_t(j) * d.kv_slot;
         if (d.dn_base) d.dn_state = d.dn_base + size_t(j) * d.dn_slot;
         if (d.conv_base) d.conv_ring = d.conv_base + size_t(j) * d.conv_slot;
+        if (d.ix_raw_base) d.ix_kraw=d.ix_raw_base+size_t(j)*max_seq*cfg.indexer_head_dim;
+        if (d.ix_cmp_base) d.ix_kcmp=d.ix_cmp_base+size_t(j)*
+            (max_seq/std::max(1,cfg.indexer_compress_ratio)+1)*cfg.indexer_head_dim;
+        if (d.ple_hist_base) d.ple_hist=d.ple_hist_base+size_t(j)*
+            std::max(1,(cfg.ple_conv_kernel-1)*cfg.ngram_size)*cfg.hc_count*cfg.hidden;
     }
+    if(q4_tok_base) q4_tok=q4_tok_base+size_t(j)*max_seq;
     seq_slot = j;
     graph_ok = false;
 }
@@ -6748,9 +6755,9 @@ void Grimoire::release() {
                         // RAM on the second load.
                         (void*)d.hc_attn.norm, (void*)d.hc_mlp.norm,
                         (void*)d.ix_qn, (void*)d.ix_kn,
-                        (void*)d.ix_kraw, (void*)d.ix_kcmp,
+                        (void*)d.ix_raw_base, (void*)d.ix_cmp_base,
                         (void*)d.ple_nk, (void*)d.ple_nq, (void*)d.ple_nc,
-                        (void*)d.ple_cw, (void*)d.ple_hist,
+                        (void*)d.ple_cw, (void*)d.ple_hist_base,
                         (void*)d.ple_mul, (void*)d.ple_size, (void*)d.ple_off,
                         const_cast<void*>(d.ple_table)})
             if (p) sycl::free(p, q);
@@ -6769,7 +6776,7 @@ void Grimoire::release() {
                      (void**)&q4_blk, (void**)&q4_idx, (void**)&q4_vis,
                      (void**)&q4_seq, (void**)&q4_qpos, (void**)&q4_emb,
                      (void**)&q4_kv, (void**)&q4_gated, (void**)&q4_conv,
-                     (void**)&q4_ids, (void**)&q4_tok})
+                     (void**)&q4_ids, (void**)&q4_tok_base})
         if (*p) { sycl::free(*p, q); *p = nullptr; }
     {
         LayerDev& d = mtp.L;
@@ -10505,10 +10512,10 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
 //  a model that is half this request and half the last one -- silently.
 // ---------------------------------------------------------------------
 bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
-                                 std::vector<int32_t>* next_tokens) {
+                                 std::vector<int32_t>* next_tokens, const SeqBatch* seqb) {
     const int M = int(tokens.size());
-    if (M <= 0 || pos + M > max_seq) return false;
-    if (next_tokens) return false;              // no speculative verify path
+    if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
+    if (next_tokens && !seqb) return false;              // no speculative verify path
     if (pp_enabled() || tp_enabled()) return false;
     const int start_pos = pos;
 
@@ -10645,7 +10652,10 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
 
     q.memcpy(dtok, tokens.data(), size_t(M) * sizeof(int32_t));
     // The n-gram hash reads the request's own token history.
-    q.memcpy(q4_tok + start_pos, tokens.data(), size_t(M) * sizeof(int32_t));
+    if(seqb) for(int r=0;r<M;++r)
+        q.memcpy(q4_tok_base+size_t(seqb->slot[r])*max_seq+seqb->pos[r],
+                 tokens.data()+r,sizeof(int32_t));
+    else q.memcpy(q4_tok + start_pos, tokens.data(), size_t(M) * sizeof(int32_t));
     launch_embed_batched(q, embed, dtok, t0, M, H, none);
     // hidden = embed(ids).repeat(1, hc_count): the SAME row in every
     // stream, not a projection.
@@ -10674,30 +10684,30 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                 launch_hc_combine(q, hyper, pinj, pend, hyper, M, HC, H, none);
                 pending = false;
             }
-            launch_ple_ngram_ids(q, q4_tok, pids, start_pos, M, d.ple_mul,
-                                 d.ple_size, d.ple_off, cfg.ngram_size - 1,
-                                 cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
+            for(int r=0;r<(seqb?M:1);++r)
+                launch_ple_ngram_ids(q,seqb?q4_tok_base+size_t(seqb->slot[r])*max_seq:q4_tok,
+                    pids+size_t(r)*NH,seqb?seqb->pos[r]:start_pos,seqb?1:M,d.ple_mul,
+                    d.ple_size,d.ple_off,cfg.ngram_size-1,cfg.heads_per_ngram,NH,
+                    cfg.eos_token_id,none);
             launch_ple_embed_gather(q, d.ple_table, d.ple_fp8, d.ple_scale,
                                     pids, pemb, M, NH, PHD, d.ple_rows, none);
             mm(d.ple_key,   pemb, pkey);
             mm(d.ple_value, pemb, pval);
             if (!ok) break;
-            launch_ple_gate(q, pkey, pval, hyper, d.ple_nk, d.ple_nq, d.ple_nc,
-                            pgat, pcnv + int64_t(SLEN) * WIDE, M, HC, H,
-                            eps, none);
-            q.memcpy(pcnv, d.ple_hist, size_t(SLEN) * WIDE * sizeof(float));
-            launch_ple_conv(q, pcnv, pgat, hyper, d.ple_cw, hyper, SLEN, M,
-                            WIDE, cfg.ple_conv_kernel, cfg.ngram_size, none);
-            // Carry the last SLEN rows into the next call.  pcnv is the
-            // old history followed by this batch, contiguously, so the
-            // last SLEN rows of the whole sequence are simply rows
-            // [M, M+SLEN) -- no special case for a batch shorter than the
-            // window, because the rows it did not replace are still in
-            // front of it.
-            if (SLEN > 0) {
-                q.memcpy(d.ple_hist, pcnv + int64_t(M) * WIDE,
-                         size_t(SLEN) * WIDE * sizeof(float));
-                q.wait();
+            // PLE history is per conversation; projections remain batched.
+            for(int r=0;r<(seqb?M:1);++r) {
+                const int count=seqb?1:M;
+                float* history=seqb?d.ple_hist_base+size_t(seqb->slot[r])*
+                    std::max(1,SLEN)*WIDE:d.ple_hist;
+                launch_ple_gate(q,pkey+int64_t(r)*WIDE,pval+int64_t(r)*H,
+                    hyper+int64_t(r)*WIDE,d.ple_nk,d.ple_nq,d.ple_nc,
+                    pgat,pcnv+int64_t(SLEN)*WIDE,count,HC,H,eps,none);
+                if(SLEN>0) q.memcpy(pcnv,history,size_t(SLEN)*WIDE*sizeof(float));
+                launch_ple_conv(q,pcnv,pgat,hyper+int64_t(r)*WIDE,d.ple_cw,
+                    hyper+int64_t(r)*WIDE,SLEN,count,WIDE,cfg.ple_conv_kernel,
+                    cfg.ngram_size,none);
+                if(SLEN>0) q.memcpy(history,pcnv+int64_t(count)*WIDE,
+                                    size_t(SLEN)*WIDE*sizeof(float));
             }
         }
 
@@ -10709,10 +10719,14 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         if (d.kind == LayerKind::LINEAR_ATTN) {
             mm(d.la_qkv, blk_in, t0);
             if (!ok) break;
-            ConvParams cp{t0, d.la_conv, d.conv_ring, nullptr, qkv_ch,
-                          cfg.conv_kernel};
-            launch_causal_conv1d_split_prefill(q, cp, M, t1, t2, t3, nullptr,
-                                               Hk * Dk, Hv * Dv);
+            for(int r=0;r<(seqb?M:1);++r) {
+                ConvParams cp{t0+int64_t(r)*qkv_ch,d.la_conv,
+                    seqb?d.conv_base+size_t(seqb->slot[r])*d.conv_slot:d.conv_ring,
+                    nullptr,qkv_ch,cfg.conv_kernel};
+                launch_causal_conv1d_split_prefill(q,cp,seqb?1:M,
+                    t1+int64_t(r)*Hk*Dk,t2+int64_t(r)*Hk*Dk,
+                    t3+int64_t(r)*Hv*Dv,nullptr,Hk*Dk,Hv*Dv);
+            }
             launch_l2norm_heads(q, t1, M * Hk, Dk, none);
             launch_l2norm_heads(q, t2, M * Hk, Dk, none);
             mm(d.la_ab, blk_in, t0);
@@ -10727,7 +10741,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                     sp.v = t3 + size_t(t) * Hv * Dv;
                     sp.a = alpha + size_t(t) * Hv;
                     sp.beta = beta + size_t(t) * Hv;
-                    sp.state = d.dn_state;
+                    sp.state = seqb?d.dn_base+size_t(seqb->slot[t])*d.dn_slot:d.dn_state;
                     sp.out = attn + size_t(t) * Hv * Dv;
                     sp.n_heads = Hv; sp.k_dim = Dk; sp.v_dim = Dv;
                     sp.n_k_heads = Hk;
@@ -10758,14 +10772,18 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             if (!ok) break;
             int nconv_groups = 1; float nconv_offset = 1.0f;
             get_norm_convention(&nconv_groups, &nconv_offset);
-            launch_qk_norm_rope_batched(q, qv, t2, d.q_norm, d.k_norm, M,
-                QH, KVH, HD, start_pos, d.rope_theta, d.partial_rope, eps,
-                none, nconv_offset);
-            launch_kv_append_batched(q, t2, t3, d.k_cache, d.v_cache, M,
-                                     start_pos, KVH, HD, max_seq, none);
+            for(int r=0;r<(seqb?M:1);++r) {
+                const int count=seqb?1:M, position=seqb?seqb->pos[r]:start_pos;
+                auto* kc=seqb?d.k_base+size_t(seqb->slot[r])*d.kv_slot:d.k_cache;
+                auto* vc=seqb?d.v_base+size_t(seqb->slot[r])*d.kv_slot:d.v_cache;
+                launch_qk_norm_rope_batched(q,qv+int64_t(r)*QH*HD,
+                    t2+int64_t(r)*KVH*HD,d.q_norm,d.k_norm,count,QH,KVH,HD,
+                    position,d.rope_theta,d.partial_rope,eps,none,nconv_offset);
+                launch_kv_append_batched(q,t2+int64_t(r)*KVH*HD,t3+int64_t(r)*KVH*HD,
+                    kc,vc,count,position,KVH,HD,max_seq,none);
+            }
 
             if (d.qsa) {
-                const int total = start_pos + M;
                 mm(d.ix_qk, blk_in, ixqk);
                 if (!ok) break;
                 // BOTH halves have to be gathered out first.  The
@@ -10782,36 +10800,45 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                                          (IH + IKV) * IHD, IHD, IHD, none);
                 launch_rmsnorm_heads(q, ixq, d.ix_qn, M * IH, IHD, eps,
                                      true, none);
-                launch_rope_rows(q, ixq, M, IH, IHD, start_pos, d.rope_theta,
-                                 d.partial_rope, none);
-                q.memcpy(d.ix_kraw + int64_t(start_pos) * IHD, ixk,
-                         size_t(M) * IHD * sizeof(float));
-                // Every block whose LAST token arrived in this batch.
-                const int b0 = start_pos / RAT, b1 = total / RAT;
-                if (b1 > b0) {
-                    float* dst = d.ix_kcmp + int64_t(b0) * IHD;
-                    launch_qsa_pool_blocks(q, d.ix_kraw, dst, b0, b1 - b0,
-                                           RAT, IHD, none);
-                    launch_rmsnorm_heads(q, dst, d.ix_kn, b1 - b0, IHD, eps,
-                                         true, none);
-                    launch_qsa_rope_blocks(q, dst, b0, b1 - b0, IHD, RAT,
-                                           d.rope_theta, d.partial_rope, none);
+                for(int r=0;r<(seqb?M:1);++r) {
+                    const int count=seqb?1:M, position=seqb?seqb->pos[r]:start_pos;
+                    const int end=position+count;
+                    const int slot=seqb?seqb->slot[r]:seq_slot;
+                    float* raw=d.ix_raw_base+size_t(slot)*max_seq*IHD;
+                    float* compressed=d.ix_cmp_base+size_t(slot)*(max_seq/RAT+1)*IHD;
+                    auto* kc=d.k_base+size_t(slot)*d.kv_slot;
+                    auto* vc=d.v_base+size_t(slot)*d.kv_slot;
+                    launch_rope_rows(q,ixq+int64_t(r)*IH*IHD,count,IH,IHD,
+                        position,d.rope_theta,d.partial_rope,none);
+                    q.memcpy(raw+int64_t(position)*IHD,ixk+int64_t(r)*IHD,
+                             size_t(count)*IHD*sizeof(float));
+                    const int b0=position/RAT, b1=end/RAT;
+                    if(b1>b0) {
+                        float* dst=compressed+int64_t(b0)*IHD;
+                        launch_qsa_pool_blocks(q,raw,dst,b0,b1-b0,RAT,IHD,none);
+                        launch_rmsnorm_heads(q,dst,d.ix_kn,b1-b0,IHD,eps,true,none);
+                        launch_qsa_rope_blocks(q,dst,b0,b1-b0,IHD,RAT,
+                                              d.rope_theta,d.partial_rope,none);
+                    }
+                    launch_qsa_row_meta(q,vis,sql,qps,count,position,end,RAT,none);
+                    const int nb=std::max(1,b1);
+                    launch_qsa_index_logits(q,ixq+int64_t(r)*IH*IHD,compressed,lgt,
+                                            count,IH,IHD,nb,vis,none);
+                    launch_qsa_topk_blocks(q,lgt,bsel,count,nb,BTK,vis,none);
+                    launch_qsa_expand_blocks(q,bsel,idx,count,BTK,RAT,
+                                             cfg.indexer_budget,sql,qps,none);
+                    launch_qsa_attention(q,qv+int64_t(r)*QH*HD,kc,vc,idx,
+                        attn+int64_t(r)*QH*HD,count,QH,KVH,HD,max_seq,EXPW,
+                        cfg.attn_softmax_scale(HD),none);
                 }
-                launch_qsa_row_meta(q, vis, sql, qps, M, start_pos, total,
-                                    RAT, none);
-                const int nb = b1 > 0 ? b1 : 1;
-                launch_qsa_index_logits(q, ixq, d.ix_kcmp, lgt, M, IH, IHD,
-                                        nb, vis, none);
-                launch_qsa_topk_blocks(q, lgt, bsel, M, nb, BTK, vis, none);
-                launch_qsa_expand_blocks(q, bsel, idx, M, BTK, RAT,
-                                         cfg.indexer_budget, sql, qps, none);
-                launch_qsa_attention(q, qv, d.k_cache, d.v_cache, idx, attn,
-                                     M, QH, KVH, HD, max_seq, EXPW,
-                                     cfg.attn_softmax_scale(HD), none);
             } else {
-                launch_dflash2_block_attention(q, qv, d.k_cache, d.v_cache,
-                    attn, M, start_pos, QH, KVH, HD, max_seq, 0, true,
-                    cfg.attn_softmax_scale(HD), none);
+                for(int r=0;r<(seqb?M:1);++r) {
+                    const int slot=seqb?seqb->slot[r]:seq_slot;
+                    launch_dflash2_block_attention(q,qv+int64_t(r)*QH*HD,
+                        d.k_base+size_t(slot)*d.kv_slot,d.v_base+size_t(slot)*d.kv_slot,
+                        attn+int64_t(r)*QH*HD,seqb?1:M,seqb?seqb->pos[r]:start_pos,
+                        QH,KVH,HD,max_seq,0,true,cfg.attn_softmax_scale(HD),none);
+                }
             }
             if (gated)
                 launch_gate_sigmoid_mul_batched(q, attn, gsplit, M, QH * HD,
@@ -10856,6 +10883,20 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
 
     if (!ok) { q.wait(); cleanup(); return false; }
 
+    if(seqb) {
+        hc_mix(hc_final,pending?pend:nullptr,pending?pinj:nullptr,nullptr,blk_in);
+        if(!ok) { q.wait(); cleanup(); return false; }
+        next_tokens->resize(size_t(M));
+        for(int r=0;r<M;++r) {
+            gemv_any(lm_head,blk_in+int64_t(r)*H,s.logits,none);
+            launch_argmax(q,s.logits,cfg.vocab,s.d_tok,s.d_val,none);
+            q.memcpy(next_tokens->data()+r,s.d_tok,sizeof(int32_t));
+        }
+        q.wait_and_throw();
+        cleanup();
+        ++g_batch_decode_steps; g_batch_decode_rows+=M;
+        return true;
+    }
     // prefill()'s contract includes s.logits for the LAST row: the caller
     // takes the first generated token from it and does not re-run the
     // prompt's final token through forward().  The tail mixer therefore
@@ -11022,7 +11063,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // still emit fluent text.  prefill_qwen4_exp() is that graph batched.
     if (cfg.is_qwen4_exp) {
         if (std::getenv("GRIMOIRE_QWEN4EXP_SEQUENTIAL_PREFILL")) return false;
-        return prefill_qwen4_exp(tokens, next_tokens);
+        return prefill_qwen4_exp(tokens, next_tokens, seqb);
     }
     const int M = int(tokens.size());
     if (M <= 0) return false;

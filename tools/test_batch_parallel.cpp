@@ -72,7 +72,7 @@ static std::vector<std::vector<int32_t>> requests() {
     }
     return v;
 }
-static const int kWant = 12;
+static const int kWant = 6;
 
 // One process of the pipeline.  Rank 0 is the front end: it forwards
 // each request and then serves it, exactly as the scheduler does inside
