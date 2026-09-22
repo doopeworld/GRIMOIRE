@@ -12,6 +12,47 @@ namespace b70 {
 extern long g_spec_batch_steps,g_spec_batch_proposals,g_spec_batch_accepted,g_spec_batch_sequences;
 }
 using Replies=std::vector<std::vector<int32_t>>;
+
+// AN MTP HEAD THAT PREDICTS EXACTLY WHAT THE TARGET WOULD (2026-09-22).
+// The random heads never accept a draft here (accepted=0 on every MTP row),
+// so the half of decode_spec_batch() that commits an accepted MTP block --
+// mtp_warm over accepted > 1, recurrent state restored from a step past
+// the first -- had never run.  A trained head is not available off the
+// card; this one is built so its answer is KNOWN:
+//   fc      = [0 | I]   drop the embedding half, pass norm(hidden) through
+//   o_proj  = 0         the decoder layer adds nothing to the residual
+//   down    = 0         (every down_proj, so a routed head too)
+//   norms   = the target's final norm, and the same on the hidden input
+// so the head computes lm_head(norm(h)) -- the target's own prediction
+// from the anchor's hidden state, i.e. the anchor again.  It guesses "the
+// target repeats itself", which the target does often enough here to be
+// accepted, and exactness is still the target's to decide.
+static mini::Arch forced_mtp(mini::Arch a) {
+    std::vector<float> norm;
+    for(const auto& t:a.tensors) if(t.name=="model.norm.weight") norm=t.fill;
+    for(auto& t:a.tensors) {
+        size_t count=1; for(int64_t d:t.shape) count*=size_t(d);
+        const std::string& n=t.name;
+        auto ends=[&](const char* tail) {
+            const std::string x(tail);
+            return n.size()>=x.size() && n.compare(n.size()-x.size(),x.size(),x)==0;
+        };
+        if(n=="mtp.fc.weight") {
+            const int H=int(t.shape[0]);
+            t.fill.assign(count,0.f);
+            for(int i=0;i<H;++i) t.fill[size_t(i)*2*H+H+i]=1.f;
+        } else if(n=="model.norm.weight" || n=="mtp.norm.weight" ||
+                  n=="mtp.pre_fc_norm_hidden.weight") {
+            // (1 + w) convention: zeros are scale one.  A fixture that
+            // already pins its final norm (Muse: ones) keeps it, copied.
+            t.fill=norm.empty()?std::vector<float>(count,0.f):norm;
+        } else if(n.rfind("mtp.layers.0.",0)==0 &&
+                  (ends("o_proj.weight") || ends("down_proj.weight"))) {
+            t.fill.assign(count,0.f);
+        }
+    }
+    return a;
+}
 static Grimoire* load(const std::filesystem::path& path) {
     auto* e=grimoire_new(); std::string error;
     if(!grimoire_load(*e,path.string(),Fmt::BF16,128,error)) {
@@ -31,10 +72,32 @@ int main() {
     for(int k=0;k<3;++k) for(int i=0;i<17+k*7;++i)
         prompts[k].push_back((i*17+k*13+7)%120);
     try {
-        for(bool hybrid:{false,true}) for(int draft_kind:{0,1,2}) {
-            const bool dflash=draft_kind!=0, forced=draft_kind==2;
-            const auto dir=std::filesystem::path(tmp)/((hybrid?"hybrid":"dense")+std::string(forced?"-forced":dflash?"-dflash":"-mtp"));
-            mini::write_model(dir,hybrid?mini::hybrid(4,!dflash):mini::dense(4,!dflash));
+        // draft kinds: 0 MTP, 1 DFlash, 2 DFlash forced to accept,
+        // 3 MTP forced to accept (forced_mtp).  MoE and Muse have MTP heads
+        // in the fixtures and no DFlash drafter shaped for them.
+        //
+        // forced_mtp guesses "the target repeats itself", so it can only be
+        // accepted where the target does.  The dense and MoE fixtures do
+        // (126 126 126 ..., 41 41 41 ...); the hybrid and Muse ones never
+        // repeat a token back to back on these prompts, so a forced MTP row
+        // there could not accept and would test nothing new.  The hybrid
+        // accept-and-restore path is the forced DFlash row's job.
+        struct Cell { const char* arch; int draft_kind; };
+        const Cell cells[]={
+            {"dense",0},{"dense",1},{"dense",2},{"dense",3},
+            {"hybrid",0},{"hybrid",1},{"hybrid",2},
+            {"moe",0},{"moe",3},{"muse",0}};
+        for(const Cell& cell:cells) {
+            const int draft_kind=cell.draft_kind;
+            const bool dflash=draft_kind==1 || draft_kind==2, forced=draft_kind>=2;
+            const std::string arch(cell.arch);
+            const char* kind[]={"-mtp","-dflash","-forced","-mtp-forced"};
+            const auto dir=std::filesystem::path(tmp)/(arch+kind[draft_kind]);
+            mini::Arch target=arch=="hybrid"?mini::hybrid(4,!dflash):
+                              arch=="moe"   ?mini::moe(4,!dflash):
+                              arch=="muse"  ?mini::muse(6,!dflash):mini::dense(4,!dflash);
+            if(draft_kind==3) target=forced_mtp(target);
+            mini::write_model(dir,target);
             ::unsetenv("GRIMOIRE_MTP"); ::unsetenv("GRIMOIRE_DFLASH_MODEL");
             auto* baseline=load(dir);
             Replies reference(3);
