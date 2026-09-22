@@ -13,7 +13,8 @@ Tower and the B70s.*
   plus 9 newer commits. **So one branch holds everything.**
 - **Ready to START testing on the Tower: yes.** At `bf961c3` every source
   compiles cleanly (0 warnings), `bin/grimoire` and `bin/grimoire-server`
-  link, and every off-card gate that finished passed (table below).
+  link, and **all 15 device gates and all 17 host suites pass off the
+  card** (CPU OpenCL device; table in section 3).
 - **"Finished": no.** It has never run on a B70. No kernel has run on XMX
   hardware, no AOT image or bridge build has been tested, OCuLink has not
   been exercised, and there is no speed number anywhere. The docs also
@@ -105,17 +106,30 @@ Device gates at `bf961c3` (unpatched tip):
 | test_scheduler | yes | ALL PASS |
 | test_batch_decode | yes | ALL PASS |
 | test_batch_parallel | yes | green in CI, all 6 shards (not re-run here) |
-| test_model_matrix | no | IN PROGRESS: every completed cell `ok` so far |
-| test_parallel_e2e | no | IN PROGRESS: every completed cell `match` so far |
-| test_spec_e2e | no | IN PROGRESS: every completed cell `identical` / `match` so far |
-| test_pp_server | no | queued behind test_spec_e2e |
+| test_model_matrix | no | ALL PASS (0 failed cells), 10 architectures x 7 formats, 49 min |
+| test_parallel_e2e | no | ALL PASS, 50 PP/TP matches, 0 failures, 55 min |
+| test_spec_e2e | no | ALL PASS (0 failures), 58 min |
+| test_pp_server | no | ALL PASS, 16 min |
 
-The last four are slow off the card: the repo's own notes put them at
-15-30+ min each on a 4-core container, and 4 ran at once here. This
-table is updated when they finish.
+**All 15 device gates and all 17 host suites are green at `bf961c3`.**
+That includes the four that timed out in the 2026-09-21 session. Given
+up to 90 min each, they all finish. (The earlier timeouts were the
+clock, as `AUDIT-REQUEST-2026-09-21-COMPOSABILITY.md` section 3
+concluded.)
 
 Gates re-run on this branch with the fixes below: test_batch_spec,
 test_batch_prefix, test_prefix_reuse, test_scheduler, all ALL PASS.
+`test_spec_e2e` on the patched build: every cell matched the tip run cell
+for cell except one that was OOM-killed (below). A clean solo re-run was
+in progress at this commit.
+
+One trap while doing this, worth knowing before running gates in
+parallel off the card: with four gates at once, the container's memory
+cgroup OOM-killed rank 0 of a `test_spec_e2e` TP cell (`dmesg`: "Memory
+cgroup out of memory: Killed process ... test_spec_e2e", 1.8 GB
+resident). The gate reports that as `TP+DFlash FAILED (rank0 -9, rank1
+4)`, which looks exactly like a code failure. `-9` means SIGKILL: check
+`dmesg` before debugging a multi-rank cell that died that way.
 
 Reviewed by reading: the full 1,729-line `grimoire.cpp` diff
 `fd41d9e..bf961c3`, plus the launch scripts, the preflight and the CI
@@ -147,8 +161,9 @@ workflow. Specific things checked and found **correct**:
 ## 4. Findings
 
 Ranked by what they cost on the Tower. "Fixed" means fixed on this branch
-and re-verified as stated. Nothing here was found by a failing gate. Every
-gate that ran passed.
+and re-verified as stated. None of these came from a failing gate: every
+gate passes. They came from reading the diff, the launchers and the
+coverage.
 
 **F1. The docs describe the code before the 9 commits. (docs, not fixed
 beyond a pointer)** `CLAUDE.md` (the "does NOT yet compose" and "Concurrency does NOT apply
