@@ -119,9 +119,11 @@ concluded.)
 
 Gates re-run on this branch with the fixes below: test_batch_spec,
 test_batch_prefix, test_prefix_reuse, test_scheduler, all ALL PASS.
-`test_spec_e2e` on the patched build: every cell matched the tip run cell
-for cell except one that was OOM-killed (below). A clean solo re-run was
-in progress at this commit.
+`test_spec_e2e` on the patched build (it loads MTP and DFlash drafters
+single-process, under TP and under PP, so it goes through the changed
+`init_draft_slots()`): **ALL PASS, and identical to the tip run cell
+for cell** on a clean solo run. An earlier concurrent run lost one cell
+to the OOM killer, described below.
 
 One trap while doing this, worth knowing before running gates in
 parallel off the card: with four gates at once, the container's memory
