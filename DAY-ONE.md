@@ -12,16 +12,16 @@ ls /mnt/storage/isos/grimoire-fuse    # if this is missing, the Unraid
                                       # It is NOT data loss.
 cd /mnt/storage/isos/grimoire-fuse
 git fetch origin
-git checkout claude/grimoire-audit-testing-qa0v98   # NOT main -- see below
+git checkout main
 git pull
 git log -1 --oneline                                # confirm the tip
 ```
 
-**Which branch (2026-09-22).** `main` stopped at 2026-08-29 and is more
-than 230 commits behind; a bare `git pull` updates whichever branch the
-checkout happens to be on.  Everything in this file is on
-`claude/grimoire-audit-testing-qa0v98` (= `codex/composable-serving` plus
-the audit fixes in `AUDIT-2026-09-22-TOWER-READINESS.md`).
+**Branch (2026-09-22): `main`.** Everything in this file is on `main`: the
+composable-serving work plus the audit fixes in
+`AUDIT-2026-09-22-TOWER-READINESS.md`.  If the Tower checkout sits on some
+other branch, `git checkout main` first -- a bare `git pull` only updates
+the branch you are on.
 
 ## 1. One command
 

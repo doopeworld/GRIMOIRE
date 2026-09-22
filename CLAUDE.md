@@ -11,7 +11,7 @@ the 2026-09-17..21 handoffs predates that and is no longer true** --
 `batch_unsupported_reason()` now refuses only TP/PP together with a
 drafter, and a single sequence slot (the default,
 `GRIMOIRE_SEQ_SLOTS=1`).  The audit says what was verified off the card,
-what was fixed, and which branch the Tower should run (NOT `main`).
+what was fixed, and the day-one order.  Everything is on `main`.
 
 **As of 2026-09-12: Ian is away until roughly 2026-09-19 and comes back
 to a Tower with two B70s on OCuLink. The job is that the box WORKS the

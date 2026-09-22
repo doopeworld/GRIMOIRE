@@ -21,11 +21,9 @@ Tower and the B70s.*
   is the first real test, not a formality. Everything that CAN be done
   off the card is done (section 4b): every finding below that code can
   fix is fixed, and the docs match the code again.
-- **Use this branch on the Tower** (`claude/grimoire-audit-testing-qa0v98`
-  = `bf961c3` + the fixes below), or `codex/composable-serving` if you
-  want the fixes left out. **Do not use `main`.** It is at `dcc549c`
-  (2026-08-29), 229 commits behind. `DAY-ONE.md` only says `git pull`,
-  which updates whichever branch the Tower checkout is on.
+- **Everything is on `main`** (fast-forwarded 2026-09-22 from
+  `claude/grimoire-audit-testing-qa0v98` = `bf961c3` + the fixes below).
+  On the Tower: `git checkout main && git pull`.
 
 ## 1. The report in the screenshot
 
@@ -359,7 +357,7 @@ Unchanged from the day-one handoff, plus what the 9 commits added:
 ssh root@192.168.8.225
 cd /mnt/storage/isos/grimoire-fuse
 git fetch origin
-git checkout claude/grimoire-audit-testing-qa0v98   # NOT main
+git checkout main && git pull
 git log -1 --oneline                                  # confirm the tip
 tools/preflight_b70.sh /models/<model-dir>            # read the generated text
 ```

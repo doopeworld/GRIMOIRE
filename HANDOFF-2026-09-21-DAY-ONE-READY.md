@@ -4,8 +4,8 @@
 > Nine later commits made batching compose with the prefix cache, TP, PP,
 > MTP/DFlash (one card) and Muse/gemma-4/Qwen4-Exp, so this file's "what is
 > refused" section and its "11 device gates" are out of date (there are 15).
-> The Tower should run branch `claude/grimoire-audit-testing-qa0v98`, not
-> `main`.  The rest of this file is still an accurate history.
+> Everything is on `main` now.  The rest of this file is still an
+> accurate history.
 
 Read this first if you are picking up GRIMOIRE now. It supersedes
 `CONCURRENCY-2026-09-17.md` as the newest status doc (that file is still
