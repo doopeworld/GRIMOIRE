@@ -251,7 +251,10 @@ run_gate bin/test_gemma4_prefill
 run_gate bin/test_qwen4_exp_e2e
 run_gate bin/test_nvfp4_e2e
 run_gate bin/test_prefix_reuse
+run_gate bin/test_batch_prefix
 run_gate bin/test_batch_decode
+run_gate bin/test_batch_spec
+run_multigpu_gate bin/test_batch_parallel
 run_gate bin/test_scheduler
 run_multigpu_gate bin/test_pp_server
 

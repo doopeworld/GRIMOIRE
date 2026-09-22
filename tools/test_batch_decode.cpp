@@ -115,6 +115,10 @@ int main() {
 
     struct Cell { const char* name; mini::Arch arch; };
     std::vector<Cell> cells;
+    cells.push_back({"qwen4-exp", mini::qwen4_exp()});
+    cells.push_back({"muse", mini::muse()});
+    cells.push_back({"gemma4", mini::gemma4()});
+    cells.push_back({"gemma4-wide", mini::gemma4_wide()});
     cells.push_back({"dense", mini::dense()});
     cells.push_back({"moe",   mini::moe()});
     // Hybrid: DeltaNet layers carry the conversation in a recurrent
