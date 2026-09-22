@@ -44,6 +44,11 @@ if docker ps --format '{{.Names}}' | grep -q '^grim-'; then
 fi
 docker rm -f "$CNAME" >/dev/null 2>&1 || true
 
+# Serving knobs pass through from the host ONLY IF SET there: `-e NAME` with
+# no value copies the host's value and adds nothing when it is unset, so
+# the default launch is unchanged.  Without these the batching, prefix-
+# cache and speculation settings could not reach the container at all.
+#
 # Both cards in one container, exactly as pp2run.sh does it: separate
 # processes, separate Level Zero contexts, full DRM access.
 CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
@@ -64,6 +69,15 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -e GRIMOIRE_XE2_ATTN_BRIDGE=/grimoire/src/libgrimoire_xe2_attention_bridge.so \
     -e GRIMOIRE_XE2_GDN_RAW_BRIDGE=/grimoire/src/libgrimoire_xe2_gdn_raw.so \
     -e GRIMOIRE_ONEDNN_BRIDGE=/grimoire/src/libgrimoire_onednn.so \
+    -e GRIMOIRE_SEQ_SLOTS \
+    -e GRIMOIRE_MAX_BATCH \
+    -e GRIMOIRE_PREFIX_CACHE \
+    -e GRIMOIRE_PREFIX_SLOTS \
+    -e GRIMOIRE_MTP \
+    -e GRIMOIRE_MTP_K \
+    -e GRIMOIRE_DFLASH_MODEL \
+    -e GRIMOIRE_DFLASH_M \
+    -e GRIMOIRE_SPEC_STATS \
     -e LD_LIBRARY_PATH=/grimoire/src:/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/usr/local/lib \
     --entrypoint /grimoire/tools/serve_pp2_worker.sh "$IMAGE" \
     "$MODEL" "$PORT" "$PROJ" "$CTX")
@@ -77,5 +91,6 @@ echo "  docker logs -f $CNAME"
 echo "  curl -s localhost:${PORT}/v1/models"
 echo
 echo "READ THE BANNER before believing anything (rule 15).  Rank 0 prints"
-echo "what it decided; 'batching one at a time -- pipeline parallel' is"
-echo "expected here and is not an error."
+echo "what the scheduler decided.  Without GRIMOIRE_SEQ_SLOTS>1 it is 'one"
+echo "request at a time -- only one sequence slot', which is expected; PP"
+echo "batching needs slots, and PP plus a drafter stays one at a time."

@@ -17,6 +17,10 @@ NODE=$(bash tools/gpunode.sh "$GPU") || { echo "cannot resolve $GPU" >&2; exit 2
 echo "GPU=$GPU -> $NODE, model=$MODEL, port=$PORT"
 
 docker rm -f "$CNAME" >/dev/null 2>&1 || true
+# Serving knobs pass through from the host ONLY IF SET there: `-e NAME` with
+# no value copies the host's value and adds nothing when it is unset, so
+# the default launch is unchanged.  Without these the batching, prefix-
+# cache and speculation settings could not reach the container at all.
 docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -p "${PORT}:${PORT}" \
   --device "/dev/dri/${NODE}:/dev/dri/${NODE}" \
@@ -27,6 +31,15 @@ docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -e GRIMOIRE_DEFER_MOE_GATHER=1 \
   -e GRIMOIRE_BF16_QKV=1 \
   -e GRIMOIRE_BF16_DN_QKV=1 \
+  -e GRIMOIRE_SEQ_SLOTS \
+  -e GRIMOIRE_MAX_BATCH \
+  -e GRIMOIRE_PREFIX_CACHE \
+  -e GRIMOIRE_PREFIX_SLOTS \
+  -e GRIMOIRE_MTP \
+  -e GRIMOIRE_MTP_K \
+  -e GRIMOIRE_DFLASH_MODEL \
+  -e GRIMOIRE_DFLASH_M \
+  -e GRIMOIRE_SPEC_STATS \
   -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
   --entrypoint /grimoire/bin/grimoire-server \
   "$IMAGE" \
