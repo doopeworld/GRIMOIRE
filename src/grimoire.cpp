@@ -2209,6 +2209,7 @@ struct Grimoire {
     };
     struct PrefixCache {
         bool valid = false;
+        bool output_valid = false; // batched snapshots have state, not scalar logits
         std::vector<int32_t> tokens;
         std::vector<PrefixLayerCache> layers;
         float *hidden = nullptr, *logits = nullptr;
@@ -2279,9 +2280,13 @@ struct Grimoire {
     // How many leading tokens the snapshot covers (0 == no reuse), and
     // the restore that leaves the cursor there so the rest can be
     // prefilled on top.
-    int  prefix_reuse(const std::vector<int32_t>& tokens) const;
+    int  prefix_reuse(const std::vector<int32_t>& tokens,
+                      const std::vector<bool>* busy = nullptr) const;
     bool restore_prefix_upto(int n);
-    bool save_prefix(const std::vector<int32_t>& tokens);
+    bool save_prefix(const std::vector<int32_t>& tokens, bool output_valid = true);
+    int admit_sequence(const std::vector<int32_t>& prompt, const std::vector<bool>& busy);
+    void cache_sequence(int slot, int position, const std::vector<int32_t>& prompt,
+                        const std::vector<int32_t>& reply);
     // What generate_tokens() calls at the end of a request, covering the
     // prompt AND the reply.  Named apart from save_prefix() so the
     // generation template does not depend on the private one's contract.
@@ -6157,7 +6162,7 @@ std::string Grimoire::prefix_cache_unusable_reason() const {
     return {};
 }
 
-bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
+bool Grimoire::save_prefix(const std::vector<int32_t>& tokens, bool output_valid) {
     if (!prefix_cache_usable() || tokens.empty()) return false;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
@@ -6206,10 +6211,14 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
         if (d.dn_state) { q.memcpy(c.dn, d.dn_state, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
         if (d.conv_ring) { q.memcpy(c.conv, d.conv_ring, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
     }
-    q.memcpy(prefix_cache.hidden, s.h, size_t(cfg.hidden) * sizeof(float));
-    q.memcpy(prefix_cache.logits, s.logits, size_t(cfg.vocab) * sizeof(float)).wait();
-    g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float)) +
-                             long(size_t(cfg.vocab) * sizeof(float));
+    if (output_valid) {
+        q.memcpy(prefix_cache.hidden, s.h, size_t(cfg.hidden) * sizeof(float));
+        q.memcpy(prefix_cache.logits, s.logits, size_t(cfg.vocab) * sizeof(float));
+        g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float)) +
+                                 long(size_t(cfg.vocab) * sizeof(float));
+    }
+    q.wait_and_throw();
+    prefix_cache.output_valid = output_valid;
     prefix_cache.tokens = tokens;
     prefix_cache.valid = true;
     prefix_cache.used = ++prefix_clock;
@@ -6235,13 +6244,14 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens) {
 // state of a hybrid model is not indexed by position, so it cannot be
 // rewound to an arbitrary point.  The only position it can resume from
 // is the one it was snapshotted at.
-int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens) const {
+int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
+                          const std::vector<bool>* busy) const {
     prefix_hit = -1;
     if (!prefix_cache_usable()) return 0;
     int best = 0;
     for (size_t sl = 0; sl < prefix_slots.size(); ++sl) {
         const PrefixCache& c = prefix_slots[sl];
-        if (!c.valid) continue;
+        if (!c.valid || (busy && (*busy)[sl])) continue;
         const size_t n = c.tokens.size();
         // Leave at least one token to process: prefill() owes s.logits for
         // the last row, and a zero-token prefill would leave the caller
@@ -6364,7 +6374,8 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     if (!prefix_cache_usable()) return false;
     int hit = -1;
     for (size_t sl = 0; sl < prefix_slots.size(); ++sl)
-        if (prefix_slots[sl].valid && prefix_slots[sl].tokens == tokens) hit = int(sl);
+        if (prefix_slots[sl].valid && prefix_slots[sl].output_valid &&
+            prefix_slots[sl].tokens == tokens) hit = int(sl);
     if (hit < 0) return false;
     // Claim the slot, for the same reason save_prefix() does: whatever
     // this request saves next belongs to the conversation it just
@@ -6419,14 +6430,79 @@ bool Grimoire::restore_prefix_upto(int n) {
         if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
         if (d.conv_ring) { q.memcpy(d.conv_ring, c.conv, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
     }
-    q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
-    g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float));
+    if (prefix_cache.output_valid) {
+        q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
+        g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float));
+    }
     pos = n;
     set_cursor(pos);
     q.wait_and_throw();
     ++g_prefix_tokens_reused_calls;
     g_prefix_tokens_reused += n;
     return true;
+}
+
+// Admission owns the choice of physical slot. Cache lookup excludes every
+// live request, including live requests with an identical system prompt.
+int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
+                            const std::vector<bool>& busy) {
+    if (busy.size() != size_t(n_seq_slots))
+        throw std::invalid_argument("sequence ownership size mismatch");
+    sync();
+    const int reused = prefix_reuse(prompt, &busy);
+    int slot = reused ? prefix_hit : -1;
+    if (slot < 0) {
+        for (int i=0; i<n_seq_slots; ++i) {
+            if (busy[size_t(i)]) continue;
+            if (slot < 0) slot = i;
+            if (size_t(i) >= prefix_slots.size() || !prefix_slots[size_t(i)].valid) {
+                slot = i; break;
+            }
+            if (prefix_slots[size_t(i)].used < prefix_slots[size_t(slot)].used)
+                slot = i;
+        }
+    }
+    if (slot < 0) throw std::runtime_error("no idle sequence slot");
+    try {
+        auto restore = [&] {
+            if (reused) {
+                prefix_hit = slot;
+                if (!restore_prefix_upto(reused))
+                    throw std::runtime_error("sequence prefix restore failed");
+            } else clear_seq_slot(slot);
+        };
+        restore();
+        const std::vector<int32_t> tail(prompt.begin()+reused, prompt.end());
+        if (!prefill(tail, nullptr, nullptr, false)) {
+            // A failed prefill may already have advanced recurrent state.
+            sync(); restore();
+            for (int32_t t : tail)
+                if (!forward(t)) throw std::runtime_error("prompt ingestion failed");
+        }
+        sync();
+        return slot;
+    } catch (...) {
+        if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
+        throw;
+    }
+}
+
+void Grimoire::cache_sequence(int slot, int position,
+                             const std::vector<int32_t>& prompt,
+                             const std::vector<int32_t>& reply) {
+    if (!prefix_cache_usable()) return;
+    std::vector<int32_t> processed = prompt;
+    processed.insert(processed.end(), reply.begin(), reply.end());
+    // Tokens may have been delivered before being fed back to the target.
+    // Never label the snapshot with state the engine has not processed.
+    if (position <= 0 || size_t(position) > processed.size()) {
+        if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
+        return;
+    }
+    processed.resize(size_t(position));
+    sync(); bind_seq_slot(slot); pos=position;
+    if (!save_prefix(processed, false) && size_t(slot)<prefix_slots.size())
+        prefix_slots[size_t(slot)].valid=false;
 }
 
 void Grimoire::snapshot_recurrent() {
@@ -12739,28 +12815,27 @@ int grimoire_serve_generate_batch(Grimoire& e,
         bool live;
     };
     std::vector<Row> rows;
+    std::vector<bool> busy(size_t(e.n_seq_slots), false);
+    struct InvalidateOnFailure {
+        Grimoire& engine;
+        std::vector<bool>& busy;
+        bool completed = false;
+        ~InvalidateOnFailure() {
+            if (!completed)
+                for (size_t i=0; i<busy.size() && i<engine.prefix_slots.size(); ++i)
+                    if (busy[i]) engine.prefix_slots[i].valid=false;
+        }
+    } invalidator{e, busy};
     const int budget_cap = e.max_seq;
     // Read each prompt into its own slot.  reset() is what clears a slot
     // and claims it; binding after it is what puts this sequence's rows
     // under the live pointers for the prefill that follows.
     for (size_t i = 0; i < prompts.size(); ++i) {
-        const int slot = int(i);
         const int budget = generation_budget(prompts[i], n_predict,
                                              budget_cap, e.cfg.vocab);
         if (budget <= 0) continue;
-        e.sync();
-        e.clear_seq_slot(slot);
-        // allow_exact_restore=false (external audit, 2026-09-21): this
-        // slot was JUST chosen and cleared for this row specifically.
-        // An exact-prompt cache hit must not silently rebind it onto
-        // whichever slot happens to hold a matching earlier snapshot --
-        // two rows of this same batch could then end up sharing one
-        // physical slot. See the note on prefill()'s declaration.
-        if (!e.prefill(prompts[i], nullptr, nullptr, false))
-            for (int32_t t : prompts[i])
-                if (!e.forward(t))
-                    throw std::runtime_error("batch prompt ingestion failed");
-        e.sync();
+        const int slot = e.admit_sequence(prompts[i], busy);
+        busy[size_t(slot)] = true;
         rows.push_back({i, slot, e.pos, e.argmax_token(), true});
     }
 
@@ -12819,8 +12894,12 @@ int grimoire_serve_generate_batch(Grimoire& e,
     // The engine's single cursor means nothing after a batch (see
     // prefill).  Leave it empty rather than leave the last row's numbers
     // looking like a finished single-sequence request.
+    for (const auto& r : rows)
+        e.cache_sequence(r.slot, r.pos, prompts[r.idx], out_ids[r.idx]);
     e.sync();
-    e.reset();
+    e.graph_ok = false;
+    e.pos = 0;
+    invalidator.completed = true;
     return int(prompts.size());
 }
 
@@ -12913,6 +12992,26 @@ struct GrimoireScheduler {
 void GrimoireScheduler::run() {
     std::vector<std::shared_ptr<SchedJob>> active;
     std::vector<bool> slot_busy(size_t(std::max(1, e.n_seq_slots)), false);
+    auto retire = [&](const std::shared_ptr<SchedJob>& j, FinishReason why,
+                      bool cache = true, const std::string& err = std::string{}) {
+        if (j->slot >= 0) {
+            if (cache) {
+                try {
+                    std::vector<int32_t> reply;
+                    { std::lock_guard<std::mutex> lock(j->mu); reply=j->ready; }
+                    e.cache_sequence(j->slot, j->pos, j->prompt, reply);
+                } catch (const std::exception& ex) {
+                    if (size_t(j->slot)<e.prefix_slots.size())
+                        e.prefix_slots[size_t(j->slot)].valid=false;
+                    std::fprintf(stderr, "prefix snapshot skipped: %s\n", ex.what());
+                }
+            } else if (size_t(j->slot)<e.prefix_slots.size()) {
+                e.prefix_slots[size_t(j->slot)].valid=false;
+            }
+            slot_busy[size_t(j->slot)] = false;
+        }
+        finish(j, why, err);
+    };
     for (;;) {
         // ---- admit ---------------------------------------------------
         std::vector<std::shared_ptr<SchedJob>> taking;
@@ -12999,16 +13098,7 @@ void GrimoireScheduler::run() {
                     finish(j, r);
                     continue;
                 }
-                e.sync();
-                e.clear_seq_slot(slot);
-                // allow_exact_restore=false, same reasoning as the direct
-                // batch driver above: this slot is THIS job's, just
-                // chosen and cleared, and nothing may silently move it.
-                if (!e.prefill(j->prompt, nullptr, nullptr, false))
-                    for (int32_t t : j->prompt)
-                        if (!e.forward(t))
-                            throw std::runtime_error("prompt ingestion failed");
-                e.sync();
+                slot = e.admit_sequence(j->prompt, slot_busy);
                 j->slot = slot;
                 j->pos  = e.pos;
                 j->next = e.argmax_token();
@@ -13016,20 +13106,16 @@ void GrimoireScheduler::run() {
                 const bool stop = (j->eos >= 0 && j->next == j->eos) ||
                                   (j->eot >= 0 && j->next == j->eot);
                 if (stop) {
-                    slot_busy[size_t(slot)] = false;
-                    finish(j, FinishReason::Stop);
+                    retire(j, FinishReason::Stop);
                 } else if (!push(j, int32_t(j->next))) {
-                    slot_busy[size_t(slot)] = false;
-                    finish(j, FinishReason::Cancelled);
+                    retire(j, FinishReason::Cancelled);
                 } else if (j->budget <= 1) {
-                    slot_busy[size_t(slot)] = false;
-                    finish(j, FinishReason::Length);
+                    retire(j, FinishReason::Length);
                 } else {
                     active.push_back(j);
                 }
             } catch (const std::exception& ex) {
-                if (j->slot >= 0) slot_busy[size_t(j->slot)] = false;
-                finish(j, FinishReason::Length, ex.what());
+                retire(j, FinishReason::Length, false, ex.what());
             }
         }
         if (active.empty()) continue;
@@ -13063,9 +13149,8 @@ void GrimoireScheduler::run() {
             size_t at = which.size();
             for (size_t i = 0; i < which.size(); ++i) if (which[i] == k) { at = i; break; }
             if (failed || at == which.size()) {
-                slot_busy[size_t(j->slot)] = false;
-                finish(j, cancelled(j) ? FinishReason::Cancelled
-                                       : FinishReason::Length, err);
+                retire(j, cancelled(j) ? FinishReason::Cancelled
+                                       : FinishReason::Length, !failed, err);
                 continue;
             }
             ++j->pos;
@@ -13075,14 +13160,11 @@ void GrimoireScheduler::run() {
             size_t n = 0;
             { std::lock_guard<std::mutex> l(j->mu); n = j->ready.size(); }
             if (stop) {
-                slot_busy[size_t(j->slot)] = false;
-                finish(j, FinishReason::Stop);
+                retire(j, FinishReason::Stop);
             } else if (!push(j, int32_t(t))) {
-                slot_busy[size_t(j->slot)] = false;
-                finish(j, FinishReason::Cancelled);
+                retire(j, FinishReason::Cancelled);
             } else if (int(n) + 1 >= j->budget || j->pos >= e.max_seq) {
-                slot_busy[size_t(j->slot)] = false;
-                finish(j, FinishReason::Length);
+                retire(j, FinishReason::Length);
             } else {
                 j->next = t;
                 keep.push_back(j);
