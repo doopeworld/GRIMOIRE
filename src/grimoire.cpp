@@ -13199,6 +13199,12 @@ int grimoire_serve_generate_batch(Grimoire& e,
         int pos;          // tokens already in the cache
         int next;         // the token to feed on the coming step
         bool live;
+        // This row's OWN budget, from generation_budget() -- which is
+        // min(n_predict, max_seq - prompt_len), NOT n_predict.  Rows in
+        // one batch have different prompt lengths, so they have
+        // different budgets, and a single shared cap cannot express
+        // that.  See the note at the stop condition below.
+        int budget;
     };
     std::vector<Row> rows;
     std::vector<bool> busy(size_t(e.n_seq_slots), false);
@@ -13222,7 +13228,7 @@ int grimoire_serve_generate_batch(Grimoire& e,
         if (budget <= 0) continue;
         const int slot = e.admit_sequence(prompts[i], busy);
         busy[size_t(slot)] = true;
-        rows.push_back({i, slot, e.pos, e.argmax_token(), true});
+        rows.push_back({i, slot, e.pos, e.argmax_token(), true, budget});
     }
 
     auto stop = [&](int t) {
@@ -13235,7 +13241,20 @@ int grimoire_serve_generate_batch(Grimoire& e,
         out_ids[r.idx].push_back(r.next);
     }
 
-    const int cap = n_predict;
+    // EACH ROW'S OWN BUDGET, NOT n_predict (2026-09-22).  This used to be
+    // `cap = n_predict` for every row, with `r.pos >= e.max_seq` as the
+    // only context guard -- and that guard is one token too late.  The
+    // first reply token is emitted from the prompt's own prefill before
+    // the loop starts, so by the time the loop refuses at pos == max_seq
+    // it has already emitted a token the serial path never emits: the
+    // serial path's budget is min(n_predict, max_seq - prompt_len), which
+    // counts the prompt, so a 126-token prompt in a 128 window yields 2
+    // tokens, while this loop yielded 3.  Every token was individually
+    // CORRECT, which is why only an equality gate against serial decode
+    // could see it.  generation_budget() is already called per row above;
+    // it was computed and then discarded.  Rows also differ from each
+    // other here -- 124/125/126-token prompts have budgets 4/3/2 -- so
+    // one shared cap cannot be right for more than one of them.
     for (;;) {
         std::vector<int32_t> toks;
         std::vector<int>     slots, poss;
@@ -13243,7 +13262,7 @@ int grimoire_serve_generate_batch(Grimoire& e,
         for (size_t k = 0; k < rows.size(); ++k) {
             Row& r = rows[k];
             if (!r.live) continue;
-            if (int(out_ids[r.idx].size()) >= cap || r.pos >= e.max_seq) {
+            if (int(out_ids[r.idx].size()) >= r.budget || r.pos >= e.max_seq) {
                 r.live = false; continue;
             }
             toks.push_back(int32_t(r.next));
@@ -13256,7 +13275,11 @@ int grimoire_serve_generate_batch(Grimoire& e,
         std::vector<int> consumed(toks.size(),1);
         if(e.speculative_batch()) {
             std::vector<int> remaining;
-            for(size_t k:which) remaining.push_back(cap-int(out_ids[rows[k].idx].size()));
+            // Per row, so a near-context row cannot have a drafter
+            // propose past its own budget: decode_spec_batch() bounds
+            // draft depth by `remaining - 1`.
+            for(size_t k:which)
+                remaining.push_back(rows[k].budget-int(out_ids[rows[k].idx].size()));
             e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
         } else {
             std::vector<int32_t> got;
@@ -13272,7 +13295,7 @@ int grimoire_serve_generate_batch(Grimoire& e,
                     throw std::runtime_error("batched decode returned invalid token");
                 if(stop(token)) { r.live=false; break; }
                 out_ids[r.idx].push_back(token); r.next=token;
-                if(int(out_ids[r.idx].size())>=cap) { r.live=false; break; }
+                if(int(out_ids[r.idx].size())>=r.budget) { r.live=false; break; }
             }
         }
     }
