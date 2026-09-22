@@ -6276,20 +6276,31 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens, bool output_valid
     prefix_hit = seq_slot;
     PrefixCache& prefix_cache = prefix_slots[size_t(prefix_hit)];
     if (prefix_cache.layers.empty()) {
+        // A non-empty `layers` is what says "allocated" to the next call,
+        // so a failure must leave it EMPTY again.  Returning with it
+        // half-filled made the next save memcpy into the null entries --
+        // on the card a device write through null, not a clean error.
+        auto unwind = [&] {
+            for (auto& c : prefix_cache.layers)
+                for (float* p : {c.dn, c.conv}) if (p) sycl::free(p, q);
+            prefix_cache.layers.clear();
+            if (prefix_cache.hidden) sycl::free(prefix_cache.hidden, q);
+            if (prefix_cache.logits) sycl::free(prefix_cache.logits, q);
+            prefix_cache.hidden = prefix_cache.logits = nullptr;
+            std::fprintf(stderr, "  prefix cache allocation failed\n");
+            return false;
+        };
         prefix_cache.layers.resize(L.size());
         for (size_t i = 0; i < L.size(); ++i) {
             auto& c = prefix_cache.layers[i];
             const auto& d = L[i];
             if (d.dn_state) c.dn = sycl::malloc_device<float>(dn_bytes / sizeof(float), q);
             if (d.conv_ring) c.conv = sycl::malloc_device<float>(conv_bytes / sizeof(float), q);
-            if ((d.dn_state && !c.dn) || (d.conv_ring && !c.conv)) {
-                std::fprintf(stderr, "  prefix cache allocation failed\n");
-                return false;
-            }
+            if ((d.dn_state && !c.dn) || (d.conv_ring && !c.conv)) return unwind();
         }
         prefix_cache.hidden = sycl::malloc_device<float>(cfg.hidden, q);
         prefix_cache.logits = sycl::malloc_device<float>(cfg.vocab, q);
-        if (!prefix_cache.hidden || !prefix_cache.logits) return false;
+        if (!prefix_cache.hidden || !prefix_cache.logits) return unwind();
     }
     // The RECURRENT state is still copied, and the asymmetry is the
     // point.  A KV row beyond `pos` is dead -- the next write overwrites
@@ -6521,38 +6532,70 @@ void Grimoire::clear_drafter_cache() {
 
 void Grimoire::init_draft_slots() {
     if(!draft_slots.empty() || !(mtp.ok || dflash2.ok)) return;
-    draft_slots.resize(size_t(n_seq_slots));
-    const size_t mkbytes=size_t(mtp.L.kv_heads)*mtp.L.head_dim*max_seq;
-    const size_t dkbytes=size_t(dflash2.kv_heads)*dflash2.head_dim*max_seq;
-    const size_t halfbytes=size_t(dflash2.num_blocks)*dflash2.block_size*
-                           dflash2.kv_heads*dflash2.head_dim*sizeof(sycl::half);
-    for(int j=0;j<n_seq_slots;++j) {
-        auto& slot=draft_slots[size_t(j)];
-        auto allocate=[&](size_t bytes)->void* {
-            auto* ptr=sycl::malloc_device<uint8_t>(std::max<size_t>(1,bytes),q);
-            if(!ptr) throw std::bad_alloc();
-            slot.owned.push_back(ptr); q.memset(ptr,0,bytes);
-            return ptr;
-        };
-        slot.hidden=static_cast<float*>(allocate(size_t(cfg.hidden)*sizeof(float)));
-        if(mtp.ok) {
-            slot.mk=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.k_cache;
-            slot.mv=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.v_cache;
+    // ALL OR NOTHING.  A non-empty draft_slots is what says "done" above,
+    // so a throw halfway through used to leave later slots holding null
+    // cache pointers that the next bind_seq_slot() installed as the live
+    // drafter caches -- a device write through null, which on the card is
+    // a DEVICE_LOST (rule 1), not a clean error.  Today the first call is
+    // build()'s closing reset(), where a throw ends the load anyway, so
+    // this is a guard for any caller that survives the throw and keeps
+    // the engine.  Build into locals; publish only once all succeeded.
+    std::vector<DraftSlot> built(static_cast<size_t>(n_seq_slots));
+    float* conv_steps=nullptr;
+    size_t extra=0;
+    try {
+        const size_t mkbytes=size_t(mtp.L.kv_heads)*mtp.L.head_dim*max_seq;
+        const size_t dkbytes=size_t(dflash2.kv_heads)*dflash2.head_dim*max_seq;
+        const size_t halfbytes=size_t(dflash2.num_blocks)*dflash2.block_size*
+                               dflash2.kv_heads*dflash2.head_dim*sizeof(sycl::half);
+        for(int j=0;j<n_seq_slots;++j) {
+            auto& slot=built[size_t(j)];
+            auto allocate=[&](size_t bytes)->void* {
+                auto* ptr=sycl::malloc_device<uint8_t>(std::max<size_t>(1,bytes),q);
+                if(!ptr) throw std::bad_alloc();
+                slot.owned.push_back(ptr); q.memset(ptr,0,bytes);
+                extra+=bytes;
+                return ptr;
+            };
+            slot.hidden=static_cast<float*>(allocate(size_t(cfg.hidden)*sizeof(float)));
+            if(mtp.ok) {
+                slot.mk=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.k_cache;
+                slot.mv=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.v_cache;
+            }
+            if(dflash2.target_aux) slot.aux=j?static_cast<float*>(allocate(
+                size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float))):dflash2.target_aux;
+            for(auto& layer:dflash2.layers) {
+                slot.k.push_back(layer.k_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.k_cache):nullptr);
+                slot.v.push_back(layer.v_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.v_cache):nullptr);
+                slot.k16.push_back(layer.k_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.k_cache_f16):nullptr);
+                slot.v16.push_back(layer.v_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.v_cache_f16):nullptr);
+            }
         }
-        if(dflash2.target_aux) slot.aux=j?static_cast<float*>(allocate(
-            size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float))):dflash2.target_aux;
-        for(auto& layer:dflash2.layers) {
-            slot.k.push_back(layer.k_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.k_cache):nullptr);
-            slot.v.push_back(layer.v_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.v_cache):nullptr);
-            slot.k16.push_back(layer.k_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.k_cache_f16):nullptr);
-            slot.v16.push_back(layer.v_cache_f16?(j?static_cast<sycl::half*>(allocate(halfbytes)):layer.v_cache_f16):nullptr);
+        if(spec_conv_elems) {
+            conv_steps=sycl::malloc_device<float>(size_t(kSpecBatch)*spec_conv_elems,q);
+            if(!conv_steps) throw std::bad_alloc();
+            extra+=size_t(kSpecBatch)*spec_conv_elems*sizeof(float);
         }
+        q.wait_and_throw();
+    } catch(...) {
+        q.wait();
+        for(auto& slot:built) for(void* ptr:slot.owned) sycl::free(ptr,q);
+        if(conv_steps) sycl::free(conv_steps,q);
+        std::fprintf(stderr,"  drafter: per-sequence caches for %d slots could not be "
+                     "allocated -- lower GRIMOIRE_SEQ_SLOTS or --ctx\n",n_seq_slots);
+        throw;
     }
-    if(spec_conv_elems) {
-        batch_conv_steps=sycl::malloc_device<float>(size_t(kSpecBatch)*spec_conv_elems,q);
-        if(!batch_conv_steps) throw std::bad_alloc();
-    }
-    q.wait_and_throw();
+    draft_slots.swap(built);
+    batch_conv_steps=conv_steps;
+    // Allocated by build()'s closing reset() and never passed to acct(),
+    // so the "GiB resident" figure printed at load does not include it.
+    // For a DFlash drafter it is dominated by the tap buffer: max_seq *
+    // taps * hidden * 4 bytes for EVERY slot past the first (Ornith's 8
+    // taps x 2048 is 64 KiB per token of --ctx, per slot).  Say it, so
+    // GRIMOIRE_SEQ_SLOTS can be sized against the card.
+    if(n_seq_slots>1)
+        std::fprintf(stderr,"  drafter: per-sequence caches for %d slots, %.2f GiB "
+                     "beyond the load-time budget\n",n_seq_slots,double(extra)/double(1ull<<30));
 }
 
 void Grimoire::bind_seq_slot(int j) {
