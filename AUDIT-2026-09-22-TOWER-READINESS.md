@@ -378,3 +378,13 @@ Then, one step at a time, reading the banner each time (rule 15):
    concurrent; batching vs drafter vs both (F7); plain decode with
    `GRIMOIRE_DECODE_GRAPH=1` vs without; PP vs TP on OCuLink; how many
    slots fit at the `--ctx` you actually use.
+
+## Final confirmation, on `main` (2026-09-23)
+
+The full suite was re-run on the merged tree (engine as of `dbe5387`, the
+last code change): **all 15 device gates and all 17 host suites pass**.
+`test_batch_parallel` passed 30 of 30 arms (PP2, PP3, TP2, TP3 and
+TP2+cache, over 6 architecture/format cases), `test_model_matrix` had 0
+failed cells, and `test_parallel_e2e`, `test_spec_e2e` and
+`test_pp_server` were ALL PASS.  GitHub CI (run 35788810884, all 7
+shards) is green on the same code.  CPU device only; the B70 run is next.
