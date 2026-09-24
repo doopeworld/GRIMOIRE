@@ -141,7 +141,10 @@ there is no `spec:` line at all.
 
 ## 2. Dual GPU
 
-GPU1 is now on OCuLink Gen4 x4, not USB4. The USB4 link tunnelled PCIe
+GPU1 is now on OCuLink Gen4 x4, not USB4. (Measured 2026-09-24: gpu1 is now
+0000:0b:00.0 and trains at Gen4 **x2**; render-node numbers move on every
+reboot and the box also has a B580 and an iGPU -- always take node names
+from `tools/gpunode.sh`. See `HANDOFF-2026-09-24-FIRST-B70-RUN.md`.) The USB4 link tunnelled PCIe
 and added large latency to every host/device transfer, and the pipeline
 boundary is two of those per layer group. **Re-measure before redesigning
 anything** — the thing that was slow may simply not be slow any more.
@@ -150,14 +153,14 @@ Pipeline parallel (the proven path, and what to use for a model that
 does not fit on one card):
 
 ```bash
-GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh renderD129 renderD130 1800 pp \
+GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 pp \
   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p "..." -n 64
 ```
 
 Tensor parallel:
 
 ```bash
-tools/tp2run.sh renderD129 renderD130 1800 tp \
+tools/tp2run.sh $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 tp \
   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p "..." -n 64
 ```
 
@@ -175,7 +178,7 @@ they call `b70run.sh`'s env path directly:
 GRIM_ENV="GRIMOIRE_MTP=1
 GRIMOIRE_MTP_K=3
 GRIMOIRE_SPEC_STATS=1" GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh \
-  renderD129 renderD130 1800 pp \
+  $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 pp \
   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p "..." -n 64
 ```
 
@@ -249,7 +252,7 @@ Two cards, model does not fit — pipeline, with speculation:
 ```bash
 GRIM_ENV='GRIMOIRE_MTP=1
 GRIMOIRE_MTP_K=3
-GRIMOIRE_MTP_DRAFT_VOCAB=131072' GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh renderD129 renderD130 1800 pp   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
+GRIMOIRE_MTP_DRAFT_VOCAB=131072' GRIMOIRE_PP_SPLIT=24 tools/pp2run.sh $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 pp   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
 ```
 
 One thing to know before comparing TG across the two modes:
@@ -413,7 +416,7 @@ the driver's order is not the one you want.
 launchers for anything other than exactly two:
 
 ```bash
-GRIMOIRE_PP_LAYERS=30,30,12 tools/nrun.sh pp   renderD128,renderD129,renderD130 1800 pp3   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
+GRIMOIRE_PP_LAYERS=30,30,12 tools/nrun.sh pp   <node0>,<node1>,<node2> 1800 pp3   /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
 ```
 
 `GRIMOIRE_PP_LAYERS` is one positive count per GPU, summing to the
