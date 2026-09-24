@@ -1,9 +1,11 @@
 #!/bin/bash
 # vLLM-style two-process/two-XPU launcher. Grimoire selects device local_rank
-# in each child. Keep the exact working container topology: host IPC,
-# privileged DRM access, 10 GiB SHM, full /dev/dri plus by-path, and the common
-# ZE_AFFINITY_MASK=0,1 visibility list.
-# Usage: pp2run.sh renderD129 renderD130 1800 name /grimoire/bin/grimoire ...
+# in each child. Container topology: host IPC, 10 GiB SHM, by-path, and ONLY
+# the two named render nodes -- never --privileged or all of /dev/dri.  Every
+# Arc device the container can see is a candidate rank, and ZE_AFFINITY_MASK
+# only filters Level Zero, so with everything mounted rank 1 landed on the
+# B580.  ZE_AFFINITY_MASK=0,1 then covers exactly the two mounted cards.
+# Usage: pp2run.sh $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 name /grimoire/bin/grimoire ...
 set -u
 
 NODE0="${1:?first render node}"; shift
@@ -52,8 +54,8 @@ if [ -n "${GRIM_ENV:-}" ]; then
 fi
 
 CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
-    --ipc=host --privileged --shm-size=10g \
-    --device /dev/dri:/dev/dri \
+    --ipc=host --shm-size=10g \
+    --device "/dev/dri/$NODE0" --device "/dev/dri/$NODE1" \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v /mnt/storage/isos/grimoire-fuse:/grimoire \
     -v /mnt/storage/Models:/models \

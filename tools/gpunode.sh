@@ -3,12 +3,14 @@
 # Render-node minor numbers are NOT stable across reboots -- they flipped on
 # 2026-08-25 (renderD129 was B70#0, became the iGPU). Always resolve by PCI addr.
 #   gpunode.sh gpu0  -> B70 at 0000:03:00.0
-#   gpunode.sh gpu1  -> B70 at 0000:35:00.0
+#   gpunode.sh gpu1  -> B70 at 0000:0b:00.0
 #   gpunode.sh igpu  -> Arc iGPU at 0000:00:02.0
+# 0000:07:00.0 is an Arc B580 (12 GB). It deliberately has no name here:
+# it is not a GRIMOIRE card.
 set -u
 case "${1:?gpu0|gpu1|igpu}" in
   gpu0) PCI=0000:03:00.0 ;;
-  gpu1) PCI=0000:35:00.0 ;;
+  gpu1) PCI=0000:0b:00.0 ;;
   igpu) PCI=0000:00:02.0 ;;
   *)    PCI="$1" ;;
 esac

@@ -4,10 +4,9 @@
 # whatever Battlemage cards the box has -- one B70, two B70s, two B70s
 # plus a B580, four of anything.
 #
-# The container topology is the one that is known to work and is copied
-# from pp2run.sh verbatim: host IPC, privileged DRM, 10 GiB SHM, full
-# /dev/dri plus by-path.  ZE_AFFINITY_MASK is built from the node count
-# rather than hardcoded to 0,1.
+# Container topology as in pp2run.sh: host IPC, 10 GiB SHM, by-path, and
+# ONLY the named render nodes mounted -- never --privileged or all of
+# /dev/dri.  ZE_AFFINITY_MASK is then 0..N-1 over exactly those cards.
 #
 #   tools/nrun.sh pp renderD128,renderD129,renderD130 1800 pp3 \
 #       /grimoire/bin/grimoire -m /models/<dir> --proj fp8 -p '...' -n 64
@@ -47,28 +46,20 @@ if docker ps --format '{{.Names}}' | grep -q '^grim-'; then
     echo "REFUSING: a grim-* container is already running" >&2; exit 3
 fi
 
-# Build the visibility list from the NAMED nodes, not from their count.
-# A bare 0,1,...,N-1 exposes every card and then selects the first N, so
-# asking for renderD129,renderD130 on a three-card box would silently run
-# on renderD128,renderD129 instead -- the names would be validated and
-# then ignored.  Level Zero enumerates in the same order the render nodes
-# are numbered, so each node's position among ALL present renderD* nodes
-# is its device index.
-ALL_NODES=$(ls /dev/dri | grep '^renderD' | sort -V)
-MASK=""
-for NODE in "${NODE_LIST[@]}"; do
-    IDX=$(printf '%s
-' "$ALL_NODES" | grep -n -x "$NODE" | cut -d: -f1)
-    [ -n "$IDX" ] || { echo "cannot place $NODE among /dev/dri render nodes" >&2; exit 2; }
-    MASK="${MASK:+$MASK,}$((IDX-1))"
-done
+# Select cards by MOUNTING only the named nodes.  Level Zero does NOT
+# enumerate in render-node order (on the Tower: B70 03:00.0, B580 07:00.0,
+# B70 0b:00.0, then the iGPU), and ZE_AFFINITY_MASK only filters Level
+# Zero while the engine takes every visible Arc device, so an index mask
+# over a full /dev/dri cannot keep a rank off the wrong card.
 # Duplicates would give two ranks the same card and deadlock the
 # collectives rather than fail.
-if [ "$(printf '%s' "$MASK" | tr ',' '
-' | sort -u | wc -l)" -ne "$N" ]; then
-    echo "duplicate render nodes in '$NODES' -> mask $MASK" >&2; exit 2
+if [ "$(printf '%s\n' "${NODE_LIST[@]}" | sort -u | wc -l)" -ne "$N" ]; then
+    echo "duplicate render nodes in '$NODES'" >&2; exit 2
 fi
-echo "device mask: $MASK  (from $NODES)"
+DEVARGS=()
+for NODE in "${NODE_LIST[@]}"; do DEVARGS+=(--device "/dev/dri/$NODE"); done
+MASK=$(seq -s, 0 $((N-1)))
+echo "devices: $NODES  (mask $MASK over only those)"
 
 CNAME="grim-$NAME"
 docker rm -f "$CNAME" >/dev/null 2>&1 || true
@@ -106,8 +97,8 @@ if [ -n "${GRIM_ENV:-}" ]; then
 fi
 
 CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
-    --ipc=host --privileged --shm-size=10g \
-    --device /dev/dri:/dev/dri \
+    --ipc=host --shm-size=10g \
+    "${DEVARGS[@]}" \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v /mnt/storage/isos/grimoire-fuse:/grimoire \
     -v /mnt/storage/Models:/models \

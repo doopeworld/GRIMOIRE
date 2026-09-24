@@ -1,7 +1,8 @@
 #!/bin/bash
-# Functional two-rank tensor-parallel launcher using the proven vLLM XPU
-# container/device topology. Initial TP keeps weights replicated and shards
-# decode projection rows; storage/expert sharding follows correctness.
+# Functional two-rank tensor-parallel launcher. Initial TP keeps weights
+# replicated and shards decode projection rows; storage/expert sharding
+# follows correctness. Mounts ONLY the two named render nodes (see pp2run.sh).
+# Usage: tp2run.sh $(tools/gpunode.sh gpu0) $(tools/gpunode.sh gpu1) 1800 name ...
 set -u
 NODE0="${1:?first render node}"; shift
 NODE1="${1:?second render node}"; shift
@@ -38,7 +39,8 @@ if [ -n "${GRIM_ENV:-}" ]; then
     while IFS= read -r kv; do [ -n "$kv" ] && ENVARGS+=(-e "$kv"); done <<< "$GRIM_ENV"
 fi
 CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
-    --ipc=host --privileged --shm-size=10g --device /dev/dri:/dev/dri \
+    --ipc=host --shm-size=10g \
+    --device "/dev/dri/$NODE0" --device "/dev/dri/$NODE1" \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v /mnt/storage/isos/grimoire-fuse:/grimoire \
     -v /mnt/storage/Models:/models "${ENVARGS[@]}" \

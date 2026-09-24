@@ -39,6 +39,8 @@ PROJ="${PROJ:-fp8}"
 CTX="${CTX:-8192}"
 
 cd /mnt/storage/isos/grimoire-fuse
+NODE0=$(bash tools/gpunode.sh gpu0) || { echo "cannot resolve gpu0" >&2; exit 2; }
+NODE1=$(bash tools/gpunode.sh gpu1) || { echo "cannot resolve gpu1" >&2; exit 2; }
 
 if docker ps --format '{{.Names}}' | grep -q '^grim-'; then
     echo "REFUSING: a grim-* container is already running" >&2; exit 3
@@ -50,12 +52,13 @@ docker rm -f "$CNAME" >/dev/null 2>&1 || true
 # the default launch is unchanged.  Without these the batching, prefix-
 # cache and speculation settings could not reach the container at all.
 #
-# Both cards in one container, exactly as pp2run.sh does it: separate
-# processes, separate Level Zero contexts, full DRM access.
+# Both B70s in one container, exactly as pp2run.sh does it: separate
+# processes, separate Level Zero contexts, and ONLY the two B70 render nodes
+# mounted, so neither rank can land on the B580 or the iGPU.
 CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -p "${PORT}:${PORT}" \
-    --ipc=host --privileged --shm-size=10g \
-    --device /dev/dri:/dev/dri \
+    --ipc=host --shm-size=10g \
+    --device "/dev/dri/$NODE0" --device "/dev/dri/$NODE1" \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v /mnt/storage/isos/grimoire-fuse:/grimoire \
     -v /mnt/storage/Models:/models \
@@ -85,7 +88,7 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     "$MODEL" "$PORT" "$PROJ" "$CTX")
 
 if [ -z "$CID" ]; then echo "launch failed" >&2; exit 4; fi
-echo "launched $CNAME ${CID:0:12} on port $PORT, split $SPLIT"
+echo "launched $CNAME ${CID:0:12} on port $PORT, split $SPLIT ($NODE0 + $NODE1)"
 echo "  front end : rank 0, serving http://0.0.0.0:${PORT}"
 echo "  worker    : rank 1, following rank 0"
 echo

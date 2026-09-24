@@ -2,6 +2,14 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-09-24: READ `HANDOFF-2026-09-24-FIRST-B70-RUN.md` FIRST.** First real
+run of `main` on the B70s.  Long-prompt prefill is NONDETERMINISTIC on the
+card (different garbage every run on the same input; not a regression, not
+the compiler, not the bridges) -- fix that before trusting any long-prompt
+output or number.  The box now also has an Arc B580 and an iGPU that the
+engine would select (both named "Arc"); two-card launchers mount only the
+two B70 render nodes, and `gpunode.sh gpu1` is 0000:0b:00.0.
+
 **2026-09-22: READ `AUDIT-2026-09-22-TOWER-READINESS.md` FIRST.** Nine
 commits (`e344cf2..bf961c3`, from `codex/composable-serving`) made
 batching compose with the prefix cache, with TP and PP, with MTP/DFlash

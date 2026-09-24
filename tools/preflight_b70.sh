@@ -24,6 +24,15 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 REPO="$PWD"
+# tune.sh and b70run.sh always mount /mnt/storage/isos/grimoire-fuse as
+# /grimoire, so the single-GPU stages run THAT checkout's binaries whatever
+# $REPO is.  Run from any other checkout and the build and the gates test
+# different trees -- missing binaries there once read as PASS.
+FUSE=/mnt/storage/isos/grimoire-fuse
+if [[ -d "$FUSE" && "$REPO" != "$FUSE" ]]; then
+  echo "run preflight from $FUSE (the checkout tune.sh mounts), not $REPO" >&2
+  exit 1
+fi
 MODEL="${1:-${MODEL:-}}"
 PROJ="${PROJ:-int4}"
 GPU="${GPU:-gpu0}"
@@ -183,13 +192,14 @@ run_gate() {
 # green -- which is a real, useful correctness check, but not a check
 # that this gate's actual multi-device launch path works.
 #
-# This wrapper reuses pp2run.sh's OWN device-exposure flags -- full
-# /dev/dri, not one node, the exact shape a real Tower run already uses
-# successfully for bin/grimoire -- rather than inventing new container
-# flags untested against real hardware. It runs the gate binary ONCE
-# (not pp2worker.sh's double-launch): these binaries fork their own
-# children internally, so doubling the outer launch would run each rank
-# twice over.
+# This wrapper mounts ONLY the two B70 render nodes (resolved by PCI
+# address through gpunode.sh), as pp2run.sh does -- never --privileged or
+# all of /dev/dri: the engine takes every visible Arc device, so with
+# everything mounted rank 1 landed on the B580.  The environment is
+# tune.sh's, so single- and two-card gates differ only in card count and
+# both load the bridges.  It runs the gate binary ONCE (not pp2worker.sh's
+# double-launch): these binaries fork their own children internally, so
+# doubling the outer launch would run each rank twice over.
 run_multigpu_gate() {
   local bin="$1"; shift
   local name="${bin##*/}"
@@ -199,6 +209,11 @@ run_multigpu_gate() {
   fi
   if ! command -v docker >/dev/null; then
     skip "$name (no docker here -- this stage only runs from the Tower)"
+    return
+  fi
+  local n0 n1
+  if ! n0=$(bash tools/gpunode.sh gpu0) || ! n1=$(bash tools/gpunode.sh gpu1); then
+    bad "$name (cannot resolve both B70 render nodes with tools/gpunode.sh)"
     return
   fi
   local cname="pf-mgpu-${name//_/-}"
@@ -211,11 +226,17 @@ run_multigpu_gate() {
   } >"$log" 2>&1
   local cid
   cid=$(docker run -d --name "$cname" -w /grimoire --init --stop-timeout 300 \
-      --ipc=host --privileged --shm-size=10g \
-      --device /dev/dri:/dev/dri \
+      --ipc=host --shm-size=10g \
+      --device "/dev/dri/$n0" --device "/dev/dri/$n1" \
       -v /dev/dri/by-path:/dev/dri/by-path \
       -v "$REPO:/grimoire" \
       -e ZE_AFFINITY_MASK=0,1 \
+      -e ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
+      -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
+      -e GRIMOIRE_XE2_GROUPED_BRIDGE=/grimoire/src/libgrimoire_xe2_grouped.so \
+      -e GRIMOIRE_XE2_ATTN_BRIDGE=/grimoire/src/libgrimoire_xe2_attention_bridge.so \
+      -e GRIMOIRE_XE2_GDN_RAW_BRIDGE=/grimoire/src/libgrimoire_xe2_gdn_raw.so \
+      -e GRIMOIRE_ONEDNN_BRIDGE=/grimoire/src/libgrimoire_onednn.so \
       --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-my-vllm-xpu:latest}" \
       --signal=TERM --kill-after=60 900 \
       "/grimoire/${bin}" "$@" 2>>"$log")
