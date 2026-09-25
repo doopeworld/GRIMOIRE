@@ -11735,6 +11735,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const bool no_f32_dense=std::getenv("GRIMOIRE_NO_F32_DENSE")!=nullptr;
     const bool exact_verify = tp_enabled() || (next_tokens &&
         std::getenv("GRIMOIRE_MTP_EXACT_VERIFY") != nullptr);
+    // Pure dense prefill (no plug-in, no TP/PP, no MoE, no verify): every
+    // consumer of the normed hidden state is a GEMM reading its bf16 copy,
+    // and r1 (the shared-expert residual) is never written.  So skip the fp32
+    // normed copy, r1's per-layer zeroing and its re-read, and let the norm /
+    // gate before an output projection write that GEMM's bf16 input directly.
+    // GRIMOIRE_NO_DENSE_PURE=1 restores the general path.
+    const bool dense_pure = !tp_enabled() && !pp_enabled() && M >= 32 && !cfg.is_moe() &&
+        !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
+        !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
+        !std::getenv("GRIMOIRE_NO_DENSE_PURE");
     const float* a8_cached_src = nullptr;
     const sycl_bf16* a8_cached_bf = nullptr;
     int a8_cached_k = 0;
@@ -12223,7 +12233,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         else if(exact_verify)
             input_bf_ready=norm_rows(bh,r0,r1,d.in_norm,bn);
         else input_bf_ready=launch_rmsnorm_residual_batched(
-            q,bh,r0,r1,d.in_norm,norm_bf_only?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
+            q,bh,r0,dense_pure?nullptr:r1,d.in_norm,(norm_bf_only||dense_pure)?nullptr:bn,
+            M,H,cfg.rms_eps,bn_bf);
         if(exact_verify && debug && li==probe_layer)
             probe("L0 in_norm",bn,H);
         pp_mark("input norm");
@@ -12406,6 +12417,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_rmsnorm_gate_silu_bf16_io(
                     q,recurrence_bf,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
                 mmb(d.la_out,xb,r0);
+            }else if(dense_pure && !d.la_out.has_i4()){
+                launch_rmsnorm_gate_silu_bf16_out(q,t0,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
+                launch_gemm_xmx(q,d.la_out.w,xb,r0,M);
             }else{
                 launch_rmsnorm_gate_silu(q,t0,z_in,d.la_norm,M*Hv,Dv,cfg.rms_eps,{});
                 mm(d.la_out,t0,r0);
@@ -12633,6 +12647,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(gated){launch_gate_sigmoid_mul_bf16_io(q,attention_bf,t2,xb,
                     size_t(M)*cfg.n_heads*d.head_dim);o_in=xb;}
                 mmb(d.o_proj,o_in,r0);
+            }else if(gated && dense_pure && !d.o_proj.has_i4()){
+                launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(M)*cfg.n_heads*d.head_dim);
+                launch_gemm_xmx(q,d.o_proj.w,xb,r0,M);
             }else{
                 if(gated) launch_gate_sigmoid_mul(q,t3,t2,M*cfg.n_heads*d.head_dim,{});
                 mm(d.o_proj,t3,r0);
@@ -12648,7 +12665,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 ? launch_rmsnorm_residual_batched_quant(q,bh,r0,nullptr,d.post_norm,
                     norm_bf_only?nullptr:bn,bn_bf,a8,a8s,M,H,cfg.rms_eps)
                 : launch_rmsnorm_residual_batched(
-                    q,bh,r0,nullptr,d.post_norm,norm_bf_only?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
+                    q,bh,r0,nullptr,d.post_norm,(norm_bf_only||dense_pure)?nullptr:bn,M,H,
+                    cfg.rms_eps,bn_bf);
         a8_cached_src=nullptr;
         a8_cached_bf=fused_ffn_quant?bn_bf:nullptr;
         if(d.moe_layer){
@@ -12933,7 +12951,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
             }
             pp_mark("dense FFN");
-            q.memset(r1,0,size_t(M)*H*sizeof(float));
+            if(!dense_pure) q.memset(r1,0,size_t(M)*H*sizeof(float));
         }
         if(prefill_host_progress){
             q.wait_and_throw();

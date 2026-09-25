@@ -892,7 +892,45 @@ sycl::event launch_causal_conv1d_split_prefill(
     sycl::queue& q,const ConvParams& p,int tokens,float* qv,float* kv,float* vv,
     sycl_bf16* vv_bf,
     int qk_size,int v_size,const std::vector<sycl::event>& deps){
-    sycl::event compute=q.submit([&](sycl::handler&hd){hd.depends_on(deps);
+    // Kernel-4 fast path: one work-item per (channel, 16 consecutive tokens)
+    // slides along the tokens with the last 3 inputs in registers, so every
+    // input is read once instead of 4 times (78 ms -> see HANDOFF for a
+    // 4088-token Qwen3.8-27B prefill).  Same fma order, same SiLU: the
+    // outputs are bit-identical to the per-(token, channel) kernel below.
+    static const bool old_conv = std::getenv("GRIMOIRE_CONV_OLD") != nullptr;
+    sycl::event compute;
+    if(!old_conv && p.kernel==4){
+        constexpr int TB=16;
+        const int nb=(tokens+TB-1)/TB;
+        compute=q.submit([&](sycl::handler&hd){hd.depends_on(deps);
+          const ConvParams pp=p;
+          hd.parallel_for(sycl::range<2>(size_t(nb),size_t(pp.channels)),[=](sycl::id<2>id){
+            const int c=int(id[1]),t0=int(id[0])*TB,ch=pp.channels;
+            const bf16_t*w=pp.weight+int64_t(c)*4;
+            const float w0=bf16_to_f32(w[0]),w1=bf16_to_f32(w[1]),
+                        w2=bf16_to_f32(w[2]),w3=bf16_to_f32(w[3]);
+            const float*ring=pp.ring+int64_t(c)*3;
+            auto in=[&](int src){            // x[src], or the ring for src < 0
+                return src>=0?pp.x[int64_t(src)*ch+c]:ring[src+3];};
+            float h0=in(t0-3),h1=in(t0-2),h2=in(t0-1);
+            const int te=sycl::min(t0+TB,tokens);
+            for(int t=t0;t<te;++t){
+                const float xt=pp.x[int64_t(t)*ch+c];
+                float acc=0.0f;
+                acc=sycl::fma(h0,w0,acc);
+                acc=sycl::fma(h1,w1,acc);
+                acc=sycl::fma(h2,w2,acc);
+                acc=sycl::fma(xt,w3,acc);
+                const float y=acc/(1.0f+sycl::exp(-acc));
+                if(c<qk_size)qv[int64_t(t)*qk_size+c]=y;
+                else if(c<2*qk_size)kv[int64_t(t)*qk_size+c-qk_size]=y;
+                else if(vv_bf)vv_bf[int64_t(t)*v_size+c-2*qk_size]=sycl_bf16(y);
+                else vv[int64_t(t)*v_size+c-2*qk_size]=y;
+                h0=h1;h1=h2;h2=xt;
+            }
+          });});
+    } else
+    compute=q.submit([&](sycl::handler&hd){hd.depends_on(deps);
       const ConvParams pp=p;
       hd.parallel_for(sycl::range<2>(size_t(tokens),size_t(pp.channels)),[=](sycl::id<2>id){
         const int t=int(id[0]),c=int(id[1]),K=pp.kernel;

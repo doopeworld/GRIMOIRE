@@ -187,6 +187,15 @@ sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
 // AOT binaries).  launch_gemm_xmx() takes it whenever the shape fits.
 // Large-M GEMM with SwiGLU fused into the epilogue (gemm_fast.cpp): w is
 // [gate; up] (N = 2*FI); writes h bf16 [M][FI] = silu(x Wg^T) * (x Wu^T).
+// One-pass "elementwise op + f32->bf16" for results that only feed a GEMM
+// (ops.cpp).  Same values as the op followed by launch_f32_to_bf16.
+sycl::event launch_gate_sigmoid_mul_bf16_out(sycl::queue& q, const float* x, const float* g,
+                                             sycl_bf16* out, size_t n,
+                                             const std::vector<sycl::event>& deps = {});
+sycl::event launch_rmsnorm_gate_silu_bf16_out(sycl::queue& q, const float* x, const float* z,
+                                              const bf16_t* w, sycl_bf16* out, int n_heads,
+                                              int dim, float eps,
+                                              const std::vector<sycl::event>& deps = {});
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
                                     sycl_bf16* h, int M,

@@ -719,6 +719,34 @@ sycl::event launch_rmsnorm_gate_silu(sycl::queue& q, float* x, const float* z,
     });
 }
 
+// launch_rmsnorm_gate_silu followed by launch_f32_to_bf16, in one pass, for
+// the DeltaNet output projection's input: same values, x left untouched.
+sycl::event launch_rmsnorm_gate_silu_bf16_out(sycl::queue& q, const float* x, const float* z,
+                                              const bf16_t* w, sycl_bf16* out, int n_heads,
+                                              int dim, float eps,
+                                              const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_heads) * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const float* p = x + int64_t(it.get_group(0)) * dim;
+                const float* g = z + int64_t(it.get_group(0)) * dim;
+                sycl_bf16* o = out + int64_t(it.get_group(0)) * dim;
+                float ss = 0.0f;
+                for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                for (int i = lane; i < dim; i += SG_SIZE) {
+                    const float zv = g[i];
+                    o[i] = sycl_bf16(p[i] * scale * bf16_to_f32(w[i])
+                                     * (zv / (1.0f + sycl::exp(-zv))));
+                }
+            });
+    });
+}
+
 // Q and K normalization plus partial RoPE in one kernel.
 sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                                 const bf16_t* qw, const bf16_t* kw,
@@ -1233,6 +1261,21 @@ sycl::event launch_gate_sigmoid_mul(sycl::queue& q, float* x, const float* g,
         h.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
             const int i = int(id[0]);
             x[i] *= 1.0f / (1.0f + sycl::exp(-g[i]));
+        });
+    });
+}
+
+// launch_gate_sigmoid_mul followed by launch_f32_to_bf16, in one pass, for a
+// result that only feeds a GEMM: out = bf16(x * sigmoid(g)), the same values.
+sycl::event launch_gate_sigmoid_mul_bf16_out(sycl::queue& q, const float* x, const float* g,
+                                             sycl_bf16* out, size_t n,
+                                             const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const float s = 1.0f / (1.0f + sycl::exp(-g[i]));
+            out[i] = sycl_bf16(x[i] * s);
         });
     });
 }
