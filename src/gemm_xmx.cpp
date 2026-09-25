@@ -452,6 +452,7 @@ sycl::event gemm_flt_dispatch(sycl::queue& q, const QuantWeight& w,
 sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
                             const sycl_bf16* x, float* y, int M,
                             const std::vector<sycl::event>& deps) {
+    if (gemm_fast_supported(w, M)) return launch_gemm_fast(q, w, x, y, M, deps);
     switch (w.fmt) {
         case Fmt::BF16:     return gemm_flt_dispatch<Fmt::BF16>(q, w, x, y, M, deps);
         case Fmt::FP8_E4M3: return gemm_flt_dispatch<Fmt::FP8_E4M3>(q, w, x, y, M, deps);

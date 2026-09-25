@@ -31,11 +31,10 @@ ${EXTRA:-}"
 docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -p "${PORT}:${PORT}" \
   --device "/dev/dri/${NODE}:/dev/dri/${NODE}" \
-  -v /mnt/storage/isos/grimoire-fuse:/grimoire \
+  -v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib \
   -v /mnt/storage/Models:/models \
   -e ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   "${ENVARGS[@]}" \
-  -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
   --entrypoint /grimoire/bin/grimoire-server \
   "$IMAGE" \
   --model "$MODEL" --proj mxfp4 --ctx 8192 --host 0.0.0.0 --port "$PORT" >/dev/null

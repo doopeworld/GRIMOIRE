@@ -76,7 +76,7 @@ jobs:
           icpx --version
           sycl-ls
           flags=(-fsycl -fsycl-targets=spir64 -O2 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno -fsycl-device-code-split=per_kernel -Wmisleading-indentation -Iinclude -Isrc -Itools)
-          for src in grimoire qwen35_loader native_model safetensors quantize gptq gemv_decode gemm_xmx attention deltanet moe_kernels moe_ref ops prefill tokenizer; do
+          for src in grimoire qwen35_loader native_model safetensors quantize gptq gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer; do
             icpx "${flags[@]}" -c "src/$src.cpp" -o "cpu-obj/$src.o" > "cpu-logs/$src.build.log" 2>&1 || { cat "cpu-logs/$src.build.log"; exit 1; }
           done
           for gate in test_batch_spec test_batch_prefix test_batch_decode test_batch_parallel test_scheduler test_prefix_reuse; do

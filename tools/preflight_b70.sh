@@ -67,40 +67,21 @@ if [[ -n "${SKIP_BUILD:-}" ]]; then
   # Only for re-running the gates against a build you just made.  Never
   # for "the build is broken, let me see if the tests pass anyway": they
   # would be testing the previous binary.
-  skip "SKIP_BUILD set -- bin/ and src/*.so are whatever was there"
+  skip "SKIP_BUILD set -- bin/ is whatever was there"
 else
-# RULE 3: build_b70.sh does NOT rebuild the cutlass bridges.  A stale .so
-# has already cost this project a DEVICE_LOST that looked like a kernel
-# bug.  Always go through build_bridges_b70.sh, which rebuilds the
-# bridges and then calls build_b70.sh.
-#
-# It runs INSIDE the container: its include paths are /src/... (the
-# vllm-xpu-kernels checkout with cutlass-sycl under .deps) and it needs
-# icpx and ocloc, none of which exist on the Unraid host.  No GPU is
-# attached -- this is an ahead-of-time compile, so nothing here can wedge
-# a card.
-IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
-KERNELS="${KERNELS:-}"
-if [[ -z "$KERNELS" ]]; then
-  for cand in /mnt/user/appdata/vllm-xpu-kernels \
-              /mnt/cache/appdata/vllm-xpu-kernels; do
-    [[ -d "$cand" ]] && { KERNELS="$cand"; break; }
-  done
-fi
-if [[ -z "$KERNELS" || ! -d "$KERNELS" ]]; then
-  bad "vllm-xpu-kernels checkout not found (tried /mnt/user and /mnt/cache appdata)"
-  echo "   Set KERNELS=/path/to/vllm-xpu-kernels and re-run."
-  echo "   Without it the bridges cannot be built, and building the engine"
-  echo "   alone would leave STALE .so files -- rule 3."
-  exit 1
-fi
-echo "   image   : $IMAGE"
-echo "   kernels : $KERNELS"
+# GRIMOIRE is SYCL + Level Zero + C++: build the engine, its tools and its
+# gates with build_b70.sh and nothing else.  The optional plug-ins
+# (tools/build_bridges_b70.sh) compile vLLM kernel sources and link libtorch;
+# they are not built, and no launcher mounts src/.  icpx and ocloc are not on
+# the Unraid host, so the compile runs in a container used ONLY as a
+# compiler: no GPU attached, nothing from the image is linked into bin/.
+BUILD_IMAGE="${GRIM_BUILD_IMAGE:-my-vllm-xpu:latest}"
+echo "   compiler image : $BUILD_IMAGE"
 
-if ! stage "bridges + engine (in $IMAGE)" \
+if ! stage "engine + gates (compiled in $BUILD_IMAGE)" \
         docker run --rm --entrypoint bash \
-          -v "$REPO":/grimoire -v "$KERNELS":/src -w /grimoire \
-          "$IMAGE" -lc 'bash tools/build_bridges_b70.sh /grimoire'; then
+          -v "$REPO":/grimoire -w /grimoire \
+          "$BUILD_IMAGE" -lc 'bash build_b70.sh'; then
   echo
   echo "   Build failed -- everything below would test a STALE bin/."
   echo "   Stopping here."
@@ -113,30 +94,24 @@ for b in bin/grimoire bin/grimoire-server; do
   [[ -x "$b" ]] && ok "$b present" || bad "$b missing (build it before trusting anything below)"
 done
 
-# RULE: GRIMOIRE is C++/SYCL/Level Zero.  A bridge that links Torch drags
-# a Python runtime into the hot path and is not what this project is.
-say "2. bridges link no Torch"
-# Read the ELF's own NEEDED list rather than ldd: ldd RESOLVES, so on the
-# host (where the container's libraries do not exist) it can fail outright
-# and report nothing at all.  objdump -p reads what the file declares.
-shopt -s nullglob
-sofiles=(src/libgrimoire_*.so)
-if (( ${#sofiles[@]} == 0 )); then
-  bad "no src/libgrimoire_*.so -- the bridges are not built"
-else
-  reader=""
-  command -v objdump >/dev/null && reader="objdump -p"
-  [[ -z "$reader" ]] && command -v readelf >/dev/null && reader="readelf -d"
-  for so in "${sofiles[@]}"; do
-    if [[ -z "$reader" ]]; then skip "$(basename "$so") (no objdump/readelf here)"; continue; fi
-    if $reader "$so" 2>/dev/null | grep -i 'NEEDED' | grep -qi 'libtorch\|libc10'; then
-      bad "$(basename "$so") links Torch"
-    else
-      ok "$(basename "$so")"
-    fi
-  done
-fi
-shopt -u nullglob
+# RULE: GRIMOIRE is C++/SYCL/Level Zero.  Every binary must resolve all of
+# its libraries in the runtime image, with nothing from torch or vLLM among
+# them -- checked with ldd INSIDE that image, since the host has neither the
+# libraries nor objdump.
+say "2. pure: binaries need no torch or vLLM"
+RUN_IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+for b in bin/grimoire bin/grimoire-server; do
+  [[ -x "$b" ]] || continue
+  deps=$(docker run --rm --entrypoint bash -v "$REPO/bin:/grimoire/bin:ro" \
+           --tmpfs /opt/grimoire/lib "$RUN_IMAGE" -c "ldd /grimoire/$b" 2>&1)
+  if grep -q "not found" <<<"$deps"; then
+    bad "$b: missing libraries in $RUN_IMAGE: $(grep 'not found' <<<"$deps" | awk '{print $1}' | tr '\n' ' ')"
+  elif grep -qiE "libtorch|libc10|vllm" <<<"$deps"; then
+    bad "$b links torch or vLLM"
+  else
+    ok "$b"
+  fi
+done
 
 # ---------------------------------------------------------------------
 say "3. host tests (no GPU)"
@@ -195,11 +170,12 @@ run_gate() {
 # This wrapper mounts ONLY the two B70 render nodes (resolved by PCI
 # address through gpunode.sh), as pp2run.sh does -- never --privileged or
 # all of /dev/dri: the engine takes every visible Arc device, so with
-# everything mounted rank 1 landed on the B580.  The environment is
-# tune.sh's, so single- and two-card gates differ only in card count and
-# both load the bridges.  It runs the gate binary ONCE (not pp2worker.sh's
-# double-launch): these binaries fork their own children internally, so
-# doubling the outer launch would run each rank twice over.
+# everything mounted rank 1 landed on the B580.  Like every launcher it
+# runs GRIMOIRE pure (see b70run.sh): torch-free image, only bin/ and
+# tools/ mounted, /opt/grimoire/lib hidden, no plug-in variables.  It runs
+# the gate binary ONCE (not pp2worker.sh's double-launch): these binaries
+# fork their own children internally, so doubling the outer launch would
+# run each rank twice over.
 run_multigpu_gate() {
   local bin="$1"; shift
   local name="${bin##*/}"
@@ -229,14 +205,10 @@ run_multigpu_gate() {
       --ipc=host --shm-size=10g \
       --device "/dev/dri/$n0" --device "/dev/dri/$n1" \
       -v /dev/dri/by-path:/dev/dri/by-path \
-      -v "$REPO:/grimoire" \
+      -v "$REPO/bin:/grimoire/bin:ro" -v "$REPO/tools:/grimoire/tools:ro" \
+      --tmpfs /opt/grimoire/lib \
       -e ZE_AFFINITY_MASK=0,1 \
       -e ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
-      -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
-      -e GRIMOIRE_XE2_GROUPED_BRIDGE=/grimoire/src/libgrimoire_xe2_grouped.so \
-      -e GRIMOIRE_XE2_ATTN_BRIDGE=/grimoire/src/libgrimoire_xe2_attention_bridge.so \
-      -e GRIMOIRE_XE2_GDN_RAW_BRIDGE=/grimoire/src/libgrimoire_xe2_gdn_raw.so \
-      -e GRIMOIRE_ONEDNN_BRIDGE=/grimoire/src/libgrimoire_onednn.so \
       --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-my-vllm-xpu:latest}" \
       --signal=TERM --kill-after=60 900 \
       "/grimoire/${bin}" "$@" 2>>"$log")

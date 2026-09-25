@@ -17,7 +17,9 @@
 #include "kernels.hpp"
 #include "gemv_step.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <type_traits>
 
 namespace b70 {
 namespace {
@@ -131,8 +133,8 @@ sycl::event launch_gemm_batched(sycl::queue& q, const QuantWeight& w,
 // token, and the sequential dependency costs nothing because 32 heads x
 // 30 layers gives plenty of independent work to fill the machine.
 // ---------------------------------------------------------------------
-sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams& p,
-                                    const std::vector<sycl::event>& deps) {
+static sycl::event deltanet_prefill_wg(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                       const std::vector<sycl::event>& deps) {
     const int KD = p.k_dim, VD = p.v_dim;
 
     return q.submit([&](sycl::handler& h) {
@@ -193,6 +195,119 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
                 for (int j = 0; j < KD; ++j) Sg[row * KD + j] = S[row * KD + j];
             });
     });
+}
+
+// ---------------------------------------------------------------------
+// DeltaNet prefill, row-parallel.
+//
+// Row i of a head's [v_dim][k_dim] state evolves on its own:
+//   w      = S_i . k_t
+//   S_i    = a_t * S_i + beta_t * (v_t[i] - a_t * w) * k_t
+//   o_t[i] = (S_i . q_t) / sqrt(k_dim)
+// so the recurrence is sequential in t but fully parallel over (head, i).
+// deltanet_prefill_wg above runs one work-group per head -- one work-item
+// per row walking k_dim serially, two work-group barriers per token, and
+// only n_heads*v_dim work-items in flight: 161 ms per layer for 5987 tokens
+// on Qwen3.8-27B.  Here one sub-group owns R rows and keeps them in
+// registers (k_dim/16 floats per lane per row); a token costs two
+// sub-group reductions per row and no barrier at all.  Same arithmetic per
+// element; only the order of the k_dim reduction changes (a tree instead
+// of a serial sum).
+// ---------------------------------------------------------------------
+template <int KPL, int R>
+static sycl::event deltanet_prefill_rows(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                         const std::vector<sycl::event>& deps) {
+    constexpr int SGS_PER_WG = 8;
+    const int KD = p.k_dim, VD = p.v_dim;
+    const int sg_per_head = VD / R;
+    const size_t total_sg = size_t(p.n_heads) * size_t(sg_per_head);
+    const size_t padded_sg = (total_sg + SGS_PER_WG - 1) / SGS_PER_WG * SGS_PER_WG;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        h.parallel_for(
+            sycl::nd_range<1>(padded_sg * SG_SIZE, size_t(SGS_PER_WG) * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const size_t gsg = it.get_global_id(0) / SG_SIZE;
+                if (gsg >= total_sg) return;
+                const int head = int(gsg / size_t(sg_per_head));
+                const int row0 = int(gsg % size_t(sg_per_head)) * R;
+                const int nk = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+                const int khead = (nk == pp.n_heads) ? head : head / (pp.n_heads / nk);
+                float* Sg = pp.state + int64_t(head) * VD * KD;
+                float S[R][KPL];
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    #pragma unroll
+                    for (int j = 0; j < KPL; ++j)
+                        S[r][j] = Sg[int64_t(row0 + r) * KD + lane + j * SG_SIZE];
+                const float scale = sycl::rsqrt(float(KD));
+                for (int t = 0; t < pp.n_tokens; ++t) {
+                    const float* kt = pp.k + (int64_t(t) * nk + khead) * KD;
+                    const float* qt = pp.q + (int64_t(t) * nk + khead) * KD;
+                    const float* vt = pp.v + (int64_t(t) * pp.n_heads + head) * VD;
+                    float kr[KPL], qr[KPL];
+                    #pragma unroll
+                    for (int j = 0; j < KPL; ++j) {
+                        kr[j] = kt[lane + j * SG_SIZE];
+                        qr[j] = qt[lane + j * SG_SIZE];
+                    }
+                    const float av = pp.a[int64_t(t) * pp.n_heads + head];
+                    const float bv = pp.beta[int64_t(t) * pp.n_heads + head];
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        float w = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < KPL; ++j) w = sycl::fma(S[r][j], kr[j], w);
+                        w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
+                        const float corr = bv * (vt[row0 + r] - av * w);
+                        float o = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < KPL; ++j) {
+                            S[r][j] = sycl::fma(av, S[r][j], corr * kr[j]);
+                            o = sycl::fma(S[r][j], qr[j], o);
+                        }
+                        o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
+                        if (lane == 0)
+                            pp.out[(int64_t(t) * pp.n_heads + head) * VD + row0 + r] = o * scale;
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    #pragma unroll
+                    for (int j = 0; j < KPL; ++j)
+                        Sg[int64_t(row0 + r) * KD + lane + j * SG_SIZE] = S[r][j];
+            });
+    });
+}
+
+sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                    const std::vector<sycl::event>& deps) {
+    static const bool old = std::getenv("GRIMOIRE_DN_PREFILL_OLD") != nullptr;
+    static const int rows = [] {
+        const char* e = std::getenv("GRIMOIRE_DN_PREFILL_ROWS");
+        const int v = e ? std::atoi(e) : 2;
+        return (v == 1 || v == 2 || v == 4) ? v : 2;
+    }();
+    if (!old && p.v_dim % rows == 0) {
+        auto pick = [&](auto kpl) -> sycl::event {
+            constexpr int KPL = decltype(kpl)::value;
+            switch (rows) {
+                case 1:  return deltanet_prefill_rows<KPL, 1>(q, p, deps);
+                case 4:  return deltanet_prefill_rows<KPL, 4>(q, p, deps);
+                default: return deltanet_prefill_rows<KPL, 2>(q, p, deps);
+            }
+        };
+        switch (p.k_dim) {
+            case 64:  return pick(std::integral_constant<int, 64 / SG_SIZE>{});
+            case 128: return pick(std::integral_constant<int, 128 / SG_SIZE>{});
+            case 256: return pick(std::integral_constant<int, 256 / SG_SIZE>{});
+            default: break;
+        }
+    }
+    return deltanet_prefill_wg(q, p, deps);
 }
 
 // One work-group per token.  This is the batched counterpart of the
@@ -1274,6 +1389,10 @@ sycl::event launch_flash_prefill(
     const uint8_t* v_cache, float* out, int tokens, int start_pos,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
     float softmax_scale, const std::vector<sycl::event>& deps) {
+    if (flash_fast_supported(head_dim, num_heads, num_kv_heads))
+        return launch_flash_prefill_fast(q, qv, k_cache, v_cache, out, tokens, start_pos,
+                                         num_heads, num_kv_heads, head_dim, seq_cap,
+                                         softmax_scale, deps);
     return head_dim > MAX_HEAD_DIM
          ? launch_flash_prefill_impl<MAX_DPL_WIDE>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
            num_kv_heads, head_dim, seq_cap, softmax_scale, deps)

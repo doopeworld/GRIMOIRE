@@ -16,7 +16,11 @@ cd /mnt/storage/isos/grimoire-fuse
 NODE=$(bash tools/gpunode.sh "$GPU") || { echo "cannot resolve $GPU" >&2; exit 2; }
 echo "GPU=$GPU -> $NODE, model=$MODEL, port=$PORT"
 
-docker rm -f "$CNAME" >/dev/null 2>&1 || true
+if docker ps --format "{{.Names}}" | grep -q "^${CNAME}$"; then
+  echo "stopping existing $CNAME (draining GPU work) ..."
+  docker stop --time 120 "$CNAME" >/dev/null 2>&1 || true
+fi
+docker rm "$CNAME" >/dev/null 2>&1 || true
 # Serving knobs pass through from the host ONLY IF SET there: `-e NAME` with
 # no value copies the host's value and adds nothing when it is unset, so
 # the default launch is unchanged.  Without these the batching, prefix-
@@ -24,7 +28,7 @@ docker rm -f "$CNAME" >/dev/null 2>&1 || true
 docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -p "${PORT}:${PORT}" \
   --device "/dev/dri/${NODE}:/dev/dri/${NODE}" \
-  -v /mnt/storage/isos/grimoire-fuse:/grimoire \
+  -v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib \
   -v /mnt/storage/Models:/models \
   -e ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   -e GRIMOIRE_W4A8=1 \
@@ -41,7 +45,6 @@ docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -e GRIMOIRE_DFLASH_M \
   -e GRIMOIRE_SPEC_STATS \
   -e GRIMOIRE_DECODE_GRAPH \
-  -e LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/opt/intel/oneapi/dnnl/2026.0/lib:/usr/local/lib:/grimoire/src \
   --entrypoint /grimoire/bin/grimoire-server \
   "$IMAGE" \
   --model "$MODEL" --proj mxfp4 --ctx 8192 --host 0.0.0.0 --port "$PORT"

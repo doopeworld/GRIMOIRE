@@ -55,11 +55,24 @@ fi
 
 # `timeout --signal=TERM --kill-after=60` inside the container: the workload
 # gets a clean TERM first and a full minute to drain GPU work before KILL.
+# GRIMOIRE is SYCL + Level Zero + C++ only.  The engine can dlopen optional
+# plug-ins from src/, /bridge and the image's /opt/grimoire/lib; the ones that
+# exist carry vLLM kernels and libtorch, and on 2026-09-24 they produced
+# different garbage on every long prompt plus a DEVICE_LOST on Ornith.  Mount
+# only bin/ and tools/ read-only and hide /opt/grimoire/lib, so none of them
+# is reachable.  The image is only the oneAPI / Level Zero runtime the
+# binaries are compiled against; nothing from its Python side is mounted or
+# loaded.  The older torch-free grimoire:b70-native (built 09-06) segfaults
+# the model-matrix fixtures (exit 139, 4 of 4 runs) where this image runs
+# them clean, so it is not the default until it is rebuilt and re-tested.
+MOUNTS=(-v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro
+        -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro
+        --tmpfs /opt/grimoire/lib)
 CID=$(docker run -d --name "$CNAME" -w /grimoire \
     --init \
     --stop-timeout 300 \
     --device "/dev/dri/$NODE" \
-    -v /mnt/storage/isos/grimoire-fuse:/grimoire \
+    "${MOUNTS[@]}" \
     -v /mnt/storage/Models:/models \
     "${ENVARGS[@]}" \
     --entrypoint /usr/bin/timeout \

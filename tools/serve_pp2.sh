@@ -60,7 +60,7 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     --ipc=host --shm-size=10g \
     --device "/dev/dri/$NODE0" --device "/dev/dri/$NODE1" \
     -v /dev/dri/by-path:/dev/dri/by-path \
-    -v /mnt/storage/isos/grimoire-fuse:/grimoire \
+    -v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib \
     -v /mnt/storage/Models:/models \
     -e ZE_AFFINITY_MASK=0,1 \
     -e GRIMOIRE_PP_WORLD_SIZE=2 \
@@ -69,10 +69,6 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -e GRIMOIRE_DEFER_MOE_GATHER=1 \
     -e GRIMOIRE_BF16_QKV=1 \
     -e GRIMOIRE_BF16_DN_QKV=1 \
-    -e GRIMOIRE_XE2_GROUPED_BRIDGE=/grimoire/src/libgrimoire_xe2_grouped.so \
-    -e GRIMOIRE_XE2_ATTN_BRIDGE=/grimoire/src/libgrimoire_xe2_attention_bridge.so \
-    -e GRIMOIRE_XE2_GDN_RAW_BRIDGE=/grimoire/src/libgrimoire_xe2_gdn_raw.so \
-    -e GRIMOIRE_ONEDNN_BRIDGE=/grimoire/src/libgrimoire_onednn.so \
     -e GRIMOIRE_SEQ_SLOTS \
     -e GRIMOIRE_MAX_BATCH \
     -e GRIMOIRE_PREFIX_CACHE \
@@ -83,7 +79,6 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -e GRIMOIRE_DFLASH_M \
     -e GRIMOIRE_SPEC_STATS \
     -e GRIMOIRE_DECODE_GRAPH \
-    -e LD_LIBRARY_PATH=/grimoire/src:/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/usr/local/lib \
     --entrypoint /grimoire/tools/serve_pp2_worker.sh "$IMAGE" \
     "$MODEL" "$PORT" "$PROJ" "$CTX")
 

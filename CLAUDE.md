@@ -2,6 +2,14 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-09-25: READ `HANDOFF-2026-09-25-PURE-B70.md` FIRST.** GRIMOIRE runs
+PURE on the B70 -- no plug-ins: the optional src/libgrimoire_xe2_*.so /
+onednn plug-ins (vLLM kernels + libtorch) caused the nondeterministic
+long-prompt garbage and the Ornith DEVICE_LOST.  Every launcher mounts only
+bin/ and tools/.  Three of GRIMOIRE's own kernels were rewritten (fast GEMM,
+matrix-unit flash prefill in bin/libgrimoire_gemm.so, row-parallel DeltaNet
+prefill): Qwen3.8-27B prefill 171 -> 1,202 tok/s at 5987 tokens, same text.
+
 **2026-09-24: READ `HANDOFF-2026-09-24-FIRST-B70-RUN.md` FIRST.** First real
 run of `main` on the B70s.  Long-prompt prefill is NONDETERMINISTIC on the
 card (different garbage every run on the same input; not a regression, not

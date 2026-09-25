@@ -178,6 +178,19 @@ void set_gemv_tuning(int epl, int unroll, int wide); // runtime autotune
 sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
                             const sycl_bf16* x, float* y, int M,
                             const std::vector<sycl::event>& deps = {});
+// Large-M prompt GEMM (src/gemm_fast.cpp; bin/libgrimoire_gemm.so in the
+// AOT binaries).  launch_gemm_xmx() takes it whenever the shape fits.
+bool gemm_fast_supported(const QuantWeight& w, int M);
+sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
+                             const sycl_bf16* x, float* y, int M,
+                             const std::vector<sycl::event>& deps = {});
+// Matrix-unit causal prefill attention (src/gemm_fast.cpp);
+// launch_flash_prefill() takes it whenever the geometry fits.
+bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads);
+sycl::event launch_flash_prefill_fast(sycl::queue& q, const float* qv,
+    const uint8_t* k_cache, const uint8_t* v_cache, float* out, int tokens,
+    int start_pos, int num_heads, int num_kv_heads, int head_dim, int seq_cap,
+    float softmax_scale, const std::vector<sycl::event>& deps = {});
 sycl::event launch_quantize_rows_int8(sycl::queue& q, const float* x,
                                       int8_t* xq, float* scales, int M, int K,
                                       const std::vector<sycl::event>& deps = {});

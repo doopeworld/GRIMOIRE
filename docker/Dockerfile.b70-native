@@ -46,6 +46,8 @@ COPY --from=builder /etc/OpenCL/vendors/intel.icd /etc/OpenCL/vendors/intel.icd
 
 COPY --from=builder /grimoire/bin/grimoire /usr/local/bin/grimoire.real
 COPY --from=builder /grimoire/bin/grimoire-server /usr/local/bin/grimoire-server.real
+# Both binaries load it from their own directory ($ORIGIN rpath).
+COPY --from=builder /grimoire/bin/libgrimoire_gemm.so /usr/local/bin/libgrimoire_gemm.so
 # Per-model recipes + the wrapper that applies them.  The wrapper is
 # installed AT each binary's own path so it still runs when a container
 # overrides --entrypoint, which the Unraid templates all do.  With no
