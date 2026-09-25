@@ -72,8 +72,8 @@ inline uint32_t mxfp4_pair_bf16(uint32_t byte, float sc) {
 
 template <Fmt F>
 sycl::event dequant_vnni(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
-                         const std::vector<sycl::event>& deps) {
-    const int N = w.N, K = w.K;
+                         const std::vector<sycl::event>& deps, int ldn = 0) {
+    const int N = w.N, K = w.K, LD = ldn ? ldn : w.N;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const QuantWeight wc = w;
@@ -104,7 +104,7 @@ sycl::event dequant_vnni(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
                 else
                     v[t] = decode_elem<F>(row, k, scale);
             }
-            sycl_bf16* o = dst + (int64_t(kp) * N + n) * 2;
+            sycl_bf16* o = dst + (int64_t(kp) * LD + n) * 2;
             o[0] = sycl_bf16(v[0]);
             o[1] = sycl_bf16(v[1]);
         });
@@ -199,8 +199,13 @@ sycl::event dequant_vnni_tiled(sycl::queue& q, const QuantWeight& w, sycl_bf16* 
 // lanes of a sub-group are 16 consecutive n, so every store instruction
 // writes one whole 64-byte line of the scratch.  No SLM, no barrier.
 // Needs K % 128 == 0 and N % 256 == 0.  Same values as dequant_vnni.
+// ilv_fi > 0 (SwiGLU): W = [gate; up] with FI = ilv_fi rows each, written
+// interleaved -- scratch columns [64b, 64b+32) hold gate rows [32b, 32b+32)
+// and [64b+32, 64b+64) the matching up rows -- so a sub-group's 64 contiguous
+// columns are a gate tile and its up tile, and the SwiGLU GEMM loads B
+// exactly like the plain one.
 sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
-                                 const std::vector<sycl::event>& deps) {
+                                 const std::vector<sycl::event>& deps, int ilv_fi = 0) {
     const int N = w.N, K = w.K;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
@@ -212,7 +217,10 @@ sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16
             const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes + kb * 64;
             const uint8_t* sr = static_cast<const uint8_t*>(wc.scales) +
                                 int64_t(n) * wc.row_scales + kb * 4;
-            uint32_t* o = reinterpret_cast<uint32_t*>(dst) + int64_t(kb) * 64 * N + n;
+            const int col = ilv_fi == 0 ? n
+                          : n < ilv_fi ? (n / 32) * 64 + n % 32
+                                       : ((n - ilv_fi) / 32) * 64 + 32 + (n - ilv_fi) % 32;
+            uint32_t* o = reinterpret_cast<uint32_t*>(dst) + int64_t(kb) * 64 * N + col;
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 const float sc = e8m0_to_f32(sr[c]);
@@ -229,7 +237,19 @@ sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16
 }
 
 sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
-                        const std::vector<sycl::event>& deps) {
+                        const std::vector<sycl::event>& deps, int ldn = 0) {
+    if (ldn && ldn != w.N) {        // padded pitch (small N): simple kernel, columns >= N untouched
+        switch (w.fmt) {
+            case Fmt::BF16:     return dequant_vnni<Fmt::BF16>(q, w, dst, deps, ldn);
+            case Fmt::FP8_E4M3: return dequant_vnni<Fmt::FP8_E4M3>(q, w, dst, deps, ldn);
+            case Fmt::FP8_E5M2: return dequant_vnni<Fmt::FP8_E5M2>(q, w, dst, deps, ldn);
+            case Fmt::MXFP8:    return dequant_vnni<Fmt::MXFP8>(q, w, dst, deps, ldn);
+            case Fmt::MXFP4:    return dequant_vnni<Fmt::MXFP4>(q, w, dst, deps, ldn);
+            case Fmt::INT8:     return dequant_vnni<Fmt::INT8>(q, w, dst, deps, ldn);
+            case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps, ldn);
+        }
+        return {};
+    }
     static const bool no_stream = std::getenv("GRIMOIRE_DEQUANT_TILED") != nullptr;
     if (!no_stream && w.fmt == Fmt::MXFP4 && w.K % 128 == 0 && w.N % 256 == 0)
         return dequant_mxfp4_stream(q, w, dst, deps);
@@ -269,9 +289,10 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
 template <int EPI>
 sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* B,
                            void* out, int M, int N, int K,
-                           const std::vector<sycl::event>& deps) {
+                           const std::vector<sycl::event>& deps, int ldb = 0) {
     constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SG_SIZE;
-    const int nMB = (M + MC2 - 1) / MC2, nNB = N / NC2, FI = N / 2, GM = gemm_group_m();
+    const int LDB = ldb ? ldb : N;               // B's column pitch: N rounded up to NC2
+    const int nMB = (M + MC2 - 1) / MC2, nNB = LDB / NC2, FI = N / 2, GM = gemm_group_m();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(nMB) * nNB * WG, WG),
@@ -284,11 +305,10 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
             const int s = int(it.get_local_id(0)) / SG_SIZE, sm = s / SGN, sn = s % SGN;
             const int m0 = mb * MC2 + sm * MC1;
             if (m0 >= M) return;
-            auto bcol = [&](int n) {
-                return EPI == 1 ? (n < 2 ? nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN
-                                         : FI + nb * (NC2 / 2) + sn * (NC1 / 2) + (n - 2) * TN)
-                                : nb * NC2 + sn * NC1 + n * TN;
-            };
+            // B columns of fragment n.  For EPI 1 the scratch is gate/up
+            // interleaved (dequant_mxfp4_stream ilv_fi), so fragments 0-1 are
+            // gate and 2-3 the matching up columns either way.
+            auto bcol = [&](int n) { return nb * NC2 + sn * NC1 + n * TN; };
             auto pA = sycl::address_space_cast<sycl::access::address_space::global_space,
                                                sycl::access::decorated::no>(A);
             auto pB = sycl::address_space_cast<sycl::access::address_space::global_space,
@@ -317,9 +337,9 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                     #pragma unroll
                     for (int n = 0; n < NC1 / TN; ++n)
                         matrix::joint_matrix_load(sg, b[n][kk],
-                            pB + size_t(k + kk * TK_BF16) / 2 * (size_t(N) * 2)
+                            pB + size_t(k + kk * TK_BF16) / 2 * (size_t(LDB) * 2)
                                + size_t(bcol(n)) * 2,
-                            size_t(N) * 2);
+                            size_t(LDB) * 2);
                 }
                 #pragma unroll
                 for (int kk = 0; kk < KC1 / TK_BF16; ++kk)
@@ -353,13 +373,14 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                     #pragma unroll
                     for (int n = 0; n < 2; ++n) {
                         matrix::joint_matrix_apply(sg, acc[m][n], acc[m][n + 2],
-                            [](float& g, float& u) { g = (g / (1.0f + sycl::exp(-g))) * u; });
+                            [](float& g, float& u) {
+                                g = sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u; });
                         matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::accumulator,
                                              TM, TN> hb;
                         matrix::joint_matrix_copy(sg, acc[m][n], hb);
                         ix::joint_matrix_store_checked(sg, hb, pH, size_t(FI),
                             matrix::layout::row_major, size_t(M), size_t(FI),
-                            size_t(m0 + m * TM), size_t(bcol(n)));
+                            size_t(m0 + m * TM), size_t(nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN));
                     }
             }
         });
@@ -476,6 +497,11 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
         });
     });
     const int qtiles = (tokens + FA_BQ - 1) / FA_BQ;
+    // Scores in log2 units: Q carries scale*log2(e), so the softmax is the
+    // hardware exp2.  The accurate sycl::exp is a long instruction sequence,
+    // three per score pair, and made the softmax -- not the matrix unit --
+    // the bottleneck.  P is rounded to bf16 before PV anyway.
+    const float qscale = scale * 1.4426950408889634f;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
         sycl::local_accessor<sycl_bf16, 1> Qs(FA_NSG * FA_RB * D, h);
@@ -497,7 +523,7 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
             sycl_bf16* qs = qs_mp.get(); float* ss = ss_mp.get(); sycl_bf16* ps = ps_mp.get();
             for (int i = lane; i < RB * D; i += SG_SIZE) {
                 const int r = i / D, d = i % D, t = r0 + r;
-                qs[i] = sycl_bf16(t < tokens ? qv[(size_t(t) * H + hq) * D + d] * scale : 0.0f);
+                qs[i] = sycl_bf16(t < tokens ? qv[(size_t(t) * H + hq) * D + d] * qscale : 0.0f);
             }
             sycl::group_barrier(sg);
             auto kg = sycl::address_space_cast<sycl::access::address_space::global_space, NO>(
@@ -548,9 +574,9 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                     const float bm = sycl::reduce_over_group(sg, sycl::fmax(v0, v1),
                                                              sycl::maximum<float>());
                     const float mn = sycl::fmax(m[r], bm);
-                    corr[r] = sycl::isinf(m[r]) ? 0.0f : sycl::exp(m[r] - mn);
-                    const float p0 = sycl::isinf(v0) ? 0.0f : sycl::exp(v0 - mn);
-                    const float p1 = sycl::isinf(v1) ? 0.0f : sycl::exp(v1 - mn);
+                    corr[r] = sycl::isinf(m[r]) ? 0.0f : sycl::native::exp2(m[r] - mn);
+                    const float p0 = sycl::isinf(v0) ? 0.0f : sycl::native::exp2(v0 - mn);
+                    const float p1 = sycl::isinf(v1) ? 0.0f : sycl::native::exp2(v1 - mn);
                     ps[r * BK + lane] = sycl_bf16(p0);
                     ps[r * BK + lane + SG_SIZE] = sycl_bf16(p1);
                     l[r] = l[r] * corr[r] +
@@ -785,7 +811,8 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
                     #pragma unroll
                     for (int n = 0; n < 2; ++n) {
                         matrix::joint_matrix_apply(sg, acc[m][n], acc[m][n + 2],
-                            [](float& g, float& u) { g = (g / (1.0f + sycl::exp(-g))) * u; });
+                            [](float& g, float& u) {
+                                g = sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u; });
                         const int r0 = m0 + m * TM;
                         const int col = nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN;
                         ix::joint_matrix_apply(sg, acc[m][n], [=](float& x, size_t r, size_t c) {
@@ -813,8 +840,9 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 
 bool gemm_fast_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FAST_GEMM") != nullptr;
-    return !off && M >= 32 && w.payload && w.N % NC2 == 0 && w.K % KC1 == 0 &&
-           size_t(w.N) * size_t(w.K) <= kMaxScratchElems;
+    const size_t np = size_t(w.N + NC2 - 1) / NC2 * NC2;
+    return !off && M >= 32 && w.payload && w.N % 16 == 0 && w.K % KC1 == 0 &&
+           np * size_t(w.K) <= kMaxScratchElems;
 }
 
 namespace {
@@ -834,17 +862,29 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     };
     if (timed) q.wait();             // earlier work must not count here
     auto t0 = now();
-    if (fused_mxfp4_ok(w)) {
+    if (fused_mxfp4_ok(w)) {                 // N % NC2 == 0 checked there
         sycl::event e = gemm_mxfp4_fused<EPI>(q, w, x, out, M, deps);
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
         return e;
     }
+    // N not a multiple of NC2 (DeltaNet's a|b gate projection, N = 96): the
+    // scratch gets pitch Np with zeroed extra columns and the stores clip at
+    // N.  It used to fall back to gemm_flt: 41 ms per Qwen prefill.
+    const int Np = (N + NC2 - 1) / NC2 * NC2;
     Scratch& s = scratch_for(q);
-    if (!grow(q, s.w, s.w_cap, size_t(N) * K))
+    if (!grow(q, s.w, s.w_cap, size_t(Np) * K))
         throw std::runtime_error("gemm_fast: weight scratch allocation failed");
-    sycl::event e = dequant_any(q, w, s.w, deps);
+    sycl::event e;
+    if (Np != N) {
+        e = q.memset(s.w, 0, size_t(Np) * K * sizeof(sycl_bf16), deps);
+        e = dequant_any(q, w, s.w, {e}, Np);
+    } else if (EPI == 1) {
+        e = dequant_mxfp4_stream(q, w, s.w, deps, N / 2);
+    } else {
+        e = dequant_any(q, w, s.w, deps);
+    }
     if (timed) { lap(stage_times().dq, t0); ++stage_times().calls; }
-    e = gemm_bf16_vnni<EPI>(q, x, s.w, out, M, N, K, {e});
+    e = gemm_bf16_vnni<EPI>(q, x, s.w, out, M, N, K, {e}, Np);
     if (timed) lap(stage_times().main, t0);
     return e;
 }
@@ -859,7 +899,8 @@ sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
 
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FUSED_SWIGLU") != nullptr;
-    return !off && gemm_fast_supported(w, M) && (w.N / 2) % (NC2 / 2) == 0;
+    return !off && gemm_fast_supported(w, M) && w.fmt == Fmt::MXFP4 && w.K % 128 == 0 &&
+           w.N % NC2 == 0 && (w.N / 2) % 32 == 0;
 }
 
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
