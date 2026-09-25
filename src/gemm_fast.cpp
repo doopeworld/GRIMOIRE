@@ -23,6 +23,7 @@
 // =====================================================================
 #include "kernels.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,18 @@ constexpr size_t kMaxScratchElems = size_t(512) << 20;
 // work-groups then share 4 A row-panels and 8 B column-panels instead of 1
 // and 32 -- B (2 bytes per weight) used to be re-read once per row block.
 // GRIMOIRE_GEMM_GROUP_M=1 restores the old column-fastest order.
+// Prefetch A and B tiles d K steps ahead into L1.  MEASURED, Qwen3.8-27B
+// 4088-token prefill, all 384 GEMMs: d=0 1579 ms, d=1 1377, d=2 1536,
+// d=3 1641.  GRIMOIRE_GEMM_PREFETCH=d overrides (0 = off).
+int gemm_prefetch() {
+    static const int d = [] {
+        const char* e = std::getenv("GRIMOIRE_GEMM_PREFETCH");
+        const int v = e ? std::atoi(e) : 1;
+        return v >= 0 && v <= 8 ? v : 0;
+    }();
+    return d;
+}
+
 int gemm_group_m() {
     static const int g = [] {
         const char* e = std::getenv("GRIMOIRE_GEMM_GROUP_M");
@@ -293,6 +306,7 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
     constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SG_SIZE;
     const int LDB = ldb ? ldb : N;               // B's column pitch: N rounded up to NC2
     const int nMB = (M + MC2 - 1) / MC2, nNB = LDB / NC2, FI = N / 2, GM = gemm_group_m();
+    const int PD = gemm_prefetch();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(nMB) * nNB * WG, WG),
@@ -323,7 +337,22 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
             // A always goes through the bounds-checked 2-D block load: the
             // hardware message is the same one either way, and one loop copy
             // (not a checked + unchecked pair) keeps the code the old kernel's.
+            const bool a_full = m0 + MC1 <= M;       // never prefetch past row M
             for (int k = 0; k < K; k += KC1) {
+                if (PD > 0 && k + PD * KC1 < K) {
+                    namespace syclex = sycl::ext::oneapi::experimental;
+                    const int kp = k + PD * KC1;
+                    if (a_full)
+                        ix::joint_matrix_prefetch<MC1, KC1>(sg, A + size_t(m0) * K + kp, K,
+                            matrix::layout::row_major,
+                            syclex::properties{syclex::prefetch_hint_L1});
+                    #pragma unroll
+                    for (int c = 0; c < NC1 * 2; c += 32)
+                        ix::joint_matrix_prefetch<KC1 / 2, 32>(sg,
+                            B + size_t(kp / 2) * (size_t(LDB) * 2) + size_t(bcol(0)) * 2 + c,
+                            size_t(LDB) * 2, matrix::layout::row_major,
+                            syclex::properties{syclex::prefetch_hint_L1});
+                }
                 matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::a, TM, TK_BF16,
                                      matrix::layout::row_major> a[MC1 / TM][KC1 / TK_BF16];
                 matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::b, TK_BF16, TN,
