@@ -175,11 +175,22 @@ int gemv_epl_override();      // 0 = use per-format default
 int gemv_unroll_override();   // 0 = use default (4)
 void set_gemv_tuning(int epl, int unroll, int wide); // runtime autotune
 
+// M (<= a few) activation rows against one weight, bit-identical per row to
+// launch_gemv() but reading the weight once per 4 rows (gemv_decode.cpp).
+sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
+                              const float* x, float* y, int M,
+                              const std::vector<sycl::event>& deps = {});
 sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
                             const sycl_bf16* x, float* y, int M,
                             const std::vector<sycl::event>& deps = {});
 // Large-M prompt GEMM (src/gemm_fast.cpp; bin/libgrimoire_gemm.so in the
 // AOT binaries).  launch_gemm_xmx() takes it whenever the shape fits.
+// Large-M GEMM with SwiGLU fused into the epilogue (gemm_fast.cpp): w is
+// [gate; up] (N = 2*FI); writes h bf16 [M][FI] = silu(x Wg^T) * (x Wu^T).
+bool gemm_fast_swiglu_supported(const QuantWeight& w, int M);
+sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
+                                    sycl_bf16* h, int M,
+                                    const std::vector<sycl::event>& deps = {});
 bool gemm_fast_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
@@ -289,6 +300,7 @@ struct DeltaNetPrefillParams {
     int n_heads, k_dim, v_dim, n_tokens;
     int n_k_heads = 0;
 };
+
 
 sycl::event launch_dequant_bf16(sycl::queue& q, const QuantWeight& w,
                                 sycl_bf16* dst,

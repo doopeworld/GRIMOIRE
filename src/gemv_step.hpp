@@ -150,6 +150,37 @@ template <int EPL> struct GemvStep<Fmt::MXFP4, EPL> {
         return a * s;
     }
 
+    // run_xv split in two for batched rows: the weights (and scale) are
+    // decoded ONCE, then each row applies `a = fma(wv[j], x[j], a)` for
+    // j = 0..EPL-1 and `a * s` -- the exact sequence run_xv performs, so the
+    // result is bit-identical while the SLM table lookups are not repeated
+    // per row.
+    template <int OPT>
+    static inline void decode_xv(const QuantWeight& w, const uint8_t* row,
+                                 const float* slut, const float* nlut,
+                                 int n, int k0, float* wv, float& s) {
+        const uint8_t X = static_cast<const uint8_t*>(w.scales)
+                          [int64_t(n) * w.row_scales + k0 / kMXBlock];
+        s = slut[X];
+        const uint8_t* p = row + (k0 >> 1);
+        #pragma unroll
+        for (int i = 0; i < EPL / 2; ++i) {
+            uint8_t byte;
+            if constexpr (EPL == 16) {
+                byte = uint8_t((*reinterpret_cast<const uint64_t*>(p)) >> (8 * i));
+            } else {
+                byte = p[i];
+            }
+            if constexpr (OPT & 2) {
+                wv[2 * i]     = e2m1_alu(byte & 0x0Fu);
+                wv[2 * i + 1] = e2m1_alu((byte >> 4) & 0x0Fu);
+            } else {
+                wv[2 * i]     = nlut[byte & 0x0F];
+                wv[2 * i + 1] = nlut[(byte >> 4) & 0x0F];
+            }
+        }
+    }
+
     static inline float run(const QuantWeight& w, const uint8_t* row,
                             const float* x, const float* lut,
                             const float* slut, const float* nlut, int n, int k0) {

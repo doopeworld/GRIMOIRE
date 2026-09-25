@@ -26,7 +26,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 
 constexpr int SG = 16, TM = 8, TN = 16, TK = 16;
 
-template <int MC1, int NC1, int KC1, int MC2, int NC2>
+template <int MC1, int NC1, int KC1, int MC2, int NC2, int PD = 0>
 struct Gemm {
     static sycl::event run(sycl::queue& q, const bf16* A, const bf16* B, float* C,
                            int M, int N, int K) {
@@ -55,6 +55,20 @@ struct Gemm {
                 for (int n = 0; n < NC1 / TN; ++n)
                     mx::joint_matrix_fill(sg, acc[m][n], 0.0f);
             for (int k = 0; k < K; k += KC1) {
+                if constexpr (PD > 0) {
+                    const int kp = k + PD * KC1;
+                    if (kp < K) {
+                        namespace syclex = sycl::ext::oneapi::experimental;
+                        mx::joint_matrix_prefetch<MC1, KC1>(sg, A + size_t(m0) * K + kp, K,
+                            mx::layout::row_major, syclex::properties{syclex::prefetch_hint_L1});
+                        #pragma unroll
+                        for (int c = 0; c < NC1 * 2; c += 32)
+                            mx::joint_matrix_prefetch<KC1 / 2, 32>(sg,
+                                B + size_t(kp / 2) * (size_t(N) * 2) + size_t(n0) * 2 + c,
+                                size_t(N) * 2, mx::layout::row_major,
+                                syclex::properties{syclex::prefetch_hint_L1});
+                    }
+                }
                 mx::joint_matrix<sycl::sub_group, bf16, mx::use::a, TM, TK,
                                  mx::layout::row_major> a[MC1 / TM][KC1 / TK];
                 mx::joint_matrix<sycl::sub_group, bf16, mx::use::b, TK, TN,
@@ -119,6 +133,39 @@ static void bench(const char* name, sycl::queue& q, const bf16* A, const bf16* B
                 2.0 * M * N * K / s / 1e12, max_rel, max_rel < 1e-3 ? "OK" : "WRONG");
 }
 
+template <class G>
+static void run_shape(const char* name, sycl::queue& q, int M, int N, int K) {
+    std::vector<bf16> hA(size_t(M) * K), hB(size_t(K) * N), hBv(size_t(K) * N);
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<float> d(-1.f, 1.f);
+    for (auto& v : hA) v = bf16(d(rng));
+    for (auto& v : hB) v = bf16(d(rng));
+    for (int k = 0; k < K; ++k)
+        for (int n = 0; n < N; ++n)
+            hBv[(size_t(k / 2) * N + n) * 2 + (k & 1)] = hB[size_t(k) * N + n];
+    bf16* A = sycl::malloc_device<bf16>(hA.size(), q);
+    bf16* B = sycl::malloc_device<bf16>(hBv.size(), q);
+    float* C = sycl::malloc_device<float>(size_t(M) * N, q);
+    q.memcpy(A, hA.data(), hA.size() * sizeof(bf16));
+    q.memcpy(B, hBv.data(), hBv.size() * sizeof(bf16)).wait();
+    char label[96]; std::snprintf(label, sizeof label, "%s M=%d N=%d K=%d", name, M, N, K);
+    bench<G>(label, q, A, B, C, M, N, K, hA, hB);
+    sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
+}
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order()};
+    std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+    const int shapes[3][3] = {{4096, 34816, 5120}, {4096, 5120, 17408}, {4096, 10240, 5120}};
+    for (auto& sh : shapes) {
+        run_shape<Gemm<32, 64, 32, 256, 256, 0>>("base ", q, sh[0], sh[1], sh[2]);
+        run_shape<Gemm<32, 64, 32, 256, 256, 1>>("pf1  ", q, sh[0], sh[1], sh[2]);
+        run_shape<Gemm<32, 64, 32, 256, 256, 2>>("pf2  ", q, sh[0], sh[1], sh[2]);
+    }
+    return 0;
+}
+#if 0
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const int M = argc > 3 ? std::atoi(argv[1]) : 6144;
@@ -148,3 +195,5 @@ int main(int argc, char** argv) {
     sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
     return 0;
 }
+
+#endif

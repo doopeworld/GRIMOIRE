@@ -283,17 +283,155 @@ static sycl::event deltanet_prefill_rows(sycl::queue& q, const DeltaNetPrefillPa
     });
 }
 
+// ---------------------------------------------------------------------
+// Same recurrence and the same arithmetic as deltanet_prefill_rows, but the
+// token stream goes through shared local memory T tokens at a time.
+// deltanet_prefill_rows loads k_t / q_t / v_t from global memory inside the
+// sequential token loop, so every token waits out a full memory round trip:
+// ~2,500 cycles a token, 362 ms of a 4088-token Qwen3.8-27B prefill.  Here a
+// work-group (8 sub-groups, all rows of one head) fetches the NEXT chunk
+// into registers while it runs the current chunk out of SLM, so global
+// latency is paid once per chunk.  Results are bit-identical to the rows
+// kernel (same fma order, same sub-group reductions).
+// ---------------------------------------------------------------------
+template <int KPL, int R>
+static sycl::event deltanet_prefill_chunked(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                            const std::vector<sycl::event>& deps) {
+    constexpr int SGS = 8, WG = SGS * SG_SIZE, KD = KPL * SG_SIZE, ROWS = SGS * R;
+    constexpr int T = 2048 / KD;                     // tokens per chunk: 16 at k_dim 128
+    constexpr int KQ4 = T * KD / (WG * 4);           // float4 of k (and of q) per work-item
+    constexpr int VPW = (T * ROWS + WG - 1) / WG;    // v values per work-item (last may idle)
+    static_assert(KQ4 >= 1 && T * KD == KQ4 * WG * 4, "chunk must split into float4s");
+    static_assert(2 * T <= WG, "a/beta staging needs 2T work-items");
+    const int VD = p.v_dim;
+    const int wg_per_head = VD / ROWS;               // caller checks VD % ROWS == 0
+    const size_t n_wg = size_t(p.n_heads) * size_t(wg_per_head);
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        sycl::local_accessor<sycl::float4, 1> sk(T * KD / 4, h), sq(T * KD / 4, h);
+        sycl::local_accessor<float, 1> sv(T * ROWS, h), sab(2 * T, h);
+        h.parallel_for(sycl::nd_range<1>(n_wg * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]);
+            const int lid = int(it.get_local_id(0));
+            const int sgi = lid / SG_SIZE;
+            const int wg = int(it.get_group(0));
+            const int head = wg / wg_per_head;
+            const int rbase = (wg % wg_per_head) * ROWS;
+            const int row0 = rbase + sgi * R;
+            const int nk = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+            const int khead = (nk == pp.n_heads) ? head : head / (pp.n_heads / nk);
+            const int NT = pp.n_tokens, NH = pp.n_heads;
+            float* Sg = pp.state + int64_t(head) * VD * KD;
+            float S[R][KPL];
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                #pragma unroll
+                for (int j = 0; j < KPL; ++j)
+                    S[r][j] = Sg[int64_t(row0 + r) * KD + lane + j * SG_SIZE];
+            const float scale = sycl::rsqrt(float(KD));
+
+            sycl::float4 rk[KQ4], rq[KQ4];
+            float rv[VPW], rab = 0.0f;
+            // Tokens past the end are clamped to the last one; they are loaded
+            // but never used.
+            auto fetch = [&](int t0) {
+                #pragma unroll
+                for (int i = 0; i < KQ4; ++i) {
+                    const int e = (i * WG + lid) * 4;
+                    const int t = sycl::min(t0 + e / KD, NT - 1);
+                    const int64_t off = (int64_t(t) * nk + khead) * KD + e % KD;
+                    rk[i] = *reinterpret_cast<const sycl::float4*>(pp.k + off);
+                    rq[i] = *reinterpret_cast<const sycl::float4*>(pp.q + off);
+                }
+                #pragma unroll
+                for (int i = 0; i < VPW; ++i) {
+                    const int e = i * WG + lid;
+                    const int t = sycl::min(t0 + e / ROWS, NT - 1);
+                    if (e < T * ROWS) rv[i] = pp.v[(int64_t(t) * NH + head) * VD + rbase + e % ROWS];
+                }
+                if (lid < 2 * T) {
+                    const int t = sycl::min(t0 + lid % T, NT - 1);
+                    rab = (lid < T ? pp.a : pp.beta)[int64_t(t) * NH + head];
+                }
+            };
+            fetch(0);
+            for (int t0 = 0; t0 < NT; t0 += T) {
+                #pragma unroll
+                for (int i = 0; i < KQ4; ++i) { sk[i * WG + lid] = rk[i]; sq[i * WG + lid] = rq[i]; }
+                #pragma unroll
+                for (int i = 0; i < VPW; ++i)
+                    if (i * WG + lid < T * ROWS) sv[i * WG + lid] = rv[i];
+                if (lid < 2 * T) sab[lid] = rab;
+                sycl::group_barrier(it.get_group());
+                if (t0 + T < NT) fetch(t0 + T);          // in flight while this chunk runs
+                const float* skf = reinterpret_cast<const float*>(
+                    sk.template get_multi_ptr<sycl::access::decorated::no>().get());
+                const float* sqf = reinterpret_cast<const float*>(
+                    sq.template get_multi_ptr<sycl::access::decorated::no>().get());
+                const int tn = sycl::min(T, NT - t0);
+                for (int tt = 0; tt < tn; ++tt) {
+                    float kr[KPL], qr[KPL];
+                    #pragma unroll
+                    for (int j = 0; j < KPL; ++j) {
+                        kr[j] = skf[tt * KD + lane + j * SG_SIZE];
+                        qr[j] = sqf[tt * KD + lane + j * SG_SIZE];
+                    }
+                    const float av = sab[tt];
+                    const float bv = sab[T + tt];
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        float w = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < KPL; ++j) w = sycl::fma(S[r][j], kr[j], w);
+                        w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
+                        const float corr = bv * (sv[tt * ROWS + sgi * R + r] - av * w);
+                        float o = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < KPL; ++j) {
+                            S[r][j] = sycl::fma(av, S[r][j], corr * kr[j]);
+                            o = sycl::fma(S[r][j], qr[j], o);
+                        }
+                        o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
+                        if (lane == 0)
+                            pp.out[(int64_t(t0 + tt) * NH + head) * VD + row0 + r] = o * scale;
+                    }
+                }
+                sycl::group_barrier(it.get_group());     // chunk fully read before it is overwritten
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                #pragma unroll
+                for (int j = 0; j < KPL; ++j)
+                    Sg[int64_t(row0 + r) * KD + lane + j * SG_SIZE] = S[r][j];
+        });
+    });
+}
+
 sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams& p,
                                     const std::vector<sycl::event>& deps) {
     static const bool old = std::getenv("GRIMOIRE_DN_PREFILL_OLD") != nullptr;
-    static const int rows = [] {
+    static const int rows_env = [] {
         const char* e = std::getenv("GRIMOIRE_DN_PREFILL_ROWS");
-        const int v = e ? std::atoi(e) : 2;
-        return (v == 1 || v == 2 || v == 4) ? v : 2;
+        const int v = e ? std::atoi(e) : 0;
+        return (v == 1 || v == 2 || v == 4) ? v : 0;     // 0: pick by k_dim below
     }();
+    // Auto: 4 rows per sub-group up to k_dim 128 (Qwen3.8-27B, 4088 tokens:
+    // 252 ms vs 349 at 2 rows); 2 above that, where 4 rows spill.
+    const int rows = rows_env ? rows_env : (p.k_dim <= 128 ? 4 : 2);
     if (!old && p.v_dim % rows == 0) {
+        static const bool nochunk = std::getenv("GRIMOIRE_DN_PREFILL_NOCHUNK") != nullptr;
         auto pick = [&](auto kpl) -> sycl::event {
             constexpr int KPL = decltype(kpl)::value;
+            if (!nochunk && p.v_dim % (8 * rows) == 0) {
+                switch (rows) {
+                    case 1:  return deltanet_prefill_chunked<KPL, 1>(q, p, deps);
+                    case 4:  return deltanet_prefill_chunked<KPL, 4>(q, p, deps);
+                    default: return deltanet_prefill_chunked<KPL, 2>(q, p, deps);
+                }
+            }
             switch (rows) {
                 case 1:  return deltanet_prefill_rows<KPL, 1>(q, p, deps);
                 case 4:  return deltanet_prefill_rows<KPL, 4>(q, p, deps);

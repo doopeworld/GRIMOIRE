@@ -11789,6 +11789,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // back to int8 would look like a random acceptance regression.
     const bool verify_a16 = exact_verify &&
         !std::getenv("GRIMOIRE_VERIFY_EXACT_GEMV") && bool(load_onednn_s4());
+    // A/B switch for the batched verify GEMV: GRIMOIRE_NO_GEMV_BATCH=1 restores
+    // one launch_gemv per row (and gemm_flt for large N).
+    static const bool no_gemv_batch = std::getenv("GRIMOIRE_NO_GEMV_BATCH") != nullptr;
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
         if(exact_verify && M<=4 && !verify_a16){
@@ -11805,10 +11808,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // avoids both activation requantization and loading the same
                 // 4-bit matrix once per candidate.
                 launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,y,w.w.N,w.w.K,M,{});
-            } else {
+            } else if(no_gemv_batch) {
                 for(int r=0;r<M;++r)
-                    launch_gemv(q,w.w,x+size_t(r)*w.w.K,
-                                y+size_t(r)*w.w.N,{});
+                    launch_gemv(q,w.w,x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,{});
+            } else {
+                launch_gemv_batch(q,w.w,x,y,M,{});
             }
             return;
         }
@@ -11867,10 +11871,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 return;
             }
             if(w.w.payload){
-                for(int r=0;r<M;++r)
-                    launch_gemv(q,w.w,x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,{});
+                if(no_gemv_batch)
+                    for(int r=0;r<M;++r)
+                        launch_gemv(q,w.w,x+size_t(r)*w.w.K,y+size_t(r)*w.w.N,{});
+                else launch_gemv_batch(q,w.w,x,y,M,{});
                 return;
             }
+        }
+        // Verify-sized batches on plain weights, ANY N.  Without a plug-in
+        // they used to fall all the way through to gemm_flt, whose 512-row
+        // tile ran an M=4 verify pass at 1250 ms (839 of it the FFN) against a
+        // 31 ms decode step.  The batched GEMV reads each weight once, and is
+        // bit-identical per row to the decode GEMV.
+        if(!no_gemv_batch && M<=16 && w.w.payload && !w.has_i4()){
+            launch_gemv_batch(q,w.w,x,y,M,{});
+            return;
         }
         // ONEDNN W4A8 -- vLLM's own path, ported byte-for-byte in
         // xe2_onednn_bridge.cpp. vLLM routes every linear layer through
@@ -12899,7 +12914,23 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }else{
             if(!mlp_bf16(d.sh_gu,d.sh_down,r0,li)){
                 const int FI=d.sh_gu.output_rows()/2;
-                mm(d.sh_gu,bn,t0); launch_swiglu_batched(q,t0,t1,M,FI); mm(d.sh_down,t1,r0);
+                // Fused SwiGLU (gemm_fast.cpp): the gate_up GEMM writes
+                // h = silu(g)*u as bf16 straight into the down projection's
+                // input -- no fp32 [M][2*FI] round trip, no separate SwiGLU
+                // or f32->bf16 pass (110 + ~45 ms of a 4088-token Qwen
+                // prefill).  Same values as the three-step path below.
+                // GRIMOIRE_NO_FUSED_SWIGLU=1 restores it.
+                if(!tp_enabled() && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                   gemm_fast_swiglu_supported(d.sh_gu.w,M) &&
+                   gemm_fast_supported(d.sh_down.w,M)){
+                    launch_gemm_fast_swiglu(q,d.sh_gu.w,bn_bf,xb,M);
+                    pp_mark("  FFN gate_up+swiglu");
+                    launch_gemm_xmx(q,d.sh_down.w,xb,r0,M);
+                }else{
+                    mm(d.sh_gu,bn,t0); pp_mark("  FFN gate_up");
+                    launch_swiglu_batched(q,t0,t1,M,FI); pp_mark("  FFN swiglu");
+                    mm(d.sh_down,t1,r0);
+                }
             }
             pp_mark("dense FFN");
             q.memset(r1,0,size_t(M)*H*sizeof(float));

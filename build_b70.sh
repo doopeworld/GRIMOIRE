@@ -282,7 +282,7 @@ icpx -fsycl -fsycl-targets=spir64 \
      -fsycl-device-code-split=per_kernel \
      -I include -I src \
      tools/test_k2_kernels_device.cpp src/ops.cpp src/prefill.cpp \
-     src/attention.cpp src/quantize.cpp \
+     src/attention.cpp src/quantize.cpp src/gemm_fast.cpp \
      -o bin/test_k2_kernels \
   && echo "built  : bin/test_k2_kernels" \
   || { echo "=== K2 KERNEL GATE BUILD FAILED ==="; REQUIRED_FAILED=1; }

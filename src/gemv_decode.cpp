@@ -16,6 +16,7 @@
 //  the loads are not coalescing, not that the card is slow.
 // =====================================================================
 #include "kernels.hpp"
+#include <algorithm>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "gemv_step.hpp"
 #include <cstdlib>
@@ -47,13 +48,21 @@ static int gemv_cap() {
 // work-groups, and mid-size shapes run out of work-groups first --
 // la_qkv (N=8192) gets 256 groups and 64% of roofline where lm_head
 // (N=248320) gets 7760 and reaches 98%.
-template <Fmt F, int EPL_F, int UNROLL, int OPT = 0, int RPS = ROWS_PER_SG>
+// MB > 1: mcount (<= MB) activation rows x[m*K..] -> y[m*N..] against ONE
+// pass over the weights.  Every row runs exactly the same accumulation
+// sequence as MB == 1, so a batched call is bit-identical to mcount single
+// calls -- which is what makes a speculative verify batch exact.
+template <Fmt F, int EPL_F, int UNROLL, int OPT = 0, int RPS = ROWS_PER_SG, int MB = 1>
 sycl::event gemv_impl(sycl::queue& q, const QuantWeight& w,
                       const float* x, float* y,
-                      const std::vector<sycl::event>& deps) {
+                      const std::vector<sycl::event>& deps, int mcount = 1) {
     const int N = w.N, K = w.K;
+    // Rows per sub-group: the dispatcher's R at MB == 1 (decode is
+    // unchanged), 1 when batched so MB activation chunks fit in registers.
+    // Which rows a sub-group owns never changes a row's accumulation order.
+    constexpr int R = (MB > 1) ? 1 : RPS;
     const int rows_per_wg_sg = WG_SUBGROUPS;
-    const int rows_per_wg    = WG_SUBGROUPS * RPS;
+    const int rows_per_wg    = WG_SUBGROUPS * R;
     const int n_blocks       = (N + rows_per_wg - 1) / rows_per_wg;
     // Wave quantization.  One work-group per row-block leaves the group count
     // at whatever N/32 happens to be: ffn gate_up gets 1088 and reaches 86%
@@ -67,6 +76,7 @@ sycl::event gemv_impl(sycl::queue& q, const QuantWeight& w,
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const QuantWeight wc = w;   // by value: raw pointers only, trivially copyable
+        const int mc = mcount;
         sycl::local_accessor<float, 1> lut_slm(256, h);   // FP8 byte -> float
         sycl::local_accessor<float, 1> e8m0_slm(256, h);  // E8M0 byte -> 2^(x-127)
         sycl::local_accessor<float, 1> e2m1_slm(16, h);   // E2M1 nibble -> float
@@ -118,7 +128,7 @@ sycl::event gemv_impl(sycl::queue& q, const QuantWeight& w,
 
               for (int blk = int(it.get_group(0)); blk < n_blocks;
                    blk += int(it.get_group_range(0))) {
-                const int n_base = blk * rows_per_wg + sgid * RPS;
+                const int n_base = blk * rows_per_wg + sgid * R;
 
                 // Activations are read straight from global. An earlier
                 // version staged them in SLM on the theory that x was
@@ -139,84 +149,144 @@ sycl::event gemv_impl(sycl::queue& q, const QuantWeight& w,
                 // K step.  The former row-outer loop completed an entire row
                 // before issuing the first load for the next one, exposing
                 // only WG_SUBGROUPS independent DRAM streams.  Keeping one
-                // accumulator per row exposes WG_SUBGROUPS*RPS
+                // accumulator per row exposes WG_SUBGROUPS*R
                 // streams without changing the per-row summation order.
-                float part[RPS][UNROLL];
+                float part[MB][R][UNROLL];
                 #pragma unroll
-                for (int r = 0; r < RPS; ++r)
+                for (int m = 0; m < MB; ++m)
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
                     #pragma unroll
-                    for (int u = 0; u < UNROLL; ++u) part[r][u] = 0.0f;
+                    for (int u = 0; u < UNROLL; ++u) part[m][r][u] = 0.0f;
 
                 const int span = STEP_F * UNROLL;
                 int base = 0;
-                if constexpr (OPT != 0 && F == Fmt::MXFP4) {
+                if constexpr (OPT != 0 && F == Fmt::MXFP4 && MB > 1) {
+                    // Batched rows: decode each weight chunk ONCE, then apply
+                    // it to every activation row with run_xv's exact
+                    // arithmetic (decode_xv).  Re-running run_xv per row
+                    // repeated the two SLM table lookups per weight byte for
+                    // every row, and an M=4 verify FFN cost 3.4x a decode.
+                    for (; base + span <= K; base += span) {
+                        const int k0 = base + lane * EPL_F;
+                        #pragma unroll
+                        for (int u = 0; u < UNROLL; ++u) {
+                            float xa[MB][EPL_F];
+                            #pragma unroll
+                            for (int m = 0; m < MB; ++m) {
+                                if (m >= mc) break;
+                                const float* xm = x + int64_t(m) * K + k0 + u * STEP_F;
+                                #pragma unroll
+                                for (int j = 0; j < EPL_F; ++j) xa[m][j] = xm[j];
+                            }
+                            #pragma unroll
+                            for (int r = 0; r < R; ++r) {
+                                const int n = n_base + r;
+                                if (n >= N) continue;
+                                const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes;
+                                float wv[EPL_F]; float sc;
+                                GemvStep<F, EPL_F>::template decode_xv<OPT>(
+                                    wc, row, slut, nlut, n, k0 + u * STEP_F, wv, sc);
+                                #pragma unroll
+                                for (int m = 0; m < MB; ++m) {
+                                    if (m >= mc) break;
+                                    float a = 0.0f;
+                                    #pragma unroll
+                                    for (int j = 0; j < EPL_F; ++j) a = sycl::fma(wv[j], xa[m][j], a);
+                                    part[m][r][u] += a * sc;
+                                }
+                            }
+                        }
+                    }
+                } else if constexpr (OPT != 0 && F == Fmt::MXFP4) {
                     // OPT bit 0: load this lane's activations ONCE per K step
-                    // and reuse them across all RPS rows.  Without it
+                    // and reuse them across all R rows.  Without it
                     // the compiler cannot prove x and row do not alias and
                     // reloads x for every row.
                     for (; base + span <= K; base += span) {
                         const int k0 = base + lane * EPL_F;
+                        #pragma unroll
+                        for (int m = 0; m < MB; ++m) {
+                        if (m >= mc) break;
+                        const float* xm = x + int64_t(m) * K;
                         float xv[UNROLL][EPL_F];
                         #pragma unroll
                         for (int u = 0; u < UNROLL; ++u)
                             #pragma unroll
                             for (int i = 0; i < EPL_F; ++i)
-                                xv[u][i] = x[k0 + u * STEP_F + i];
+                                xv[u][i] = xm[k0 + u * STEP_F + i];
                         #pragma unroll
-                        for (int r = 0; r < RPS; ++r) {
+                        for (int r = 0; r < R; ++r) {
                             const int n = n_base + r;
                             if (n >= N) continue;
                             const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes;
                             #pragma unroll
                             for (int u = 0; u < UNROLL; ++u)
-                                part[r][u] += GemvStep<F, EPL_F>::template run_xv<OPT>(
+                                part[m][r][u] += GemvStep<F, EPL_F>::template run_xv<OPT>(
                                     wc,row,&xv[u][0],slut,nlut,n,k0+u*STEP_F);
+                        }
                         }
                     }
                 } else
                 for (; base + span <= K; base += span) {
                     const int k0 = base + lane * EPL_F;
                     #pragma unroll
-                    for (int r = 0; r < RPS; ++r) {
+                    for (int m = 0; m < MB; ++m) {
+                    if (m >= mc) break;
+                    const float* xm = x + int64_t(m) * K;
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
                         const int n = n_base + r;
                         if (n >= N) continue;
                         const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes;
                         #pragma unroll
                         for (int u = 0; u < UNROLL; ++u)
-                            part[r][u] += GemvStep<F, EPL_F>::run(
-                                wc,row,x,lut,slut,nlut,n,k0+u*STEP_F);
+                            part[m][r][u] += GemvStep<F, EPL_F>::run(
+                                wc,row,xm,lut,slut,nlut,n,k0+u*STEP_F);
+                    }
                     }
                 }
                 for (; base + STEP_F <= K; base += STEP_F) {
                     const int k0=base+lane*EPL_F;
                     #pragma unroll
-                    for (int r=0;r<RPS;++r) {
+                    for (int m=0;m<MB;++m) {
+                    if (m>=mc) break;
+                    const float* xm=x+int64_t(m)*K;
+                    #pragma unroll
+                    for (int r=0;r<R;++r) {
                         const int n=n_base+r;if(n>=N)continue;
                         const uint8_t* row=wc.payload+int64_t(n)*wc.row_bytes;
-                        part[r][0]+=GemvStep<F,EPL_F>::run(
-                            wc,row,x,lut,slut,nlut,n,k0);
+                        part[m][r][0]+=GemvStep<F,EPL_F>::run(
+                            wc,row,xm,lut,slut,nlut,n,k0);
+                    }
                     }
                 }
 
-                float acc[RPS];
                 #pragma unroll
-                for(int r=0;r<RPS;++r){
+                for (int m = 0; m < MB; ++m) {
+                if (m >= mc) break;
+                const float* xm = x + int64_t(m) * K;
+                float* ym = y + int64_t(m) * N;
+                float acc[R];
+                #pragma unroll
+                for(int r=0;r<R;++r){
                     float sum=0.0f;
                     #pragma unroll
-                    for(int u=0;u<UNROLL;++u)sum+=part[r][u];
+                    for(int u=0;u<UNROLL;++u)sum+=part[m][r][u];
                     acc[r]=sum;
                     const int n=n_base+r;if(n>=N)continue;
                     const int done=(K/STEP_F)*STEP_F;
                     for(int k=done+lane;k<K;k+=SG_SIZE)
-                        acc[r]=sycl::fma(wc.at(n,k),x[k],acc[r]);
+                        acc[r]=sycl::fma(wc.at(n,k),xm[k],acc[r]);
                 }
 
                 #pragma unroll
-                for (int r = 0; r < RPS; ++r) {
+                for (int r = 0; r < R; ++r) {
                     const float total =
                         sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
                     const int n = n_base + r;
-                    if (lane == 0 && n < N) y[n] = total;
+                    if (lane == 0 && n < N) ym[n] = total;
+                }
                 }
               }
             });
@@ -586,9 +656,9 @@ int gemv_opt_override() {
     return v;
 }
 
-template <Fmt F>
+template <Fmt F, int MB = 1>
 sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
-                     float* y, const std::vector<sycl::event>& deps) {
+                     float* y, const std::vector<sycl::event>& deps, int mc = 1) {
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;
     if (epl > GemvGeom<F>::EPL_MAX) epl = GemvGeom<F>::EPL_MAX;
@@ -620,12 +690,21 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
             const int wdiv = wide_relaxed() ? 1 : SG_SIZE;
             if constexpr (MX >= 64)
                 if (slice % (wdiv * 64) == 0)
-                    return gemv_wide<F, 64>(q, w, x, y, deps);
+                    { if constexpr (MB == 1) return gemv_wide<F, 64>(q, w, x, y, deps);
+                  sycl::event e; for (int m = 0; m < mc; ++m)
+                      e = gemv_wide<F, 64>(q, w, x + int64_t(m) * w.K, y + int64_t(m) * w.N, m ? std::vector<sycl::event>{e} : deps);
+                  return e; }
             if constexpr (MX >= 32)
                 if (slice % (wdiv * 32) == 0)
-                    return gemv_wide<F, 32>(q, w, x, y, deps);
+                    { if constexpr (MB == 1) return gemv_wide<F, 32>(q, w, x, y, deps);
+                  sycl::event e; for (int m = 0; m < mc; ++m)
+                      e = gemv_wide<F, 32>(q, w, x + int64_t(m) * w.K, y + int64_t(m) * w.N, m ? std::vector<sycl::event>{e} : deps);
+                  return e; }
             if (slice % (wdiv * 16) == 0)
-                return gemv_wide<F, 16>(q, w, x, y, deps);
+                { if constexpr (MB == 1) return gemv_wide<F, 16>(q, w, x, y, deps);
+                  sycl::event e; for (int m = 0; m < mc; ++m)
+                      e = gemv_wide<F, 16>(q, w, x + int64_t(m) * w.K, y + int64_t(m) * w.N, m ? std::vector<sycl::event>{e} : deps);
+                  return e; }
         }
     }
     int un = gemv_unroll_override();
@@ -640,43 +719,43 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
         const int opt = gemv_opt_override();
         if (epl == 16 && opt > 0) {
             if (opt == 1) {
-                if (un == 4) return gemv_impl<F, 16, 4, 1>(q, w, x, y, deps);
-                if (un == 8) return gemv_impl<F, 16, 8, 1>(q, w, x, y, deps);
+                if (un == 4) return gemv_impl<F, 16, 4, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+                if (un == 8) return gemv_impl<F, 16, 8, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
                 const int rps = rps_for(w.N);
-                if (rps == 1) return gemv_impl<F, 16, 2, 1, 1>(q, w, x, y, deps);
-                if (rps == 2) return gemv_impl<F, 16, 2, 1, 2>(q, w, x, y, deps);
-                if (rps == 8) return gemv_impl<F, 16, 2, 1, 8>(q, w, x, y, deps);
-                return gemv_impl<F, 16, 2, 1, 4>(q, w, x, y, deps);
+                if (rps == 1) return gemv_impl<F, 16, 2, 1, 1, MB>(q, w, x, y, deps, mc);
+                if (rps == 2) return gemv_impl<F, 16, 2, 1, 2, MB>(q, w, x, y, deps, mc);
+                if (rps == 8) return gemv_impl<F, 16, 2, 1, 8, MB>(q, w, x, y, deps, mc);
+                return gemv_impl<F, 16, 2, 1, 4, MB>(q, w, x, y, deps, mc);
             }
             if (opt == 2) {
-                if (un == 4) return gemv_impl<F, 16, 4, 2>(q, w, x, y, deps);
-                if (un == 8) return gemv_impl<F, 16, 8, 2>(q, w, x, y, deps);
-                return gemv_impl<F, 16, 2, 2>(q, w, x, y, deps);
+                if (un == 4) return gemv_impl<F, 16, 4, 2, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+                if (un == 8) return gemv_impl<F, 16, 8, 2, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+                return gemv_impl<F, 16, 2, 2, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
             }
-            if (un == 4) return gemv_impl<F, 16, 4, 3>(q, w, x, y, deps);
-            if (un == 8) return gemv_impl<F, 16, 8, 3>(q, w, x, y, deps);
-            return gemv_impl<F, 16, 2, 3>(q, w, x, y, deps);
+            if (un == 4) return gemv_impl<F, 16, 4, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+            if (un == 8) return gemv_impl<F, 16, 8, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+            return gemv_impl<F, 16, 2, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
         }
     }
     if (epl == 16) {
-        if (un == 1) return gemv_impl<F, 16, 1>(q, w, x, y, deps);
-        if (un == 2) return gemv_impl<F, 16, 2>(q, w, x, y, deps);
-        if (un == 8) return gemv_impl<F, 16, 8>(q, w, x, y, deps);
-        return gemv_impl<F, 16, 4>(q, w, x, y, deps);
+        if (un == 1) return gemv_impl<F, 16, 1, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 2) return gemv_impl<F, 16, 2, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 8) return gemv_impl<F, 16, 8, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        return gemv_impl<F, 16, 4, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
     }
     if (epl == 32 && MX >= 32) {
-        if (un == 1) return gemv_impl<F, 32, 1>(q, w, x, y, deps);
-        if (un == 2) return gemv_impl<F, 32, 2>(q, w, x, y, deps);
-        if (un == 8) return gemv_impl<F, 32, 8>(q, w, x, y, deps);
-        return gemv_impl<F, 32, 4>(q, w, x, y, deps);
+        if (un == 1) return gemv_impl<F, 32, 1, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 2) return gemv_impl<F, 32, 2, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 8) return gemv_impl<F, 32, 8, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        return gemv_impl<F, 32, 4, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
     }
     if constexpr (MX >= 64) {
-        if (un == 1) return gemv_impl<F, 64, 1>(q, w, x, y, deps);
-        if (un == 2) return gemv_impl<F, 64, 2>(q, w, x, y, deps);
-        if (un == 8) return gemv_impl<F, 64, 8>(q, w, x, y, deps);
-        return gemv_impl<F, 64, 4>(q, w, x, y, deps);
+        if (un == 1) return gemv_impl<F, 64, 1, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 2) return gemv_impl<F, 64, 2, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        if (un == 8) return gemv_impl<F, 64, 8, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        return gemv_impl<F, 64, 4, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
     }
-    return gemv_impl<F, 16, 4>(q, w, x, y, deps);
+    return gemv_impl<F, 16, 4, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
 }
 } // namespace
 
@@ -935,6 +1014,33 @@ sycl::event launch_gemv_int4sym(sycl::queue& q, const uint8_t* pack,
     if (wide && N <= 2048 && K % (WG_SUBGROUPS * 16) == 0)
         return gemv_int4sym_wide(q, pack, ws, x, y, N, K, deps);
     return gemv_int4sym_impl<4, 2>(q, pack, ws, x, y, N, K, deps);
+}
+
+// M activation rows against one weight matrix, bit-identical per row to
+// launch_gemv() -- the same variant, the same accumulation order -- but the
+// weights are read once per chunk of 4 rows instead of once per row.  This is
+// the verify path for speculative decoding on plain (unconverted) weights.
+sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
+                              const float* x, float* y, int M,
+                              const std::vector<sycl::event>& deps) {
+    if (M <= 1) return launch_gemv(q, w, x, y, deps);
+    sycl::event e;
+    for (int m0 = 0; m0 < M; m0 += 4) {
+        const int mc = std::min(4, M - m0);
+        const float* xm = x + int64_t(m0) * w.K;
+        float* ym = y + int64_t(m0) * w.N;
+        const std::vector<sycl::event> d = m0 ? std::vector<sycl::event>{e} : deps;
+        switch (w.fmt) {
+            case Fmt::BF16:     e = dispatch<Fmt::BF16, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::FP8_E4M3: e = dispatch<Fmt::FP8_E4M3, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::FP8_E5M2: e = dispatch<Fmt::FP8_E5M2, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::INT8:     e = dispatch<Fmt::INT8, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::INT4:     e = dispatch<Fmt::INT4, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::MXFP8:    e = dispatch<Fmt::MXFP8, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::MXFP4:    e = dispatch<Fmt::MXFP4, 4>(q, w, xm, ym, d, mc); break;
+        }
+    }
+    return e;
 }
 
 sycl::event launch_gemv(sycl::queue& q, const QuantWeight& w,

@@ -135,7 +135,7 @@ NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
 NATIVE_SRC = grimoire qwen35_loader native_model safetensors quantize gptq \
- gemv_decode gemm_xmx attention deltanet moe_kernels moe_ref ops prefill tokenizer
+ gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer
 NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
 
 .PHONY: native
