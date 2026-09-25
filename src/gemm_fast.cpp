@@ -207,6 +207,7 @@ sycl::event dequant_vnni_tiled(sycl::queue& q, const QuantWeight& w, sycl_bf16* 
     });
 }
 
+
 // MXFP4 W [N][K] -> bf16 VNNI [K/2][N][2], streaming.  One work-item per
 // (row n, 128 k): one 64-byte payload line in, 64 dword stores out; the 16
 // lanes of a sub-group are 16 consecutive n, so every store instruction
@@ -223,10 +224,17 @@ sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const QuantWeight wc = w;
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(K / 128), size_t(N)),
-                                         sycl::range<2>(1, 256)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-            const int kb = int(it.get_global_id(0)), n = int(it.get_global_id(1));
+        // Row blocks fastest: the work-groups in flight write adjacent 1 KB
+        // runs of the same k-pair rows.  MEASURED (all 384 dequants of a
+        // 4088-token Qwen prefill): this order 159 ms; k chunks fastest
+        // 293 ms; 2 or 4 chunks per work-item 192 / 242 ms -- write locality
+        // dominates.
+        const int KB = K / 128, NB = N / 256;
+        h.parallel_for(sycl::nd_range<1>(size_t(KB) * NB * 256, 256),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const int L = int(it.get_group(0));
+            const int n = (L % NB) * 256 + int(it.get_local_id(0));
+            const int kb = L / NB;
             const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes + kb * 64;
             const uint8_t* sr = static_cast<const uint8_t*>(wc.scales) +
                                 int64_t(n) * wc.row_scales + kb * 4;
@@ -479,6 +487,7 @@ struct FlashScratch {
     sycl_bf16* lut = nullptr;                   // e4m3 byte -> bf16
     sycl_bf16* kp = nullptr; size_t kp_cap = 0;
     sycl_bf16* vp = nullptr; size_t vp_cap = 0;
+    sycl_bf16* qb = nullptr; size_t qb_cap = 0; // Q * scale*log2(e), [H][Tp][D]
 };
 
 FlashScratch& flash_scratch_for(sycl::queue& q) {
@@ -525,15 +534,29 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 s < kend ? lut[vc[(size_t(hh) * seq_cap + s) * D + d]] : sycl_bf16(0.0f);
         });
     });
-    const int qtiles = (tokens + FA_BQ - 1) / FA_BQ;
+    const int qtiles = (tokens + FA_BQ - 1) / FA_BQ, Tp = qtiles * FA_BQ;
     // Scores in log2 units: Q carries scale*log2(e), so the softmax is the
     // hardware exp2.  The accurate sycl::exp is a long instruction sequence,
     // three per score pair, and made the softmax -- not the matrix unit --
     // the bottleneck.  P is rounded to bf16 before PV anyway.
     const float qscale = scale * 1.4426950408889634f;
+    // Q packed once, head-major and zero-padded to whole query tiles, so each
+    // sub-group loads its A fragments from global memory.  (Q used to sit in
+    // SLM -- 32 of the work-group's 44 KB -- which allowed only 2 work-groups
+    // per Xe core.)
+    if (!grow(q, fs.qb, fs.qb_cap, size_t(H) * Tp * D))
+        throw std::runtime_error("flash_fast: Q scratch allocation failed");
+    sycl_bf16* Qb = fs.qb;
+    e = q.submit([&](sycl::handler& h) {
+        h.depends_on(e);
+        h.parallel_for(sycl::range<3>(size_t(H), size_t(Tp), size_t(D)), [=](sycl::id<3> id) {
+            const int hh = int(id[0]), t = int(id[1]), d = int(id[2]);
+            Qb[(size_t(hh) * Tp + t) * D + d] =
+                sycl_bf16(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
+        });
+    });
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
-        sycl::local_accessor<sycl_bf16, 1> Qs(FA_NSG * FA_RB * D, h);
         sycl::local_accessor<float, 1> Ss(FA_NSG * FA_RB * FA_BK, h);
         sycl::local_accessor<sycl_bf16, 1> Ps(FA_NSG * FA_RB * FA_BK, h);
         h.parallel_for(sycl::nd_range<1>(size_t(qtiles) * H * WG, WG),
@@ -543,18 +566,17 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
             constexpr int RB = FA_RB, BK = FA_BK;
             auto sg = it.get_sub_group();
             const int sgid = int(sg.get_group_id()[0]), lane = int(sg.get_local_id()[0]);
-            const int g = int(it.get_group(0)), qt = g / H, hq = g % H, kvh = hq / (H / KVH);
+            // Longest (latest) query tiles first: causal work grows with qt,
+            // and the last wave should be the short tiles.
+            const int g = int(it.get_group(0)), qt = qtiles - 1 - g / H, hq = g % H,
+                      kvh = hq / (H / KVH);
             const int r0 = qt * FA_BQ + sgid * RB;
             if (r0 >= tokens) return;                   // uniform per sub-group; no WG barriers below
-            auto qs_mp = Qs.template get_multi_ptr<NO>() + sgid * RB * D;
             auto ss_mp = Ss.template get_multi_ptr<NO>() + sgid * RB * BK;
             auto ps_mp = Ps.template get_multi_ptr<NO>() + sgid * RB * BK;
-            sycl_bf16* qs = qs_mp.get(); float* ss = ss_mp.get(); sycl_bf16* ps = ps_mp.get();
-            for (int i = lane; i < RB * D; i += SG_SIZE) {
-                const int r = i / D, d = i % D, t = r0 + r;
-                qs[i] = sycl_bf16(t < tokens ? qv[(size_t(t) * H + hq) * D + d] * qscale : 0.0f);
-            }
-            sycl::group_barrier(sg);
+            float* ss = ss_mp.get(); sycl_bf16* ps = ps_mp.get();
+            auto qg = sycl::address_space_cast<sycl::access::address_space::global_space, NO>(
+                Qb + (size_t(hq) * Tp + r0) * D);
             auto kg = sycl::address_space_cast<sycl::access::address_space::global_space, NO>(
                 Kp + size_t(kvh) * (D / 2) * Sp * 2);
             auto vg = sycl::address_space_cast<sycl::access::address_space::global_space, NO>(
@@ -576,7 +598,7 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 for (int k = 0; k < D; k += TK_BF16) {
                     matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::a, TM, TK_BF16,
                                          matrix::layout::row_major> a;
-                    matrix::joint_matrix_load(sg, a, qs_mp + k, D);
+                    matrix::joint_matrix_load(sg, a, qg + k, D);
                     #pragma unroll
                     for (int c = 0; c < BK / TN; ++c) {
                         matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::b, TK_BF16,
@@ -895,7 +917,7 @@ sycl::event deltanet_q4_impl(sycl::queue& q, const DeltaNetPrefillParams& p,
                              const std::vector<sycl::event>& deps) {
     constexpr int LPR = 4, GPS = SG_SIZE / LPR, KPL = KD / LPR, RR = 2;
     constexpr int SGS = 8, WG = SGS * SG_SIZE, ROWS = SGS * GPS * RR;   // 64 rows
-    constexpr int T = 16;
+    constexpr int T = 16;          // tokens per SLM chunk; 32 spills (541 vs 218 ms)
     constexpr int KQ4 = T * KD / (WG * 4);
     constexpr int VPW = T * ROWS / WG;
     static_assert(KPL % 4 == 0 && KQ4 >= 1 && T * KD == KQ4 * WG * 4, "k split");
