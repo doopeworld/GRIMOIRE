@@ -418,6 +418,7 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
         const int v = e ? std::atoi(e) : 0;
         return (v == 1 || v == 2 || v == 4) ? v : 0;     // 0: pick by k_dim below
     }();
+    if (!old && deltanet_q4_supported(p)) return launch_deltanet_prefill_q4(q, p, deps);
     // Auto: 4 rows per sub-group up to k_dim 128 (Qwen3.8-27B, 4088 tokens:
     // 252 ms vs 349 at 2 rows); 2 above that, where 4 rows spill.
     const int rows = rows_env ? rows_env : (p.k_dim <= 128 ? 4 : 2);

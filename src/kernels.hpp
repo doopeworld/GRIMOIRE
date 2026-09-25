@@ -301,6 +301,13 @@ struct DeltaNetPrefillParams {
     int n_k_heads = 0;
 };
 
+// DeltaNet prefill recurrence, 4 lanes per state row (gemm_fast.cpp,
+// 256-register library).  k_dim 64 or 128, v_dim a multiple of 64.
+// GRIMOIRE_DN_PREFILL_NOQ4=1 disables it.
+bool deltanet_q4_supported(const DeltaNetPrefillParams& p);
+sycl::event launch_deltanet_prefill_q4(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                       const std::vector<sycl::event>& deps = {});
+
 
 sycl::event launch_dequant_bf16(sycl::queue& q, const QuantWeight& w,
                                 sycl_bf16* dst,
