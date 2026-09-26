@@ -1,4 +1,8 @@
 #!/bin/bash
+# RETIRED 2026-09-26: this is the old plug-in launcher (vLLM bridges + torch
+# library path) and its default node renderD129 is the iGPU now.  GRIMOIRE
+# runs pure since 0283b7d -- use tools/tune.sh (resolves the B70 by PCI).
+echo "$(basename "$0") is retired: use tools/tune.sh (pure GRIMOIRE, B70 by PCI)" >&2; exit 2
 # Minimal run: bridges + library path only. NO model-specific tuning flags.
 set -u
 export GRIM_ENV="LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/torch/lib:/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/intel/oneapi/lib:/usr/local/lib

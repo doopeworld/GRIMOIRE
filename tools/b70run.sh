@@ -36,9 +36,18 @@ IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
 
 if [ ! -e "/dev/dri/$NODE" ]; then echo "no such render node: $NODE" >&2; exit 2; fi
 
-# Refuse to start if anything is already holding a GPU.
-if docker ps --format '{{.Names}}' | grep -q '^grim-'; then
-    echo "REFUSING: a grim-* container is already running:" >&2
+# Refuse to start if a grim-* container already holds THIS render node.
+# Other cards are independent: on 2026-09-26 a container stuck in the driver
+# of a wedged card (07:00.0) blocked every run on the healthy one.
+busy=""
+for c in $(docker ps --format '{{.Names}}' | grep '^grim-'); do
+    if docker inspect --format '{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' "$c" \
+         2>/dev/null | tr ' ' '\n' | grep -qx "/dev/dri/$NODE"; then
+        busy="$busy $c"
+    fi
+done
+if [ -n "$busy" ]; then
+    echo "REFUSING: /dev/dri/$NODE is held by:$busy" >&2
     docker ps --format '  {{.ID}} {{.Names}} {{.Status}}' | grep grim- >&2
     exit 3
 fi
