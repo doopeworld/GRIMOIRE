@@ -22,6 +22,7 @@
 //  this file directly (slower there, same arithmetic).
 // =====================================================================
 #include "kernels.hpp"
+#include "b70/tiered_moe.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -274,6 +275,43 @@ sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16
     });
 }
 
+// NVFP4 W [N][K] (E2M1 nibbles + one E4M3 scale per 16) -> bf16 VNNI
+// [K/2][N][2], the same streaming walk as dequant_mxfp4_stream: a 16-byte
+// payload chunk covers two 16-wide blocks, so its first eight bytes take
+// scale 2c and the last eight scale 2c+1.  e2m1 x e4m3 has at most 6
+// significant bits, so the bf16 values are EXACT; the tensor's F32 scale
+// is applied in fp32 by the GEMM epilogue, not folded in here.
+// Needs K % 128 == 0 and N % 256 == 0.  `pay`/`scl` may be host memory.
+sycl::event dequant_nvfp4_stream(sycl::queue& q, const uint8_t* pay, const uint8_t* scl,
+                                 int N, int K, sycl_bf16* dst,
+                                 const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const int KB = K / 128, NB = N / 256;
+        const int64_t rb = K / 2, rs = K / 16;
+        h.parallel_for(sycl::nd_range<1>(size_t(KB) * NB * 256, 256),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const int L = int(it.get_group(0));
+            const int n = (L % NB) * 256 + int(it.get_local_id(0));
+            const int kb = L / NB;
+            const uint8_t* row = pay + int64_t(n) * rb + kb * 64;
+            const uint8_t* sr = scl + int64_t(n) * rs + kb * 8;
+            uint32_t* o = reinterpret_cast<uint32_t*>(dst) + int64_t(kb) * 64 * N + n;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float s0 = e4m3_to_f32(sr[2 * c]), s1 = e4m3_to_f32(sr[2 * c + 1]);
+                const sycl::uint4 v = *reinterpret_cast<const sycl::uint4*>(row + c * 16);
+                #pragma unroll
+                for (int d = 0; d < 4; ++d)
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b)
+                        o[int64_t(c * 16 + d * 4 + b) * N] =
+                            mxfp4_pair_bf16((v[d] >> (8 * b)) & 0xFFu, d < 2 ? s0 : s1);
+            }
+        });
+    });
+}
+
 sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
                         const std::vector<sycl::event>& deps, int ldn = 0) {
     if (ldn && ldn != w.N) {        // padded pitch (small N): simple kernel, columns >= N untouched
@@ -324,10 +362,14 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
 //          computes a gate tile and the matching up tile and writes
 //          h bf16 [M][FI] = silu(gate) * up -- launch_swiglu_batched's
 //          formula on the same fp32 values, rounded as launch_f32_to_bf16.
-template <int EPI>
+//   SC (EPI 0 only): C *= s0 for columns < split, s1 from split on -- an
+//          NVFP4 expert's per-projection F32 scales, applied in fp32.  split
+//          is a multiple of TN, so one fragment never straddles it.
+template <int EPI, bool SC = false>
 sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* B,
                            void* out, int M, int N, int K,
-                           const std::vector<sycl::event>& deps, int ldb = 0) {
+                           const std::vector<sycl::event>& deps, int ldb = 0,
+                           float s0 = 1.0f, float s1 = 1.0f, int split = 0) {
     constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SG_SIZE;
     const int LDB = ldb ? ldb : N;               // B's column pitch: N rounded up to NC2
     const int nMB = (M + MC2 - 1) / MC2, nNB = LDB / NC2, FI = N / 2, GM = gemm_group_m();
@@ -422,6 +464,11 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                                 size_t(m0 + m * TM), size_t(bcol(n)));
                             matrix::joint_matrix_apply(sg, acc[m][n], cin,
                                 [](float& a, float& c) { a = c + a; });
+                        }
+                        if constexpr (SC) {
+                            const float sc = bcol(n) < split ? s0 : s1;
+                            matrix::joint_matrix_apply(sg, acc[m][n],
+                                [=](float& a) { a *= sc; });
                         }
                         ix::joint_matrix_store_checked(sg, acc[m][n], pC, size_t(N),
                             matrix::layout::row_major, size_t(M), size_t(N),
@@ -2043,6 +2090,21 @@ bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
                                     sycl_bf16* h, int M, const std::vector<sycl::event>& deps) {
     return gemm_fast_run<1>(q, w, x, h, M, deps);
+}
+
+// One tiered NVFP4 expert (b70/tiered_moe.hpp): decode its block into the
+// caller's scratch, then out = A W^T with the projection scales in fp32.
+sycl::event launch_nvfp4_expert_gemm(sycl::queue& q, const uint8_t* block,
+                                     const NvExpertLayout& L, bool gate_up,
+                                     float s0, float s1, const sycl_bf16* A, float* out,
+                                     int M, sycl_bf16* scratch,
+                                     const std::vector<sycl::event>& deps) {
+    const int N = gate_up ? 2 * L.I : L.H, K = gate_up ? L.H : L.I;
+    sycl::event e = dequant_nvfp4_stream(q, block + (gate_up ? L.gu_p : L.dn_p),
+                                         block + (gate_up ? L.gu_s : L.dn_s),
+                                         N, K, scratch, deps);
+    return gemm_bf16_vnni<0, true>(q, A, scratch, out, M, N, K, {e}, 0,
+                                   s0, gate_up ? s1 : s0, gate_up ? L.I : N);
 }
 
 } // namespace b70

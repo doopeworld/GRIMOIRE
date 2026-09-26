@@ -287,6 +287,16 @@ struct TensorRef {
     // which is why this flag exists and why the direct-MXFP4 upload has
     // to test it.  See b70/nvfp4.hpp.
     bool     nvfp4 = false;
+    // modelopt's NVFP4 (weight U8 + weight_scale E4M3 + weight_scale_2)
+    // MULTIPLIES by its per-tensor scale; compressed-tensors'
+    // weight_global_scale is DIVIDED by.  Same payload, opposite
+    // convention -- reading one as the other scales every weight by
+    // global^2 and still generates fluent text.
+    bool     nvfp4_mul = false;
+    // FP8 with 2-D block scales (weight_scale_inv [ceil(N/128)][ceil(K/128)],
+    // DeepSeek/Qwen "fp8" checkpoints).  The scale MULTIPLIES despite the
+    // name.  Ignoring it is what made Qwen3.8-27B-FP8 generate garbage.
+    bool     block_scaled = false;
     int      gscale_shard = -1;
     STTensor gscale_t;
     int      qzeros_shard = -1, scales_shard = -1;

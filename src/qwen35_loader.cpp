@@ -774,15 +774,47 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     auto linear = [&](const std::string& base) {
         TensorRef r = get(base + ".weight");
         if (r.ok()) {
-            // compressed-tensors FP8 stores a per-output-channel scale
-            // beside every quantized Linear weight.  This is not limited to
-            // routed experts: attention, shared experts, routers and the
-            // output projection use the same convention.
             TensorRef sc = get(base + ".weight_scale");
+            // modelopt NVFP4 (Ornith-1.5-35B-A3B-NVFP4, Qwen3.8-Flash-Next-
+            // NVFP4): a PLAIN .weight holding U8 [N][K/2] E2M1 nibbles, an
+            // E4M3 .weight_scale [N][K/16], and an F32 .weight_scale_2 that
+            // MULTIPLIES.  Before this branch the pair fell through to the
+            // FP8 case below and the nibbles were read as FP8 values.
+            if (sc.ok() && r.t.dtype == STDtype::U8 && sc.t.dtype == STDtype::F8_E4M3 &&
+                r.t.shape.size() == 2 && sc.t.shape.size() == 2) {
+                TensorRef g2 = get(base + ".weight_scale_2");
+                const int64_t N = r.t.shape[0], K = r.t.shape[1] * 2;
+                if (g2.ok() && g2.t.numel() == 1 && sc.t.shape[0] == N &&
+                    sc.t.shape[1] * 16 == K) {
+                    r.nvfp4 = true;
+                    r.nvfp4_mul = true;
+                    r.scales_shard = sc.shard;  r.scales_t = sc.t;
+                    r.gscale_shard = g2.shard;  r.gscale_t = g2.t;
+                    r.t.shape = {N, K};
+                    return r;
+                }
+                return TensorRef{};    // U8 weight we cannot interpret: refuse
+            }
+            // compressed-tensors FP8 stores a scale beside every quantized
+            // Linear weight: per output channel ([N] or [N,1]) or, in
+            // modelopt checkpoints, ONE scalar per tensor.  Both multiply;
+            // the readers broadcast a scalar (read_row_scales).
             if (sc.ok()) {
                 r.row_scaled = true;
                 r.scales_shard = sc.shard;
                 r.scales_t = sc.t;
+                return r;
+            }
+            // Block FP8: weight_scale_inv, one scale per 128x128 tile.
+            TensorRef si = get(base + ".weight_scale_inv");
+            if (si.ok() && si.t.shape.size() == 2 && r.t.shape.size() == 2 &&
+                (r.t.dtype == STDtype::F8_E4M3 || r.t.dtype == STDtype::F8_E5M2)) {
+                const int64_t N = r.t.shape[0], K = r.t.shape[1];
+                if (si.t.shape[0] != (N + 127) / 128 || si.t.shape[1] != (K + 127) / 128)
+                    return TensorRef{};  // not the 128x128 layout: refuse, never guess
+                r.block_scaled = true;
+                r.scales_shard = si.shard;
+                r.scales_t = si.t;
             }
             return r;
         }
@@ -857,8 +889,11 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         hc_final.down = get(m + "input_mix_weight_down.weight");
         hc_final.up   = get(m + "input_mix_weight_up.weight");
     }
-    lm_head    = get("lm_head.weight");
-    if (!lm_head.ok()) lm_head = get(prefix + "lm_head.weight");
+    // linear(), not get(): the head can be quantized too (Ornith-1.5-NVFP4
+    // ships lm_head as modelopt NVFP4), and a raw get() handed its U8
+    // nibbles to the upload as if they were the weight.
+    lm_head    = linear("lm_head");
+    if (!lm_head.ok()) lm_head = linear(prefix + "lm_head");
     if (!embed.ok()) { err = "embed_tokens not found (prefix " + prefix + ")"; return false; }
 
     // ---- layers ------------------------------------------------------
@@ -1121,7 +1156,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 auto fallback = [&](const std::string& base, TensorRef& p, TensorRef& s) {
                     if (p.ok()) return;
                     p = linear(base);
-                    if (!p.ok() || p.gptq) return;
+                    // linear() has already classified NVFP4 and block FP8;
+                    // re-marking an NVFP4 expert row_scaled here would read
+                    // its E4M3 block scales as FP32 channel scales.
+                    if (!p.ok() || p.gptq || p.nvfp4 || p.block_scaled) return;
                     s = get(base + ".weight_scale");
                     if (s.ok()) {
                         p.row_scaled = true;

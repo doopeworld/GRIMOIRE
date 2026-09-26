@@ -17,6 +17,6 @@ icpx -fsycl -fsycl-targets=intel_gpu_bmg_g31 -O3 -std=c++20 \
   tools/grimoire_main.cpp src/grimoire.cpp src/qwen35_loader.cpp \
   src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
   src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-  src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+  src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
   src/tokenizer.cpp -Lbin -lgrimoire_gemm '-Wl,-rpath,$ORIGIN' -o bin/grimoire.new
 mv bin/grimoire.new bin/grimoire

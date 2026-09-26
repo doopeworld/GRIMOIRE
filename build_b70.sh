@@ -147,7 +147,7 @@ icpx -fsycl \
      -I include -I src \
      src/main.cpp src/quantize.cpp src/gemv_decode.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp src/gemm_fast.cpp \
      -o "$OUT"
 
@@ -195,7 +195,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      tools/grimoire_main.cpp src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp \
      src/safetensors.cpp src/quantize.cpp src/gptq.cpp src/gemv_decode.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
      -Lbin -lgrimoire_gemm '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire \
@@ -215,7 +215,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      tools/grimoire_server.cpp src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp \
      src/safetensors.cpp src/quantize.cpp src/gptq.cpp src/gemv_decode.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
      -lpthread -Lbin -lgrimoire_gemm '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire-server \
@@ -232,7 +232,7 @@ icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
      tools/count_launches_probe.cpp src/grimoire.cpp src/qwen35_loader.cpp \
      src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
      src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
-     src/moe_kernels.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
+     src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp src/gemm_fast.cpp -o bin/count_launches_probe \
   && echo "built  : bin/count_launches_probe" \
   || echo "warn: count_launches_probe failed to build"
@@ -310,7 +310,7 @@ icpx -fsycl -fsycl-targets=spir64 \
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
-            src/deltanet.cpp src/moe_kernels.cpp src/moe_ref.cpp
+            src/deltanet.cpp src/moe_kernels.cpp src/tiered_moe.cpp src/moe_ref.cpp
             src/ops.cpp src/prefill.cpp src/tokenizer.cpp src/gemm_fast.cpp)
 # These build for spir64 (JIT), not the AOT "$TARGET".  They are
 # CORRECTNESS gates: the kernel source is identical either way, and an

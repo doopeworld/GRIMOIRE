@@ -29,6 +29,7 @@
 #include "b70/dflash_config.hpp"
 #include "b70/qwen4_exp.hpp"
 #include "b70/nvfp4.hpp"
+#include "b70/tiered_moe.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -921,6 +922,25 @@ bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
 bool read_scalar_f32(const Qwen35Model& ck, const TensorRef& r,
                      float& out, std::string& err);
 
+// The N per-output-row multipliers of a row_scaled FP8 tensor.  The scale is
+// either per channel ([N] or [N,1]) or ONE scalar for the whole tensor
+// (modelopt).  Reading a scalar as "N floats" filled row 0 and left rows
+// 1..N-1 at zero -- a model that loads and is mostly zeros.
+static bool row_scales_ok(const TensorRef& r, int N) {
+    return r.row_scaled && (r.scales_t.numel() == N || r.scales_t.numel() == 1);
+}
+static bool read_row_scales(const Qwen35Model& ck, const TensorRef& r, int N,
+                            float* out, std::string& err) {
+    const int64_t n = r.scales_t.numel();
+    if (n != N && n != 1) {
+        err = "FP8 scale has " + std::to_string(n) + " values for " +
+              std::to_string(N) + " rows (neither per-channel nor per-tensor)";
+        return false;
+    }
+    if (!ck.shards[r.scales_shard]->read_f32(r.scales_t, out, err)) return false;
+    if (n == 1) std::fill(out + 1, out + N, out[0]);
+    return true;
+}
 
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
@@ -972,12 +992,12 @@ bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
         // convention; under divide it would produce inf/nan that
         // propagates through the whole model instead.  Refuse rather
         // than load a checkpoint that cannot mean this.
-        if (g == 0.0f) {
+        if (g == 0.0f && !r.nvfp4_mul) {
             err = "NVFP4 weight_global_scale is zero, which cannot be a "
                   "valid quantization scale";
             return false;
         }
-        nvfp4_dequant(pk.data(), sc.data(), g, N, K, dst);
+        nvfp4_dequant(pk.data(), sc.data(), g, N, K, dst, r.nvfp4_mul);
         return true;
     }
     if (!r.gptq) {
@@ -985,11 +1005,23 @@ bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
         if (r.row_scaled) {
             const int N = int(r.t.shape[0]), K = int(r.t.shape[1]);
             std::vector<float> scale(N);
-            if (!ck.shards[r.scales_shard]->read_f32(r.scales_t, scale.data(), err))
-                return false;
+            if (!read_row_scales(ck, r, N, scale.data(), err)) return false;
             for (int n = 0; n < N; ++n)
                 for (int k = 0; k < K; ++k)
                     dst[int64_t(n) * K + k] *= scale[n];
+        }
+        if (r.block_scaled) {
+            // [ceil(N/128)][ceil(K/128)] multipliers, one per 128x128 tile.
+            const int N = int(r.t.shape[0]), K = int(r.t.shape[1]);
+            const int SN = (N + 127) / 128, SK = (K + 127) / 128;
+            std::vector<float> bs(size_t(SN) * SK);
+            if (!ck.shards[r.scales_shard]->read_f32(r.scales_t, bs.data(), err))
+                return false;
+            for (int n = 0; n < N; ++n) {
+                const float* srow = bs.data() + size_t(n / 128) * SK;
+                float* drow = dst + int64_t(n) * K;
+                for (int k = 0; k < K; ++k) drow[k] *= srow[k / 128];
+            }
         }
         return true;
     }
@@ -1210,14 +1242,14 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     }
     const int N = int(r.t.shape[0]);
     const int K = int(r.t.shape[1]);
-    const bool direct_fp8=r.row_scaled&&r.scales_t.numel()==N&&
+    const bool direct_fp8=row_scales_ok(r,N)&&
         ((fmt==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
          (fmt==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2));
     if(direct_fp8){
         std::vector<uint8_t> hp(size_t(N)*K);
         std::vector<float> hs(size_t(N),0.0f);std::string rr;
         if(!ck.read_raw(r,hp.data(),rr)||
-           !ck.shards[r.scales_shard]->read_f32(r.scales_t,hs.data(),rr)){
+           !read_row_scales(ck,r,N,hs.data(),rr)){
             std::printf("\n  direct FP8 read failed for %s: %s\n",what,rr.c_str());*ok=false;return d;}
         d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
         d.scales=dev_copy<float>(q,hs.data(),hs.size()*sizeof(float));
@@ -1534,12 +1566,12 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const bool direct_fp8=
        ((fmt==Fmt::FP8_E4M3&&ra.t.dtype==STDtype::F8_E4M3&&rb.t.dtype==STDtype::F8_E4M3)||
         (fmt==Fmt::FP8_E5M2&&ra.t.dtype==STDtype::F8_E5M2&&rb.t.dtype==STDtype::F8_E5M2))&&
-       ra.row_scaled&&rb.row_scaled&&ra.scales_t.numel()==Na&&rb.scales_t.numel()==Nb;
+       row_scales_ok(ra,Na)&&row_scales_ok(rb,Nb);
     if(direct_fp8){
         std::vector<uint8_t> hp(size_t(N)*K);std::vector<float> hs(size_t(N),0.0f);std::string rr;
         if(!ck.read_raw(ra,hp.data(),rr)||!ck.read_raw(rb,hp.data()+size_t(Na)*K,rr)||
-           !ck.shards[ra.scales_shard]->read_f32(ra.scales_t,hs.data(),rr)||
-           !ck.shards[rb.scales_shard]->read_f32(rb.scales_t,hs.data()+Na,rr)){
+           !read_row_scales(ck,ra,Na,hs.data(),rr)||
+           !read_row_scales(ck,rb,Nb,hs.data()+Na,rr)){
             std::printf("\n  direct FP8 concatenate failed for %s: %s\n",what,rr.c_str());*ok=false;return d;}
         d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
         d.scales=dev_copy<float>(q,hs.data(),hs.size()*sizeof(float));
@@ -2020,6 +2052,19 @@ struct Grimoire {
     Qwen35Model   ck;              // mmapped checkpoint, host side
     Qwen35Config  cfg;
 
+    // Tiered NVFP4 experts (b70/tiered_moe.hpp, FLASH-NEXT-TIERED.md).
+    NvExpertLayout tm_lay;
+    bool      tm_any = false;           // any layer tiered
+    int       tm_vram_per_layer = -1;   // decided at the first tiered layer
+    size_t    tm_vram_bytes = 0, tm_host_bytes = 0;
+    uint8_t*  tm_stage = nullptr;       // pinned staging for VRAM-bound blocks
+    sycl_bf16* tm_scratch = nullptr;    // prefill: one expert's bf16 VNNI weight
+    // prefill scratch, grown on demand (rows = M * top_k)
+    size_t    tm_cap = 0;
+    sycl_bf16* tm_xperm = nullptr;
+    float     *tm_tgu = nullptr, *tm_mh = nullptr, *tm_yperm = nullptr;
+    int32_t   *tm_ptoken = nullptr, *tm_pinv = nullptr;
+
     // Quantized-at-load projections, per layer.
     struct LayerDev {
         LayerKind kind;
@@ -2043,6 +2088,15 @@ struct Grimoire {
         // experts: zero-copy MXFP4, expert-major
         MoeLayer moe;
         int expert_begin = 0, expert_count = 0;
+        // Tiered NVFP4 experts (b70/tiered_moe.hpp).  When `tiered` is set
+        // d.moe is EMPTY: each expert is one block in tm_vpool (VRAM) or
+        // tm_hpool (pinned host), found through tm_eptr.
+        bool tiered = false;
+        const uint8_t** tm_eptr = nullptr;           // device [E]
+        std::vector<const uint8_t*> tm_hptr;         // host mirror of tm_eptr
+        std::vector<float> tm_gs;                    // [E][3] gate/up/down scale
+        uint8_t *tm_vpool = nullptr, *tm_hpool = nullptr;
+        int tm_nvram = 0;
         uint8_t *gu_pack = nullptr, *gu_scale = nullptr, *gu_zero = nullptr;
         uint8_t *dn_pack = nullptr, *dn_scale = nullptr, *dn_zero = nullptr;
         bool xe2_signed_int4 = false;
@@ -2966,6 +3020,16 @@ struct Grimoire {
     const float* forward_muse(int token); // Muse Glimmer dense sandwich path
     const float* forward_gemma4(int token); // gemma-4 sandwich + per-layer-type
     const float* forward_qwen4_exp(int token); // Qwen4-Exp: HC + QSA + PLE
+    // Tiered experts: load one layer's experts into VRAM / pinned host
+    // blocks, and run one layer's routed MoE over M >= 32 prompt rows
+    // (x fp32 [M][H] in, out fp32 [M][H] = the routed sum, overwritten).
+    bool upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
+                               LayerDev& d, int layer, std::string& err);
+    bool tiered_moe_prefill(const LayerDev& d, const float* x, const int32_t* rex,
+                            const float* rwt, float* out, int M);
+    TieredMoeView tm_view(const LayerDev& d) const {
+        return TieredMoeView{tm_lay, d.tm_eptr, cfg.n_experts, cfg.top_k};
+    }
     bf16_t* muse_zero = nullptr;           // zeroed weight -> scaleless (1+0) norm
     // gemma-4's v_norm is Gemma4RMSNorm(head_dim, eps, with_scale=False):
     // a norm with NO weight parameter, i.e. scale 1.  gemma-4 runs on the
@@ -3847,9 +3911,15 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::fflush(stdout);
     if((!pp_enabled()||pp_rank==pp_world-1)&&ck.lm_head.ok()&&ck.lm_head.t.shape.size()==2) {
         const int V = int(ck.lm_head.t.shape[0]);
+        // A quantized head (NVFP4 / scaled FP8) must be DECODED even when
+        // the target is bf16 -- the raw copy below is for a bf16 tensor.
+        const bool head_quantized = ck.lm_head.nvfp4 || ck.lm_head.row_scaled ||
+                                    ck.lm_head.block_scaled;
         if (!preserve_muse_lm_head && opt.quantize_lm_head &&
             opt.lm_head_fmt != Fmt::BF16) {
             lm_head = quantize_upload_t(q, ck, ck.lm_head, opt.lm_head_fmt, "lm_head", &ok);
+        } else if (head_quantized) {
+            lm_head = quantize_upload_t(q, ck, ck.lm_head, Fmt::BF16, "lm_head", &ok);
         } else {
             lm_head.payload = dev_copy_t<uint8_t>(q, ck, ck.lm_head, "lm_head", &ok);
             lm_head.w = QuantWeight{Fmt::BF16, V, H, lm_head.payload, nullptr, nullptr,
@@ -4380,6 +4450,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     "mlp.gate.bias", &ok);
             shard(d.router,lq);
 
+            // Tiered NVFP4 experts: native blocks in VRAM or pinned host
+            // memory (b70/tiered_moe.hpp).  Always for Qwen4-Exp, whose
+            // 68 GB of experts cannot be VRAM-resident; opt-in elsewhere
+            // (GRIMOIRE_TIERED_MOE=1), where it also means NVFP4 is run
+            // natively instead of being re-quantized to MXFP4.
+            const char* tme = std::getenv("GRIMOIRE_TIERED_MOE");
+            const bool tiered = !tp_enabled() && !src.e_gate_p.empty() &&
+                src.e_gate_p[0].nvfp4 && !(tme && *tme == '0') &&
+                (cfg.is_qwen4_exp || (tme && *tme == '1'));
+            if (tiered) {
+                if (!upload_tiered_experts(lq, src, d, i, err)) return false;
+            } else {
             // Experts: concatenate gate and up into one [E][2I][H] block
             // and copy the packed bytes verbatim. No dequantize, no
             // requantize -- the on-disk layout IS the kernel layout.
@@ -4425,12 +4507,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                         uint8_t* scales, uint8_t* zeros, int N, int K,
                                         size_t row_bytes, size_t scale_bytes, size_t zero_bytes,
                                         std::string& rr) {
-                    if(r.row_scaled&&r.scales_t.numel()==N&&
+                    if(row_scales_ok(r,N)&&
                        ((EF==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
                         (EF==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2))){
                         std::vector<float> hs(size_t(N),0.0f);
                         if(!ck.read_raw(r,payload,rr)||
-                           !ck.shards[r.scales_shard]->read_f32(r.scales_t,hs.data(),rr))return false;
+                           !read_row_scales(ck,r,N,hs.data(),rr))return false;
                         std::memcpy(scales,hs.data(),size_t(N)*sizeof(float));return true;
                     }
                     if(EF==Fmt::BF16&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
@@ -4541,6 +4623,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                         d.gu_zero, int64_t(gu_row), scales_per_row(EF, H)};
             d.moe.down    = QuantWeight{EF, E * H, I, d.dn_pack, d.dn_scale,
                                         d.dn_zero, int64_t(dn_row), scales_per_row(EF, I)};
+            }   // !tiered
 
             // gate and up share an input and are consumed together by
             // SwiGLU: one [2*I][H] matrix, one launch.
@@ -7075,8 +7158,10 @@ void Grimoire::release() {
                         (void*)d.ple_nk, (void*)d.ple_nq, (void*)d.ple_nc,
                         (void*)d.ple_cw, (void*)d.ple_hist_base,
                         (void*)d.ple_mul, (void*)d.ple_size, (void*)d.ple_off,
-                        const_cast<void*>(d.ple_table)})
+                        const_cast<void*>(d.ple_table),
+                        (void*)d.tm_eptr, (void*)d.tm_vpool, (void*)d.tm_hpool})
             if (p) sycl::free(p, q);
+        d.tm_eptr = nullptr; d.tm_vpool = d.tm_hpool = nullptr; d.tiered = false;
         d.hc_attn.down.release(q); d.hc_attn.inject.release(q);
         d.hc_attn.up.release(q);
         d.hc_mlp.down.release(q);  d.hc_mlp.inject.release(q);
@@ -7092,8 +7177,12 @@ void Grimoire::release() {
                      (void**)&q4_blk, (void**)&q4_idx, (void**)&q4_vis,
                      (void**)&q4_seq, (void**)&q4_qpos, (void**)&q4_emb,
                      (void**)&q4_kv, (void**)&q4_gated, (void**)&q4_conv,
-                     (void**)&q4_ids, (void**)&q4_tok_base})
+                     (void**)&q4_ids, (void**)&q4_tok_base,
+                     (void**)&tm_stage, (void**)&tm_scratch, (void**)&tm_xperm,
+                     (void**)&tm_tgu, (void**)&tm_mh, (void**)&tm_yperm,
+                     (void**)&tm_ptoken, (void**)&tm_pinv})
         if (*p) { sycl::free(*p, q); *p = nullptr; }
+    tm_cap = 0; tm_any = false; tm_vram_per_layer = -1; tm_vram_bytes = tm_host_bytes = 0;
     {
         LayerDev& d = mtp.L;
         mtp.fc.release(q);
@@ -8694,9 +8783,15 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             gemv_any(d.router, s.h2, s.rlogits, none);
             launch_router_topk(q, s.rlogits, cfg.n_experts, cfg.top_k,
                                s.d_expert, s.d_weight, true, none);
+            if (d.tiered) {
+                launch_tmoe_gate_up(q, tm_view(d), s.d_expert, s.h2, s.moe_h, 1, none);
+                launch_tmoe_down(q, tm_view(d), s.d_expert, s.d_weight, s.moe_h,
+                                 q4_pend, 1, none);
+            } else {
             launch_moe_gate_up(q, d.moe, s.d_expert, s.h2, s.moe_h, none);
             launch_moe_down(q, d.moe, s.d_expert, s.d_weight, s.moe_h,
                             q4_pend, none);
+            }
             (void)I;
             if (d.sh_gu.w.N) {
                 const int SI = d.sh_gu.output_rows() / 2;
@@ -8743,7 +8838,8 @@ const float* Grimoire::forward(int token) {
     if (cfg.is_muse) return forward_muse(token);
     if (cfg.is_gemma4) return forward_gemma4(token);
     if (cfg.is_qwen4_exp) return forward_qwen4_exp(token);
-    if (dag && !tp_enabled()) return forward_dag(token);
+    // the DAG path has no tiered-expert branch (and is opt-in and broken)
+    if (dag && !tp_enabled() && !tm_any) return forward_dag(token);
     const int H  = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -9045,10 +9141,12 @@ const float* Grimoire::forward(int token) {
                 });
                 route_expert=tp_expert;route_weight=tp_weight;
             }
-            launch_moe_gate_up(q,d.moe,route_expert,s.h2,s.moe_h,none);
+            if (d.tiered) launch_tmoe_gate_up(q,tm_view(d),route_expert,s.h2,s.moe_h,1,none);
+            else launch_moe_gate_up(q,d.moe,route_expert,s.h2,s.moe_h,none);
             MK("  moe_gate_up");
             if (i == probe_layer) probe("L0 moe_h (gate_up)", s.moe_h, cfg.top_k * I);
-            launch_moe_down(q,d.moe,route_expert,route_weight,s.moe_h,s.moe_y,none);
+            if (d.tiered) launch_tmoe_down(q,tm_view(d),route_expert,route_weight,s.moe_h,s.moe_y,1,none);
+            else launch_moe_down(q,d.moe,route_expert,route_weight,s.moe_h,s.moe_y,none);
             if(tp_enabled()&&!tp_allreduce_sum(s.moe_y,H)){
                 std::fprintf(stderr,"TP MoE all-reduce failed\n");return nullptr;
             }
@@ -10840,6 +10938,207 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
 //  two key caches or a PLE layer's conv history, so a hit would restore
 //  a model that is half this request and half the last one -- silently.
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Tiered NVFP4 experts (b70/tiered_moe.hpp, FLASH-NEXT-TIERED.md)
+// ---------------------------------------------------------------------
+static size_t mem_available_bytes() {
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256]; size_t kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+    std::fclose(f);
+    return kb * 1024;
+}
+
+// One expert's three NVFP4 projections -> one native block.  The payload
+// and the E4M3 scales are copied byte for byte; only the per-projection F32
+// scale is normalized to a multiplier (compressed-tensors stores 1/scale).
+static bool build_nv_block(const Qwen35Model& ck, const TensorRef& g, const TensorRef& u,
+                           const TensorRef& dn, const NvExpertLayout& L, uint8_t* dst,
+                           float gs[3], std::string& err) {
+    auto shaped = [](const TensorRef& r, int N, int K) {
+        return r.ok() && r.nvfp4 && r.t.shape.size() == 2 &&
+               r.t.shape[0] == N && r.t.shape[1] == K;
+    };
+    if (!shaped(g, L.I, L.H) || !shaped(u, L.I, L.H) || !shaped(dn, L.H, L.I)) {
+        err = "expert is not NVFP4 gate/up [I][H] + down [H][I]";
+        return false;
+    }
+    auto part = [&](const TensorRef& r, uint8_t* pay, uint8_t* scl, float& out) {
+        TensorRef s;  s.shard = r.scales_shard;  s.t = r.scales_t;
+        TensorRef gg; gg.shard = r.gscale_shard; gg.t = r.gscale_t;
+        float v = 0.0f;
+        if (!ck.read_raw(r, pay, err) || !ck.read_raw(s, scl, err) ||
+            !read_scalar_f32(ck, gg, v, err)) return false;
+        if (!r.nvfp4_mul) {
+            if (v == 0.0f) { err = "NVFP4 global scale is zero"; return false; }
+            v = 1.0f / v;
+        }
+        out = v;
+        return true;
+    };
+    if (!part(g, dst + L.gu_p, dst + L.gu_s, gs[0]) ||
+        !part(u, dst + L.gu_p + size_t(L.I) * (L.H / 2),
+                 dst + L.gu_s + size_t(L.I) * (L.H / 16), gs[1]) ||
+        !part(dn, dst + L.dn_p, dst + L.dn_s, gs[2])) return false;
+    float* g4 = reinterpret_cast<float*>(dst + L.gsc);
+    g4[0] = gs[0]; g4[1] = gs[1]; g4[2] = gs[2]; g4[3] = 0.0f;
+    std::memset(dst + L.gsc + 16, 0, L.bytes - L.gsc - 16);
+    return true;
+}
+
+bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
+                                     LayerDev& d, int layer, std::string& err) {
+    const int H = cfg.hidden, I = cfg.moe_inter, E = cfg.n_experts;
+    const NvExpertLayout lay = NvExpertLayout::make(H, I);
+    if (!lay.supported()) {
+        err = "tiered experts need hidden and moe_intermediate_size multiples of 128";
+        return false;
+    }
+    if (int(src.e_gate_p.size()) != E || int(src.e_up_p.size()) != E ||
+        int(src.e_down_p.size()) != E) {
+        err = "tiered experts: expert list does not match num_experts";
+        return false;
+    }
+    if (!tm_any) {
+        // Decide the split ONCE, for every layer, before anything is
+        // allocated: the host budget is checked against MemAvailable so a
+        // model that cannot fit fails here -- not by an OOM kill with GPU
+        // work in flight, which is what drops a card off the bus.
+        tm_lay = lay; tm_any = true;
+        int moe_layers = 0;
+        for (const auto& l : ck.layers) if (!l.e_gate_p.empty()) ++moe_layers;
+        const size_t all = size_t(E) * lay.bytes * size_t(moe_layers);
+        const size_t dev = lq.get_device().get_info<sycl::info::device::global_mem_size>();
+        int nv = E;
+        if (const char* v = std::getenv("GRIMOIRE_EXPERT_VRAM_PER_LAYER")) {
+            nv = std::max(0, std::min(E, std::atoi(v)));
+        } else {
+            const char* g = std::getenv("GRIMOIRE_EXPERT_VRAM_GB");
+            const size_t budget = g ? size_t(std::max(0.0, std::atof(g)) * 1073741824.0)
+                                : (all <= dev / 10 * 6 ? all : size_t(16) << 30);
+            nv = int(std::min<size_t>(size_t(E), budget / (lay.bytes * size_t(moe_layers))));
+        }
+        tm_vram_per_layer = nv;
+        const size_t host_need = size_t(E - nv) * lay.bytes * size_t(moe_layers);
+        const size_t avail = mem_available_bytes();
+        std::printf("  tiered experts: %d layers x %d, %.2f MB each -- %d/layer in VRAM "
+                    "(%.1f GB), %d/layer in pinned RAM (%.1f GB of %.1f GB available)\n",
+                    moe_layers, E, lay.bytes / 1048576.0, nv,
+                    double(nv) * lay.bytes * moe_layers / 1073741824.0, E - nv,
+                    host_need / 1073741824.0, avail / 1073741824.0);
+        std::fflush(stdout);
+        if (host_need && host_need + (size_t(8) << 30) > avail) {
+            err = "tiered experts need " + std::to_string(host_need >> 30) +
+                  " GB of pinned RAM plus 8 GB headroom, but only " +
+                  std::to_string(avail >> 30) + " GB is available; raise "
+                  "GRIMOIRE_EXPERT_VRAM_GB or free memory";
+            return false;
+        }
+        if (nv > 0 && !(tm_stage = sycl::malloc_host<uint8_t>(size_t(nv) * lay.bytes, lq))) {
+            err = "tiered experts: staging allocation failed"; return false;
+        }
+        if (!(tm_scratch = sycl::malloc_device<sycl_bf16>(size_t(2) * I * H, lq))) {
+            err = "tiered experts: scratch allocation failed"; return false;
+        }
+    }
+    const int nv = tm_vram_per_layer;
+    d.tm_nvram = nv;
+    d.tm_hptr.assign(size_t(E), nullptr);
+    d.tm_gs.assign(size_t(3) * E, 0.0f);
+    if (nv > 0 && !(d.tm_vpool = sycl::malloc_device<uint8_t>(size_t(nv) * lay.bytes, lq))) {
+        err = "VRAM expert pool allocation failed at layer " + std::to_string(layer);
+        return false;
+    }
+    if (nv < E && !(d.tm_hpool = sycl::malloc_host<uint8_t>(size_t(E - nv) * lay.bytes, lq))) {
+        err = "pinned RAM expert pool allocation failed at layer " + std::to_string(layer);
+        return false;
+    }
+    for (int e = 0; e < E; ++e) {
+        uint8_t* dst = e < nv ? tm_stage + size_t(e) * lay.bytes
+                              : d.tm_hpool + size_t(e - nv) * lay.bytes;
+        float gs[3];
+        if (!build_nv_block(ck, src.e_gate_p[size_t(e)], src.e_up_p[size_t(e)],
+                            src.e_down_p[size_t(e)], lay, dst, gs, err)) {
+            err = "layer " + std::to_string(layer) + " expert " + std::to_string(e) + ": " + err;
+            return false;
+        }
+        d.tm_gs[size_t(3) * e] = gs[0];
+        d.tm_gs[size_t(3) * e + 1] = gs[1];
+        d.tm_gs[size_t(3) * e + 2] = gs[2];
+        d.tm_hptr[size_t(e)] = e < nv ? d.tm_vpool + size_t(e) * lay.bytes
+                                      : d.tm_hpool + size_t(e - nv) * lay.bytes;
+    }
+    if (nv > 0) lq.memcpy(d.tm_vpool, tm_stage, size_t(nv) * lay.bytes);
+    if (!(d.tm_eptr = sycl::malloc_device<const uint8_t*>(size_t(E), lq))) {
+        err = "expert pointer table allocation failed"; return false;
+    }
+    lq.memcpy(d.tm_eptr, d.tm_hptr.data(), size_t(E) * sizeof(const uint8_t*));
+    lq.wait_and_throw();              // tm_stage is reused by the next layer
+    d.tiered = true;
+    d.moe.cfg.hidden = H; d.moe.cfg.inter = I; d.moe.cfg.top_k = cfg.top_k;
+    d.moe.cfg.num_experts = 0;        // no VRAM-only [E][..] weight exists
+    tm_vram_bytes += size_t(nv) * lay.bytes;
+    tm_host_bytes += size_t(E - nv) * lay.bytes;
+    return true;
+}
+
+bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32_t* rex,
+                                  const float* rwt, float* out, int M) {
+    const int H = cfg.hidden, I = cfg.moe_inter, K = cfg.top_k, E = cfg.n_experts;
+    const size_t R = size_t(M) * K;
+    if (R > tm_cap) {
+        q.wait();
+        for (void* p : {(void*)tm_xperm, (void*)tm_tgu, (void*)tm_mh, (void*)tm_yperm,
+                        (void*)tm_ptoken, (void*)tm_pinv})
+            if (p) sycl::free(p, q);
+        tm_xperm  = sycl::malloc_device<sycl_bf16>(R * size_t(std::max(H, I)), q);
+        tm_tgu    = sycl::malloc_device<float>(R * 2 * I, q);
+        tm_mh     = sycl::malloc_device<float>(R * I, q);
+        tm_yperm  = sycl::malloc_device<float>(R * H, q);
+        tm_ptoken = sycl::malloc_device<int32_t>(R, q);
+        tm_pinv   = sycl::malloc_device<int32_t>(R, q);
+        tm_cap = (tm_xperm && tm_tgu && tm_mh && tm_yperm && tm_ptoken && tm_pinv) ? R : 0;
+        if (!tm_cap) { std::fprintf(stderr, "tiered MoE: prefill scratch allocation failed\n"); return false; }
+    }
+    // Group the M*K routes by expert on the host (the same counting sort as
+    // the untiered per-expert path), so every expert's weight is decoded
+    // and streamed ONCE for all of its rows.
+    std::vector<int32_t> hex(R), hp(R), hi(R);
+    std::vector<int> count(size_t(E), 0), off(size_t(E) + 1, 0);
+    q.memcpy(hex.data(), rex, R * sizeof(int32_t)).wait();
+    for (size_t r = 0; r < R; ++r) {
+        const int e = hex[r];
+        if (e < 0 || e >= E) { std::fprintf(stderr, "tiered MoE: bad route %d\n", e); return false; }
+        ++count[size_t(e)];
+    }
+    for (int e = 0; e < E; ++e) off[size_t(e) + 1] = off[size_t(e)] + count[size_t(e)];
+    std::vector<int> cur(off.begin(), off.end() - 1);
+    for (size_t r = 0; r < R; ++r) {
+        const int p = cur[size_t(hex[r])]++;
+        hp[size_t(p)] = int32_t(r / size_t(K));
+        hi[r] = p;
+    }
+    q.memcpy(tm_ptoken, hp.data(), R * sizeof(int32_t));
+    q.memcpy(tm_pinv, hi.data(), R * sizeof(int32_t)).wait();
+    launch_permute_rows_bf16(q, x, tm_ptoken, tm_xperm, int(R), H);
+    for (int e = 0; e < E; ++e) if (count[size_t(e)])
+        launch_nvfp4_expert_gemm(q, d.tm_hptr[size_t(e)], tm_lay, true,
+            d.tm_gs[size_t(3) * e], d.tm_gs[size_t(3) * e + 1],
+            tm_xperm + size_t(off[size_t(e)]) * H, tm_tgu + size_t(off[size_t(e)]) * 2 * I,
+            count[size_t(e)], tm_scratch, {});
+    launch_swiglu_batched(q, tm_tgu, tm_mh, int(R), I);
+    launch_f32_to_bf16(q, tm_mh, tm_xperm, R * I);
+    for (int e = 0; e < E; ++e) if (count[size_t(e)])
+        launch_nvfp4_expert_gemm(q, d.tm_hptr[size_t(e)], tm_lay, false,
+            d.tm_gs[size_t(3) * e + 2], 0.0f,
+            tm_xperm + size_t(off[size_t(e)]) * I, tm_yperm + size_t(off[size_t(e)]) * H,
+            count[size_t(e)], tm_scratch, {});
+    launch_moe_unpermute(q, tm_yperm, tm_pinv, rwt, out, M, K, H);
+    return true;
+}
+
 bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                                  std::vector<int32_t>* next_tokens, const SeqBatch* seqb) {
     const int M = int(tokens.size());
@@ -11184,8 +11483,15 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             if (!ok) break;
             launch_router_topk_batched(q, rlog, M, cfg.n_experts, cfg.top_k,
                                        rex, rwt, true, none);
+            if (d.tiered && M >= 32 && device_can_matrix(q)) {
+                if (!tiered_moe_prefill(d, blk_in, rex, rwt, pend, M)) { ok = false; break; }
+            } else if (d.tiered) {
+                launch_tmoe_gate_up(q, tm_view(d), rex, blk_in, mh, M, none);
+                launch_tmoe_down(q, tm_view(d), rex, rwt, mh, pend, M, none);
+            } else {
             launch_moe_gate_up_batched(q, d.moe, rex, blk_in, mh, M);
             launch_moe_down_batched(q, d.moe, rex, rwt, mh, pend, M);
+            }
             if (d.sh_gu.w.N) {
                 const int SI = d.sh_gu.output_rows() / 2;
                 mm(d.sh_gu, blk_in, t0);
@@ -12808,7 +13114,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // an out-of-bounds weight read, a DEVICE_LOST on the card.
             // Unreachable today (TP only batches decode rows, M <= 16); this
             // keeps it unreachable when TP prompt prefill arrives.
-            if(M>=32 && device_can_matrix(q) && !tp_enabled()){
+            if(d.tiered){
+                if(M>=32 && device_can_matrix(q)){
+                    if(!tiered_moe_prefill(d,bn,rex,rwt,r0,M))
+                        throw std::runtime_error("tiered MoE prefill failed");
+                }else{
+                    launch_tmoe_gate_up(q,tm_view(d),rex,bn,mh,M,{});
+                    launch_tmoe_down(q,tm_view(d),rex,rwt,mh,r0,M,{});
+                }
+            }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);

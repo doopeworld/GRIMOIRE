@@ -84,23 +84,29 @@ constexpr int kNVFP4Block = 16;
 // convention. See rule 18: a format that shares another's on-disk shape
 // still needs the discriminator checked against an OUTSIDE source, not
 // a reference derived from the same misreading.
+//
+// mul: modelopt's convention (weight_scale_2), which MULTIPLIES --
+// NVIDIA ModelOpt / TensorRT-LLM / vLLM modelopt all compute
+// w = e2m1 * weight_scale * weight_scale_2.  Same nibbles, same E4M3
+// block scales, opposite use of the per-tensor scalar.
 inline void nvfp4_dequant_row(const uint8_t* packed, const uint8_t* scales,
-                              float gscale, int K, float* out) {
+                              float gscale, int K, float* out, bool mul = false) {
     for (int k = 0; k < K; ++k) {
         const uint8_t byte = packed[k >> 1];
         const uint8_t nib  = (k & 1) ? uint8_t(byte >> 4) : uint8_t(byte & 0x0F);
         const float   blk  = e4m3_to_f32(scales[k / kNVFP4Block]);
-        out[k] = e2m1_to_f32(nib) * blk / gscale;
+        out[k] = mul ? e2m1_to_f32(nib) * blk * gscale
+                     : e2m1_to_f32(nib) * blk / gscale;
     }
 }
 
 // The whole matrix, row-major [N][K].
 inline void nvfp4_dequant(const uint8_t* packed, const uint8_t* scales,
-                          float gscale, int N, int K, float* out) {
+                          float gscale, int N, int K, float* out, bool mul = false) {
     for (int n = 0; n < N; ++n)
         nvfp4_dequant_row(packed + size_t(n) * (K / 2),
                           scales + size_t(n) * (K / kNVFP4Block),
-                          gscale, K, out + size_t(n) * K);
+                          gscale, K, out + size_t(n) * K, mul);
 }
 
 } // namespace b70
