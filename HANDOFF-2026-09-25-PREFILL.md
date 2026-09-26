@@ -124,3 +124,41 @@ DeltaNet, dequant and small-N / elementwise work.
 - Never the B580 (12 GB): use `tools/tune.sh` / `tools/gpunode.sh` (gpu0/gpu1).
 - Never kill a container with GPU work in flight (drops the B70 off the bus).
 - Every change: speed AND the correctness cmp, twice.
+
+---
+
+## UPDATE 2026-09-26 — resume here after Ian's reboot
+
+**Speed:** 4088-token prefill **2.11 s (~1,935 tok/s)** on gpu0; vLLM ≈ 2.03 s.
+Gap ~80 ms. Text identical to `ref-sherlock-5987-n24.txt`. Commit `10981c4`.
+NOTE: `bin/` on the Tower was built from a discarded experiment (lazy rescale,
+slower) — **rebuild first** (`tools/build_grimoire_only_b70.sh`).
+
+**Hardware (Ian moved cards on 09-26):** B580 removed. gpu0 = B70 03:00.0
+(renderD128, Gen4 x8). gpu1 = B70 07:00.0 (renderD130, **Gen4 x4**).
+`tools/gpunode.sh` updated (checks device id 0xe223).
+- **gpu1 dropped off the PCIe bus at 10:53 during its first run after the move**
+  (my first sanity run on it): root port 00:06.0 logged a PCIe physical-layer
+  RxErr at 16 GT/s, then the card read 0xFFFFFFFF and xe declared it wedged.
+  Log: `/mnt/storage/isos/tower-logs/syslog-2026-09-26-gpu1-07.00.0-wedged.txt`.
+- **Do not put load on 07:00.0 again until Ian says the slot is fixed**
+  (BIOS: that slot at Gen3, or reseat riser/cable, check power). When it is:
+  start with a tiny smoke test and watch `dmesg | grep -E "AER|RxErr|07:00.0"`.
+- After a reboot the Unraid array is NOT auto-started (`startArray="no"`):
+  `/mnt/storage` (repo + models) is missing until it is started.
+- Temporary rsyslog drop rule for the wedge's reset flood lived in RAM
+  (/etc/rsyslog.conf) — gone after the reboot.
+
+**Done today:** hardware bf16 conversion (`bf16_rne`, the SYCL bfloat16
+constructor links a branchy software fallback on this target), branch-free
+flash softmax (147 → 137 ms), launcher guard per render node, old plug-in
+launchers retired.
+
+**Measured dead ends today (see commit messages):** flash lazy rescale (181 ms),
+constant-indexed get_wi_data rescale (spills 5.7 KB), row-scale tile (same code),
+fused dequant with col_major SLM B (64 SLM gathers/K step, spills), second-queue
+dequant overlap (~20% only).
+
+**Next (after rebuild + re-verify on gpu0):** DeltaNet recurrence (218 ms),
+residual add fused into out/down GEMM epilogues (~20 ms), attention q|k|v and
+DN qkv|z GEMM fusions (~20 ms), flash (137 ms) restructure.
