@@ -189,6 +189,14 @@ sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
 // [gate; up] (N = 2*FI); writes h bf16 [M][FI] = silu(x Wg^T) * (x Wu^T).
 // One-pass "elementwise op + f32->bf16" for results that only feed a GEMM
 // (ops.cpp).  Same values as the op followed by launch_f32_to_bf16.
+sycl::event launch_gate_sigmoid_mul_bf16_out_qg(sycl::queue& q, const float* x, const float* qg,
+                                                sycl_bf16* out, int tokens, int heads, int dim,
+                                                const std::vector<sycl::event>& deps = {});
+sycl::event launch_qk_norm_rope_batched_qg(
+    sycl::queue& q, float* qdst, const float* qg, float* kv, const bf16_t* qw,
+    const bf16_t* kw, int tokens, int q_heads, int k_heads, int dim, int start_pos,
+    float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps = {},
+    float weight_offset = 1.0f);
 sycl::event launch_gate_sigmoid_mul_bf16_out(sycl::queue& q, const float* x, const float* g,
                                              sycl_bf16* out, size_t n,
                                              const std::vector<sycl::event>& deps = {});

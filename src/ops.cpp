@@ -719,6 +719,24 @@ sycl::event launch_rmsnorm_gate_silu(sycl::queue& q, float* x, const float* z,
     });
 }
 
+// launch_gate_sigmoid_mul_bf16_out with the gate read from the q
+// projection's interleaved output qg ([token][head][q | gate]) -- no split.
+sycl::event launch_gate_sigmoid_mul_bf16_out_qg(sycl::queue& q, const float* x, const float* qg,
+                                                sycl_bf16* out, int tokens, int heads, int dim,
+                                                const std::vector<sycl::event>& deps) {
+    const size_t n = size_t(tokens) * heads * dim;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const size_t th = i / size_t(dim), d = i % size_t(dim);   // th = token*heads + head
+            const float g = qg[th * 2 * size_t(dim) + size_t(dim) + d];
+            const float s = 1.0f / (1.0f + sycl::exp(-g));
+            out[i] = sycl_bf16(x[i] * s);
+        });
+    });
+}
+
 // launch_rmsnorm_gate_silu followed by launch_f32_to_bf16, in one pass, for
 // the DeltaNet output projection's input: same values, x left untouched.
 sycl::event launch_rmsnorm_gate_silu_bf16_out(sycl::queue& q, const float* x, const float* z,

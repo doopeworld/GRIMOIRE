@@ -23,8 +23,11 @@
 // =====================================================================
 #include "kernels.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <chrono>
+#include <vector>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -540,6 +543,149 @@ FlashScratch& flash_scratch_for(sycl::queue& q) {
     return s;
 }
 
+// GRIMOIRE_FLASH_ESIMD=1|0 selects the ESIMD flash prefill kernel.
+int& flash_esimd_flag() {
+    static int f = [] { const char* e = std::getenv("GRIMOIRE_FLASH_ESIMD"); return e ? std::atoi(e) : 0; }();
+    return f;
+}
+bool flash_use_esimd() { return flash_esimd_flag() != 0; }
+
+// ---------------------------------------------------------------------
+// Flash prefill, ESIMD: one hardware thread owns 8 query rows of a head.
+// Same inputs as the joint_matrix kernel below (Q packed bf16 * scale*log2e
+// [H][Tp][D], K packed [D/2][Sp][2], V packed [Sp/2][D][2]) and the same math.
+// Explicit registers: each DPAS result (8 rows x 16 keys, fp32, row-major) is
+// masked, max-reduced per row, exponentiated and converted to bf16 IN PLACE
+// as the A operand of P.V; O (8 x D fp32) stays in registers and is rescaled
+// per row with compile-time register indices.  The joint_matrix version
+// round-tripped S and P through SLM and kept corr[] in private memory (IGC
+// ISA dump).  All building blocks checked on the B70 by tools/esimd_probe.cpp.
+// ---------------------------------------------------------------------
+template <int D>
+sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, int Tp,
+                        const sycl_bf16* Kp, const sycl_bf16* Vp, int Sp, float* out,
+                        int tokens, int start, int H, int KVH) {
+    namespace es = sycl::ext::intel::esimd;
+    namespace xmx = sycl::ext::intel::esimd::xmx;
+    constexpr int RB = 8, BK = 32, DT = D / 16, TPW = 8;
+    const int qtiles = (tokens + RB * TPW - 1) / (RB * TPW);
+    const size_t nthreads = size_t(qtiles) * H * TPW;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(dep);
+        h.parallel_for(sycl::nd_range<1>(nthreads, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            constexpr float NINF = -std::numeric_limits<float>::infinity();
+            const int g = int(it.get_group(0)), lt = int(it.get_local_id(0));
+            const int hq = g % H, qt = qtiles - 1 - g / H, kvh = hq / (H / KVH);
+            const int r0 = (qt * TPW + lt) * RB;
+            if (r0 >= tokens) return;
+            const int lastr = tokens - 1 < r0 + RB - 1 ? tokens - 1 : r0 + RB - 1;
+            const int kmax = start + lastr + 1;
+            const sycl_bf16* qh = Qb + size_t(hq) * Tp * D;
+            const uint32_t* kh = reinterpret_cast<const uint32_t*>(Kp + size_t(kvh) * (D / 2) * Sp * 2);
+            const uint32_t* vh = reinterpret_cast<const uint32_t*>(Vp + size_t(kvh) * (Sp / 2) * D * 2);
+            es::simd<float, RB * D> o = 0.0f;            // DT tiles of [RB][16], row-major
+            es::simd<float, RB> m = NINF, l = 0.0f;
+            const es::simd<int, 16> col(0, 1);
+            for (int s0 = 0; s0 < kmax; s0 += BK) {
+                es::simd<float, RB * 16> slo = 0.0f, shi = 0.0f;
+                // partial unroll: fully unrolled, all 16 steps' tiles were
+                // hoisted at once and the kernel spilled 8 KB
+                #pragma unroll 4
+                for (int dt = 0; dt < DT; ++dt) {
+                    es::simd<sycl_bf16, RB * 16> a = es::load_2d<sycl_bf16, 16, RB>(
+                        qh, D * 2 - 1, Tp - 1, D * 2 - 1, dt * 16, r0);
+                    // 2-D blocks are at most 64 bytes wide: one per 16 keys
+                    es::simd<uint32_t, 128> b0 = es::load_2d<uint32_t, 16, 8>(
+                        kh, Sp * 4 - 1, D / 2 - 1, Sp * 4 - 1, s0, dt * 8);
+                    es::simd<uint32_t, 128> b1 = es::load_2d<uint32_t, 16, 8>(
+                        kh, Sp * 4 - 1, D / 2 - 1, Sp * 4 - 1, s0 + 16, dt * 8);
+                    slo = xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                        slo, b0.template bit_cast_view<sycl_bf16>().read(), a);
+                    shi = xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                        shi, b1.template bit_cast_view<sycl_bf16>().read(), a);
+                }
+                // causal mask (and rows past the prompt): only blocks that reach
+                // past the first row's position need it -- a uniform branch.
+                if (s0 + BK - 1 > start + r0) {
+                    #pragma unroll
+                    for (int r = 0; r < RB; ++r) {
+                        const int lim = r0 + r < tokens ? start + r0 + r : -1;
+                        es::simd<float, 16> v0 = slo.template select<16, 1>(16 * r);
+                        es::simd<float, 16> v1 = shi.template select<16, 1>(16 * r);
+                        v0.merge(es::simd<float, 16>(NINF), col + s0 > lim);
+                        v1.merge(es::simd<float, 16>(NINF), col + (s0 + 16) > lim);
+                        slo.template select<16, 1>(16 * r) = v0;
+                        shi.template select<16, 1>(16 * r) = v1;
+                    }
+                }
+                es::simd<float, RB> bm;
+                #pragma unroll
+                for (int r = 0; r < RB; ++r) {
+                    es::simd<float, 16> v = es::max(es::simd<float, 16>(slo.template select<16, 1>(16 * r)),
+                                                    es::simd<float, 16>(shi.template select<16, 1>(16 * r)));
+                    bm[r] = es::hmax<float>(v);
+                }
+                es::simd<float, RB> mn = es::max(m, bm);
+                es::simd<float, RB> ms = mn;
+                ms.merge(es::simd<float, RB>(0.0f), mn == NINF);
+                es::simd<float, RB> corr = es::exp2(m - ms);   // m = -inf -> 0
+                es::simd<float, RB> rs;
+                #pragma unroll
+                for (int r = 0; r < RB; ++r) {
+                    const float msr = ms[r];
+                    es::simd<float, 16> p0 = es::exp2(es::simd<float, 16>(slo.template select<16, 1>(16 * r)) - msr);
+                    es::simd<float, 16> p1 = es::exp2(es::simd<float, 16>(shi.template select<16, 1>(16 * r)) - msr);
+                    slo.template select<16, 1>(16 * r) = p0;
+                    shi.template select<16, 1>(16 * r) = p1;
+                    rs[r] = es::reduce<float>(p0 + p1, std::plus<>());
+                }
+                l = l * corr + rs;
+                m = mn;
+                float cr[RB];
+                #pragma unroll
+                for (int r = 0; r < RB; ++r) cr[r] = corr[r];
+                #pragma unroll
+                for (int dt = 0; dt < DT; ++dt)
+                    #pragma unroll
+                    for (int r = 0; r < RB; ++r)
+                        o.template select<16, 1>((dt * RB + r) * 16) *= cr[r];
+                const es::simd<sycl_bf16, RB * 16> plo = slo, phi = shi;
+                // full unroll: O is indexed by dt and must see constant
+                // offsets (a runtime offset into the 8 KB O is rejected by RA)
+                #pragma unroll
+                for (int dt = 0; dt < DT; ++dt) {
+                    // 16 key-pairs (32 keys) x 16 d, VNNI over keys: rows 0-7 are
+                    // keys s0..s0+15, rows 8-15 keys s0+16..s0+31
+                    es::simd<uint32_t, 16 * 16> v = es::load_2d<uint32_t, 16, 16>(
+                        vh, D * 4 - 1, Sp / 2 - 1, D * 4 - 1, dt * 16, s0 / 2);
+                    es::simd<uint32_t, 128> v0 = v.template select<128, 1>(0);
+                    es::simd<uint32_t, 128> v1 = v.template select<128, 1>(128);
+                    o.template select<RB * 16, 1>(dt * RB * 16) =
+                        xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                            xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                                es::simd<float, RB * 16>(o.template select<RB * 16, 1>(dt * RB * 16)),
+                                v0.template bit_cast_view<sycl_bf16>().read(), plo),
+                            v1.template bit_cast_view<sycl_bf16>().read(), phi);
+                }
+            }
+            es::simd<float, RB> inv = 1.0f / l;
+            inv.merge(es::simd<float, RB>(0.0f), l == 0.0f);
+            float iv[RB];
+            #pragma unroll
+            for (int r = 0; r < RB; ++r) iv[r] = inv[r];
+            #pragma unroll
+            for (int dt = 0; dt < DT; ++dt) {
+                #pragma unroll
+                for (int r = 0; r < RB; ++r)
+                    o.template select<16, 1>((dt * RB + r) * 16) *= iv[r];
+                es::store_2d<float, 16, RB>(out, H * D * 4 - 1, tokens - 1, H * D * 4 - 1,
+                                            hq * D + dt * 16, r0,
+                                            es::simd<float, RB * 16>(o.template select<RB * 16, 1>(dt * RB * 16)));
+            }
+        });
+    });
+}
+
 template <int D>
 sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                             const uint8_t* vc, float* out, int tokens, int start, int H,
@@ -589,6 +735,8 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 bf16_rne(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
         });
     });
+    if (flash_use_esimd())
+        return flash_esimd<D>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
         sycl::local_accessor<float, 1> Ss(FA_NSG * FA_RB * FA_BK, h);
@@ -743,11 +891,41 @@ sycl::event launch_flash_prefill_fast(sycl::queue& q, const float* qv, const uin
                                       int start_pos, int num_heads, int num_kv_heads,
                                       int head_dim, int seq_cap, float softmax_scale,
                                       const std::vector<sycl::event>& deps) {
-    return head_dim == 128
-        ? flash_fast_impl<128>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
-                               num_kv_heads, seq_cap, softmax_scale, deps)
-        : flash_fast_impl<256>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
-                               num_kv_heads, seq_cap, softmax_scale, deps);
+    auto run = [&](float* o, const std::vector<sycl::event>& dd) {
+        return head_dim == 128
+            ? flash_fast_impl<128>(q, qv, k_cache, v_cache, o, tokens, start_pos, num_heads,
+                                   num_kv_heads, seq_cap, softmax_scale, dd)
+            : flash_fast_impl<256>(q, qv, k_cache, v_cache, o, tokens, start_pos, num_heads,
+                                   num_kv_heads, seq_cap, softmax_scale, dd);
+    };
+    // GRIMOIRE_FLASH_VERIFY=n: for the first n calls run the ESIMD kernel into
+    // `out` and the joint_matrix kernel into a scratch copy, and print how far
+    // apart they are.
+    static int verify_left = [] { const char* e = std::getenv("GRIMOIRE_FLASH_VERIFY"); return e ? std::atoi(e) : 0; }();
+    if (verify_left > 0) {
+        --verify_left;
+        const size_t n = size_t(tokens) * num_heads * head_dim;
+        float* ref = sycl::malloc_device<float>(n, q);
+        const int saved = flash_esimd_flag();
+        flash_esimd_flag() = 0;
+        run(ref, deps).wait();
+        flash_esimd_flag() = 1;
+        run(out, {}).wait();
+        flash_esimd_flag() = saved;
+        std::vector<float> a(n), b(n);
+        q.memcpy(a.data(), out, n * sizeof(float));
+        q.memcpy(b.data(), ref, n * sizeof(float)).wait();
+        double dmax = 0.0, rmax = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            dmax = std::max(dmax, std::fabs(double(a[i]) - double(b[i])));
+            rmax = std::max(rmax, std::fabs(double(b[i])));
+        }
+        std::fprintf(stderr, "  flash verify (esimd vs joint_matrix, %d tokens, start %d): "
+                     "max|diff| %.3e (max|ref| %.3e)\n", tokens, start_pos, dmax, rmax);
+        sycl::free(ref, q);
+        return sycl::event{};
+    }
+    return run(out, deps);
 }
 
 namespace {

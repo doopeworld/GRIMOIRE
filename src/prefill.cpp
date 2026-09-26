@@ -1077,6 +1077,55 @@ sycl::event launch_qk_norm_rope_batched(
     });
 }
 
+// launch_qk_norm_rope_batched, with q read from the q projection's
+// interleaved output qg ([token][head][q (dim) | gate (dim)]) and written
+// to qdst ([token][head][dim]) -- the separate q/gate split pass (a pure
+// copy, 11 ms of a 4088-token Qwen3.8-27B prefill) is not needed.  Same
+// operations in the same order as the in-place kernel.
+sycl::event launch_qk_norm_rope_batched_qg(
+    sycl::queue& q, float* qdst, const float* qg, float* kv, const bf16_t* qw,
+    const bf16_t* kw, int tokens, int q_heads, int k_heads, int dim, int start_pos,
+    float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps,
+    float weight_offset) {
+    const int rot = int(dim * partial_factor) & ~1;
+    const int heads_per_token = q_heads + k_heads;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(tokens) * heads_per_token * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int gh = int(it.get_group(0));
+                const int t = gh / heads_per_token;
+                const int h0 = gh % heads_per_token;
+                const bool isq = h0 < q_heads;
+                const int hi = isq ? h0 : h0 - q_heads;
+                float* p = isq ? qdst + (int64_t(t) * q_heads + hi) * dim
+                               : kv + (int64_t(t) * k_heads + hi) * dim;
+                const float* src = isq ? qg + (int64_t(t) * q_heads + hi) * 2 * dim : p;
+                const bf16_t* w = isq ? qw : kw;
+                float ss = 0.0f;
+                for (int d = lane; d < dim; d += SG_SIZE)
+                    ss = sycl::fma(src[d], src[d], ss);
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                for (int d = lane; d < dim; d += SG_SIZE)
+                    p[d] = src[d] * (scale * (weight_offset + bf16_to_f32(w[d])));
+                sycl::group_barrier(sg);
+                const int pos = start_pos + t;
+                for (int j = lane; j < rot / 2; j += SG_SIZE) {
+                    const float inv = sycl::exp(-float(2 * j) / float(rot) * sycl::log(theta));
+                    const float ang = float(pos) * inv;
+                    const float cs = sycl::cos(ang), sn = sycl::sin(ang);
+                    const float a = p[j], b = p[j + rot / 2];
+                    p[j] = a * cs - b * sn;
+                    p[j + rot / 2] = a * sn + b * cs;
+                }
+            });
+    });
+}
+
 // ---------------------------------------------------------------------
 // Batched q/k norm + PROPORTIONAL RoPE -- gemma-4 full-attention layers.
 //

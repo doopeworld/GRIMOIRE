@@ -12472,7 +12472,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             mm(d.q_proj,bn,t0);
             pp_mark("attn q proj");
             float* qv=t0;
-            if(gated){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,d.head_dim);qv=t1;}
+            // dense_pure: no q/gate split pass -- the q norm+RoPE kernel reads q
+            // from t0's interleaved layout into t1 and the output gate reads
+            // its half of t0 directly (t0 stays intact until then).
+            const bool qg_direct = gated && dense_pure && !seqb && !d.rope_proportional;
+            if(gated && !qg_direct){launch_split_qgate_batched(q,t0,t1,t2,M,cfg.n_heads,d.head_dim);qv=t1;}
+            if(qg_direct) qv=t1;
             mm(d.k_proj,bn,t3);
             if (d.k2_sparse) {
                 // One readback for the whole batch instead of two stalls
@@ -12532,6 +12537,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     d.k_norm,M,cfg.n_heads,d.kv_heads,d.head_dim,pos,
                     d.rope_theta,d.partial_rope,cfg.rms_eps,{},1.0f,
                     d.rope_factor);
+            else if(qg_direct)
+                launch_qk_norm_rope_batched_qg(q,t1,t0,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
+                    d.kv_heads,d.head_dim,pos,d.rope_theta,d.partial_rope,cfg.rms_eps);
             else
                 launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
                     d.kv_heads,d.head_dim,pos,d.rope_theta,d.partial_rope,cfg.rms_eps);
@@ -12655,7 +12663,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     size_t(M)*cfg.n_heads*d.head_dim);o_in=xb;}
                 mmb(d.o_proj,o_in,r0);
             }else if(gated && dense_pure && !d.o_proj.has_i4()){
-                launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(M)*cfg.n_heads*d.head_dim);
+                if(qg_direct)
+                    launch_gate_sigmoid_mul_bf16_out_qg(q,t3,t0,xb,M,cfg.n_heads,d.head_dim);
+                else
+                    launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(M)*cfg.n_heads*d.head_dim);
                 if(gemm_fast_supported(d.o_proj.w,M)){
                     launch_gemm_fast_residual(q,d.o_proj.w,xb,bh,M);r0_in_h=true;
                 }else launch_gemm_xmx(q,d.o_proj.w,xb,r0,M);
