@@ -44,6 +44,20 @@ constexpr int MC1 = 32, NC1 = 64, KC1 = 32, MC2 = 256, NC2 = 256;
 // matrix from allocating gigabytes; such shapes stay on gemm_flt.
 constexpr size_t kMaxScratchElems = size_t(512) << 20;
 
+// float -> bf16, round to nearest even, on the conversion hardware.
+// sycl::ext::oneapi::bfloat16's constructor links the SOFTWARE devicelib
+// fallback for this AOT target: integer RNE plus a NaN branch per value --
+// 130 divergent branches in the SwiGLU GEMM epilogue, 22 in the dequant, 16
+// per key block in flash (IGC ISA dump, 2026-09-26).  Identical result for
+// every non-NaN input.
+inline sycl_bf16 bf16_rne(float f) {
+#ifdef __SYCL_DEVICE_ONLY__
+    return sycl::bit_cast<sycl_bf16>(__spirv_ConvertFToBF16INTEL(f));
+#else
+    return sycl_bf16(f);
+#endif
+}
+
 // Work-groups are dispatched in linear order, so the order decides what
 // shares L2.  GROUP_M row blocks at a time, rows fastest: the ~32 resident
 // work-groups then share 4 A row-panels and 8 B column-panels instead of 1
@@ -78,7 +92,7 @@ inline uint32_t mxfp4_pair_bf16(uint32_t byte, float sc) {
         const uint32_t m = nib & 7u;
         const uint32_t mag = m >= 2u ? 0x3F00u + (m << 6) : (m == 1u ? 0x3F00u : 0u);
         const float f = sycl::bit_cast<float>(((nib & 8u) << 28) | (mag << 16)) * sc;
-        return uint32_t(sycl::bit_cast<uint16_t>(sycl_bf16(f)));
+        return uint32_t(sycl::bit_cast<uint16_t>(bf16_rne(f)));
     };
     return one(byte & 0x0Fu) | (one(byte >> 4) << 16);
 }
@@ -118,8 +132,8 @@ sycl::event dequant_vnni(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
                     v[t] = decode_elem<F>(row, k, scale);
             }
             sycl_bf16* o = dst + (int64_t(kp) * LD + n) * 2;
-            o[0] = sycl_bf16(v[0]);
-            o[1] = sycl_bf16(v[1]);
+            o[0] = bf16_rne(v[0]);
+            o[1] = bf16_rne(v[1]);
         });
     });
 }
@@ -191,7 +205,7 @@ sycl::event dequant_vnni_tiled(sycl::queue& q, const QuantWeight& w, sycl_bf16* 
                     }
                 }
                 #pragma unroll
-                for (int j = 0; j < 16; ++j) t[(c * 16 + j) * TN_ + r] = sycl_bf16(v[j]);
+                for (int j = 0; j < 16; ++j) t[(c * 16 + j) * TN_ + r] = bf16_rne(v[j]);
             }
             sycl::group_barrier(it.get_group());
             {
@@ -414,7 +428,15 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                                 g = sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u; });
                         matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::accumulator,
                                              TM, TN> hb;
-                        matrix::joint_matrix_copy(sg, acc[m][n], hb);
+                        // joint_matrix_copy converts through the software
+                        // bf16 path (a NaN branch per element); convert on
+                        // the hardware instead, element for element.
+                        {
+                            auto src = sycl::ext::oneapi::detail::get_wi_data(sg, acc[m][n]);
+                            auto dst = sycl::ext::oneapi::detail::get_wi_data(sg, hb);
+                            #pragma unroll
+                            for (int i = 0; i < TM; ++i) dst[i] = bf16_rne(float(src[i]));
+                        }
                         ix::joint_matrix_store_checked(sg, hb, pH, size_t(FI),
                             matrix::layout::row_major, size_t(M), size_t(FI),
                             size_t(m0 + m * TM), size_t(nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN));
@@ -552,7 +574,7 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
         h.parallel_for(sycl::range<3>(size_t(H), size_t(Tp), size_t(D)), [=](sycl::id<3> id) {
             const int hh = int(id[0]), t = int(id[1]), d = int(id[2]);
             Qb[(size_t(hh) * Tp + t) * D + d] =
-                sycl_bf16(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
+                bf16_rne(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
         });
     });
     return q.submit([&](sycl::handler& h) {
@@ -613,33 +635,41 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                     matrix::joint_matrix_store(sg, sa[c], ss_mp + c * TN, BK,
                                                matrix::layout::row_major);
                 sycl::group_barrier(sg);
+                // Branch-free: the S slice is always valid memory, so load it
+                // unconditionally and mask with selects; exp2(-inf) = 0 covers
+                // masked keys and an empty history, and a fully masked row
+                // (mn = -inf) subtracts 0 instead of -inf.  (The conditional
+                // loads and isinf branches compiled to ~40 divergent branches
+                // per key block.)  Same values as before in every case.
+                constexpr float NINF = -std::numeric_limits<float>::infinity();
                 float corr[RB];
                 #pragma unroll
                 for (int r = 0; r < RB; ++r) {
                     const int t = r0 + r, qpos = start + t;
-                    const float v0 = (t < tokens && s0 + lane <= qpos) ? ss[r * BK + lane]
-                                     : -std::numeric_limits<float>::infinity();
-                    const float v1 = (t < tokens && s0 + lane + SG_SIZE <= qpos)
-                                     ? ss[r * BK + lane + SG_SIZE]
-                                     : -std::numeric_limits<float>::infinity();
+                    const float sv0 = ss[r * BK + lane], sv1 = ss[r * BK + lane + SG_SIZE];
+                    const float v0 = (t < tokens && s0 + lane <= qpos) ? sv0 : NINF;
+                    const float v1 = (t < tokens && s0 + lane + SG_SIZE <= qpos) ? sv1 : NINF;
                     const float bm = sycl::reduce_over_group(sg, sycl::fmax(v0, v1),
                                                              sycl::maximum<float>());
                     const float mn = sycl::fmax(m[r], bm);
-                    corr[r] = sycl::isinf(m[r]) ? 0.0f : sycl::native::exp2(m[r] - mn);
-                    const float p0 = sycl::isinf(v0) ? 0.0f : sycl::native::exp2(v0 - mn);
-                    const float p1 = sycl::isinf(v1) ? 0.0f : sycl::native::exp2(v1 - mn);
-                    ps[r * BK + lane] = sycl_bf16(p0);
-                    ps[r * BK + lane + SG_SIZE] = sycl_bf16(p1);
+                    const float ms = sycl::isinf(mn) ? 0.0f : mn;
+                    corr[r] = sycl::native::exp2(m[r] - ms);
+                    const float p0 = sycl::native::exp2(v0 - ms);
+                    const float p1 = sycl::native::exp2(v1 - ms);
+                    ps[r * BK + lane] = bf16_rne(p0);
+                    ps[r * BK + lane + SG_SIZE] = bf16_rne(p1);
                     l[r] = l[r] * corr[r] +
                            sycl::reduce_over_group(sg, p0 + p1, sycl::plus<float>());
                     m[r] = mn;
                 }
                 sycl::group_barrier(sg);
-                // MEASURED (Qwen3.8-27B, 4088 tokens, whole prefill): a
-                // counter-indexed plain apply here was 2x slower (323 vs
-                // 158 ms) and skipping the rescale when no row's max moved
-                // (lazy max, threshold 2^8) was slower too (239 ms, spills):
-                // this kernel sits at the 256-register limit.
+                // corr[] indexed by the runtime row lives in private memory
+                // (512 B/work-item).  Tried: constant-indexed get_wi_data
+                // (spilled 5.7 KB), a row-scale tile + element-wise apply
+                // (compiled to the same code).  The D=256 kernel is at the
+                // 256-register limit.
+                // (Lazy rescale -- skip unless a row's max grew by > 2^8 --
+                // measured SLOWER again on 2026-09-26: 181 vs 137 ms.)
                 #pragma unroll
                 for (int n = 0; n < NF; ++n)
                     ix::joint_matrix_apply(sg, o[n],
@@ -873,7 +903,7 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
                         const int col = nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN;
                         ix::joint_matrix_apply(sg, acc[m][n], [=](float& x, size_t r, size_t c) {
                             if (r0 + int(r) < M)
-                                H[size_t(r0 + int(r)) * FI + col + c] = sycl_bf16(x);
+                                H[size_t(r0 + int(r)) * FI + col + c] = bf16_rne(x);
                         });
                     }
             }
