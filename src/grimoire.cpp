@@ -12216,6 +12216,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
         }
     }
+    // dense_pure: the output projections add their result straight into bh
+    // (launch_gemm_fast_residual) and set this, so the next norm does not
+    // re-add r0 or rewrite bh -- same fp32 addition, one less pass over bh.
+    bool r0_in_h=false;
     for(int li=prefill_layer_begin;li<prefill_layer_limit;++li){
         a8_cached_src=nullptr;
         a8_cached_bf=nullptr;
@@ -12233,8 +12237,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         else if(exact_verify)
             input_bf_ready=norm_rows(bh,r0,r1,d.in_norm,bn);
         else input_bf_ready=launch_rmsnorm_residual_batched(
-            q,bh,r0,dense_pure?nullptr:r1,d.in_norm,(norm_bf_only||dense_pure)?nullptr:bn,
-            M,H,cfg.rms_eps,bn_bf);
+            q,bh,r0_in_h?nullptr:r0,dense_pure?nullptr:r1,d.in_norm,
+            (norm_bf_only||dense_pure)?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
+        r0_in_h=false;
         if(exact_verify && debug && li==probe_layer)
             probe("L0 in_norm",bn,H);
         pp_mark("input norm");
@@ -12419,7 +12424,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 mmb(d.la_out,xb,r0);
             }else if(dense_pure && !d.la_out.has_i4()){
                 launch_rmsnorm_gate_silu_bf16_out(q,t0,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
-                launch_gemm_xmx(q,d.la_out.w,xb,r0,M);
+                if(gemm_fast_supported(d.la_out.w,M)){
+                    launch_gemm_fast_residual(q,d.la_out.w,xb,bh,M);r0_in_h=true;
+                }else launch_gemm_xmx(q,d.la_out.w,xb,r0,M);
             }else{
                 launch_rmsnorm_gate_silu(q,t0,z_in,d.la_norm,M*Hv,Dv,cfg.rms_eps,{});
                 mm(d.la_out,t0,r0);
@@ -12649,7 +12656,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 mmb(d.o_proj,o_in,r0);
             }else if(gated && dense_pure && !d.o_proj.has_i4()){
                 launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(M)*cfg.n_heads*d.head_dim);
-                launch_gemm_xmx(q,d.o_proj.w,xb,r0,M);
+                if(gemm_fast_supported(d.o_proj.w,M)){
+                    launch_gemm_fast_residual(q,d.o_proj.w,xb,bh,M);r0_in_h=true;
+                }else launch_gemm_xmx(q,d.o_proj.w,xb,r0,M);
             }else{
                 if(gated) launch_gate_sigmoid_mul(q,t3,t2,M*cfg.n_heads*d.head_dim,{});
                 mm(d.o_proj,t3,r0);
@@ -12665,8 +12674,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 ? launch_rmsnorm_residual_batched_quant(q,bh,r0,nullptr,d.post_norm,
                     norm_bf_only?nullptr:bn,bn_bf,a8,a8s,M,H,cfg.rms_eps)
                 : launch_rmsnorm_residual_batched(
-                    q,bh,r0,nullptr,d.post_norm,(norm_bf_only||dense_pure)?nullptr:bn,M,H,
-                    cfg.rms_eps,bn_bf);
+                    q,bh,r0_in_h?nullptr:r0,nullptr,d.post_norm,
+                    (norm_bf_only||dense_pure)?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
+        r0_in_h=false;
         a8_cached_src=nullptr;
         a8_cached_bf=fused_ffn_quant?bn_bf:nullptr;
         if(d.moe_layer){
@@ -12943,7 +12953,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                    gemm_fast_supported(d.sh_down.w,M)){
                     launch_gemm_fast_swiglu(q,d.sh_gu.w,bn_bf,xb,M);
                     pp_mark("  FFN gate_up+swiglu");
-                    launch_gemm_xmx(q,d.sh_down.w,xb,r0,M);
+                    if(dense_pure){
+                        launch_gemm_fast_residual(q,d.sh_down.w,xb,bh,M);r0_in_h=true;
+                    }else launch_gemm_xmx(q,d.sh_down.w,xb,r0,M);
                 }else{
                     mm(d.sh_gu,bn,t0); pp_mark("  FFN gate_up");
                     launch_swiglu_batched(q,t0,t1,M,FI); pp_mark("  FFN swiglu");
@@ -12983,7 +12995,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
           launch_rmsnorm_moe_residual_batched(q,bh,moe_res,pinv,rwt,r1,fnorm,bn,
               nullptr,M,cfg.top_k,H,cfg.rms_eps);
       else if(exact_verify) norm_rows(bh,r0,r1,fnorm,bn);
-      else launch_rmsnorm_residual_batched(q,bh,r0,r1,fnorm,bn,M,H,cfg.rms_eps);
+      else launch_rmsnorm_residual_batched(q,bh,r0_in_h?nullptr:r0,r1,fnorm,bn,M,H,cfg.rms_eps);
       if(prefill_host_progress){q.wait_and_throw();
           std::fprintf(stderr,"    prefill stage: final norm done\n");std::fflush(stderr);}
       if (next_tokens) {

@@ -401,17 +401,29 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                             matrix::joint_matrix_mad(sg, acc[m][n], a[m][kk], b[n][kk],
                                                      acc[m][n]);
             }
-            if constexpr (EPI == 0) {
+            if constexpr (EPI == 0 || EPI == 2) {
                 auto pC = sycl::address_space_cast<sycl::access::address_space::global_space,
                                                    sycl::access::decorated::no>(
                     static_cast<float*>(out));
                 #pragma unroll
                 for (int m = 0; m < MC1 / TM; ++m)
                     #pragma unroll
-                    for (int n = 0; n < NC1 / TN; ++n)
+                    for (int n = 0; n < NC1 / TN; ++n) {
+                        if constexpr (EPI == 2) {
+                            // residual: out = out + x W^T -- the same fp32
+                            // addition the next norm would do (h + r0)
+                            matrix::joint_matrix<sycl::sub_group, float,
+                                                 matrix::use::accumulator, TM, TN> cin;
+                            ix::joint_matrix_load_checked(sg, cin, pC, size_t(N),
+                                matrix::layout::row_major, size_t(M), size_t(N),
+                                size_t(m0 + m * TM), size_t(bcol(n)));
+                            matrix::joint_matrix_apply(sg, acc[m][n], cin,
+                                [](float& a, float& c) { a = c + a; });
+                        }
                         ix::joint_matrix_store_checked(sg, acc[m][n], pC, size_t(N),
                             matrix::layout::row_major, size_t(M), size_t(N),
                             size_t(m0 + m * TM), size_t(bcol(n)));
+                    }
             } else {
                 // silu(gate) * up in registers, rounded to a bf16 tile, one
                 // bounds-checked 2-D block store.  (Per-element coordinate
@@ -1071,6 +1083,290 @@ sycl::event launch_deltanet_prefill_q4(sycl::queue& q, const DeltaNetPrefillPara
     return p.k_dim == 64 ? deltanet_q4_impl<64>(q, p, deps) : deltanet_q4_impl<128>(q, p, deps);
 }
 
+// ---------------------------------------------------------------------
+// DeltaNet prefill, chunked: 16 tokens at a time, fp32 on the vector units.
+//
+// Per state row s (a k_dim vector) the recurrence is
+//   s_t = a_t s_{t-1} + u_t k_t,   u_t = beta_t (v_t - a_t s_{t-1}.k_t)
+// and over a chunk starting from s0, with gamma_j = prod_{i<=j} a_i:
+//   (I + L) u = beta . (v - gamma . (K s0)),  L[j][i] = beta_j (gamma_j/gamma_i) k_j.k_i  (i < j)
+//   o_j = gamma_j s0.q_j + sum_{i<=j} (gamma_j/gamma_i) (q_j.k_i) u_i
+//   s_C = gamma_last s0 + sum_i (gamma_last/gamma_i) u_i k_i
+// L, the output mixing matrix Mq and the decays depend only on (head,
+// chunk): dn_chunk_prep builds them once and all 128 rows of the head reuse
+// them.  Per row a chunk is then 2 x 16 INDEPENDENT dot products with s0, a
+// 16x16 forward substitution and one state update -- no token-to-token
+// dependency chain inside the chunk.  deltanet_q4_impl paid a dependent
+// 4-lane reduction chain per token: 218 ms of a 4088-token Qwen3.8-27B
+// prefill.  Same math; the summation order differs (GRIMOIRE_DN_VERIFY=n
+// compares both on the first n layers).  Tokens past the end of the prompt
+// are padded with a = 1, beta = 0, k = q = v = 0, which leaves u = 0.
+// ---------------------------------------------------------------------
+namespace {
+
+constexpr int DNC = 16;                                   // tokens per chunk
+constexpr int DNO_L = 0, DNO_M = DNC * DNC, DNO_EG = 2 * DNC * DNC,
+              DNO_DL = DNO_EG + DNC, DNO_BT = DNO_DL + DNC, DNO_GL = DNO_BT + DNC;
+constexpr int DNP = (DNO_GL + 1 + 3) / 4 * 4;             // floats per (head, chunk), float4-padded
+
+template <int KD>
+sycl::event dn_chunk_prep(sycl::queue& q, const DeltaNetPrefillParams& p, float* prep,
+                          const std::vector<sycl::event>& deps) {
+    constexpr int WG = DNC * DNC;
+    const int NH = p.n_heads, NT = p.n_tokens, NC = (NT + DNC - 1) / DNC;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        sycl::local_accessor<float, 1> ks(DNC * KD, h), qs(DNC * KD, h), g(DNC, h), bt(DNC, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(NH) * NC * WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = int(it.get_local_id(0)), wg = int(it.get_group(0));
+            const int head = wg / NC, c = wg % NC, t0 = c * DNC;
+            const int nk = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+            const int khead = (nk == NH) ? head : head / (NH / nk);
+            for (int e = lid; e < DNC * KD; e += WG) {
+                const int t = t0 + e / KD, d = e % KD;
+                const int64_t off = (int64_t(t) * nk + khead) * KD + d;
+                ks[e] = t < NT ? pp.k[off] : 0.0f;
+                qs[e] = t < NT ? pp.q[off] : 0.0f;
+            }
+            if (lid < DNC) {
+                const int t = t0 + lid;
+                g[lid] = t < NT ? sycl::log(sycl::fmax(pp.a[int64_t(t) * NH + head],
+                                                        std::numeric_limits<float>::min()))
+                                : 0.0f;
+                bt[lid] = t < NT ? pp.beta[int64_t(t) * NH + head] : 0.0f;
+            }
+            sycl::group_barrier(it.get_group());
+            if (lid == 0)
+                for (int j = 1; j < DNC; ++j) g[j] += g[j - 1];
+            sycl::group_barrier(it.get_group());
+            const int j = lid / DNC, i = lid % DNC;
+            float akk = 0.0f, aqk = 0.0f;
+            for (int d = 0; d < KD; ++d) {
+                const float ki = ks[i * KD + d];
+                akk = sycl::fma(ks[j * KD + d], ki, akk);
+                aqk = sycl::fma(qs[j * KD + d], ki, aqk);
+            }
+            float* out = prep + (int64_t(head) * NC + c) * DNP;
+            const float dec = sycl::exp(g[j] - g[i]);          // i <= j: <= 1
+            out[DNO_L + j * DNC + i] = i < j ? bt[j] * dec * akk : 0.0f;
+            out[DNO_M + j * DNC + i] = i <= j ? dec * aqk : 0.0f;
+            if (lid < DNC) {
+                out[DNO_EG + lid] = sycl::exp(g[lid]);
+                out[DNO_DL + lid] = sycl::exp(g[DNC - 1] - g[lid]);
+                out[DNO_BT + lid] = bt[lid];
+            }
+            if (lid == 0) out[DNO_GL] = sycl::exp(g[DNC - 1]);
+        });
+    });
+}
+
+template <int KD>
+sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const float* prep,
+                          const std::vector<sycl::event>& deps) {
+    constexpr int LPR = 4, GPS = SG_SIZE / LPR, KPL = KD / LPR, RR = 2;
+    constexpr int SGS = 8, WG = SGS * SG_SIZE, ROWS = SGS * GPS * RR;   // 64 rows
+    constexpr int C = DNC;
+    constexpr int KQ4 = C * KD / (WG * 4);
+    constexpr int VPW = C * ROWS / WG;
+    constexpr int PP4 = DNP / 4;
+    static_assert(KPL % 4 == 0 && KQ4 >= 1 && C * KD == KQ4 * WG * 4, "k split");
+    constexpr int PPW = (PP4 + WG - 1) / WG;                 // prep float4 per work-item
+    static_assert(VPW >= 1 && C * ROWS == VPW * WG && PPW <= 2, "chunk split");
+    const int VD = p.v_dim, wg_per_head = VD / ROWS, NT = p.n_tokens, NC = (NT + C - 1) / C;
+    const size_t n_wg = size_t(p.n_heads) * size_t(wg_per_head);
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        sycl::local_accessor<sycl::float4, 1> sk(C * KD / 4, h), sq(C * KD / 4, h), spr(PP4, h);
+        sycl::local_accessor<float, 1> sv(C * ROWS, h);
+        h.parallel_for(sycl::nd_range<1>(n_wg * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]);
+            const int lid = int(it.get_local_id(0)), sgi = lid / SG_SIZE;
+            const int grp = lane / LPR, j4 = lane % LPR;
+            const int wg = int(it.get_group(0));
+            const int head = wg / wg_per_head, rbase = (wg % wg_per_head) * ROWS;
+            const int nk = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+            const int khead = (nk == pp.n_heads) ? head : head / (pp.n_heads / nk);
+            const int NH = pp.n_heads;
+            auto rloc = [&](int r) { return (sgi * GPS + grp) * RR + r; };
+            float* Sg = pp.state + int64_t(head) * VD * KD;
+            float S[RR][KPL];
+            #pragma unroll
+            for (int r = 0; r < RR; ++r)
+                #pragma unroll
+                for (int i = 0; i < KPL; i += 4) {
+                    const sycl::float4 v4 = *reinterpret_cast<const sycl::float4*>(
+                        Sg + int64_t(rbase + rloc(r)) * KD + j4 * KPL + i);
+                    S[r][i] = v4[0]; S[r][i + 1] = v4[1]; S[r][i + 2] = v4[2]; S[r][i + 3] = v4[3];
+                }
+            const float scale = sycl::rsqrt(float(KD));
+            sycl::float4 rk[KQ4], rq[KQ4], rp[PPW];
+            float rv[VPW];
+            auto fetch = [&](int c) {
+                const int t0 = c * C;
+                #pragma unroll
+                for (int i = 0; i < KQ4; ++i) {
+                    const int e = (i * WG + lid) * 4;
+                    const int t = t0 + e / KD;
+                    const int64_t off = (int64_t(sycl::min(t, NT - 1)) * nk + khead) * KD + e % KD;
+                    const sycl::float4 z(0.0f);
+                    rk[i] = t < NT ? *reinterpret_cast<const sycl::float4*>(pp.k + off) : z;
+                    rq[i] = t < NT ? *reinterpret_cast<const sycl::float4*>(pp.q + off) : z;
+                }
+                #pragma unroll
+                for (int i = 0; i < VPW; ++i) {
+                    const int e = i * WG + lid;
+                    const int t = t0 + e / ROWS;
+                    rv[i] = t < NT ? pp.v[(int64_t(t) * NH + head) * VD + rbase + e % ROWS] : 0.0f;
+                }
+                #pragma unroll
+                for (int i = 0; i < PPW; ++i)
+                    if (i * WG + lid < PP4)
+                        rp[i] = reinterpret_cast<const sycl::float4*>(
+                            prep + (int64_t(head) * NC + c) * DNP)[i * WG + lid];
+            };
+            fetch(0);
+            for (int c = 0; c < NC; ++c) {
+                #pragma unroll
+                for (int i = 0; i < KQ4; ++i) { sk[i * WG + lid] = rk[i]; sq[i * WG + lid] = rq[i]; }
+                #pragma unroll
+                for (int i = 0; i < VPW; ++i) sv[i * WG + lid] = rv[i];
+                #pragma unroll
+                for (int i = 0; i < PPW; ++i)
+                    if (i * WG + lid < PP4) spr[i * WG + lid] = rp[i];
+                sycl::group_barrier(it.get_group());
+                if (c + 1 < NC) fetch(c + 1);            // in flight while this chunk runs
+                const float* pr = reinterpret_cast<const float*>(
+                    spr.template get_multi_ptr<sycl::access::decorated::no>().get());
+                // 1. dot products of the chunk-start state with every k_i and q_i
+                float ks[RR][C], qs[RR][C];
+                #pragma unroll
+                for (int i = 0; i < C; ++i) {
+                    float pk[RR], pq[RR];
+                    #pragma unroll
+                    for (int r = 0; r < RR; ++r) { pk[r] = 0.0f; pq[r] = 0.0f; }
+                    #pragma unroll
+                    for (int d = 0; d < KPL; d += 4) {
+                        const sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
+                        const sycl::float4 q4 = sq[(i * KD + j4 * KPL + d) / 4];
+                        #pragma unroll
+                        for (int r = 0; r < RR; ++r) {
+                            pk[r] = sycl::fma(S[r][d], k4[0], pk[r]);
+                            pk[r] = sycl::fma(S[r][d + 1], k4[1], pk[r]);
+                            pk[r] = sycl::fma(S[r][d + 2], k4[2], pk[r]);
+                            pk[r] = sycl::fma(S[r][d + 3], k4[3], pk[r]);
+                            pq[r] = sycl::fma(S[r][d], q4[0], pq[r]);
+                            pq[r] = sycl::fma(S[r][d + 1], q4[1], pq[r]);
+                            pq[r] = sycl::fma(S[r][d + 2], q4[2], pq[r]);
+                            pq[r] = sycl::fma(S[r][d + 3], q4[3], pq[r]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < RR; ++r) { ks[r][i] = pk[r]; qs[r][i] = pq[r]; }
+                }
+                #pragma unroll
+                for (int r = 0; r < RR; ++r)
+                    #pragma unroll
+                    for (int i = 0; i < C; ++i) {
+                        ks[r][i] += sycl::permute_group_by_xor(sg, ks[r][i], 1);
+                        ks[r][i] += sycl::permute_group_by_xor(sg, ks[r][i], 2);
+                        qs[r][i] += sycl::permute_group_by_xor(sg, qs[r][i], 1);
+                        qs[r][i] += sycl::permute_group_by_xor(sg, qs[r][i], 2);
+                    }
+                // 2. per row: u by forward substitution, outputs, u -> state weights
+                const int t0 = c * C;
+                #pragma unroll
+                for (int r = 0; r < RR; ++r) {
+                    const int rl = rloc(r);
+                    #pragma unroll
+                    for (int jj = 0; jj < C; ++jj) {      // ks[r][] becomes u
+                        float u = pr[DNO_BT + jj] * (sv[jj * ROWS + rl] - pr[DNO_EG + jj] * ks[r][jj]);
+                        #pragma unroll
+                        for (int i = 0; i < jj; ++i) u = sycl::fma(-pr[DNO_L + jj * C + i], ks[r][i], u);
+                        ks[r][jj] = u;
+                    }
+                    #pragma unroll
+                    for (int jj = 0; jj < C; ++jj) {
+                        float o = pr[DNO_EG + jj] * qs[r][jj];
+                        #pragma unroll
+                        for (int i = 0; i <= jj; ++i) o = sycl::fma(pr[DNO_M + jj * C + i], ks[r][i], o);
+                        if (j4 == jj % LPR && t0 + jj < NT)
+                            pp.out[(int64_t(t0 + jj) * NH + head) * VD + rbase + rl] = o * scale;
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < C; ++i) qs[r][i] = pr[DNO_DL + i] * ks[r][i];   // state weights
+                }
+                // 3. state update: S = gamma_last S + sum_i w_i k_i
+                const float gl = pr[DNO_GL];
+                #pragma unroll
+                for (int r = 0; r < RR; ++r)
+                    #pragma unroll
+                    for (int d = 0; d < KPL; ++d) S[r][d] *= gl;
+                #pragma unroll
+                for (int i = 0; i < C; ++i)
+                    #pragma unroll
+                    for (int d = 0; d < KPL; d += 4) {
+                        const sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
+                        #pragma unroll
+                        for (int r = 0; r < RR; ++r) {
+                            S[r][d]     = sycl::fma(qs[r][i], k4[0], S[r][d]);
+                            S[r][d + 1] = sycl::fma(qs[r][i], k4[1], S[r][d + 1]);
+                            S[r][d + 2] = sycl::fma(qs[r][i], k4[2], S[r][d + 2]);
+                            S[r][d + 3] = sycl::fma(qs[r][i], k4[3], S[r][d + 3]);
+                        }
+                    }
+                sycl::group_barrier(it.get_group());     // chunk fully read before it is overwritten
+            }
+            #pragma unroll
+            for (int r = 0; r < RR; ++r)
+                #pragma unroll
+                for (int i = 0; i < KPL; i += 4)
+                    *reinterpret_cast<sycl::float4*>(Sg + int64_t(rbase + rloc(r)) * KD + j4 * KPL + i) =
+                        sycl::float4(S[r][i], S[r][i + 1], S[r][i + 2], S[r][i + 3]);
+        });
+    });
+}
+
+struct DnChunkScratch { float* prep = nullptr; size_t cap = 0; };
+DnChunkScratch& dn_chunk_scratch(sycl::queue& q) {
+    static std::mutex mu;
+    static std::map<const sycl::queue*, DnChunkScratch> all;
+    std::lock_guard<std::mutex> lk(mu);
+    return all[&q];
+}
+
+} // namespace
+
+// Opt-in (GRIMOIRE_DN_CHUNK16=1).  MEASURED 2026-09-26, Qwen3.8-27B 4088
+// tokens: matches the sequential kernel to ~2e-6 relative (GRIMOIRE_DN_VERIFY)
+// and reproduces the generated text byte for byte, but is SLOWER (321 vs
+// 218 ms): with a row spread over 4 lanes the chunked form does about as
+// many FMAs per token as the sequential one, spills 2.7 KB and reads the
+// small per-chunk matrices from SLM.  It pays off only with the big
+// products (K s0, Q s0, the state update) on the matrix unit.
+bool deltanet_chunk16_supported(const DeltaNetPrefillParams& p) {
+    static const bool on = std::getenv("GRIMOIRE_DN_CHUNK16") != nullptr;
+    return on && (p.k_dim == 64 || p.k_dim == 128) && p.v_dim % 64 == 0 && p.n_tokens > 0 &&
+           (p.n_k_heads == 0 || p.n_heads % p.n_k_heads == 0);
+}
+
+sycl::event launch_deltanet_prefill_chunk16(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                            const std::vector<sycl::event>& deps) {
+    const int NC = (p.n_tokens + DNC - 1) / DNC;
+    DnChunkScratch& s = dn_chunk_scratch(q);
+    if (!grow(q, s.prep, s.cap, size_t(p.n_heads) * NC * DNP))
+        throw std::runtime_error("deltanet chunk16: prep scratch allocation failed");
+    if (p.k_dim == 64) {
+        sycl::event e = dn_chunk_prep<64>(q, p, s.prep, deps);
+        return dn_chunk_main<64>(q, p, s.prep, {e});
+    }
+    sycl::event e = dn_chunk_prep<128>(q, p, s.prep, deps);
+    return dn_chunk_main<128>(q, p, s.prep, {e});
+}
+
 bool gemm_fast_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FAST_GEMM") != nullptr;
     const size_t np = size_t(w.N + NC2 - 1) / NC2 * NC2;
@@ -1095,7 +1391,7 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     };
     if (timed) q.wait();             // earlier work must not count here
     auto t0 = now();
-    if (fused_mxfp4_ok(w)) {                 // N % NC2 == 0 checked there
+    if (EPI != 2 && fused_mxfp4_ok(w)) {     // N % NC2 == 0 checked there
         sycl::event e = gemm_mxfp4_fused<EPI>(q, w, x, out, M, deps);
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
         return e;
@@ -1128,6 +1424,13 @@ sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
                              const std::vector<sycl::event>& deps) {
     return gemm_fast_run<0>(q, w, x, y, M, deps);
+}
+
+// h[M][N] += x W^T in place (the residual add fused into the epilogue).
+sycl::event launch_gemm_fast_residual(sycl::queue& q, const QuantWeight& w,
+                                      const sycl_bf16* x, float* h, int M,
+                                      const std::vector<sycl::event>& deps) {
+    return gemm_fast_run<2>(q, w, x, h, M, deps);
 }
 
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {

@@ -196,6 +196,11 @@ sycl::event launch_rmsnorm_gate_silu_bf16_out(sycl::queue& q, const float* x, co
                                               const bf16_t* w, sycl_bf16* out, int n_heads,
                                               int dim, float eps,
                                               const std::vector<sycl::event>& deps = {});
+// h[M][N] += x W^T in place: the residual add fused into the fast GEMM's
+// epilogue (gemm_fast.cpp).  Same fp32 addition as the norm's h + r0.
+sycl::event launch_gemm_fast_residual(sycl::queue& q, const QuantWeight& w,
+                                      const sycl_bf16* x, float* h, int M,
+                                      const std::vector<sycl::event>& deps = {});
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
                                     sycl_bf16* h, int M,
@@ -316,6 +321,12 @@ struct DeltaNetPrefillParams {
 bool deltanet_q4_supported(const DeltaNetPrefillParams& p);
 sycl::event launch_deltanet_prefill_q4(sycl::queue& q, const DeltaNetPrefillParams& p,
                                        const std::vector<sycl::event>& deps = {});
+// DeltaNet prefill recurrence, chunked 16 tokens (gemm_fast.cpp): the
+// per-token dependency chain becomes a 16x16 triangular solve per chunk.
+// k_dim 64 or 128, v_dim a multiple of 64.  Opt-in: GRIMOIRE_DN_CHUNK16=1 (slower in SIMT).
+bool deltanet_chunk16_supported(const DeltaNetPrefillParams& p);
+sycl::event launch_deltanet_prefill_chunk16(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                            const std::vector<sycl::event>& deps = {});
 
 
 sycl::event launch_dequant_bf16(sycl::queue& q, const QuantWeight& w,

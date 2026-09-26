@@ -17,6 +17,9 @@
 #include "kernels.hpp"
 #include "gemv_step.hpp"
 #include <algorithm>
+#include <cmath>
+#include <vector>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
@@ -418,6 +421,51 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
         const int v = e ? std::atoi(e) : 0;
         return (v == 1 || v == 2 || v == 4) ? v : 0;     // 0: pick by k_dim below
     }();
+    if (!old && deltanet_chunk16_supported(p)) {
+        // GRIMOIRE_DN_VERIFY=n: for the first n calls, also run the sequential
+        // kernel on a copy of the state and print how far the chunked output
+        // and final state are from it (the summation order differs).
+        static int verify_left = [] {
+            const char* e = std::getenv("GRIMOIRE_DN_VERIFY");
+            return e ? std::atoi(e) : 0;
+        }();
+        if (verify_left > 0 && deltanet_q4_supported(p)) {
+            --verify_left;
+            const size_t ns = size_t(p.n_heads) * p.v_dim * p.k_dim;
+            const size_t no = size_t(p.n_tokens) * p.n_heads * p.v_dim;
+            float* st = sycl::malloc_device<float>(ns, q);
+            float* ot = sycl::malloc_device<float>(no, q);
+            sycl::event::wait(deps);
+            q.memcpy(st, p.state, ns * sizeof(float)).wait();
+            DeltaNetPrefillParams pr = p;
+            pr.state = st; pr.out = ot;
+            launch_deltanet_prefill_q4(q, pr, {}).wait();
+            launch_deltanet_prefill_chunk16(q, p, {}).wait();
+            std::vector<float> a(no), b(no), sa(ns), sb(ns);
+            q.memcpy(a.data(), p.out, no * sizeof(float));
+            q.memcpy(b.data(), ot, no * sizeof(float));
+            q.memcpy(sa.data(), p.state, ns * sizeof(float));
+            q.memcpy(sb.data(), st, ns * sizeof(float)).wait();
+            auto cmp = [](const std::vector<float>& x, const std::vector<float>& y,
+                          double& dmax, double& rmax) {
+                dmax = 0.0; rmax = 0.0;
+                for (size_t i = 0; i < x.size(); ++i) {
+                    dmax = std::max(dmax, std::fabs(double(x[i]) - double(y[i])));
+                    rmax = std::max(rmax, std::fabs(double(y[i])));
+                }
+            };
+            double od, orf, sd, srf;
+            cmp(a, b, od, orf);
+            cmp(sa, sb, sd, srf);
+            std::fprintf(stderr, "  DN verify (chunk16 vs sequential, %d tokens): out max|diff| %.3e "
+                         "(max|ref| %.3e)  state max|diff| %.3e (max|ref| %.3e)\n",
+                         p.n_tokens, od, orf, sd, srf);
+            sycl::free(st, q);
+            sycl::free(ot, q);
+            return sycl::event{};
+        }
+        return launch_deltanet_prefill_chunk16(q, p, deps);
+    }
     if (!old && deltanet_q4_supported(p)) return launch_deltanet_prefill_q4(q, p, deps);
     // Auto: 4 rows per sub-group up to k_dim 128 (Qwen3.8-27B, 4088 tokens:
     // 252 ms vs 349 at 2 rows); 2 above that, where 4 rows spill.
