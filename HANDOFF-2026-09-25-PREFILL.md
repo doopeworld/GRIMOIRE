@@ -162,3 +162,34 @@ dequant overlap (~20% only).
 **Next (after rebuild + re-verify on gpu0):** DeltaNet recurrence (218 ms),
 residual add fused into out/down GEMM epilogues (~20 ms), attention q|k|v and
 DN qkv|z GEMM fusions (~20 ms), flash (137 ms) restructure.
+
+---
+
+## UPDATE 2026-09-26 (afternoon) — GRIMOIRE prefill is faster than vLLM
+
+**Qwen3.8-27B MXFP4, 4088-token prompt, one B70 (gpu0): 1.972-1.976 s ≈ 2,070 tok/s**
+(vLLM on the same card: 2,015.6 tok/s). 5987-token run 3.92 s; generated text
+byte-identical to `ref-sherlock-5987-n24.txt`. Commit `9932802`.
+
+**What did it:** the DeltaNet recurrence moved onto the matrix unit (219 → 94 ms):
+chunked (16-token) algebra, every big product on DPAS in bf16 with fp32 accumulation
+and fp32 state, written in **ESIMD** (explicit registers; `xmx::dpas`, `load_2d`,
+`prefetch_2d`). Precision was measured BEFORE building it (`GRIMOIRE_DN_BF16EMU=1`)
+and verified after (`GRIMOIRE_DN_VERIFY=48`: outputs ≤ 6.7e-3, state ≤ 5.8e-3 of max).
+Default on; `GRIMOIRE_DN_NOXMX=1` restores the sequential kernel.
+
+**Hardware now:** gpu0 = B70 03:00.0 (x8), gpu1 = B70 0b:00.0, B580 at 07:00.0.
+Correctable PCIe RxErr at boot on both cards behind 00:06.x. Work ran on gpu0 only,
+every run through `tools/g0run.sh` (refuses anything but 03:00.0, stops on any new
+AER/xe error). gpu0 link: 0 errors all day.
+
+**Method that worked (keep doing this):** IGC ISA dumps
+(`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=...`) to see spills / private memory /
+branches / send counts; emulate precision before building a lower-precision kernel;
+a verify mode comparing against the reference kernel on real layers; per-kernel timers
+that `q.wait()` BEFORE starting the clock.
+
+**Next (in order):** DN pack (27 ms) fused into the conv/qk-norm output; flash prefill
+(137 ms; the ESIMD version is bit-exact but spills — split D or fewer rows per thread);
+the dequant pass (160 ms); verify the DPAS DeltaNet on Ornith before relying on it;
+llama-benchy via grimoire-server for the apples-to-apples number.
