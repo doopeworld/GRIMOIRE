@@ -1287,7 +1287,13 @@ constexpr int DNO_L = 0, DNO_M = DNC * DNC, DNO_EG = 2 * DNC * DNC,
               DNO_DL = DNO_EG + DNC, DNO_BT = DNO_DL + DNC, DNO_GL = DNO_BT + DNC;
 constexpr int DNP = (DNO_GL + 1 + 3) / 4 * 4;             // floats per (head, chunk), float4-padded
 
-template <int KD>
+// EMU: round every operand a matrix-unit version would feed the DPAS to bf16
+// (k, q, the state in the dot products; L, Mq, r and u in the small
+// products; the state-update weights and keys), accumulating in fp32 --
+// GRIMOIRE_DN_BF16EMU=1, to measure that precision before building it.
+inline float bfr(float x) { return float(bf16_rne(x)); }
+
+template <int KD, bool EMU = false>
 sycl::event dn_chunk_prep(sycl::queue& q, const DeltaNetPrefillParams& p, float* prep,
                           const std::vector<sycl::event>& deps) {
     constexpr int WG = DNC * DNC;
@@ -1321,14 +1327,16 @@ sycl::event dn_chunk_prep(sycl::queue& q, const DeltaNetPrefillParams& p, float*
             const int j = lid / DNC, i = lid % DNC;
             float akk = 0.0f, aqk = 0.0f;
             for (int d = 0; d < KD; ++d) {
-                const float ki = ks[i * KD + d];
-                akk = sycl::fma(ks[j * KD + d], ki, akk);
-                aqk = sycl::fma(qs[j * KD + d], ki, aqk);
+                const float ki = EMU ? bfr(ks[i * KD + d]) : ks[i * KD + d];
+                akk = sycl::fma(EMU ? bfr(ks[j * KD + d]) : ks[j * KD + d], ki, akk);
+                aqk = sycl::fma(EMU ? bfr(qs[j * KD + d]) : qs[j * KD + d], ki, aqk);
             }
             float* out = prep + (int64_t(head) * NC + c) * DNP;
             const float dec = sycl::exp(g[j] - g[i]);          // i <= j: <= 1
-            out[DNO_L + j * DNC + i] = i < j ? bt[j] * dec * akk : 0.0f;
-            out[DNO_M + j * DNC + i] = i <= j ? dec * aqk : 0.0f;
+            const float lv = i < j ? bt[j] * dec * akk : 0.0f;
+            const float mv = i <= j ? dec * aqk : 0.0f;
+            out[DNO_L + j * DNC + i] = EMU ? bfr(lv) : lv;
+            out[DNO_M + j * DNC + i] = EMU ? bfr(mv) : mv;
             if (lid < DNC) {
                 out[DNO_EG + lid] = sycl::exp(g[lid]);
                 out[DNO_DL + lid] = sycl::exp(g[DNC - 1] - g[lid]);
@@ -1339,7 +1347,7 @@ sycl::event dn_chunk_prep(sycl::queue& q, const DeltaNetPrefillParams& p, float*
     });
 }
 
-template <int KD>
+template <int KD, bool EMU = false>
 sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const float* prep,
                           const std::vector<sycl::event>& deps) {
     constexpr int LPR = 4, GPS = SG_SIZE / LPR, KPL = KD / LPR, RR = 2;
@@ -1428,18 +1436,22 @@ sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const 
                     for (int r = 0; r < RR; ++r) { pk[r] = 0.0f; pq[r] = 0.0f; }
                     #pragma unroll
                     for (int d = 0; d < KPL; d += 4) {
-                        const sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
-                        const sycl::float4 q4 = sq[(i * KD + j4 * KPL + d) / 4];
+                        sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
+                        sycl::float4 q4 = sq[(i * KD + j4 * KPL + d) / 4];
+                        if constexpr (EMU)
+                            for (int e = 0; e < 4; ++e) { k4[e] = bfr(k4[e]); q4[e] = bfr(q4[e]); }
                         #pragma unroll
                         for (int r = 0; r < RR; ++r) {
-                            pk[r] = sycl::fma(S[r][d], k4[0], pk[r]);
-                            pk[r] = sycl::fma(S[r][d + 1], k4[1], pk[r]);
-                            pk[r] = sycl::fma(S[r][d + 2], k4[2], pk[r]);
-                            pk[r] = sycl::fma(S[r][d + 3], k4[3], pk[r]);
-                            pq[r] = sycl::fma(S[r][d], q4[0], pq[r]);
-                            pq[r] = sycl::fma(S[r][d + 1], q4[1], pq[r]);
-                            pq[r] = sycl::fma(S[r][d + 2], q4[2], pq[r]);
-                            pq[r] = sycl::fma(S[r][d + 3], q4[3], pq[r]);
+                            float s0v = S[r][d], s1v = S[r][d + 1], s2v = S[r][d + 2], s3v = S[r][d + 3];
+                            if constexpr (EMU) { s0v = bfr(s0v); s1v = bfr(s1v); s2v = bfr(s2v); s3v = bfr(s3v); }
+                            pk[r] = sycl::fma(s0v, k4[0], pk[r]);
+                            pk[r] = sycl::fma(s1v, k4[1], pk[r]);
+                            pk[r] = sycl::fma(s2v, k4[2], pk[r]);
+                            pk[r] = sycl::fma(s3v, k4[3], pk[r]);
+                            pq[r] = sycl::fma(s0v, q4[0], pq[r]);
+                            pq[r] = sycl::fma(s1v, q4[1], pq[r]);
+                            pq[r] = sycl::fma(s2v, q4[2], pq[r]);
+                            pq[r] = sycl::fma(s3v, q4[3], pq[r]);
                         }
                     }
                     #pragma unroll
@@ -1462,9 +1474,10 @@ sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const 
                     #pragma unroll
                     for (int jj = 0; jj < C; ++jj) {      // ks[r][] becomes u
                         float u = pr[DNO_BT + jj] * (sv[jj * ROWS + rl] - pr[DNO_EG + jj] * ks[r][jj]);
+                        if constexpr (EMU) u = bfr(u);
                         #pragma unroll
                         for (int i = 0; i < jj; ++i) u = sycl::fma(-pr[DNO_L + jj * C + i], ks[r][i], u);
-                        ks[r][jj] = u;
+                        ks[r][jj] = EMU ? bfr(u) : u;
                     }
                     #pragma unroll
                     for (int jj = 0; jj < C; ++jj) {
@@ -1475,7 +1488,10 @@ sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const 
                             pp.out[(int64_t(t0 + jj) * NH + head) * VD + rbase + rl] = o * scale;
                     }
                     #pragma unroll
-                    for (int i = 0; i < C; ++i) qs[r][i] = pr[DNO_DL + i] * ks[r][i];   // state weights
+                    for (int i = 0; i < C; ++i) {
+                        const float wv = pr[DNO_DL + i] * ks[r][i];            // state weights
+                        qs[r][i] = EMU ? bfr(wv) : wv;
+                    }
                 }
                 // 3. state update: S = gamma_last S + sum_i w_i k_i
                 const float gl = pr[DNO_GL];
@@ -1487,7 +1503,9 @@ sycl::event dn_chunk_main(sycl::queue& q, const DeltaNetPrefillParams& p, const 
                 for (int i = 0; i < C; ++i)
                     #pragma unroll
                     for (int d = 0; d < KPL; d += 4) {
-                        const sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
+                        sycl::float4 k4 = sk[(i * KD + j4 * KPL + d) / 4];
+                        if constexpr (EMU)
+                            for (int e = 0; e < 4; ++e) k4[e] = bfr(k4[e]);
                         #pragma unroll
                         for (int r = 0; r < RR; ++r) {
                             S[r][d]     = sycl::fma(qs[r][i], k4[0], S[r][d]);
@@ -1537,12 +1555,417 @@ sycl::event launch_deltanet_prefill_chunk16(sycl::queue& q, const DeltaNetPrefil
     DnChunkScratch& s = dn_chunk_scratch(q);
     if (!grow(q, s.prep, s.cap, size_t(p.n_heads) * NC * DNP))
         throw std::runtime_error("deltanet chunk16: prep scratch allocation failed");
+    static const bool emu = std::getenv("GRIMOIRE_DN_BF16EMU") != nullptr;
     if (p.k_dim == 64) {
-        sycl::event e = dn_chunk_prep<64>(q, p, s.prep, deps);
-        return dn_chunk_main<64>(q, p, s.prep, {e});
+        sycl::event e = emu ? dn_chunk_prep<64, true>(q, p, s.prep, deps)
+                            : dn_chunk_prep<64>(q, p, s.prep, deps);
+        return emu ? dn_chunk_main<64, true>(q, p, s.prep, {e}) : dn_chunk_main<64>(q, p, s.prep, {e});
     }
-    sycl::event e = dn_chunk_prep<128>(q, p, s.prep, deps);
-    return dn_chunk_main<128>(q, p, s.prep, {e});
+    sycl::event e = emu ? dn_chunk_prep<128, true>(q, p, s.prep, deps)
+                        : dn_chunk_prep<128>(q, p, s.prep, deps);
+    return emu ? dn_chunk_main<128, true>(q, p, s.prep, {e}) : dn_chunk_main<128>(q, p, s.prep, {e});
+}
+
+// ---------------------------------------------------------------------
+// DeltaNet prefill on the MATRIX UNIT: chunked (16 tokens), ESIMD + DPAS.
+//
+// Same chunked algebra as dn_chunk_main (see its header), with every big
+// product on DPAS in bf16 and fp32 accumulation; the state stays fp32.
+// Precision measured before building it (GRIMOIRE_DN_BF16EMU on the SIMT
+// chunk kernel, 48 layers, 5987 tokens): outputs <= 7.2e-3, state <= 5.4e-3
+// relative to max, generated text byte-identical.
+//
+// One ESIMD thread owns 8 state rows of a value head; the state is 8 DPAS
+// accumulator tiles [8 rows][16 d].  Per chunk (26 DPAS):
+//   KS = S K^T, QS = S Q^T      A = bf16(state tile t), B = K^T / Q^T tile
+//   R  = beta . (V^T - gamma . KS)            (V^T by a transposed 2-D load)
+//   U  = R T^T,  O = gamma . QS + U Mq^T       (T = (I+L)^-1, Mq: dn_xmx_prep)
+//   S  = gamma_last S + (U . dl) K            B = K tile, VNNI over tokens
+// Each DPAS result [8 rows][16] is directly the next A operand -- no
+// shuffles, no SLM, no barriers.
+// ---------------------------------------------------------------------
+namespace {
+
+constexpr int DXC = 16;          // tokens per chunk
+
+// k, q fp32 [M][nk][KD] -> KdT, QdT bf16 [nk][KD/2][Sp][2] (VNNI over d) and
+// Kt bf16 [nk][Sp/2][KD][2] (VNNI over tokens); tokens >= M are zero.
+sycl::event dn_xmx_pack(sycl::queue& q, const DeltaNetPrefillParams& p, int Sp,
+                        sycl_bf16* KdT, sycl_bf16* QdT, sycl_bf16* Kt,
+                        const std::vector<sycl::event>& deps) {
+    const int KD = p.k_dim, M = p.n_tokens;
+    const int nk = p.n_k_heads ? p.n_k_heads : p.n_heads;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        h.parallel_for(sycl::range<3>(size_t(nk), size_t(Sp), size_t(KD)), [=](sycl::id<3> id) {
+            const int kh = int(id[0]), s = int(id[1]), d = int(id[2]);
+            const int64_t src = (int64_t(s) * nk + kh) * KD + d;
+            const sycl_bf16 kv = bf16_rne(s < M ? pp.k[src] : 0.0f);
+            const sycl_bf16 qv = bf16_rne(s < M ? pp.q[src] : 0.0f);
+            const size_t dt = ((size_t(kh) * (KD / 2) + d / 2) * Sp + s) * 2 + (d & 1);
+            KdT[dt] = kv;
+            QdT[dt] = qv;
+            Kt[((size_t(kh) * (Sp / 2) + s / 2) * KD + d) * 2 + (s & 1)] = kv;
+        });
+    });
+}
+
+// Per (value head, chunk): T = (I + L)^-1 and Mq as bf16 DPAS B tiles
+// (VNNI over the contraction index i: [(i/2)*16 + j][i&1]), and the decays.
+// prepB: [NH][NC][512] bf16 (T^T then Mq^T); prepF: [NH][NC][64] floats
+// (gamma_j @0, gamma_last/gamma_i @16, beta_j @32, gamma_last @48).
+sycl::event dn_xmx_prep(sycl::queue& q, const DeltaNetPrefillParams& p, int NC,
+                        sycl_bf16* prepB, float* prepF, const std::vector<sycl::event>& deps) {
+    constexpr int C = DXC, WG = C * C;
+    const int NH = p.n_heads, KD = p.k_dim, M = p.n_tokens;
+    const int nk = p.n_k_heads ? p.n_k_heads : NH;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        sycl::local_accessor<float, 1> ks(C * 128, h), qs(C * 128, h);
+        sycl::local_accessor<float, 1> g(C, h), bt(C, h), L(C * C, h), T(C * C, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(NH) * NC * WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = int(it.get_local_id(0)), wg = int(it.get_group(0));
+            const int head = wg / NC, c = wg % NC, t0 = c * C;
+            const int khead = (nk == NH) ? head : head / (NH / nk);
+            for (int e = lid; e < C * KD; e += WG) {
+                const int t = t0 + e / KD, d = e % KD;
+                const int64_t off = (int64_t(t) * nk + khead) * KD + d;
+                ks[e] = t < M ? pp.k[off] : 0.0f;
+                qs[e] = t < M ? pp.q[off] : 0.0f;
+            }
+            if (lid < C) {
+                const int t = t0 + lid;
+                g[lid] = t < M ? sycl::log(sycl::fmax(pp.a[int64_t(t) * NH + head],
+                                                       std::numeric_limits<float>::min()))
+                               : 0.0f;
+                bt[lid] = t < M ? pp.beta[int64_t(t) * NH + head] : 0.0f;
+            }
+            sycl::group_barrier(it.get_group());
+            if (lid == 0)
+                for (int j = 1; j < C; ++j) g[j] += g[j - 1];
+            sycl::group_barrier(it.get_group());
+            const int j = lid / C, i = lid % C;
+            float akk = 0.0f, aqk = 0.0f;
+            for (int d = 0; d < KD; ++d) {
+                const float ki = ks[i * KD + d];
+                akk = sycl::fma(ks[j * KD + d], ki, akk);
+                aqk = sycl::fma(qs[j * KD + d], ki, aqk);
+            }
+            const float dec = sycl::exp(g[j] - g[i]);
+            L[j * C + i] = i < j ? bt[j] * dec * akk : 0.0f;
+            const float mq = i <= j ? dec * aqk : 0.0f;
+            T[j * C + i] = i == j ? 1.0f : 0.0f;
+            sycl::group_barrier(it.get_group());
+            // T = (I + L)^-1, unit lower triangular, one row at a time:
+            // T[jj][i] = -sum_{m=i}^{jj-1} L[jj][m] T[m][i]   (i < jj)
+            for (int jj = 1; jj < C; ++jj) {
+                if (j == jj && i < jj) {
+                    float t = 0.0f;
+                    for (int m = i; m < jj; ++m) t = sycl::fma(L[jj * C + m], T[m * C + i], t);
+                    T[jj * C + i] = -t;
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            sycl_bf16* ob = prepB + (size_t(head) * NC + c) * 512;
+            // B tile element (k = i, n = j): T^T[i][j] = T[j][i], Mq^T[i][j] = Mq[j][i]
+            ob[((i / 2) * C + j) * 2 + (i & 1)] = bf16_rne(T[j * C + i]);
+            ob[256 + ((i / 2) * C + j) * 2 + (i & 1)] = bf16_rne(mq);
+            float* of = prepF + (size_t(head) * NC + c) * 64;
+            if (lid < C) {
+                of[lid] = sycl::exp(g[lid]);
+                of[16 + lid] = sycl::exp(g[C - 1] - g[lid]);
+                of[32 + lid] = bt[lid];
+            }
+            if (lid == 0) of[48] = sycl::exp(g[C - 1]);
+        });
+    });
+}
+
+// dn_xmx_prep on the matrix unit: one ESIMD thread per (value head, chunk).
+// K K^T and Q K^T are 16x16x128 products -- 32 DPAS from the fp32 k/q tiles
+// (rounded to bf16, as the precision emulation did) against the packed K^T;
+// the decays via hardware log2/exp2; T = (I+L)^-1 by forward substitution on
+// 16-wide register rows; the B tiles by an 8x16 dword transpose.  The SIMT
+// version (dn_xmx_prep: SLM dots, 16 barriers) took 118 ms per prefill.
+sycl::event dn_xmx_prep_es(sycl::queue& q, const DeltaNetPrefillParams& p, int NC, int Sp,
+                           const sycl_bf16* KdT, sycl_bf16* prepB, float* prepF,
+                           const std::vector<sycl::event>& deps) {
+    constexpr int C = DXC, KD = 128, TPW = 8;
+    const int NH = p.n_heads, M = p.n_tokens;
+    const int nk = p.n_k_heads ? p.n_k_heads : NH;
+    const size_t nth = size_t(NH) * NC, padded = (nth + TPW - 1) / TPW * TPW;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        h.parallel_for(sycl::nd_range<1>(padded, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            const int tid = int(it.get_global_id(0));
+            if (tid >= NH * NC) return;
+            const int head = tid / NC, c = tid % NC, t0 = c * C;
+            const int kh = (nk == NH) ? head : head / (NH / nk);
+            const unsigned W = unsigned(nk) * KD * 4 - 1, Hs = unsigned(M) - 1;
+            const uint32_t* kd = reinterpret_cast<const uint32_t*>(KdT + size_t(kh) * (KD / 2) * Sp * 2);
+            es::simd<float, 128> akk0 = 0.0f, akk1 = 0.0f, aqk0 = 0.0f, aqk1 = 0.0f;
+            #pragma unroll
+            for (int sd = 0; sd < KD / 16; ++sd) {
+                es::simd<float, 128> kf0 = es::load_2d<float, 16, 8>(pp.k, W, Hs, W, kh * KD + 16 * sd, t0);
+                es::simd<float, 128> kf1 = es::load_2d<float, 16, 8>(pp.k, W, Hs, W, kh * KD + 16 * sd, t0 + 8);
+                es::simd<float, 128> qf0 = es::load_2d<float, 16, 8>(pp.q, W, Hs, W, kh * KD + 16 * sd, t0);
+                es::simd<float, 128> qf1 = es::load_2d<float, 16, 8>(pp.q, W, Hs, W, kh * KD + 16 * sd, t0 + 8);
+                es::simd<uint32_t, 128> b = es::load_2d<uint32_t, 16, 8>(
+                    kd, Sp * 4 - 1, KD / 2 - 1, Sp * 4 - 1, t0, 8 * sd);
+                const es::simd<sycl_bf16, 256> bb = b.template bit_cast_view<sycl_bf16>().read();
+                akk0 = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(akk0, bb, es::simd<sycl_bf16, 128>(kf0));
+                akk1 = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(akk1, bb, es::simd<sycl_bf16, 128>(kf1));
+                aqk0 = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(aqk0, bb, es::simd<sycl_bf16, 128>(qf0));
+                aqk1 = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(aqk1, bb, es::simd<sycl_bf16, 128>(qf1));
+            }
+            const es::simd<int, 16> iv(0, 1);
+            es::simd<uint32_t, 16> offs = (es::simd<uint32_t, 16>(iv) + unsigned(t0)) * unsigned(NH * 4) + unsigned(head * 4);
+            es::simd_mask<16> valid = (iv + t0) < M;
+            es::simd<float, 16> av = es::gather<float, 16>(pp.a, offs, valid);
+            es::simd<float, 16> bv = es::gather<float, 16>(pp.beta, offs, valid);
+            av.merge(es::simd<float, 16>(1.0f), !valid);
+            bv.merge(es::simd<float, 16>(0.0f), !valid);
+            es::simd<float, 16> g = es::log2(es::max(av, es::simd<float, 16>(std::numeric_limits<float>::min())));
+            #pragma unroll
+            for (int j = 1; j < C; ++j) g[j] = g[j] + g[j - 1];
+            es::simd<float, 256> Lm, Mm, Tm = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < C; ++j) {
+                es::simd<float, 16> arow = j < 8 ? es::simd<float, 16>(akk0.template select<16, 1>(16 * j))
+                                                 : es::simd<float, 16>(akk1.template select<16, 1>(16 * (j - 8)));
+                es::simd<float, 16> qrow = j < 8 ? es::simd<float, 16>(aqk0.template select<16, 1>(16 * j))
+                                                 : es::simd<float, 16>(aqk1.template select<16, 1>(16 * (j - 8)));
+                const float gj = g[j], bj = bv[j];
+                es::simd<float, 16> dec = es::exp2(gj - g);
+                es::simd<float, 16> lr = arow * dec * bj;
+                lr.merge(es::simd<float, 16>(0.0f), iv >= j);      // keep i < j
+                es::simd<float, 16> mr = qrow * dec;
+                mr.merge(es::simd<float, 16>(0.0f), iv > j);       // keep i <= j
+                Lm.template select<16, 1>(16 * j) = lr;
+                Mm.template select<16, 1>(16 * j) = mr;
+            }
+            // T = (I + L)^-1: T_j = e_j - sum_{m<j} L[j][m] T_m
+            #pragma unroll
+            for (int j = 0; j < C; ++j) {
+                es::simd<float, 16> row = 0.0f;
+                row[j] = 1.0f;
+                #pragma unroll
+                for (int m = 0; m < j; ++m) {
+                    const float l = Lm[16 * j + m];
+                    row -= l * es::simd<float, 16>(Tm.template select<16, 1>(16 * m));
+                }
+                Tm.template select<16, 1>(16 * j) = row;
+            }
+            // B tiles: dword (p, j) = (X[j][2p], X[j][2p+1]) -> transpose [j][p] -> [p][j]
+            uint32_t* ob = reinterpret_cast<uint32_t*>(prepB + (size_t(head) * NC + c) * 512);
+            #pragma unroll
+            for (int w = 0; w < 2; ++w) {             // (lambdas are not allowed in ESIMD kernels)
+                es::simd<sycl_bf16, 256> xb = w == 0 ? Tm : Mm;
+                es::simd<uint32_t, 128> xd = xb.template bit_cast_view<uint32_t>().read();
+                es::simd<uint32_t, 128> xt;
+                #pragma unroll
+                for (int pp2 = 0; pp2 < 8; ++pp2)
+                    xt.template select<16, 1>(16 * pp2) = xd.template select<16, 8>(pp2);
+                es::block_store<uint32_t, 128>(ob + 128 * w, xt);
+            }
+            float* of = prepF + (size_t(head) * NC + c) * 64;
+            const float glast = g[C - 1];
+            es::block_store<float, 16>(of, es::exp2(g));
+            es::block_store<float, 16>(of + 16, es::exp2(glast - g));
+            es::block_store<float, 16>(of + 32, bv);
+            es::simd<float, 16> gl16 = es::exp2(es::simd<float, 16>(glast));
+            es::block_store<float, 16>(of + 48, gl16);
+        });
+    });
+}
+
+template <int KD>
+sycl::event dn_xmx_main(sycl::queue& q, const DeltaNetPrefillParams& p, int Sp,
+                        const sycl_bf16* KdT, const sycl_bf16* QdT, const sycl_bf16* Kt,
+                        const sycl_bf16* prepB, const float* prepF,
+                        const std::vector<sycl::event>& deps) {
+    constexpr int R = 8, C = DXC, NT_ = KD / 16, TPW = 8;
+    const int NH = p.n_heads, VD = p.v_dim, M = p.n_tokens, NC = Sp / C;
+    const int nk = p.n_k_heads ? p.n_k_heads : NH;
+    const int rbh = VD / R;                       // threads per head
+    const size_t nthreads = size_t(NH) * rbh;     // VD % (R*TPW) == 0 checked by the caller
+    const float scale = 1.0f / std::sqrt(float(KD));
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetPrefillParams pp = p;
+        h.parallel_for(sycl::nd_range<1>(nthreads, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            const int tid = int(it.get_global_id(0));
+            const int head = tid / rbh, r0 = (tid % rbh) * R;
+            const int kh = (nk == NH) ? head : head / (NH / nk);
+            float* st = pp.state + size_t(head) * VD * KD;
+            const uint32_t* kd = reinterpret_cast<const uint32_t*>(KdT + size_t(kh) * (KD / 2) * Sp * 2);
+            const uint32_t* qd = reinterpret_cast<const uint32_t*>(QdT + size_t(kh) * (KD / 2) * Sp * 2);
+            const uint32_t* kt = reinterpret_cast<const uint32_t*>(Kt + size_t(kh) * (Sp / 2) * KD * 2);
+            es::simd<float, R * KD> S;
+            #pragma unroll
+            for (int t = 0; t < NT_; ++t)
+                S.template select<R * 16, 1>(t * R * 16) =
+                    es::load_2d<float, 16, R>(st, KD * 4 - 1, VD - 1, KD * 4 - 1, 16 * t, r0);
+            // L1 prefetch two chunks ahead: every tile load of a chunk used to
+            // wait out a full memory round trip (~8 us per chunk, 102 ms)
+            constexpr auto PF = sycl::ext::oneapi::experimental::properties{
+                es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+            for (int c = 0; c < NC; ++c) {
+                const int t0 = c * C;
+                if (c + 2 < NC) {
+                    const int tp = t0 + 2 * C;
+                    #pragma unroll
+                    for (int t = 0; t < NT_; ++t) {
+                        es::prefetch_2d<uint32_t, 16, 8>(kd, Sp * 4 - 1, KD / 2 - 1, Sp * 4 - 1, tp, 8 * t, PF);
+                        es::prefetch_2d<uint32_t, 16, 8>(qd, Sp * 4 - 1, KD / 2 - 1, Sp * 4 - 1, tp, 8 * t, PF);
+                        es::prefetch_2d<uint32_t, 16, 8>(kt, KD * 4 - 1, Sp / 2 - 1, KD * 4 - 1, 16 * t, tp / 2, PF);
+                    }
+                    es::prefetch_2d<float, 8, 16>(pp.v, NH * VD * 4 - 1, M - 1, NH * VD * 4 - 1,
+                                                  head * VD + r0, tp, PF);
+                    const size_t rec = size_t(head) * NC + c + 2;
+                    es::prefetch_2d<uint32_t, 16, 16>(reinterpret_cast<const uint32_t*>(prepB),
+                        63, unsigned(NH * NC * 16) - 1, 63, 0, int(rec * 16), PF);
+                    es::prefetch_2d<uint32_t, 16, 4>(reinterpret_cast<const uint32_t*>(prepF),
+                        63, unsigned(NH * NC * 4) - 1, 63, 0, int(rec * 4), PF);
+                }
+                es::simd<float, R * 16> ks = 0.0f, qs = 0.0f;
+                #pragma unroll
+                for (int t = 0; t < NT_; ++t) {
+                    const es::simd<sycl_bf16, R * 16> a = S.template select<R * 16, 1>(t * R * 16);
+                    es::simd<uint32_t, 128> bk = es::load_2d<uint32_t, 16, 8>(
+                        kd, Sp * 4 - 1, KD / 2 - 1, Sp * 4 - 1, t0, 8 * t);
+                    es::simd<uint32_t, 128> bq = es::load_2d<uint32_t, 16, 8>(
+                        qd, Sp * 4 - 1, KD / 2 - 1, Sp * 4 - 1, t0, 8 * t);
+                    ks = xmx::dpas<8, R, float, float, sycl_bf16, sycl_bf16>(
+                        ks, bk.template bit_cast_view<sycl_bf16>().read(), a);
+                    qs = xmx::dpas<8, R, float, float, sycl_bf16, sycl_bf16>(
+                        qs, bq.template bit_cast_view<sycl_bf16>().read(), a);
+                }
+                const float* pf = prepF + (size_t(head) * NC + c) * 64;
+                const es::simd<float, 16> eg = es::block_load<float, 16>(pf);
+                const es::simd<float, 16> dl = es::block_load<float, 16>(pf + 16);
+                const es::simd<float, 16> bt = es::block_load<float, 16>(pf + 32);
+                const es::simd<float, 16> gl4 = es::block_load<float, 16>(pf + 48);
+                const float gl = gl4[0];
+                // V^T tile [8 rows][16 tokens]: transposed 2-D load of v[t][head][r0..r0+7]
+                es::simd<float, R * 16> vt = es::load_2d<float, R, 16, 1, true, false>(
+                    pp.v, NH * VD * 4 - 1, M - 1, NH * VD * 4 - 1, head * VD + r0, t0);
+                es::simd<float, R * 16> rr;
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    rr.template select<16, 1>(16 * r) =
+                        bt * (es::simd<float, 16>(vt.template select<16, 1>(16 * r)) -
+                              eg * es::simd<float, 16>(ks.template select<16, 1>(16 * r)));
+                const sycl_bf16* pb = prepB + (size_t(head) * NC + c) * 512;
+                es::simd<uint32_t, 128> tt = es::block_load<uint32_t, 128>(
+                    reinterpret_cast<const uint32_t*>(pb));
+                es::simd<uint32_t, 128> mt = es::block_load<uint32_t, 128>(
+                    reinterpret_cast<const uint32_t*>(pb + 256));
+                es::simd<float, R * 16> u = xmx::dpas<8, R, float, float, sycl_bf16, sycl_bf16>(
+                    es::simd<float, R * 16>(0.0f), tt.template bit_cast_view<sycl_bf16>().read(),
+                    es::simd<sycl_bf16, R * 16>(rr));
+                es::simd<float, R * 16> o = xmx::dpas<8, R, float, float, sycl_bf16, sycl_bf16>(
+                    es::simd<float, R * 16>(0.0f), mt.template bit_cast_view<sycl_bf16>().read(),
+                    es::simd<sycl_bf16, R * 16>(u));
+                es::simd<float, 16 * R> ot;                // [16 tokens][8 rows]
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const es::simd<float, 16> orow =
+                        (es::simd<float, 16>(o.template select<16, 1>(16 * r)) +
+                         eg * es::simd<float, 16>(qs.template select<16, 1>(16 * r))) * scale;
+                    ot.template select<16, R>(r) = orow;
+                }
+                // 2-D stores are at most 8 rows high: tokens 0-7, then 8-15
+                es::store_2d<float, R, 8>(pp.out, NH * VD * 4 - 1, M - 1, NH * VD * 4 - 1,
+                                          head * VD + r0, t0, es::simd<float, 8 * R>(ot.template select<8 * R, 1>(0)));
+                es::store_2d<float, R, 8>(pp.out, NH * VD * 4 - 1, M - 1, NH * VD * 4 - 1,
+                                          head * VD + r0, t0 + 8, es::simd<float, 8 * R>(ot.template select<8 * R, 1>(8 * R)));
+                es::simd<float, R * 16> uw;
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    uw.template select<16, 1>(16 * r) = es::simd<float, 16>(u.template select<16, 1>(16 * r)) * dl;
+                const es::simd<sycl_bf16, R * 16> ua = uw;
+                S *= gl;
+                #pragma unroll
+                for (int t = 0; t < NT_; ++t) {
+                    es::simd<uint32_t, 128> bkt = es::load_2d<uint32_t, 16, 8>(
+                        kt, KD * 4 - 1, Sp / 2 - 1, KD * 4 - 1, 16 * t, t0 / 2);
+                    S.template select<R * 16, 1>(t * R * 16) = xmx::dpas<8, R, float, float, sycl_bf16, sycl_bf16>(
+                        es::simd<float, R * 16>(S.template select<R * 16, 1>(t * R * 16)),
+                        bkt.template bit_cast_view<sycl_bf16>().read(), ua);
+                }
+            }
+            #pragma unroll
+            for (int t = 0; t < NT_; ++t)
+                es::store_2d<float, 16, R>(st, KD * 4 - 1, VD - 1, KD * 4 - 1, 16 * t, r0,
+                                           es::simd<float, R * 16>(S.template select<R * 16, 1>(t * R * 16)));
+        });
+    });
+}
+
+struct DnXmxScratch {
+    sycl_bf16* kd = nullptr; size_t kd_cap = 0;
+    sycl_bf16* qd = nullptr; size_t qd_cap = 0;
+    sycl_bf16* kt = nullptr; size_t kt_cap = 0;
+    sycl_bf16* pb = nullptr; size_t pb_cap = 0;
+    float*     pf = nullptr; size_t pf_cap = 0;
+};
+DnXmxScratch& dn_xmx_scratch(sycl::queue& q) {
+    static std::mutex mu;
+    static std::map<const sycl::queue*, DnXmxScratch> all;
+    std::lock_guard<std::mutex> lk(mu);
+    return all[&q];
+}
+
+} // namespace
+
+// Default since 2026-09-26.  MEASURED, Qwen3.8-27B 4088 tokens: DN recurrence
+// 219 -> 94 ms (pack 27, prep 11, main 56), prefill 2.09 -> 1.99 s; 48-layer
+// GRIMOIRE_DN_VERIFY vs the fp32 sequential kernel: outputs <= 6.7e-3, state
+// <= 5.8e-3 relative to max; generated text byte-identical.
+// GRIMOIRE_DN_NOXMX=1 falls back to the sequential kernel.
+bool deltanet_xmx_supported(const DeltaNetPrefillParams& p) {
+    static const bool off = std::getenv("GRIMOIRE_DN_NOXMX") != nullptr;
+    return !off && p.k_dim == 128 && p.v_dim % 64 == 0 && p.n_tokens > 0 &&
+           (p.n_k_heads == 0 || p.n_heads % p.n_k_heads == 0);
+}
+
+sycl::event launch_deltanet_prefill_xmx(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                        const std::vector<sycl::event>& deps) {
+    const int Sp = (p.n_tokens + DXC - 1) / DXC * DXC, NC = Sp / DXC;
+    const int nk = p.n_k_heads ? p.n_k_heads : p.n_heads;
+    DnXmxScratch& s = dn_xmx_scratch(q);
+    const size_t pk = size_t(nk) * Sp * p.k_dim;
+    if (!grow(q, s.kd, s.kd_cap, pk) || !grow(q, s.qd, s.qd_cap, pk) || !grow(q, s.kt, s.kt_cap, pk) ||
+        !grow(q, s.pb, s.pb_cap, size_t(p.n_heads) * NC * 512) ||
+        !grow(q, s.pf, s.pf_cap, size_t(p.n_heads) * NC * 64))
+        throw std::runtime_error("deltanet xmx: scratch allocation failed");
+    // GRIMOIRE_DN_XMX_TIMING=1: wait after each kernel, print totals at exit.
+    static const bool timed = std::getenv("GRIMOIRE_DN_XMX_TIMING") != nullptr;
+    struct Tot { double pack = 0, prep = 0, main = 0; int n = 0;
+                 ~Tot() { if (n) std::fprintf(stderr, "  DN xmx: %d calls  pack %.1f ms  prep %.1f ms  main %.1f ms\n",
+                                              n, pack, prep, main); } };
+    static Tot tot;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    static const bool old_prep = std::getenv("GRIMOIRE_DN_XMX_PREP_OLD") != nullptr;
+    if (timed) q.wait();                        // earlier work must not count as pack
+    auto t0 = now();
+    sycl::event e1 = dn_xmx_pack(q, p, Sp, s.kd, s.qd, s.kt, deps);
+    if (timed) { e1.wait(); auto t1 = now(); tot.pack += ms(t0, t1); t0 = t1; }
+    sycl::event e2 = old_prep ? dn_xmx_prep(q, p, NC, s.pb, s.pf, {e1})
+                              : dn_xmx_prep_es(q, p, NC, Sp, s.kd, s.pb, s.pf, {e1});
+    if (timed) { e2.wait(); auto t1 = now(); tot.prep += ms(t0, t1); t0 = t1; }
+    sycl::event e3 = dn_xmx_main<128>(q, p, Sp, s.kd, s.qd, s.kt, s.pb, s.pf, {e2});
+    if (timed) { e3.wait(); tot.main += ms(t0, now()); ++tot.n; }
+    return e3;
 }
 
 bool gemm_fast_supported(const QuantWeight& w, int M) {

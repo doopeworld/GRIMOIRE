@@ -421,7 +421,8 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
         const int v = e ? std::atoi(e) : 0;
         return (v == 1 || v == 2 || v == 4) ? v : 0;     // 0: pick by k_dim below
     }();
-    if (!old && deltanet_chunk16_supported(p)) {
+    const bool use_xmx = !old && deltanet_xmx_supported(p);
+    if (use_xmx || (!old && deltanet_chunk16_supported(p))) {
         // GRIMOIRE_DN_VERIFY=n: for the first n calls, also run the sequential
         // kernel on a copy of the state and print how far the chunked output
         // and final state are from it (the summation order differs).
@@ -440,7 +441,7 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
             DeltaNetPrefillParams pr = p;
             pr.state = st; pr.out = ot;
             launch_deltanet_prefill_q4(q, pr, {}).wait();
-            launch_deltanet_prefill_chunk16(q, p, {}).wait();
+            (use_xmx ? launch_deltanet_prefill_xmx(q, p, {}) : launch_deltanet_prefill_chunk16(q, p, {})).wait();
             std::vector<float> a(no), b(no), sa(ns), sb(ns);
             q.memcpy(a.data(), p.out, no * sizeof(float));
             q.memcpy(b.data(), ot, no * sizeof(float));
@@ -457,14 +458,15 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
             double od, orf, sd, srf;
             cmp(a, b, od, orf);
             cmp(sa, sb, sd, srf);
-            std::fprintf(stderr, "  DN verify (chunk16 vs sequential, %d tokens): out max|diff| %.3e "
+            std::fprintf(stderr, "  DN verify (%s vs sequential, %d tokens): out max|diff| %.3e "
                          "(max|ref| %.3e)  state max|diff| %.3e (max|ref| %.3e)\n",
-                         p.n_tokens, od, orf, sd, srf);
+                         use_xmx ? "xmx" : "chunk16", p.n_tokens, od, orf, sd, srf);
             sycl::free(st, q);
             sycl::free(ot, q);
             return sycl::event{};
         }
-        return launch_deltanet_prefill_chunk16(q, p, deps);
+        return use_xmx ? launch_deltanet_prefill_xmx(q, p, deps)
+                       : launch_deltanet_prefill_chunk16(q, p, deps);
     }
     if (!old && deltanet_q4_supported(p)) return launch_deltanet_prefill_q4(q, p, deps);
     // Auto: 4 rows per sub-group up to k_dim 128 (Qwen3.8-27B, 4088 tokens:

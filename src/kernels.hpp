@@ -332,6 +332,12 @@ sycl::event launch_deltanet_prefill_q4(sycl::queue& q, const DeltaNetPrefillPara
 // DeltaNet prefill recurrence, chunked 16 tokens (gemm_fast.cpp): the
 // per-token dependency chain becomes a 16x16 triangular solve per chunk.
 // k_dim 64 or 128, v_dim a multiple of 64.  Opt-in: GRIMOIRE_DN_CHUNK16=1 (slower in SIMT).
+// DeltaNet prefill recurrence on the matrix unit: chunked (16), ESIMD + DPAS,
+// bf16 operands, fp32 state (gemm_fast.cpp).  k_dim 128, v_dim % 64 == 0.
+// Default; GRIMOIRE_DN_NOXMX=1 disables it.
+bool deltanet_xmx_supported(const DeltaNetPrefillParams& p);
+sycl::event launch_deltanet_prefill_xmx(sycl::queue& q, const DeltaNetPrefillParams& p,
+                                        const std::vector<sycl::event>& deps = {});
 bool deltanet_chunk16_supported(const DeltaNetPrefillParams& p);
 sycl::event launch_deltanet_prefill_chunk16(sycl::queue& q, const DeltaNetPrefillParams& p,
                                             const std::vector<sycl::event>& deps = {});
