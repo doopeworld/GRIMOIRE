@@ -29,9 +29,35 @@ std::string read_file(const std::string& p) {
 
 // Minimal scalar extraction: find "key" then the next number/string/bool.
 // The safetensors header parser is strict; config.json only needs lookups.
+//
+// The SHALLOWEST occurrence wins, and among equally shallow ones the first.
+// Qwen3.8-Flash-Next's text_config nests "mtp": {"num_hidden_layers": 1}
+// alphabetically BEFORE its own "num_hidden_layers": 48, and taking the
+// first textual match built a one-layer model that loaded and ran.
 bool find_scalar(const std::string& j, const std::string& key, std::string& out) {
     const std::string pat = "\"" + key + "\"";
-    size_t p = j.find(pat);
+    size_t p = std::string::npos;
+    {
+        int depth = 0, best = 1 << 30;
+        bool in_str = false;
+        for (size_t i = 0; i < j.size(); ++i) {
+            const char c = j[i];
+            if (in_str) {
+                if (c == '\\') { ++i; continue; }
+                if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '{') { ++depth; continue; }
+            if (c == '}') { --depth; continue; }
+            if (c != '"') continue;
+            if (depth < best && j.compare(i, pat.size(), pat) == 0) {
+                size_t k = i + pat.size();
+                while (k < j.size() && isspace((unsigned char)j[k])) ++k;
+                if (k < j.size() && j[k] == ':') { best = depth; p = i; }
+            }
+            in_str = true;
+        }
+    }
     if (p == std::string::npos) return false;
     p = j.find(':', p + pat.size());
     if (p == std::string::npos) return false;
@@ -446,6 +472,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         // eos_token_id can be a LIST in a Qwen config; take the first.
         cfg.eos_token_id     = cfg_i_first(cj, "eos_token_id", 0);
         cfg.hc_count         = cfg_i(cj, "hc_count", 4);
+        {
+            std::string ogt;
+            cfg.dn_gate_sigmoid = find_scalar(cj, "output_gate_type", ogt) && ogt == "sigmoid";
+        }
         cfg.hc_lowrank       = cfg_i(cj, "hc_lowrank", 320);
         cfg.ngram_size       = cfg_i(cj, "ngram_size", 3);
         cfg.heads_per_ngram  = cfg_i(cj, "heads_per_ngram", 8);
@@ -954,6 +984,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 lay.ple_table     = get(pl + "ple_embedding.ngram_embedding.weight");
                 lay.ple_table_scale =
                     get(pl + "ple_embedding.ngram_embedding.weight_scale");
+                if (!lay.ple_table.ok())
+                    for (int sh = 0;; ++sh) {
+                        TensorRef t = get(pl + "ple_embedding.ngram_embedding.shard_" +
+                                          std::to_string(sh) + ".weight");
+                        if (!t.ok()) break;
+                        lay.ple_shards.push_back(t);
+                    }
+                lay.ple_mul_t = get(pl + "ple_embedding.layer_multipliers");
+                lay.ple_vsz_t = get(pl + "ple_embedding.ngram_heads_vocab_sizes");
+                lay.ple_off_t = get(pl + "ple_embedding.ngram_heads_offsets");
             }
         }
 
@@ -1252,7 +1292,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 need(lay.ple_norm_key,   "ple.norm_key", L);
                 need(lay.ple_norm_query, "ple.norm_query", L);
                 need(lay.ple_norm_conv,  "ple.norm_conv", L);
-                need(lay.ple_table,      "ple.ple_embedding.ngram_embedding", L);
+                need(lay.ple_table.ok() || lay.ple_shards.empty() ? lay.ple_table
+                                                                 : lay.ple_shards[0],
+                     "ple.ple_embedding.ngram_embedding", L);
             }
         }
         if (lay.kind == LayerKind::LINEAR_ATTN) {

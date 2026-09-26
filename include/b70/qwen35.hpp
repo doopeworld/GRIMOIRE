@@ -61,6 +61,9 @@ struct Qwen35Config {
     float rope_theta    = 1e7f;
     float partial_rope  = 1.0f;   // fraction of head_dim that gets RoPE
     bool  attn_out_gate = false;
+    // Qwen4-Exp "output_gate_type": "sigmoid" -- the DeltaNet output norm
+    // gates with sigmoid(z) instead of silu(z).
+    bool  dn_gate_sigmoid = false;
     bool  is_muse       = false;   // Muse Glimmer: sandwich norms, scaleless qk/embed norm
     // ---- Agnes ------------------------------------------------------
     // Agnes-3.0-Flash (model_type "agnes"): a Qwen3.5-shaped hybrid --
@@ -375,6 +378,13 @@ struct Qwen35Layer {
     // is missing rather than assuming 1.0, because a silently unscaled
     // table is just a differently-weighted embedding.
     TensorRef ple_table, ple_table_scale;
+    // The published checkpoint splits the table into split_ngram_parts
+    // row shards (ngram_embedding.shard_{i}.weight, rows [i*S, (i+1)*S))
+    // and STORES the hash constants the reference registers as persistent
+    // buffers.  ple_table stays empty then; the engine reads rows from the
+    // shards on demand (the table is ~51 GB).
+    std::vector<TensorRef> ple_shards;
+    TensorRef ple_mul_t, ple_vsz_t, ple_off_t;
 };
 
 struct Qwen35Model {

@@ -339,7 +339,9 @@ inline void ple_ngram_ids(int token, const int* hist, int hist_len,
         bool crossed = false;
         for (int shift = 1; shift <= ngram_context_len; ++shift) {
             const int at = hist_len - shift;
-            int64_t cand = (at >= 0) ? int64_t(hist[at]) : 0;
+            // before the sequence: EOS (the reference's previous_context
+            // is eos-filled), NOT 0
+            int64_t cand = (at >= 0) ? int64_t(hist[at]) : int64_t(eos_token_id);
             // sticky EOS: everything older than a boundary is EOS
             if (crossed) cand = eos_token_id;
             if (cand == eos_token_id) crossed = true;

@@ -719,6 +719,34 @@ sycl::event launch_rmsnorm_gate_silu(sycl::queue& q, float* x, const float* z,
     });
 }
 
+// Same as launch_rmsnorm_gate_silu with the gate through a SIGMOID:
+// Qwen4-Exp's DeltaNet output norm is RMSNormGated(activation=
+// output_gate_type) and its config says "sigmoid" -- norm(x)*w*sigmoid(z),
+// where Qwen3-Next/3.5 use silu(z).
+sycl::event launch_rmsnorm_gate_sigmoid(sycl::queue& q, float* x, const float* z,
+                                        const bf16_t* w, int n_heads, int dim,
+                                        float eps,
+                                        const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_heads) * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                float* p = x + int64_t(it.get_group(0)) * dim;
+                const float* g = z + int64_t(it.get_group(0)) * dim;
+                float ss = 0.0f;
+                for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                for (int i = lane; i < dim; i += SG_SIZE) {
+                    const float zv = g[i];
+                    p[i] = p[i] * scale * bf16_to_f32(w[i]) * (1.0f / (1.0f + sycl::exp(-zv)));
+                }
+            });
+    });
+}
+
 // launch_gate_sigmoid_mul_bf16_out with the gate read from the q
 // projection's interleaved output qg ([token][head][q | gate]) -- no split.
 sycl::event launch_gate_sigmoid_mul_bf16_out_qg(sycl::queue& q, const float* x, const float* qg,
@@ -2217,7 +2245,10 @@ sycl::event launch_ple_ngram_ids(sycl::queue& q, const int32_t* tokens,
                 bool crossed = false;
                 for (int shift = 1; shift <= ngram_context_len; ++shift) {
                     const int at = t - shift;
-                    int64_t cand = (at >= 0) ? int64_t(tokens[at]) : 0;
+                    // before the sequence: EOS, as the reference's
+                    // eos-filled previous_context (HF modeling_qwen4_exp
+                    // Qwen4ExpTextNGramEmbedding.forward) -- not 0.
+                    int64_t cand = (at >= 0) ? int64_t(tokens[at]) : int64_t(eos_token_id);
                     if (crossed) cand = eos_token_id;
                     if (cand == eos_token_id) crossed = true;
                     if (order > shift) mixed ^= cand * multipliers[shift];

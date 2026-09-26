@@ -58,6 +58,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <cstdlib>
 #include <cerrno>
 #include <thread>
+#include <atomic>
 #include <tuple>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -597,6 +598,8 @@ sycl::event launch_deltanet_gates(sycl::queue&, const float*, const float*,
                                   int, const std::vector<sycl::event>&);
 sycl::event launch_gate_silu(sycl::queue&, const float*, const float*, float*, int,
                              const std::vector<sycl::event>&);
+sycl::event launch_rmsnorm_gate_sigmoid(sycl::queue&, float*, const float*, const bf16_t*,
+                                        int, int, float, const std::vector<sycl::event>&);
 sycl::event launch_rmsnorm_gate_silu(sycl::queue&, float*, const float*, const bf16_t*,
                                      int, int, float, const std::vector<sycl::event>&);
 sycl::event launch_qk_norm_rope(sycl::queue&, float*, float*, const bf16_t*,
@@ -2064,6 +2067,13 @@ struct Grimoire {
     sycl_bf16* tm_xperm = nullptr;
     float     *tm_tgu = nullptr, *tm_mh = nullptr, *tm_yperm = nullptr;
     int32_t   *tm_ptoken = nullptr, *tm_pinv = nullptr;
+    // PLE rows fetched from the checkpoint file (ple_ssd layers): the
+    // request's tokens on the host, a pinned row staging area, and an
+    // identity id list so the existing gather kernel reads staging row i.
+    std::vector<int32_t> q4_tok_h;
+    uint8_t*  ple_stage = nullptr;  size_t ple_stage_cap = 0;
+    int64_t*  ple_iota = nullptr;   size_t ple_iota_cap = 0;
+    double    ple_read_ms = 0.0;    long ple_read_rows = 0;
 
     // Quantized-at-load projections, per layer.
     struct LayerDev {
@@ -2214,6 +2224,14 @@ struct Grimoire {
         float    ple_scale = 1.0f;
         int64_t  ple_rows = 0;
         int64_t *ple_mul=nullptr, *ple_size=nullptr, *ple_off=nullptr;
+        // Row-sharded table read from the checkpoint FILE on demand (the
+        // published Flash-Next table: 128 shards, ~51 GB, never loaded).
+        // Host copies of the hash constants let the CPU compute which rows
+        // a token needs before the layer runs.
+        bool     ple_ssd = false;
+        int64_t  ple_shard_rows = 0, ple_wid = 0;
+        std::vector<TensorRef> ple_shard_refs;
+        std::vector<int64_t> ple_mul_h, ple_size_h, ple_off_h;
         // The dilated conv's carried history: (kernel-1)*dilation rows of
         // conv_in, oldest first.  Only this window is needed, which is
         // what keeps a PLE layer's state constant in context length.
@@ -3027,6 +3045,8 @@ struct Grimoire {
                                LayerDev& d, int layer, std::string& err);
     bool tiered_moe_prefill(const LayerDev& d, const float* x, const int32_t* rex,
                             const float* rwt, float* out, int M);
+    // PLE from the file: rows for positions [p0, p0+M) into ple_stage.
+    bool ple_fetch_rows(const LayerDev& d, int p0, int M);
     TieredMoeView tm_view(const LayerDev& d) const {
         return TieredMoeView{tm_lay, d.tm_eptr, cfg.n_experts, cfg.top_k};
     }
@@ -4104,7 +4124,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 // is the architecture's design and vLLM pins it in host
                 // memory for exactly this reason; the gather touches only
                 // the rows of the current tokens.
-                if (!src.ple_table.ok() || src.ple_table.t.shape.size() != 2) {
+                // Either one table tensor (the synthetic fixtures) or the
+                // published checkpoint's row shards, which are NOT loaded:
+                // their rows are read from the file per token
+                // (ple_fetch_rows) -- 51 GB of table would take the RAM the
+                // offloaded experts need.
+                const bool sharded = !src.ple_table.ok() && !src.ple_shards.empty();
+                const TensorRef& tt = sharded ? src.ple_shards[0] : src.ple_table;
+                if (!tt.ok() || tt.t.shape.size() != 2) {
                     err = "ple_embedding.ngram_embedding has an unexpected shape";
                     return false;
                 }
@@ -4112,8 +4139,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 // case is not an optimisation: the published table is
                 // ~51B parameters, which is 51 GB of host memory at FP8
                 // and 102 GB at BF16.
-                const bool tfp8 = src.ple_table.t.dtype == STDtype::F8_E4M3;
-                if (!tfp8 && src.ple_table.t.dtype != STDtype::BF16) {
+                const bool tfp8 = tt.t.dtype == STDtype::F8_E4M3;
+                if (!tfp8 && tt.t.dtype != STDtype::BF16) {
                     err = "the PLE n-gram table is neither BF16 nor FP8-E4M3; "
                           "this engine reads that table straight out of host "
                           "memory and has a dequantiser for those two only";
@@ -4137,19 +4164,45 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         return false;
                     }
                 }
-                const int64_t rows = int64_t(src.ple_table.t.shape[0]);
-                const int64_t wid  = int64_t(src.ple_table.t.shape[1]);
+                const int64_t wid  = int64_t(tt.t.shape[1]);
                 const size_t  esz  = tfp8 ? 1 : sizeof(bf16_t);
-                void* host = sycl::malloc_host(size_t(rows*wid) * esz, lq);
-                if (!host) { err = "PLE host table allocation failed"; return false; }
-                // read_raw, NOT ck.data(): the file mappings were dropped
-                // above (unmap_all), so every read after that point is a
-                // pread and dereferencing the mapping is a segfault.
-                if (!ck.read_raw(src.ple_table, host, err)) {
-                    err = "reading the PLE n-gram table failed: " + err;
-                    return false;
+                int64_t rows = 0;
+                if (sharded) {
+                    // Shard i holds rows [i*S, (i+1)*S); only the last may
+                    // be short (ref/qwen4_exp_nvidia_ngram_embedding.py:907).
+                    const int64_t S = int64_t(tt.t.shape[0]);
+                    for (size_t k = 0; k < src.ple_shards.size(); ++k) {
+                        const TensorRef& sh = src.ple_shards[k];
+                        if (sh.t.shape.size() != 2 || sh.t.shape[1] != wid ||
+                            sh.t.dtype != tt.t.dtype ||
+                            (k + 1 < src.ple_shards.size() && sh.t.shape[0] != S)) {
+                            err = "PLE table shard " + std::to_string(k) +
+                                  " does not match shard 0's row layout";
+                            return false;
+                        }
+                        rows += sh.t.shape[0];
+                    }
+                    d.ple_ssd = true;
+                    d.ple_shard_rows = S;
+                    d.ple_wid = wid;
+                    d.ple_shard_refs = src.ple_shards;
+                    d.ple_table = nullptr;
+                    std::printf("\n  PLE table: %zu shards, %lld rows x %lld, read from the "
+                                "checkpoint per token (not loaded)\n  ",
+                                src.ple_shards.size(), (long long)rows, (long long)wid);
+                } else {
+                    rows = int64_t(tt.t.shape[0]);
+                    void* host = sycl::malloc_host(size_t(rows*wid) * esz, lq);
+                    if (!host) { err = "PLE host table allocation failed"; return false; }
+                    // read_raw, NOT ck.data(): the file mappings were dropped
+                    // above (unmap_all), so every read after that point is a
+                    // pread and dereferencing the mapping is a segfault.
+                    if (!ck.read_raw(src.ple_table, host, err)) {
+                        err = "reading the PLE n-gram table failed: " + err;
+                        return false;
+                    }
+                    d.ple_table = host;
                 }
-                d.ple_table = host;
                 d.ple_fp8   = tfp8;
                 d.ple_scale = tscale;
                 d.ple_rows  = rows;
@@ -4160,8 +4213,38 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 qwen4_exp::ngram_multipliers(cfg.ngram_size, cfg.vocab,
                                              cfg.ngram_seed, d.ple_dense_id,
                                              mul.data());
-                const int64_t total = qwen4_exp::ngram_vocab_layout(
+                int64_t total = qwen4_exp::ngram_vocab_layout(
                     cfg.ngram_vocab_base, NH, d.ple_dense_id, sz.data(), of.data());
+                // The published checkpoint STORES the three hash buffers (the
+                // reference registers them persistent and loads them over
+                // its own derivation).  The stored ones are authoritative;
+                // a disagreement is printed, never silently papered over.
+                if (src.ple_mul_t.ok() && src.ple_vsz_t.ok() && src.ple_off_t.ok()) {
+                    auto rd = [&](const TensorRef& r, std::vector<int64_t>& v,
+                                  const char* what) {
+                        if (r.t.dtype != STDtype::I64 || r.t.numel() != int64_t(v.size())) {
+                            err = std::string("stored PLE ") + what + " has an unexpected "
+                                  "dtype or length";
+                            return false;
+                        }
+                        std::vector<int64_t> st(v.size());
+                        if (!ck.read_raw(r, st.data(), err)) return false;
+                        if (st != v) {
+                            size_t k = 0; while (st[k] == v[k]) ++k;
+                            std::printf("\n  PLE %s: checkpoint differs from the derived "
+                                        "value at [%zu] (%lld vs %lld) -- using the "
+                                        "checkpoint's\n  ", what, k, (long long)st[k],
+                                        (long long)v[k]);
+                            v = st;
+                        }
+                        return true;
+                    };
+                    if (!rd(src.ple_mul_t, mul, "layer_multipliers") ||
+                        !rd(src.ple_vsz_t, sz, "ngram_heads_vocab_sizes") ||
+                        !rd(src.ple_off_t, of, "ngram_heads_offsets")) return false;
+                    total = of.back() + sz.back();
+                }
+                d.ple_mul_h = mul; d.ple_size_h = sz; d.ple_off_h = of;
                 if (total > rows) {
                     err = "the PLE table is smaller than the derived n-gram "
                           "layout needs; ngram_vocab_size_base or the head "
@@ -7180,8 +7263,10 @@ void Grimoire::release() {
                      (void**)&q4_ids, (void**)&q4_tok_base,
                      (void**)&tm_stage, (void**)&tm_scratch, (void**)&tm_xperm,
                      (void**)&tm_tgu, (void**)&tm_mh, (void**)&tm_yperm,
-                     (void**)&tm_ptoken, (void**)&tm_pinv})
+                     (void**)&tm_ptoken, (void**)&tm_pinv,
+                     (void**)&ple_stage, (void**)&ple_iota})
         if (*p) { sycl::free(*p, q); *p = nullptr; }
+    ple_stage_cap = ple_iota_cap = 0;
     tm_cap = 0; tm_any = false; tm_vram_per_layer = -1; tm_vram_bytes = tm_host_bytes = 0;
     {
         LayerDev& d = mtp.L;
@@ -8578,6 +8663,8 @@ const float* Grimoire::forward_qwen4_exp(int token) {
     {
         int32_t* tok = q4_tok; const int at = pos; const int32_t tv = token;
         q.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) { tok[at] = tv; });
+        if (q4_tok_h.size() < size_t(max_seq)) q4_tok_h.resize(size_t(max_seq), 0);
+        q4_tok_h[size_t(pos)] = token;
     }
     // hidden_states = embed(id).repeat(1, hc_count) -- the SAME row in
     // every stream.  A projection here would be a different model.
@@ -8619,11 +8706,20 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             const int NH = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
             const int HD = cfg.ple_embed_dim / NH;
             const int state_len = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+            if (d.ple_ssd) {
+                if (!ple_fetch_rows(d, pos, 1)) {
+                    std::fprintf(stderr, "PLE: reading table rows failed\n");
+                    return nullptr;
+                }
+                launch_ple_embed_gather(q, ple_stage, d.ple_fp8, d.ple_scale,
+                                        ple_iota, q4_emb, 1, NH, HD, NH, none);
+            } else {
             launch_ple_ngram_ids(q, q4_tok, q4_ids, pos, 1, d.ple_mul,
                                  d.ple_size, d.ple_off, cfg.ngram_size - 1,
                                  cfg.heads_per_ngram, NH, cfg.eos_token_id, none);
             launch_ple_embed_gather(q, d.ple_table, d.ple_fp8, d.ple_scale,
                                     q4_ids, q4_emb, 1, NH, HD, d.ple_rows, none);
+            }
             gemv_any(d.ple_key,   q4_emb, q4_kv, none);
             gemv_any(d.ple_value, q4_emb, q4_kv + WIDE, none);
             // key is the first hc*H rows of the merged projection, value
@@ -8673,6 +8769,10 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             dp.n_k_heads = Hk;
             launch_deltanet_step(q, dp, none);
             gemv_any(d.la_z, s.h2, s.zbuf, none);
+            if (cfg.dn_gate_sigmoid)
+                launch_rmsnorm_gate_sigmoid(q, s.attn_out, s.zbuf, d.la_norm,
+                                            Hv, Dv, cfg.rms_eps, none);
+            else
             launch_rmsnorm_gate_silu(q, s.attn_out, s.zbuf, d.la_norm,
                                      Hv, Dv, cfg.rms_eps, none);
             gemv_any(d.la_out, s.attn_out, s.moe_y, none);
@@ -10939,6 +11039,71 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
 //  a model that is half this request and half the last one -- silently.
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
+// PLE rows straight from the checkpoint file.  The ids are computed on the
+// host from the stored hash constants (qwen4_exp::ple_ngram_ids, the same
+// reference the device kernel is tested against), then each 160-byte row
+// is one pread.  Rows land in pinned ple_stage in id order, and the
+// existing gather kernel reads them through the identity list ple_iota.
+// ---------------------------------------------------------------------
+bool Grimoire::ple_fetch_rows(const LayerDev& d, int p0, int M) {
+    const int NH = (cfg.ngram_size - 1) * cfg.heads_per_ngram;
+    const size_t rowb = size_t(d.ple_wid) * (d.ple_fp8 ? 1 : sizeof(bf16_t));
+    const size_t n = size_t(M) * NH;
+    if (n * rowb > ple_stage_cap) {
+        q.wait();
+        if (ple_stage) sycl::free(ple_stage, q);
+        ple_stage = sycl::malloc_host<uint8_t>(n * rowb, q);
+        ple_stage_cap = ple_stage ? n * rowb : 0;
+        if (!ple_stage) return false;
+    }
+    if (n > ple_iota_cap) {
+        q.wait();
+        if (ple_iota) sycl::free(ple_iota, q);
+        ple_iota = sycl::malloc_device<int64_t>(n, q);
+        ple_iota_cap = ple_iota ? n : 0;
+        if (!ple_iota) return false;
+        std::vector<int64_t> io(n);
+        for (size_t i = 0; i < n; ++i) io[i] = int64_t(i);
+        q.memcpy(ple_iota, io.data(), n * sizeof(int64_t)).wait();
+    }
+    if (q4_tok_h.size() < size_t(p0 + M)) return false;
+    std::vector<int64_t> ids(n);
+    for (int m = 0; m < M; ++m)
+        qwen4_exp::ple_ngram_ids(q4_tok_h[size_t(p0 + m)], q4_tok_h.data(), p0 + m,
+                                 d.ple_mul_h.data(), d.ple_size_h.data(),
+                                 d.ple_off_h.data(), cfg.ngram_size - 1,
+                                 cfg.heads_per_ngram, NH, cfg.eos_token_id,
+                                 ids.data() + size_t(m) * NH);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<bool> bad{false};
+    auto work = [&](size_t b, size_t e) {
+        std::string er;
+        for (size_t i = b; i < e && !bad.load(std::memory_order_relaxed); ++i) {
+            uint8_t* dst = ple_stage + i * rowb;
+            const int64_t r = ids[i];
+            if (r < 0 || r >= d.ple_rows) { std::memset(dst, 0, rowb); continue; }
+            const int64_t sh = r / d.ple_shard_rows, lr = r - sh * d.ple_shard_rows;
+            const TensorRef& T = d.ple_shard_refs[size_t(sh)];
+            STTensor sub = T.t;
+            sub.begin = T.t.begin + uint64_t(lr) * rowb;
+            sub.end   = sub.begin + rowb;
+            if (!ck.shards[size_t(T.shard)]->read_raw(sub, dst, er)) bad = true;
+        }
+    };
+    const size_t nt = n < 512 ? 1 : std::min<size_t>(16, n / 256);
+    if (nt == 1) work(0, n);
+    else {
+        std::vector<std::thread> th;
+        for (size_t t = 0; t < nt; ++t) th.emplace_back(work, n * t / nt, n * (t + 1) / nt);
+        for (auto& x : th) x.join();
+    }
+    ple_read_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    ple_read_rows += long(n);
+    return !bad;
+}
+
+// ---------------------------------------------------------------------
 // Tiered NVFP4 experts (b70/tiered_moe.hpp, FLASH-NEXT-TIERED.md)
 // ---------------------------------------------------------------------
 static size_t mem_available_bytes() {
@@ -11284,6 +11449,10 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         q.memcpy(q4_tok_base+size_t(seqb->slot[r])*max_seq+seqb->pos[r],
                  tokens.data()+r,sizeof(int32_t));
     else q.memcpy(q4_tok + start_pos, tokens.data(), size_t(M) * sizeof(int32_t));
+    if (!seqb) {
+        if (q4_tok_h.size() < size_t(max_seq)) q4_tok_h.resize(size_t(max_seq), 0);
+        std::copy(tokens.begin(), tokens.end(), q4_tok_h.begin() + start_pos);
+    }
     launch_embed_batched(q, embed, dtok, t0, M, H, none);
     // hidden = embed(ids).repeat(1, hc_count): the SAME row in every
     // stream, not a projection.
@@ -11312,6 +11481,13 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                 launch_hc_combine(q, hyper, pinj, pend, hyper, M, HC, H, none);
                 pending = false;
             }
+            if (d.ple_ssd) {
+                // file-backed table: single sequence only (the host keeps
+                // one token history)
+                if (seqb || !ple_fetch_rows(d, start_pos, M)) { ok = false; break; }
+                launch_ple_embed_gather(q, ple_stage, d.ple_fp8, d.ple_scale,
+                                        ple_iota, pemb, M, NH, PHD, int64_t(M) * NH, none);
+            } else {
             for(int r=0;r<(seqb?M:1);++r)
                 launch_ple_ngram_ids(q,seqb?q4_tok_base+size_t(seqb->slot[r])*max_seq:q4_tok,
                     pids+size_t(r)*NH,seqb?seqb->pos[r]:start_pos,seqb?1:M,d.ple_mul,
@@ -11319,6 +11495,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                     cfg.eos_token_id,none);
             launch_ple_embed_gather(q, d.ple_table, d.ple_fp8, d.ple_scale,
                                     pids, pemb, M, NH, PHD, d.ple_rows, none);
+            }
             mm(d.ple_key,   pemb, pkey);
             mm(d.ple_value, pemb, pval);
             if (!ok) break;
@@ -11382,6 +11559,10 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             }
             mm(d.la_z, blk_in, t3);
             if (!ok) break;
+            if (cfg.dn_gate_sigmoid)
+                launch_rmsnorm_gate_sigmoid(q, attn, t3, d.la_norm, M * Hv, Dv,
+                                            eps, none);
+            else
             launch_rmsnorm_gate_silu(q, attn, t3, d.la_norm, M * Hv, Dv,
                                      eps, none);
             mm(d.la_out, attn, pend);
