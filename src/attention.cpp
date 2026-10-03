@@ -42,7 +42,7 @@ namespace b70 {
 // 128 keys per split is the measured optimum. 64 was tried and is WORSE
 // (TG 22.1 vs 28.7): more partials means more merge rounding, which costs
 // speculative draft acceptance.
-static inline int decode_splits(const AttnParams& p) {
+static int keys_per_split() {
     // keys per split; tunable so the decode/merge balance can be swept without
     // a rebuild. More splits = more parallelism in flash_decode but a more
     // expensive flash_merge (it walks [head][split] partials serially).
@@ -63,10 +63,25 @@ static inline int decode_splits(const AttnParams& p) {
         const int v = e ? std::atoi(e) : 32;
         return v > 0 ? v : 32;
     }();
-    int want = (p.seq_len + KPS - 1) / KPS;
-    if (want < p.splits) want = p.splits;
-    if (want > MAX_SPLITS) want = MAX_SPLITS;
+    return KPS;
+}
+
+// The split count single-token decode uses for seq_len keys: ~kps keys per
+// split, at least min_splits, at most cap.  The host sizes launches with it
+// and, under graph capture, every kernel re-derives it on the device from
+// the live length (AttnParams::capture), so the two cannot disagree.
+static inline int splits_for(int seq_len, int min_splits, int kps, int cap) {
+    int want = (seq_len + kps - 1) / kps;
+    if (want < min_splits) want = min_splits;
+    if (want > cap) want = cap;
     return want > 0 ? want : 1;
+}
+
+// Launch geometry.  Direct submission knows the length and sizes for it.  A
+// recorded launch is replayed at every later length, so it is sized for the
+// whole cache and the kernels use the live count (the rest return at once).
+static inline int decode_splits(const AttnParams& p) {
+    return splits_for(p.capture ? p.seq_cap : p.seq_len, p.splits, keys_per_split(), MAX_SPLITS);
 }
 
 template <int MAXD>
@@ -94,6 +109,7 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
         // and it is what turns the kernel from latency-bound into
         // bandwidth-bound.
         const int splits = decode_splits(p);
+        const int kps = keys_per_split();
         h.parallel_for(
             sycl::nd_range<1>(size_t(pp.num_heads) * size_t(splits) * SG_SIZE,
                               size_t(SG_SIZE)),
@@ -110,13 +126,17 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                 const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
                 if ((pp.gate_le > 0 && seq > pp.gate_le) || (pp.gate_gt > 0 && seq <= pp.gate_gt))
                     return;                          // the other gated kernel owns this length
+                // Recorded launch: the split count direct submission would
+                // use at THIS length; the merge reads only that many.
+                const int nsp   = pp.capture ? splits_for(seq, pp.splits, kps, splits) : splits;
+                if (part >= nsp) return;
                 // Sliding attention: everything before the window is
                 // masked to -inf, which contributes nothing, so drop it
                 // from the scan instead of scoring and discarding it.
                 const int lo    = pp.window_left > 0
                                 ? sycl::max(0, seq - pp.window_left) : 0;
                 const int span  = seq - lo;
-                const int per   = (span + splits - 1) / splits;
+                const int per   = (span + nsp - 1) / nsp;
                 const int s_beg = lo + part * per;
                 const int s_end = sycl::min(s_beg + per, seq);
 
@@ -279,6 +299,7 @@ static sycl::event flash_decode_gqa(sycl::queue& q, const AttnParams& p,
     const int G      = p.num_heads / p.num_kv_heads;
     const int chunks = G / GC;
     const int splits = decode_splits(p);
+    const int kps = keys_per_split();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const AttnParams pp = p;
@@ -299,10 +320,12 @@ static sycl::event flash_decode_gqa(sycl::queue& q, const AttnParams& p,
                 const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
                 if ((pp.gate_le > 0 && seq > pp.gate_le) || (pp.gate_gt > 0 && seq <= pp.gate_gt))
                     return;                          // the other gated kernel owns this length
+                const int nsp   = pp.capture ? splits_for(seq, pp.splits, kps, splits) : splits;
+                if (part >= nsp) return;             // recorded launch: live count only
                 const int lo    = pp.window_left > 0
                                 ? sycl::max(0, seq - pp.window_left) : 0;
                 const int span  = seq - lo;
-                const int per   = (span + splits - 1) / splits;
+                const int per   = (span + nsp - 1) / nsp;
                 const int s_beg = lo + part * per;
                 const int s_end = sycl::min(s_beg + per, seq);
 
@@ -471,6 +494,7 @@ sycl::event flash_decode_esimd256(sycl::queue& q, const AttnParams& p,
                                   const std::vector<sycl::event>& deps) {
     constexpr int HD = 256, NK = 16;
     const int splits = decode_splits(p);
+    const int kps = keys_per_split();
     const int G = p.num_heads / p.num_kv_heads;
     const int hgroups = G / GH;
     const AttnParams pp = p;
@@ -485,8 +509,19 @@ sycl::event flash_decode_esimd256(sycl::queue& q, const AttnParams& p,
             const int kvh = rest / hgroups;
             const int h0 = kvh * G + hg * GH;
             const int seq = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+            // Recorded launch: use the split count direct submission would
+            // launch at this length (splits_for, written out -- ESIMD code
+            // gets only what it can see inline); the merge reads that many.
+            int nsp = splits;
+            if (pp.capture) {
+                nsp = (seq + kps - 1) / kps;
+                if (nsp < pp.splits) nsp = pp.splits;
+                if (nsp > splits) nsp = splits;
+                if (nsp < 1) nsp = 1;
+            }
+            if (part >= nsp) return;
             // 16-aligned split boundaries keep every tile load aligned
-            int per = (seq + splits - 1) / splits;
+            int per = (seq + nsp - 1) / nsp;
             per = (per + NK - 1) / NK * NK;
             const int s_beg = part * per;
             const int s_end = s_beg + per < seq ? s_beg + per : seq;
@@ -643,7 +678,8 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const AttnParams pp = p;
-        const int msplits = decode_splits(p);
+        const int msplits = decode_splits(p);    // the partials' stride
+        const int kps = keys_per_split();
         // One sub-group per (head, dim-tile) instead of one per head. The old
         // geometry launched num_heads = 24 sub-groups for the whole merge --
         // 1.2% of a 256-EU card -- so the merge cost grew linearly with the
@@ -668,12 +704,16 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
                 const int head = gid / dtiles;
                 const int tile = gid % dtiles;
                 if (head >= pp.num_heads) return;
-                const int splits = msplits;
+                // How many of the msplits slots hold this step's splits: all
+                // of them for direct submission, the live count for a
+                // recorded launch (the decode kernels used the same one).
+                const int seq = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+                const int splits = pp.capture ? splits_for(seq, pp.splits, kps, msplits) : msplits;
                 const int d = tile * SG_SIZE + lane;
                 if (d >= pp.head_dim) return;
 
-                const float* pm = pp.part_m + int64_t(head) * splits;
-                const float* pl = pp.part_l + int64_t(head) * splits;
+                const float* pm = pp.part_m + int64_t(head) * msplits;
+                const float* pl = pp.part_l + int64_t(head) * msplits;
 
                 float m = -std::numeric_limits<float>::infinity();
                 for (int i = 0; i < splits; ++i)
@@ -686,7 +726,7 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
                     if (sycl::isinf(mi)) continue;
                     const float e = sycl::exp(mi - m);
                     l += pl[i] * e;
-                    a += pp.partials[(int64_t(head) * splits + i) * pp.head_dim + d] * e;
+                    a += pp.partials[(int64_t(head) * msplits + i) * pp.head_dim + d] * e;
                 }
 
                 const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;

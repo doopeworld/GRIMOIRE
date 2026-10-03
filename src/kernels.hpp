@@ -264,6 +264,18 @@ struct AttnParams {
     // every context length.
     const int32_t* d_seq_len = nullptr;   // if set, overrides seq_len
 
+    // Set while a decode graph is being RECORDED.  A recorded launch keeps
+    // its shape for every token after it, so the split count must not come
+    // from the length at capture: grimoire-server captures once, on its
+    // first request, and every longer request after that ran its whole
+    // context through the capture-time count.  MEASURED 2026-10-03, Ornith
+    // served after a short first request: 8 splits (64 ESIMD threads on a
+    // 256-EU card) at every depth.  With `capture` the launch is sized for
+    // the whole cache and each kernel derives, from the device-side length,
+    // the count direct submission would launch -- a replayed step computes
+    // exactly what a direct one does, at every length.
+    bool capture = false;
+
     // Sliding-attention window, in keys, counting the current position.
     // <= 0 means the whole history, which is every model here except
     // gemma-4's sliding layers.  Applied by NARROWING the scanned range

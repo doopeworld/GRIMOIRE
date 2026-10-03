@@ -2,6 +2,17 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-03: READ `HANDOFF-2026-10-03-SERVED.md` FIRST.** Served decode now
+equals engine decode.  llama-benchy on Ornith gives 195 / 183 / 172 tok/s at
+depth ~0 / 2K / 4K (127.6 / 101.3 at 2K / 4K on 10-02).  There were two
+causes, both fixed: the decode graph froze the attention split count at
+its first capture (`AttnParams::capture`), and every GRIMOIRE Unraid
+template forced the legacy Level Zero adapter.  **Never set
+`SYCL_UR_USE_LEVEL_ZERO_V2=0`.**  gpu1 (0b:00.0) dropped off the PCIe bus
+under load on 10-03 (RxErr on root port 00:06.2, a hardware link problem).
+Use gpu0 only until that slot is fixed.  The concurrency 1/2/4/8 and
+prefix-cache results for every model are in the same handoff.
+
 **2026-09-25: READ `HANDOFF-2026-09-25-PURE-B70.md` FIRST.** GRIMOIRE runs
 PURE on the B70 -- no plug-ins: the optional src/libgrimoire_xe2_*.so /
 onednn plug-ins (vLLM kernels + libtorch) caused the nondeterministic

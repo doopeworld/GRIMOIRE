@@ -8843,6 +8843,7 @@ const float* Grimoire::forward_muse(int token) {
         ap.softmax_scale = sm_scale;
         ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
         ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
+        ap.capture = recording;     // graph: split count from the live length
         // Muse iRoPE: the SLIDING layers are the rope-using ones and they
         // are the ones with a window (ref/muse_glimmer.py:1191 --
         // `sliding_window = None if not self.use_rope else
@@ -9065,6 +9066,7 @@ const float* Grimoire::forward_gemma4(int token) {
         ap.softmax_scale = cfg.attn_softmax_scale(HD);
         ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
         ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
+        ap.capture = recording;     // graph: split count from the live length
         // Only the SLIDING layers have a window; the full-attention ones
         // see the whole history.  Identical until the context passes the
         // window, then quietly wrong -- which is why a short-prompt smoke
@@ -9853,6 +9855,7 @@ const float* Grimoire::forward(int token) {
                 return e && *e ? std::max(1, std::min(MAX_SPLITS, std::atoi(e))) : GRAPH_SPLITS; }();
             ap.splits    = dec_splits;
             ap.d_seq_len = s.d_seq_len;
+            ap.capture   = recording;   // graph: split count from the live length
             if (i == probe_layer) probe("FA v", s.bbuf, d.kv_heads * d.head_dim);
             // GQA redundancy: this model is 24 query heads over 4 KV heads, so
             // launch_flash_decode's one-subgroup-per-query-head mapping fetches
