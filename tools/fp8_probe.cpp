@@ -64,7 +64,47 @@ int main() {
         for (int i = 0; i < it; ++i) launch_gemv(q, ws[i % copies], x, y);
         q.wait();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
-        std::printf("%-8s N=%-6d K=%-5d  rel err %.2e  %8.1f us  %6.1f GB/s\n", sh.nm, N, K, mx > 0 ? md / mx : md, us, pb / us / 1e3);
+        std::printf("%-8s N=%-6d K=%-5d  rel err %.2e  %8.1f us  %6.1f GB/s  (M=1 GEMV)\n", sh.nm, N, K, mx > 0 ? md / mx : md, us, pb / us / 1e3);
+        // M = 5 rows (an MTP-4 verify): the DPAS small-M kernel vs a double reference on the
+        // bf16-rounded rows, and vs the old SIMT batched GEMV's time.
+        {
+            const int Mr = 5;
+            std::vector<float> hxm(size_t(Mr) * K);
+            for (auto& v : hxm) v = float(int(rng() % 2001) - 1000) / 1000.0f;
+            std::vector<sycl_bf16> hxb(hxm.size());
+            for (size_t i = 0; i < hxm.size(); ++i) hxb[i] = sycl_bf16(hxm[i]);
+            float* xm = sycl::malloc_device<float>(hxm.size(), q);
+            sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(hxb.size(), q);
+            float* ym = sycl::malloc_device<float>(size_t(Mr) * N, q);
+            q.memcpy(xm, hxm.data(), hxm.size() * 4); q.memcpy(xb, hxb.data(), hxb.size() * 2).wait();
+            if (!fp8_smallm_ok(ws[0], Mr, xb, ym)) { std::printf("  fp8_smallm not ok for this shape\n"); }
+            else {
+                launch_fp8_smallm(q, ws[0], xb, ym, Mr); q.wait();
+                std::vector<float> hym(size_t(Mr) * N); q.memcpy(hym.data(), ym, hym.size() * 4).wait();
+                double mx2 = 0, md2 = 0;
+                for (int m = 0; m < Mr; ++m)
+                    for (int n = 0; n < N; n += (N > 50000 ? 13 : 3)) {
+                        double acc = 0; const uint8_t* row = hp.data() + size_t(n) * K;
+                        for (int k = 0; k < K; ++k) acc += e4m3(row[k]) * double(float(hxb[size_t(m) * K + k]));
+                        acc *= hs[n];
+                        mx2 = std::max(mx2, std::fabs(acc)); md2 = std::max(md2, std::fabs(acc - double(hym[size_t(m) * N + n])));
+                    }
+                auto tm = [&](auto&& f) {
+                    for (int i = 0; i < 2 * copies; ++i) f(ws[i % copies]);
+                    q.wait();
+                    const int it2 = std::max(10, 2 * copies);
+                    auto t1 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < it2; ++i) f(ws[i % copies]);
+                    q.wait();
+                    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / it2;
+                };
+                const double us_new = tm([&](const QuantWeight& w) { launch_fp8_smallm(q, w, xb, ym, Mr); });
+                const double us_old = tm([&](const QuantWeight& w) { launch_gemv_batch(q, w, xm, ym, Mr); });
+                std::printf("         M=5 DPAS rel err %.2e  %8.1f us (%6.1f GB/s)   old batched GEMV %8.1f us (%6.1f GB/s)\n",
+                            mx2 > 0 ? md2 / mx2 : md2, us_new, pb / us_new / 1e3, us_old, pb / us_old / 1e3);
+            }
+            sycl::free(xm, q); sycl::free(xb, q); sycl::free(ym, q);
+        }
         for (void* m : mem) sycl::free(m, q); sycl::free(x, q); sycl::free(y, q);
     }
     return 0;

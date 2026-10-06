@@ -1382,6 +1382,32 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
         : int4_smallm_impl<1, 128>(q, w, X, Y, M, KS, kc, TPT, deps);
 }
 
+// FP8 E4M3 at 2..8 rows (speculative verify, batched decode): the DPAS
+// small-M GEMM of int4_smallm.hpp (fp8_smallm_impl) with the M <= 8 INT4
+// split-K plan, from this 128-register build.  Without it FP8 verify went
+// to launch_gemv_batch: the SIMT GEMV, the weights read once per 4 rows --
+// Qwen3.8-27B FP8 + MTP on two B70s ran 4.1 tok/s against 9.4 plain
+// (2026-10-06).  GRIMOIRE_FP8_SMALLM=0 = the old path.
+bool fp8_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_FP8_SMALLM");
+        return !(e && *e == '0'); }();
+    auto a64 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 63) == 0; };
+    return on && w.fmt == Fmt::FP8_E4M3 && w.payload && w.scales && M >= 1 && M <= 8 &&
+           w.K % 512 == 0 && w.N % 16 == 0 && w.row_bytes >= int64_t(w.K) && w.row_bytes % 64 == 0 &&
+           a64(w.payload) && a64(w.scales) && (!X || a64(X)) && (!Y || a64(Y));
+}
+sycl::event launch_fp8_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                              float* Y, int M, const std::vector<sycl::event>& deps) {
+    const int N = w.N, K = w.K, tiles = N / 16;
+    int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
+    return fp8_smallm_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
+}
+
 // ---------------------------------------------------------------------
 //  BATCHED symmetric-int4 GEMV: MB token rows against one weight matrix.
 //

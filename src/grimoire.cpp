@@ -12025,10 +12025,11 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
             const char* e = std::getenv("GRIMOIRE_SANDWICH_SMALLM"); return !(e && *e == '0'); }();
         if (sw_smallm && seqb && !seqb->spans && M <= 16) {
             if (!w.has_i4() && (mxfp4_smallm_ok(w.w, M, xb, y) || bf16_smallm_ok(w.w, M, xb, y) ||
-                                int4_smallm_ok(w.w, M, xb, y))) {
+                                int4_smallm_ok(w.w, M, xb, y) || fp8_smallm_ok(w.w, M, xb, y))) {
                 launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
                 if (w.w.fmt == Fmt::BF16) launch_bf16_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::INT4) launch_int4_smallm(q, w.w, xb, y, M);
+                else if (w.w.fmt == Fmt::FP8_E4M3) launch_fp8_smallm(q, w.w, xb, y, M);
                 else launch_mxfp4_smallm(q, w.w, xb, y, M);
                 return;
             }
@@ -13979,7 +13980,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // 4 / 8 users through them (2026-10-04).
         const bool dpas_i4 = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && int4_smallm_ok(w.w,M,nullptr,y);
-        const bool dpas_ok = dpas_bf || dpas_i4 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+        // FP8 E4M3 (2026-10-06): before this it took launch_gemv_batch below,
+        // the SIMT GEMV at ~50 GB/s -- Qwen3.8-27B FP8 + MTP on two B70s 4.1
+        // tok/s against 9.4 without speculation.
+        const bool dpas_f8 = smallm_dpas && M>=2 && M<=8 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && fp8_smallm_ok(w.w,M,nullptr,y);
+        const bool dpas_ok = dpas_bf || dpas_i4 || dpas_f8 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
@@ -13995,6 +14001,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(!from_bn) launch_f32_to_bf16(q,x,smallm_bf,need);
                 if(dpas_ok){
                     if(dpas_i4) launch_int4_smallm(q,w.w,xin,y,M);
+                    else if(dpas_f8) launch_fp8_smallm(q,w.w,xin,y,M);
                     else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
                     else launch_mxfp4_smallm(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
@@ -14003,7 +14010,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
                         for(int r=0;r<M;++r)
                             launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
-                        smallm_report(dpas_i4?"int4":dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
+                        smallm_report(dpas_i4?"int4":dpas_f8?"fp8":dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
                         sycl::free(ref,q);
                     }
                     return;
@@ -15736,7 +15743,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     batch_logits, lm_head.w.N, lm_head.w.K, M, {});
             }
         } else if ((lm_head.w.fmt == Fmt::MXFP4 ||
-                    (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)))
+                    (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+                    (lm_head.w.fmt == Fmt::FP8_E4M3 && fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)))
                    && lm_head.w.payload) {
             // Verification is a matrix multiplication, not M independent
             // decode GEMVs.  Load the large vocabulary matrix once per batch.
@@ -15745,7 +15753,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             mm(lm_head, bn, batch_logits);
         }
         const bool lm_batched = lm_head.w.fmt == Fmt::MXFP4 ||
-            (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr));
+            (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+            (lm_head.w.fmt == Fmt::FP8_E4M3 && fp8_smallm_ok(lm_head.w, M, nullptr, nullptr));
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
             if (!tp_enabled() && !lm_head.has_i4() && !lm_batched)
