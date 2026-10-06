@@ -62,13 +62,27 @@ case "${1:-server}" in
             sock="$GRIMOIRE_PP_SOCKET"
         fi
         rm -f "${sock}"* 2>/dev/null || true
+        # One card per process: rank r sees ONLY the r-th device of
+        # GRIMOIRE_MULTI_DEVICES (default: the container's ZE_AFFINITY_MASK,
+        # e.g. 0,1).  The B70 inference cookbook found that two-card workers
+        # which can each see both cards are not equivalent to one mask per
+        # worker (host memory ~11 GB vs < 1 GB per process, and a dual-B70
+        # host that crashed without the per-worker masks).  GRIMOIRE_DEVICES
+        # then maps every rank to index 0, the one card its process sees.
+        IFS=',' read -r -a devs <<< "${GRIMOIRE_MULTI_DEVICES:-${ZE_AFFINITY_MASK:-}}"
+        if [ "${#devs[@]}" -lt "$n" ]; then
+            echo "multi: $n ranks need $n devices in GRIMOIRE_MULTI_DEVICES or ZE_AFFINITY_MASK" \
+                 "(got '${GRIMOIRE_MULTI_DEVICES:-${ZE_AFFINITY_MASK:-}}')" >&2
+            exit 2
+        fi
+        zeros=$(printf '0,%.0s' $(seq 1 "$n")); zeros=${zeros%,}
         pids=()
         # Later ranks listen and earlier ones connect, so start from the back.
         # Process substitution keeps $! the server's PID (not the log
         # prefixer's) -- see tools/serve_pp2_worker.sh.
         for ((r = n - 1; r >= 0; --r)); do
-            env "GRIMOIRE_${mode}_RANK=$r" /grimoire/bin/grimoire-server "$@" \
-                > >(sed -u "s/^/[rank$r] /") 2>&1 &
+            env "GRIMOIRE_${mode}_RANK=$r" "ZE_AFFINITY_MASK=${devs[r]}" "GRIMOIRE_DEVICES=$zeros" \
+                /grimoire/bin/grimoire-server "$@" > >(sed -u "s/^/[rank$r] /") 2>&1 &
             pids[r]=$!
         done
         # docker stop reaches this script (tini forwards to it), not the
