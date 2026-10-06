@@ -1073,6 +1073,76 @@ sycl::event esgemv2_int4(sycl::queue& q, const QuantWeight& w, const float* x, f
         });
     });
 }
+// ESIMD decode GEMV for FP8 E4M3 (M = 1) with GRIMOIRE's per-output-channel
+// fp32 scale: esgemv2_int4's geometry -- R rows per work-group, KP weights
+// (= KP bytes) of each row per thread, every load issued before any
+// arithmetic.  E4M3 -> fp16 is exact by moving the bits, (b & 0x7F) << 7 |
+// (b & 0x80) << 8, subnormals included; the exponent biases differ by 8, so
+// the 256x is folded into the row scale.  The SIMT kernel streamed
+// Qwen3.8-27B-FP8 at ~250 GB/s: 9.4 tok/s on two B70s (2026-10-06).  Not
+// bit-identical to it (summation order).  GRIMOIRE_ESGEMV_FP8=0 = SIMT.
+template <int R, int KP>
+sycl::event esgemv2_fp8(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                        const std::vector<sycl::event>& deps) {
+    constexpr int RP = R < 4 ? 4 : R;
+    const int KS = w.K / KP;
+    const uint8_t* pay = w.payload;
+    const float* scl = static_cast<const float*>(w.scales);
+    const int64_t rb = w.row_bytes;
+    const int n_wg = w.N / R;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<kEs4MaxKS * RP * 4>();
+            const int t = int(it.get_local_id(0));
+            const int64_t row0 = int64_t(it.get_group(0)) * R;
+            const int kb = t * KP;
+            es::simd<uint8_t, KP> pb[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                pb[r] = es::block_load<uint8_t, KP>(pay + (row0 + r) * rb + kb);
+            es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+            es::simd<float, RP> red = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                es::simd<float, 16> acc = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < KP / 64; ++c) {
+                    es::simd<uint16_t, 64> u = pb[r].template select<64, 1>(c * 64);
+                    es::simd<uint16_t, 64> hb = ((u & 0x7F) << 7) | ((u & 0x80) << 8);
+                    es::simd<float, 64> wf = hb.template bit_cast_view<sycl::half>().read();
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b)
+                        acc += wf.template select<16, 1>(16 * b) * xs.template select<16, 1>(c * 64 + 16 * b);
+                }
+                red[r] = es::reduce<float>(acc, std::plus<>());
+            }
+            if (KS > 1) {
+                es::slm_block_store<float, RP>(t * RP * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[row0 + r] = red[r] * (scl[row0 + r] * 256.0f);
+        });
+    });
+}
+
+bool esgemv_fp8_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                    const std::vector<sycl::event>& deps, sycl::event& out) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV_FP8");
+        return !(e && *e == '0'); }();
+    if (!on || w.fmt != Fmt::FP8_E4M3 || !w.payload || !w.scales || w.N % 2 != 0 ||
+        w.row_bytes < int64_t(w.K) || w.row_bytes % 64 != 0)
+        return false;
+    const int K = w.K;
+    if (K % 256 == 0 && K / 256 <= kEs4MaxKS) { out = esgemv2_fp8<2, 256>(q, w, x, y, deps); return true; }
+    if (K % 512 == 0 && K / 512 <= kEs4MaxKS) { out = esgemv2_fp8<2, 512>(q, w, x, y, deps); return true; }
+    return false;
+}
+
 bool esgemv_i4_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
                    const std::vector<sycl::event>& deps, sycl::event& out) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV_I4");
@@ -1125,6 +1195,10 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
     if constexpr (F == Fmt::INT4 && MB == 1) {
         sycl::event ev;
         if (esgemv_i4_try(q, w, x, y, deps, ev)) return ev;
+    }
+    if constexpr (F == Fmt::FP8_E4M3 && MB == 1) {
+        sycl::event ev;
+        if (esgemv_fp8_try(q, w, x, y, deps, ev)) return ev;
     }
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;
