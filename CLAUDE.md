@@ -2,6 +2,21 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-06 evening: PAUSED until 10-07 (Ian).**  Nothing runs on the Tower.
+- Image v1.8.3 (`grimoire-b70:v1.8.3`, 5e01d55a9c00, code 2840755: ESIMD FP8
+  decode GEMV, FP8 small-M DPAS, one card per rank in `multi`) passed validation
+  on gpu0 (`tools/bench/validate_image_v183.sh`).  NOT released yet.
+- Ornith pp512 prompt is 6-7% slower than the v1.8 image in the same session
+  (7,240 -> 6,702 at 1 user, 9,726 -> 9,184 at 8); decode identical; not the
+  interleaving.  Bisect v1.8.1 / v1.8.2 first (`tools/bench/ab_ornith_pp.sh`),
+  then release v1.8.3.
+- gpu1 (0b:00.0): NEVER run anything on it unless Ian says "run it on gpu1 now".
+  The two-card Qwen3.8-27B FP8 (+ MTP) run is his to start.  Stop every GPU
+  container as soon as its test ends.
+- Next engine work: Megatron-style tensor parallel (half the heads / FFN width
+  per rank, o_proj / DeltaNet out / down sliced along K, one all-reduce per
+  block); develop with two ranks on gpu0 (`GRIMOIRE_MULTI_DEVICES=0,0`).
+
 **2026-10-06: release v1.8 -- Qwen3.8-27B GPTQ-Int4 + MTP is the focus** (Reddit
 compares GRIMOIRE with the vLLM "B70 inference cookbook").  llama-benchy, 1 user:
 MTP 63-70 tok/s (v1.7.1: 49-51), prompt 2,078 tok/s at 4K (1,731); 8 users 187.
