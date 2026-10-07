@@ -3715,7 +3715,10 @@ bool Grimoire::pp_recv_hidden(float* dev, size_t elems) {
         const auto t1 = std::chrono::steady_clock::now();
         // start reading the next chunk's rows into the other buffer now
         const int nxt = pipe_recv_i ^ 1;
-        const size_t next = size_t(pp_next_rows) * size_t(cfg.hidden);
+        // Qwen4-Exp stages exchange the whole multi-stream residual per row.
+        const size_t row_w = cfg.is_qwen4_exp && cfg.hc_count > 0
+                           ? size_t(cfg.hc_count) * size_t(cfg.hidden) : size_t(cfg.hidden);
+        const size_t next = size_t(pp_next_rows) * row_w;
         pp_next_rows = 0;
         if (next > 0 && ensure(nxt, next)) {
             const int fd = pp_prev_fd;
@@ -4335,12 +4338,14 @@ std::string Grimoire::unsupported_reason() const {
         // references in b70/qwen4_exp.hpp).  What is refused here is what
         // is NOT built, named individually -- each of these is a wrong
         // number or a hang rather than an error if it runs anyway.
-        if (tp_ranked() || pp_enabled())
-            return "qwen4_exp under TP or PP.  The multi-stream residual is "
-                   "hc_count * hidden wide and a stage boundary transports ONE "
-                   "tensor, so a pending hyper-connection combine has to be "
-                   "materialised before it is sent and the stages have to agree "
-                   "on hc_count; neither is wired.  Single process works.";
+        // PP is wired: a stage lands its pending hyper-connection combine
+        // and sends the whole hc_count * hidden residual (forward_qwen4_exp);
+        // every stage loads the same config, so hc_count agrees.  The
+        // prompt goes token by token under PP (prefill_qwen4_exp declines).
+        if (tp_ranked())
+            return "qwen4_exp under TP.  The multi-stream residual and the "
+                   "PLE / hyper-connection blocks are not split by heads; use "
+                   "pipeline parallel (multi PP) for several GPUs.";
         if (cfg.hc_count <= 0 || cfg.hc_lowrank <= 0)
             return "qwen4_exp with no hc_count / hc_lowrank: the residual "
                    "stream's width and the mix's rank are not optional, and "
@@ -9981,19 +9986,32 @@ const float* Grimoire::forward_qwen4_exp(int token) {
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
     const std::vector<sycl::event> none{};
 
-    launch_embed(q, embed, token, s.h, H, none);
+    // Pipeline: the first stage embeds; a later one receives the whole
+    // multi-stream residual (hc_count * hidden) the stage before sent, with
+    // any deferred combine already applied.
+    const bool pp_later = pp_enabled() && pp_rank > 0;
+    const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
+    if (!pp_later) launch_embed(q, embed, token, s.h, H, none);
     // The n-gram hash walks backwards through the request's own tokens,
-    // so the engine has to keep them.  One int per position.
+    // so the engine has to keep them.  One int per position.  Every stage
+    // keeps them: its PLE layers hash them too.
     {
         int32_t* tok = q4_tok; const int at = pos; const int32_t tv = token;
         q.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) { tok[at] = tv; });
         if (q4_tok_h.size() < size_t(max_seq)) q4_tok_h.resize(size_t(max_seq), 0);
         q4_tok_h[size_t(pos)] = token;
     }
+    if (pp_later) {
+        if (!pp_recv_hidden(q4_hyper, size_t(WIDE))) {
+            std::fprintf(stderr, "PP rank %d: multi-stream residual receive failed\n", pp_rank);
+            return nullptr;
+        }
+    } else {
     // hidden_states = embed(id).repeat(1, hc_count) -- the SAME row in
     // every stream.  A projection here would be a different model.
     for (int c = 0; c < HC; ++c)
         q.memcpy(q4_hyper + size_t(c) * H, s.h, size_t(H) * sizeof(float));
+    }
 
     bool pending = false;          // is a deferred combine outstanding?
     static const bool q4t = std::getenv("GRIMOIRE_Q4_TIMING") != nullptr;
@@ -10038,7 +10056,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             gemv_any(hc.inject, q4_normed, inj_out, none);
     };
 
-    for (int i = 0; i < cfg.n_layers; ++i) {
+    for (int i = pp_enabled() ? pp_begin : 0; i < (pp_enabled() ? pp_end : cfg.n_layers); ++i) {
         LayerDev& d = L[i];
 
         // ---- PLE ------------------------------------------------------
@@ -10342,6 +10360,25 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         }
         pending = true;    // (q4_pend, q4_pinj) travel to the next layer
         q4lap(4);
+    }
+
+    // Pipeline: a stage that does not own the head lands the deferred
+    // combine (as the PLE block does) and sends the full multi-stream
+    // residual; the next stage starts with nothing pending.
+    if (!pp_last) {
+        if (pending)
+            launch_hc_combine(q, q4_hyper, q4_pinj, q4_pend, q4_hyper, 1, HC, H, none);
+        if (!pp_send_hidden(q4_hyper, size_t(WIDE))) {
+            std::fprintf(stderr, "PP rank %d: multi-stream residual send failed\n", pp_rank);
+            return nullptr;
+        }
+        if (fusion_mask & 8) launch_incr_pos2(q, s.d_pos, s.d_seq_len, none);
+        else {
+            launch_incr_pos(q, s.d_pos, none);
+            launch_incr_pos(q, s.d_seq_len, none);
+        }
+        ++pos;
+        return s.logits;
     }
 
     // ---- the tail mixer ----------------------------------------------
@@ -12948,8 +12985,14 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         // model that cannot fit fails here -- not by an OOM kill with GPU
         // work in flight, which is what drops a card off the bus.
         tm_lay = lay; tm_any = true;
+        // MoE layers THIS rank loads: under PP a stage owns [pp_begin,
+        // pp_end), and budgeting VRAM and pinned RAM over every layer of
+        // the checkpoint would give each stage half the experts it has room
+        // for and ask for twice the RAM it needs.
         int moe_layers = 0;
-        for (const auto& l : ck.layers) if (!l.e_gate_p.empty()) ++moe_layers;
+        for (int l = 0; l < int(ck.layers.size()); ++l)
+            if ((!pp_enabled() || (l >= pp_begin && l < pp_end)) &&
+                !ck.layers[size_t(l)].e_gate_p.empty()) ++moe_layers;
         const size_t all = size_t(E) * lay.bytes * size_t(moe_layers);
         const size_t dev = lq.get_device().get_info<sycl::info::device::global_mem_size>();
         int nv = E;
@@ -13215,7 +13258,12 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     const int M = int(tokens.size());
     if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
     if (next_tokens && !seqb) return false;              // no speculative verify path
-    if (pp_enabled() || tp_enabled()) return false;
+    // Pipeline: prompts are batched across stages (the multi-stream residual
+    // crosses each boundary, every pending combine landed first); batched
+    // DECODE steps are not, so a pipeline runs one sequence at a time.
+    if (tp_ranked() || (pp_enabled() && seqb)) return false;
+    const bool pp_later = pp_enabled() && pp_rank > 0;
+    const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
     const int start_pos = pos;
 
     const int H = cfg.hidden, QH = cfg.n_heads;
@@ -13359,12 +13407,19 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         if (q4_tok_h.size() < size_t(max_seq)) q4_tok_h.resize(size_t(max_seq), 0);
         std::copy(tokens.begin(), tokens.end(), q4_tok_h.begin() + start_pos);
     }
+    if (pp_later) {
+        if (!pp_recv_hidden(hyper, size_t(M) * WIDE)) {
+            std::fprintf(stderr, "PP rank %d: batched multi-stream receive failed\n", pp_rank);
+            q.wait(); cleanup(); return false;
+        }
+    } else {
     launch_embed_batched(q, embed, dtok, t0, M, H, none);
     // hidden = embed(ids).repeat(1, hc_count): the SAME row in every
     // stream, not a projection.
     for (int c = 0; c < HC; ++c)
         launch_copy_rows_strided(q, t0, hyper + int64_t(c) * H, M, H, WIDE,
                                  H, none);
+    }
 
     bool pending = false;
     auto hc_mix = [&](const LayerDev::HCDev& hc, const float* pblk,
@@ -13401,7 +13456,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         q4clk = t;
     };
     if (q4t) { q.wait(); q4clk = std::chrono::steady_clock::now(); }
-    for (int i = 0; i < cfg.n_layers && ok; ++i) {
+    for (int i = pp_enabled() ? pp_begin : 0; i < (pp_enabled() ? pp_end : cfg.n_layers) && ok; ++i) {
         LayerDev& d = L[i];
 
         if (d.ple) {
@@ -13684,6 +13739,21 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                      qsams[3], qsams[4], qsams[5]);
 
     if (!ok) { q.wait(); cleanup(); return false; }
+
+    // Pipeline: a stage without the head lands the deferred combine on every
+    // row and sends the whole multi-stream residual on.
+    if (!pp_last) {
+        if (pending) launch_hc_combine(q, hyper, pinj, pend, hyper, M, HC, H, none);
+        if (!pp_send_hidden(hyper, size_t(M) * WIDE)) {
+            std::fprintf(stderr, "PP rank %d: batched multi-stream send failed\n", pp_rank);
+            q.wait(); cleanup(); return false;
+        }
+        q.wait_and_throw();
+        pos += M;
+        set_cursor(pos);
+        cleanup();
+        return true;
+    }
 
     if(seqb) {
         hc_mix(hc_final,pending?pend:nullptr,pending?pinj:nullptr,nullptr,blk_in);
