@@ -2029,7 +2029,54 @@ struct Grimoire {
     std::vector<int> tp_peer_fd;
     std::string pp_socket;
     bool pp_enabled() const { return pp_rank >= 0; }
-    bool tp_enabled() const { return tp_rank >= 0; }
+    // Two tensor-parallel algorithms share the rank plumbing (sockets, the
+    // control stream, the worker loop, the collectives -- tp_ranked()).
+    //
+    // tp_enabled(): the LEGACY algorithm.  Every projection is sharded by
+    // output rows and all-gathered right after it, so every rank holds the
+    // full activations and recomputes attention, DeltaNet and the KV cache
+    // for every head.  ~4 host round trips per layer, no batched prefill,
+    // no speculation, no decode graph.
+    //
+    // tp_mega (Megatron-style, the default where the model allows it): each
+    // rank IS the model with 1/world of the attention heads, KV heads,
+    // DeltaNet heads and FFN width -- cfg is narrowed at load, the column-
+    // parallel projections (q/k/v, DeltaNet in-projections, gate_up) keep
+    // this rank's rows, and the row-parallel ones (o_proj, DeltaNet
+    // out_proj, down_proj) keep this rank's columns.  Every kernel then runs
+    // unchanged on a narrower model, and the only cross-rank traffic is ONE
+    // all-reduce of each block's output before the residual add (2 per
+    // layer).  Embedding, norms and lm_head are replicated, so every rank
+    // sees the identical hidden state and computes identical logits; rank
+    // 0's tokens are still broadcast so the ranks can never drift.
+    // tp_enabled() is false in this mode: every "not under TP" fast path
+    // (batched prefill, DPAS small-M verify, MTP) applies as on one card.
+    bool tp_mega = false;
+    bool tp_enabled() const { return tp_rank >= 0 && !tp_mega; }
+    bool tp_ranked() const { return tp_rank >= 0; }
+    // This rank's slice of each split dimension: [*0, *0 + *n) of the full
+    // count (q heads, KV heads, DeltaNet k / v heads, FFN width).
+    struct TpSplit {
+        int qh = 0, qh0 = 0, qhn = 0;
+        int kvh = 0, kv0 = 0, kvn = 0;
+        int hk = 0, hk0 = 0, hkn = 0;
+        int hv = 0, hv0 = 0, hvn = 0;
+        int fi = 0, f0 = 0, fn = 0;
+    } tps;
+    std::string tp_mega_refusal() const;
+    bool tp_take_rows(DevQuant& d, const std::vector<std::pair<int,int>>& blocks,
+                      sycl::queue& owner, std::string& err);
+    bool tp_take_cols(DevQuant& d, int k0, int kn, sycl::queue& owner, std::string& err);
+    bool tp_take_vec_rows(bf16_t*& v, int row_elems,
+                          const std::vector<std::pair<int,int>>& blocks,
+                          sycl::queue& owner, std::string& err);
+    // Megatron TP: sum this block's partial output over the ranks, in place.
+    // A no-op on one GPU and under the legacy algorithm.
+    bool tp_block_reduce(float* dev, size_t elems) {
+        return !tp_mega || tp_allreduce_sum(dev, int(elems));
+    }
+    int  tp_sync_token(int token);
+    bool tp_sync_tokens(std::vector<int32_t>& toks);
     int comm_rank() const { return pp_enabled()?pp_rank:tp_rank; }
     static bool fd_write_all(int fd,const void* data,size_t bytes) {
         const uint8_t* p=static_cast<const uint8_t*>(data);
@@ -2065,7 +2112,7 @@ struct Grimoire {
     // Rank 0 driving the TP workers, or a TP worker obeying it.  Both ends
     // of every tp_agree() must test the same thing, or one side blocks.
     bool tp_coordinated() const {
-        return tp_enabled() && (tp_rank == 0 ? serving_control : following_control);
+        return tp_ranked() && (tp_rank == 0 ? serving_control : following_control);
     }
     bool pp_send_request(const PPRequest& r);
     bool pp_recv_request(PPRequest& r);
@@ -2719,7 +2766,7 @@ struct Grimoire {
     float* batch_conv_steps=nullptr;
     void init_draft_slots();
     bool speculative_batch() const {
-        return !pp_enabled() && !tp_enabled() && (mtp.ok || dflash2.ok);
+        return !pp_enabled() && !tp_ranked() && (mtp.ok || dflash2.ok);
     }
     bool decode_spec_batch(const std::vector<int32_t>& tokens,
         const std::vector<int>& slots, const std::vector<int>& positions,
@@ -3351,10 +3398,10 @@ struct Grimoire {
 
 // ---------------------------------------------------------------------
 bool Grimoire::pp_connect(std::string& err) {
-    const char* env = tp_enabled() ? std::getenv("GRIMOIRE_TP_SOCKET")
+    const char* env = tp_ranked() ? std::getenv("GRIMOIRE_TP_SOCKET")
                                    : std::getenv("GRIMOIRE_PP_SOCKET");
     pp_socket = env && *env ? env :
-        (tp_enabled() ? "/tmp/grimoire-tp.sock" : "/tmp/grimoire-pp.sock");
+        (tp_ranked() ? "/tmp/grimoire-tp.sock" : "/tmp/grimoire-pp.sock");
     auto make_addr = [&](const std::string& path, sockaddr_un& addr) {
         if (path.size() >= sizeof(addr.sun_path)) return false;
         addr = {}; addr.sun_family = AF_UNIX;
@@ -3459,8 +3506,8 @@ bool Grimoire::pp_connect(std::string& err) {
             return false;
         }
     }
-    std::printf("  %s rank %d/%d: connected%s\n",tp_enabled()?"TP":"PP",
-                comm_rank(),(tp_enabled()?tp_world:pp_world),
+    std::printf("  %s rank %d/%d: connected%s\n",tp_ranked()?"TP":"PP",
+                comm_rank(),(tp_ranked()?tp_world:pp_world),
                 pp_enabled() ? (pp_spec ? ", speculation ON" : ", speculation off") : "");
     std::fflush(stdout);return true;
 }
@@ -3509,7 +3556,7 @@ bool Grimoire::pp_recv_taps(int first, int rows) {
 // is that both sides agree, byte for byte, on every message.
 bool Grimoire::pp_send_request(const PPRequest& r) {
     std::vector<int> peers;
-    if(tp_enabled()) {
+    if(tp_ranked()) {
         if(tp_rank!=0) return true;
         for(int i=1;i<tp_world;++i) peers.push_back(tp_peer_fd[size_t(i)]);
     } else if(pp_next_fd>=0) { pp_send_wait(); peers.push_back(pp_next_fd); }
@@ -3528,7 +3575,7 @@ bool Grimoire::pp_send_request(const PPRequest& r) {
 }
 
 bool Grimoire::pp_recv_request(PPRequest& r) {
-    const int upstream=tp_enabled()?(tp_rank>0?tp_peer_fd[0]:-1):pp_prev_fd;
+    const int upstream=tp_ranked()?(tp_rank>0?tp_peer_fd[0]:-1):pp_prev_fd;
     if (upstream < 0) return false;             // rank 0 has no upstream
     int32_t head[5] = {0,0,0,0,0};
     if (!fd_read_all(upstream, head, sizeof head)) return false;
@@ -3870,7 +3917,7 @@ bool Grimoire::tp_allgather_multi(const std::vector<std::pair<float*,int>>& spec
 }
 
 bool Grimoire::tp_allreduce_sum(float* dev,int elems){
-    if(!tp_enabled()||tp_peer_fd.empty())return false;
+    if(!tp_ranked()||tp_peer_fd.empty())return false;
     const size_t n=size_t(elems);
     if(n>pipe_host_elems){if(pipe_host)sycl::free(pipe_host,q);pipe_host=sycl::malloc_host<float>(n,q);pipe_host_elems=pipe_host?n:0;}
     if(!pipe_host)return false;
@@ -3885,7 +3932,7 @@ bool Grimoire::tp_allreduce_sum(float* dev,int elems){
 }
 
 bool Grimoire::tp_agree(int& value) {
-    if (!tp_enabled() || tp_peer_fd.empty()) return true;
+    if (!tp_ranked() || tp_peer_fd.empty()) return true;
     int32_t mine = int32_t(value), common = mine;
     if (tp_rank == 0) {
         bool same = true;
@@ -3941,6 +3988,198 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 }
 
 // ---------------------------------------------------------------------
+// Megatron TP (tp_mega): which models it covers, and the load-time slicing.
+//
+// Empty string = supported.  Everything here is a reason the narrow-model
+// trick would compute something different from the full model, not a
+// performance preference -- the legacy algorithm stays for those.
+std::string Grimoire::tp_mega_refusal() const {
+    const int W=tp_world;
+    if(cfg.is_moe())return "MoE layers (experts are split by the legacy algorithm)";
+    if(cfg.is_muse||cfg.is_gemma4||cfg.is_qwen4_exp||cfg.is_k2)return "architecture not covered yet";
+    if(cfg.parallel_ffn_inter>0)return "parallel FFN";
+    if(cfg.n_global_kv_heads>0||cfg.global_head_dim>0)return "per-layer head geometry";
+    if(cfg.n_heads<=0||cfg.n_heads%W||cfg.n_kv_heads<=0||cfg.n_kv_heads%W)
+        return "attention / KV heads do not divide by the world size";
+    if(cfg.lin_v_heads%W||cfg.lin_k_heads%W)return "DeltaNet heads do not divide by the world size";
+    if(cfg.lin_k_heads>0&&cfg.lin_v_heads%cfg.lin_k_heads)return "DeltaNet v / k head ratio";
+    // the K slices of o_proj, DeltaNet out_proj and down_proj must cut on
+    // whole quantization groups (INT4 g128 is the coarsest)
+    if((cfg.n_heads/W*cfg.head_dim)%128)return "o_proj K slice is not a multiple of 128";
+    if(cfg.lin_v_heads>0&&(cfg.lin_v_heads/W*cfg.lin_v_dim)%128)return "DeltaNet out_proj K slice is not a multiple of 128";
+    if(cfg.dense_inter<=0||(cfg.dense_inter/W)%128||cfg.dense_inter%W)return "FFN width slice is not a multiple of 128";
+    const char* df=std::getenv("GRIMOIRE_DFLASH_MODEL");
+    const char* df2=std::getenv("GRIMOIRE_DFLASH2_MODEL");
+    if((df&&*df)||(df2&&*df2))return "DFlash drafter";
+    return "";
+}
+
+// Copy `rows` rows of `nb` bytes each from src (row stride sb, starting at
+// byte `off` of each row) into a packed dst.  One work-item per 4 bytes when
+// everything is word-aligned, per byte otherwise; load time only.
+static void tp_copy_rows(sycl::queue& q, uint8_t* dst, const uint8_t* src, int64_t rows,
+                         int64_t nb, int64_t sb, int64_t off) {
+    if(rows<=0||nb<=0)return;
+    if(nb%4==0&&sb%4==0&&off%4==0&&(reinterpret_cast<uintptr_t>(dst)|reinterpret_cast<uintptr_t>(src))%4==0){
+        const int64_t nw=nb/4,sw=sb/4,ow=off/4;
+        uint32_t* d4=reinterpret_cast<uint32_t*>(dst);
+        const uint32_t* s4=reinterpret_cast<const uint32_t*>(src);
+        q.parallel_for(sycl::range<2>(size_t(rows),size_t(nw)),[=](sycl::id<2> ix){
+            const int64_t r=int64_t(ix[0]),j=int64_t(ix[1]);
+            d4[r*nw+j]=s4[r*sw+ow+j];
+        });
+    }else{
+        q.parallel_for(sycl::range<2>(size_t(rows),size_t(nb)),[=](sycl::id<2> ix){
+            const int64_t r=int64_t(ix[0]),j=int64_t(ix[1]);
+            dst[r*nb+j]=src[r*sb+off+j];
+        });
+    }
+}
+
+static bool tp_mega_fmt_ok(Fmt f) {
+    return f==Fmt::BF16||f==Fmt::FP8_E4M3||f==Fmt::FP8_E5M2||f==Fmt::INT8||
+           f==Fmt::INT4||f==Fmt::MXFP8||f==Fmt::MXFP4;
+}
+
+// Keep the listed output-row blocks (begin, count) of a column-parallel
+// weight, packed in order.  The result is an ordinary local weight
+// (full_N stays 0): every GEMV / GEMM path treats it as a narrower matrix.
+bool Grimoire::tp_take_rows(DevQuant& d,const std::vector<std::pair<int,int>>& blocks,
+                            sycl::queue& owner,std::string& err){
+    if(d.w.N<=0)return true;
+    if(d.has_i4()||d.fp16||d.tp_sharded()||!tp_mega_fmt_ok(d.w.fmt)){
+        err="TP Megatron: cannot row-slice this weight (companion copy, legacy shard or format)";return false;
+    }
+    int n=0;
+    for(const auto& b:blocks){
+        if(b.first<0||b.second<=0||b.first+b.second>d.w.N){
+            err="TP Megatron: row slice ["+std::to_string(b.first)+","+std::to_string(b.first+b.second)+
+                ") is outside a "+std::to_string(d.w.N)+"-row weight";return false;
+        }
+        n+=b.second;
+    }
+    const size_t rb=size_t(d.w.row_bytes);
+    const size_t srow=d.scales?size_t(d.w.row_scales)*scale_value_bytes(d.w.fmt):0;
+    const size_t zrow=d.zeros?size_t(d.w.row_scales):0;
+    uint8_t* np=d.payload?sycl::malloc_device<uint8_t>(size_t(n)*rb,owner):nullptr;
+    uint8_t* ns=srow?sycl::malloc_device<uint8_t>(size_t(n)*srow,owner):nullptr;
+    uint8_t* nz=zrow?sycl::malloc_device<uint8_t>(size_t(n)*zrow,owner):nullptr;
+    if((d.payload&&!np)||(srow&&!ns)||(zrow&&!nz)){
+        if(np)sycl::free(np,owner);if(ns)sycl::free(ns,owner);if(nz)sycl::free(nz,owner);
+        err="TP Megatron row-slice allocation failed";return false;
+    }
+    size_t at=0;
+    for(const auto& b:blocks){
+        if(np)owner.memcpy(np+at*rb,d.payload+size_t(b.first)*rb,size_t(b.second)*rb);
+        if(ns)owner.memcpy(ns+at*srow,static_cast<uint8_t*>(d.scales)+size_t(b.first)*srow,size_t(b.second)*srow);
+        if(nz)owner.memcpy(nz+at*zrow,d.zeros+size_t(b.first)*zrow,size_t(b.second)*zrow);
+        at+=size_t(b.second);
+    }
+    owner.wait();
+    if(d.payload)sycl::free(d.payload,owner);if(d.scales)sycl::free(d.scales,owner);if(d.zeros)sycl::free(d.zeros,owner);
+    if(d.od_scales){sycl::free(d.od_scales,owner);d.od_scales=nullptr;}
+    if(d.od_scales_fp16){sycl::free(d.od_scales_fp16,owner);d.od_scales_fp16=nullptr;}
+    d.payload=np;d.scales=ns;d.zeros=nz;
+    d.w.payload=np;d.w.scales=ns;d.w.zeros=nz;d.w.N=n;
+    return true;
+}
+
+// Keep input columns [k0, k0+kn) of a row-parallel weight.  Each rank then
+// produces a PARTIAL sum of the full output, which tp_block_reduce adds up.
+bool Grimoire::tp_take_cols(DevQuant& d,int k0,int kn,sycl::queue& owner,std::string& err){
+    if(d.w.N<=0)return true;
+    const Fmt f=d.w.fmt;
+    const int K=d.w.K,N=d.w.N;
+    if(d.has_i4()||d.fp16||d.tp_sharded()||!tp_mega_fmt_ok(f)){
+        err="TP Megatron: cannot column-slice this weight (companion copy, legacy shard or format)";return false;
+    }
+    if(k0<0||kn<=0||k0+kn>K||int64_t(d.w.row_bytes)!=int64_t(bytes_per_row(f,K))||
+       ((f==Fmt::INT4||f==Fmt::MXFP4)&&((k0|kn)&1))){
+        err="TP Megatron: column slice ["+std::to_string(k0)+","+std::to_string(k0+kn)+") does not fit a "+
+            std::to_string(K)+"-wide weight";return false;
+    }
+    const bool per_row=f==Fmt::FP8_E4M3||f==Fmt::FP8_E5M2||f==Fmt::INT8;
+    const int rs=d.w.row_scales;
+    int s0=0,sn=rs;
+    if(!per_row&&rs>0){
+        const int G=K/rs;
+        if(K%rs||k0%G||kn%G){err="TP Megatron: column slice does not cut on whole scale groups";return false;}
+        s0=k0/G;sn=kn/G;
+    }
+    const size_t se=scale_value_bytes(f);
+    const int64_t pb=bytes_per_row(f,kn),po=bytes_per_row(f,k0);
+    uint8_t* np=d.payload?sycl::malloc_device<uint8_t>(size_t(N)*size_t(pb),owner):nullptr;
+    uint8_t* ns=(d.scales&&!per_row&&rs>0)?sycl::malloc_device<uint8_t>(size_t(N)*size_t(sn)*se,owner):nullptr;
+    uint8_t* nz=(d.zeros&&rs>0)?sycl::malloc_device<uint8_t>(size_t(N)*size_t(sn),owner):nullptr;
+    if((d.payload&&!np)||(d.scales&&!per_row&&rs>0&&!ns)||(d.zeros&&rs>0&&!nz)){
+        if(np)sycl::free(np,owner);if(ns)sycl::free(ns,owner);if(nz)sycl::free(nz,owner);
+        err="TP Megatron column-slice allocation failed";return false;
+    }
+    if(np)tp_copy_rows(owner,np,d.payload,N,pb,d.w.row_bytes,po);
+    if(ns)tp_copy_rows(owner,ns,static_cast<const uint8_t*>(d.scales),N,int64_t(sn)*int64_t(se),
+                       int64_t(rs)*int64_t(se),int64_t(s0)*int64_t(se));
+    if(nz)tp_copy_rows(owner,nz,d.zeros,N,sn,rs,s0);
+    owner.wait();
+    if(d.payload)sycl::free(d.payload,owner);
+    if(ns&&d.scales)sycl::free(d.scales,owner);     // per-row scales are kept as they are
+    if(nz&&d.zeros)sycl::free(d.zeros,owner);
+    if(d.od_scales){sycl::free(d.od_scales,owner);d.od_scales=nullptr;}
+    if(d.od_scales_fp16){sycl::free(d.od_scales_fp16,owner);d.od_scales_fp16=nullptr;}
+    d.payload=np;d.w.payload=np;
+    if(ns){d.scales=ns;d.w.scales=ns;}
+    if(nz){d.zeros=nz;d.w.zeros=nz;}
+    d.w.K=kn;d.w.row_bytes=pb;
+    if(!per_row)d.w.row_scales=sn;
+    return true;
+}
+
+// Row blocks of a small bf16 tensor laid out [rows][row_elems] (the conv1d
+// weight, A_log, dt_bias).
+bool Grimoire::tp_take_vec_rows(bf16_t*& v,int row_elems,const std::vector<std::pair<int,int>>& blocks,
+                                sycl::queue& owner,std::string& err){
+    if(!v)return true;
+    size_t n=0;for(const auto& b:blocks)n+=size_t(b.second);
+    bf16_t* nv=sycl::malloc_device<bf16_t>(n*size_t(row_elems),owner);
+    if(!nv){err="TP Megatron vector-slice allocation failed";return false;}
+    size_t at=0;
+    for(const auto& b:blocks){
+        owner.memcpy(nv+at*size_t(row_elems),v+size_t(b.first)*size_t(row_elems),
+                     size_t(b.second)*size_t(row_elems)*sizeof(bf16_t));
+        at+=size_t(b.second);
+    }
+    owner.wait();
+    sycl::free(v,owner);v=nv;
+    return true;
+}
+
+// Rank 0's choice wins.  Megatron ranks compute identical logits from an
+// identical (all-reduced) hidden state, so this normally changes nothing;
+// it exists so a last-bit difference in a replicated kernel can never send
+// two ranks down different branches -- that would be a deadlock, not an
+// error message.
+int Grimoire::tp_sync_token(int token){
+    if(!tp_mega||tp_peer_fd.empty())return token;
+    int32_t wire=int32_t(token);
+    if(tp_rank==0){
+        for(int r=1;r<tp_world;++r)if(!fd_write_all(tp_peer_fd[size_t(r)],&wire,sizeof wire))return -1;
+    }else if(!fd_read_all(tp_peer_fd[0],&wire,sizeof wire))return -1;
+    return int(wire);
+}
+bool Grimoire::tp_sync_tokens(std::vector<int32_t>& toks){
+    if(!tp_mega||tp_peer_fd.empty())return true;
+    uint32_t n=uint32_t(toks.size());
+    if(tp_rank==0){
+        for(int r=1;r<tp_world;++r)
+            if(!fd_write_all(tp_peer_fd[size_t(r)],&n,sizeof n)||
+               (n&&!fd_write_all(tp_peer_fd[size_t(r)],toks.data(),n*sizeof(int32_t))))return false;
+        return true;
+    }
+    if(!fd_read_all(tp_peer_fd[0],&n,sizeof n))return false;
+    toks.resize(n);
+    return !n||fd_read_all(tp_peer_fd[0],toks.data(),n*sizeof(int32_t));
+}
+
+// ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
     // Qwen4-Exp / Qwen3.8-Flash-Next.  The loader resolves this config
     // (rule 10: the loader says what the file IS), and the engine says
@@ -3960,7 +4199,7 @@ std::string Grimoire::unsupported_reason() const {
         // references in b70/qwen4_exp.hpp).  What is refused here is what
         // is NOT built, named individually -- each of these is a wrong
         // number or a hang rather than an error if it runs anyway.
-        if (tp_enabled() || pp_enabled())
+        if (tp_ranked() || pp_enabled())
             return "qwen4_exp under TP or PP.  The multi-stream residual is "
                    "hc_count * hidden wide and a stage boundary transports ONE "
                    "tensor, so a pending hyper-connection combine has to be "
@@ -4162,17 +4401,43 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     n_seq_slots = seq_slots_requested();
     seq_slot = 0;
 
-    if (pp_enabled() && tp_enabled()) {
+    if (pp_enabled() && tp_ranked()) {
         err = "GRIMOIRE_PP_RANK and GRIMOIRE_TP_RANK are mutually exclusive";
         return false;
     }
-    if(tp_enabled()){
+    if(tp_ranked()){
         if(tp_world<2||tp_rank>=tp_world){err="TP rank must be 0..TP_WORLD_SIZE-1 and world size must be at least 2";return false;}
-        std::printf("  multiprocess TP rank %d/%d: stores 1/%d of every weight\n",
-                    tp_rank,tp_world,tp_world);
+        // GRIMOIRE_TP_MODE=legacy forces the old all-gather algorithm.
+        const char* mode_env=std::getenv("GRIMOIRE_TP_MODE");
+        const bool want_legacy=mode_env&&std::strcmp(mode_env,"legacy")==0;
+        const std::string why=tp_mega_refusal();
+        tp_mega=!want_legacy&&why.empty();
+        if(tp_mega){
+            // Narrow cfg to this rank's slice NOW, before anything is sized
+            // from it: the KV cache, the DeltaNet state, every scratch
+            // buffer and every kernel launch then describe the narrow model.
+            // tps keeps the full counts for slicing the checkpoint tensors.
+            const int W=tp_world,r=tp_rank;
+            tps.qh=cfg.n_heads;      tps.qhn=tps.qh/W;  tps.qh0=r*tps.qhn;
+            tps.kvh=cfg.n_kv_heads;  tps.kvn=tps.kvh/W; tps.kv0=r*tps.kvn;
+            tps.hk=cfg.lin_k_heads;  tps.hkn=tps.hk/W;  tps.hk0=r*tps.hkn;
+            tps.hv=cfg.lin_v_heads;  tps.hvn=tps.hv/W;  tps.hv0=r*tps.hvn;
+            tps.fi=cfg.dense_inter;  tps.fn=tps.fi/W;   tps.f0=r*tps.fn;
+            cfg.n_heads=tps.qhn; cfg.n_kv_heads=tps.kvn;
+            cfg.lin_k_heads=tps.hkn; cfg.lin_v_heads=tps.hvn;
+            cfg.dense_inter=tps.fn;
+            std::printf("  multiprocess TP rank %d/%d (Megatron): attention heads [%d,%d) of %d, "
+                        "KV heads [%d,%d) of %d, DeltaNet v heads [%d,%d) of %d, FFN [%d,%d) of %d; "
+                        "one all-reduce per block\n",
+                        tp_rank,tp_world,tps.qh0,tps.qh0+tps.qhn,tps.qh,tps.kv0,tps.kv0+tps.kvn,tps.kvh,
+                        tps.hv0,tps.hv0+tps.hvn,tps.hv,tps.f0,tps.f0+tps.fn,tps.fi);
+        }else{
+            std::printf("  multiprocess TP rank %d/%d (legacy all-gather%s%s): stores 1/%d of every weight\n",
+                        tp_rank,tp_world,why.empty()?"":"; Megatron split unavailable: ",why.c_str(),tp_world);
+        }
     }
 
-    if ((pp_enabled() || tp_enabled()) && pipeline_enabled()) {
+    if ((pp_enabled() || tp_ranked()) && pipeline_enabled()) {
         err = "multiprocess rank mode and single-process GRIMOIRE_PIPELINE are mutually exclusive";
         return false;
     }
@@ -4214,6 +4479,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     auto acct = [&](size_t b) { bytes += b; };
     auto shard = [&](DevQuant& d,sycl::queue& owner) {
         if(ok&&!tp_shard_rows(d,owner,err))ok=false;
+    };
+    // Megatron TP slicing (no-ops otherwise).  tps holds the FULL counts;
+    // the local Hk/Hv/qkv_ch below are already this rank's narrow ones.
+    using Blocks = std::vector<std::pair<int,int>>;
+    auto mrows = [&](DevQuant& d,sycl::queue& owner,const Blocks& b) {
+        if(ok&&tp_mega&&!tp_take_rows(d,b,owner,err))ok=false;
+    };
+    auto mcols = [&](DevQuant& d,sycl::queue& owner,int k0,int kn) {
+        if(ok&&tp_mega&&!tp_take_cols(d,k0,kn,owner,err))ok=false;
+    };
+    auto mvec = [&](bf16_t*& v,sycl::queue& owner,int row_elems,const Blocks& b) {
+        if(ok&&tp_mega&&!tp_take_vec_rows(v,row_elems,b,owner,err))ok=false;
+    };
+    // DeltaNet in_proj_qkv rows / conv1d channels: [q: Hk*Dk | k: Hk*Dk | v: Hv*Dv],
+    // and v head j reads k head j / (Hv/Hk), so contiguous head ranges stay paired.
+    const Blocks mega_qkv = tp_mega ? Blocks{
+        {tps.hk0*cfg.lin_k_dim, tps.hkn*cfg.lin_k_dim},
+        {tps.hk*cfg.lin_k_dim + tps.hk0*cfg.lin_k_dim, tps.hkn*cfg.lin_k_dim},
+        {2*tps.hk*cfg.lin_k_dim + tps.hv0*cfg.lin_v_dim, tps.hvn*cfg.lin_v_dim}} : Blocks{};
+    // the transformer FFN (also the MTP head's): gate_up = [gate: FI | up: FI]
+    const Blocks mega_gu = tp_mega ? Blocks{{tps.f0, tps.fn}, {tps.fi + tps.f0, tps.fn}} : Blocks{};
+    // attention: q_proj is [q | gate] per head when the output gate is fused
+    // (called once q/k/v AND o_proj are uploaded)
+    auto mega_attn = [&](LayerDev& d, sycl::queue& owner, bool has_v) {
+        if(!tp_mega||!ok)return;
+        const int hd=d.head_dim;
+        const int qrow=(d.q_proj.w.N==2*tps.qh*hd)?2*hd:hd;
+        mrows(d.q_proj,owner,{{tps.qh0*qrow,tps.qhn*qrow}});
+        mrows(d.k_proj,owner,{{tps.kv0*hd,tps.kvn*hd}});
+        if(has_v)mrows(d.v_proj,owner,{{tps.kv0*hd,tps.kvn*hd}});
+        mcols(d.o_proj,owner,tps.qh0*hd,tps.qhn*hd);
     };
 
     // Drop the file mappings now. Every subsequent read is a pread, and
@@ -4657,6 +4953,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.la_z   = quantize_upload_t(lq, ck, src.la_in_z,   PF, "la.in_proj_z",   &ok);
             d.la_out = quantize_upload_t(lq, ck, src.la_out,    PF, "la.out_proj",    &ok);
             shard(d.la_qkv,lq);shard(d.la_z,lq);shard(d.la_out,lq);
+            mrows(d.la_qkv,lq,mega_qkv);
+            mrows(d.la_z,lq,{{tps.hv0*Dv,tps.hvn*Dv}});
+            mcols(d.la_out,lq,tps.hv0*Dv,tps.hvn*Dv);
             acct(size_t(d.la_qkv.w.bytes() + d.la_z.w.bytes() + d.la_out.w.bytes()
                       + d.la_ab.w.bytes()));
 
@@ -4667,10 +4966,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.la_ab = concat_upload_t(lq, ck, src.la_in_a, src.la_in_b,
                                       Fmt::BF16, "la.in_proj_ab", &ok);
             shard(d.la_ab,lq);
+            mrows(d.la_ab,lq,{{tps.hv0,tps.hvn},{tps.hv+tps.hv0,tps.hvn}});
             // Experimental only: the single wider GEMM measured slower on B70
             // than the three specialized shapes.  Do not spend VRAM on the
             // concatenated copy in the production path.
-            if(!tp_enabled()&&PF==Fmt::MXFP4&&std::getenv("GRIMOIRE_FUSE_DN_PROJECTIONS"))
+            if(!tp_ranked()&&PF==Fmt::MXFP4&&std::getenv("GRIMOIRE_FUSE_DN_PROJECTIONS"))
                 d.la_all=concat4_native_mxfp4_t(lq,ck,src.la_in_qkv,src.la_in_z,
                     src.la_in_a,src.la_in_b,"la.in_proj_qkv_z_ab",&ok);
             d.la_conv = dev_copy_t<bf16_t>(lq, ck, src.la_conv1d, "la.conv1d", &ok);
@@ -4679,10 +4979,16 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.la_norm = dev_copy_t<bf16_t>(lq, ck, src.la_norm, "la.norm", &ok);
 
             // recurrent state: constant in context length
-            const int conv_ch = src.la_conv1d.ok() && !src.la_conv1d.t.shape.empty()
-                              ? int(src.la_conv1d.t.shape[0]) : qkv_ch;
             const int conv_k  = src.la_conv1d.ok() && src.la_conv1d.t.shape.size() >= 3
                               ? int(src.la_conv1d.t.shape[2]) : cfg.conv_kernel;
+            // Megatron: this rank's conv channels (same blocks as la_qkv's
+            // rows), its A_log / dt_bias heads; la_norm is per-Dv, shared.
+            mvec(d.la_conv,lq,conv_k,mega_qkv);
+            mvec(d.la_Alog,lq,1,{{tps.hv0,tps.hvn}});
+            mvec(d.la_dtb,lq,1,{{tps.hv0,tps.hvn}});
+            const int conv_ch = tp_mega ? qkv_ch
+                              : src.la_conv1d.ok() && !src.la_conv1d.t.shape.empty()
+                              ? int(src.la_conv1d.t.shape[0]) : qkv_ch;
             d.dn_slot   = size_t(Hv) * Dv * Dk;
             d.conv_slot = size_t(conv_ch) * (conv_k - 1);
             // One copy per sequence slot.  Constant in context length, so
@@ -4834,6 +5140,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             }
             d.o_proj = quantize_upload_t(lq, ck, src.o_proj, PF, "self_attn.o_proj", &ok);
             shard(d.o_proj,lq);
+            mega_attn(d,lq,!no_v);   // Megatron: this rank's heads; q/k_norm are per-head_dim, shared
             // Per-head q/k RMSNorm, applied before RoPE. These were
             // resolved from the checkpoint but never uploaded or used.
             if (src.q_norm.ok())
@@ -5133,6 +5440,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                         "mlp.gate_up", &ok);
             d.sh_down = quantize_upload_t(lq, ck, src.sh_down, PF, "mlp.down_proj", &ok);
             shard(d.sh_gu,lq);shard(d.sh_down,lq);
+            mrows(d.sh_gu,lq,mega_gu);           // Megatron: this rank's FFN width
+            mcols(d.sh_down,lq,tps.f0,tps.fn);
             acct(size_t(d.sh_gu.w.bytes() + d.sh_down.w.bytes()));
         }
 
@@ -5323,7 +5632,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             auto shape_ok=[](const TensorRef& r,std::initializer_list<int64_t> shape) {
                 return r.ok() && r.t.shape==std::vector<int64_t>(shape);
             };
-            const int H=cfg.hidden,HD=cfg.head_dim,Q=cfg.n_heads*HD,KV=cfg.n_kv_heads*HD;
+            // The checkpoint holds the FULL head; under Megatron TP cfg is
+            // already this rank's narrow slice, so check against tps.
+            const int H=cfg.hidden,HD=cfg.head_dim;
+            const int Q=(tp_mega?tps.qh:cfg.n_heads)*HD,KV=(tp_mega?tps.kvh:cfg.n_kv_heads)*HD;
             if(!shape_ok(t_fc,{H,2LL*H}) || !shape_ok(t_preh,{H}) || !shape_ok(t_pree,{H}) ||
                !shape_ok(t_nrm,{H}) || !shape_ok(t_in,{H}) || !shape_ok(t_pon,{H}) ||
                (!shape_ok(t_q,{Q,H})&&!shape_ok(t_q,{2LL*Q,H})) ||
@@ -5353,6 +5665,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             m.o_proj    = quantize_upload_t(q, ck, t_o, mtp_fmt(t_o), "mtp.o_proj", &mok);
             if (t_qn.ok()) m.q_norm = dev_copy_t<bf16_t>(q, ck, t_qn, "mtp.q_norm", &mok);
             if (t_kn.ok()) m.k_norm = dev_copy_t<bf16_t>(q, ck, t_kn, "mtp.k_norm", &mok);
+            // Megatron TP: the head is one more layer of the narrow model --
+            // this rank's attention heads, o_proj columns and FFN width, and
+            // the same two block all-reduces in mtp_draft.  fc and the norms
+            // are replicated.
+            if (mok) mega_attn(m, q, true);
+            if (!ok) return false;
 
             size_t mtp_ffn_bytes = 0;
             if (mtp_moe) {
@@ -5425,6 +5743,16 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                           "mtp.gate_up", &mok);
                 m.sh_down = quantize_upload_t(q, ck, t_d, mtp_fmt(t_d),
                                               "mtp.down", &mok);
+                if (tp_mega && mok) {
+                    const int fim = m.sh_gu.w.N / 2, fnm = fim / tp_world, f0m = tp_rank * fnm;
+                    if (fim % tp_world || fnm % 128) {
+                        err = "TP Megatron: the MTP head's FFN width does not split into 128-wide slices";
+                        return false;
+                    }
+                    mrows(m.sh_gu, q, {{f0m, fnm}, {fim + f0m, fnm}});
+                    mcols(m.sh_down, q, f0m, fnm);
+                    if (!ok) return false;
+                }
                 mtp_ffn_bytes = m.sh_gu.w.bytes() + m.sh_down.w.bytes();
             }
             m.k_cache   = sycl::malloc_device<uint8_t>(
@@ -6594,7 +6922,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     q.wait();
 
-    if (pp_enabled() || tp_enabled()) {
+    if (pp_enabled() || tp_ranked()) {
         pipe_host = sycl::malloc_host<float>(size_t(H), q);
         if (!pipe_host) { err = "multiprocess host staging allocation failed"; return false; }
         pipe_host_elems = size_t(H);
@@ -6630,8 +6958,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // up being reported as a result.  State what is actually active.
     {
         std::printf("  capabilities:\n");
-        if (tp_enabled())
-            std::printf("    parallel      TENSOR, rank %d of %d\n", tp_rank, tp_world);
+        if (tp_mega)
+            std::printf("    parallel      TENSOR (Megatron: 1/%d of the heads and FFN, "
+                        "one all-reduce per block), rank %d of %d\n", tp_world, tp_rank, tp_world);
+        else if (tp_enabled())
+            std::printf("    parallel      TENSOR (legacy all-gather), rank %d of %d\n", tp_rank, tp_world);
         else if (pp_enabled())
             std::printf("    parallel      PIPELINE, rank %d of %d, layers [%d,%d)\n",
                         pp_rank, pp_world, pp_begin, pp_end);
@@ -7065,7 +7396,7 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //  * a drafter and a batch both want the verify path; combining them is
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
-    if ((pp_enabled() || tp_enabled()) && (pp_spec || pp_dflash || mtp.ok || dflash2.ok))
+    if ((pp_enabled() || tp_ranked()) && (pp_spec || pp_dflash || mtp.ok || dflash2.ok))
         return "distributed speculative batching is not implemented";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
@@ -7139,7 +7470,11 @@ int Grimoire::prefill_token_budget() {
     const double per = pf_per_token > 0 ? pf_per_token : est;
     const auto dev = q.get_device();
     double free_b = -1;
-    if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+    // Megatron TP ranks must cut a prompt into the SAME chunks -- every chunk
+    // is a sequence of collectives -- so they skip the live free-memory
+    // query (each card, or each process on a shared card, reports its own)
+    // and use the accounted figure, which is identical by construction.
+    if (!tp_mega && dev.has(sycl::aspect::ext_intel_free_memory)) {
         try { free_b = double(dev.get_info<sycl::ext::intel::info::device::free_memory>()); }
         catch (...) { free_b = -1; }
     }
@@ -7196,7 +7531,7 @@ void Grimoire::mtp_follow_batch(const std::vector<int32_t>& next,
 bool Grimoire::solo_ok() const {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_SCHED_SOLO");
         return !(e && *e == '0'); }();
-    return on && !pp_enabled() && !tp_enabled() && !dag && !cfg.is_qwen4_exp &&
+    return on && !pp_enabled() && !tp_ranked() && !dag && !cfg.is_qwen4_exp &&
            !mtp.ok && !dflash2.ok;
 }
 
@@ -7540,7 +7875,7 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
     // An MTP head is fine: prefill() warms each span's head cache (2026-10-05;
     // admitting MTP prompts one at a time held 8-user prefill at one prompt's
     // speed).  A DFlash drafter still admits one prompt at a time.
-    if (pp_enabled() || tp_enabled() || dflash2.ok || prefix_cache_usable() ||
+    if (pp_enabled() || tp_ranked() || dflash2.ok || prefix_cache_usable() ||
         cfg.is_muse || cfg.is_gemma4 || cfg.is_qwen4_exp ||
         !batch_unsupported_reason().empty())
         return false;
@@ -7609,7 +7944,7 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
 // One card only (interleave_ok()): under PP / TP every rank runs
 // admit_sequence() on the whole prompt in lockstep.
 bool Grimoire::interleave_ok() const {
-    return !pp_enabled() && !tp_enabled() && !dflash2.ok && !cfg.is_muse && !cfg.is_qwen4_exp;
+    return !pp_enabled() && !tp_ranked() && !dflash2.ok && !cfg.is_muse && !cfg.is_qwen4_exp;
 }
 int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
                           const std::vector<bool>& busy, int& done) {
@@ -7653,7 +7988,7 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
                             const std::vector<bool>& busy) {
     int reused = 0;
     const int slot = admit_pick_slot(prompt, busy, reused);
-    if(serving_control && (pp_enabled() || tp_enabled()) && comm_rank()==0) {
+    if(serving_control && (pp_enabled() || tp_ranked()) && comm_rank()==0) {
         PPRequest request;
         request.kind=2; request.budget=slot; request.prompt=prompt;
         if(!pp_send_request(request))
@@ -7747,7 +8082,7 @@ void Grimoire::cache_sequence(int slot, int position,
         return;
     }
     processed.resize(size_t(position));
-    if(serving_control && tp_enabled() && tp_rank==0) {
+    if(serving_control && tp_ranked() && tp_rank==0) {
         PPRequest request;
         request.kind=4; request.budget=slot; request.eos=position; request.prompt=processed;
         if(!pp_send_request(request))
@@ -7895,7 +8230,7 @@ void Grimoire::release() {
     for(int& fd:tp_peer_fd)if(fd>=0){::close(fd);fd=-1;}
     if(pp_enabled()&&pp_rank>0&&!pp_socket.empty())
         ::unlink((pp_socket+"-"+std::to_string(pp_rank)).c_str());
-    if(tp_enabled()&&tp_rank==0&&!pp_socket.empty())::unlink(pp_socket.c_str());
+    if(tp_ranked()&&tp_rank==0&&!pp_socket.empty())::unlink(pp_socket.c_str());
     if (pipe_host) { sycl::free(pipe_host, q); pipe_host = nullptr; }
     for (int i = 0; i < 2; ++i) {
         if (pipe_send[i]) { sycl::free(pipe_send[i], q); pipe_send[i] = nullptr; pipe_send_elems[i] = 0; }
@@ -9894,7 +10229,7 @@ const float* Grimoire::forward(int token) {
     if (cfg.is_qwen4_exp) return forward_qwen4_exp(token);
     // the DAG path has no tiered-expert branch and no K2 output gate or K2
     // router (and is opt-in and broken)
-    if (dag && !tp_enabled() && !tm_any && !cfg.is_k2) return forward_dag(token);
+    if (dag && !tp_ranked() && !tm_any && !cfg.is_k2) return forward_dag(token);
     const int H  = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -10095,6 +10430,8 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("L0 after gate", s.attn_out, Hv * Dv);
             MK("  rmsnorm + gate");
             gemv_any(d.la_out, s.attn_out, s.moe_y, none);
+            if (!tp_block_reduce(s.moe_y, size_t(H))) {
+                std::fprintf(stderr, "TP block all-reduce failed\n"); return nullptr; }
             if (i == probe_layer) probe("L0 attn out", s.moe_y, H);
             MK("  out gemv");
         } else {
@@ -10242,6 +10579,8 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("FA after gate", s.attn_out, qheads * d.head_dim);
             MK("  attn out gate");
             gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+            if (!tp_block_reduce(s.moe_y, size_t(H))) {
+                std::fprintf(stderr, "TP block all-reduce failed\n"); return nullptr; }
             if (i == probe_layer) probe("FA out", s.moe_y, H);
             MK("  o gemv");
             (void)KD;
@@ -10378,6 +10717,8 @@ const float* Grimoire::forward(int token) {
             launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, none);
             MK("  ffn swiglu");
             ffn_gemv(d, false, s.sh_g, s.moe_y, none);
+            if (!tp_block_reduce(s.moe_y, size_t(H))) {
+                std::fprintf(stderr, "TP block all-reduce failed\n"); return nullptr; }
             MK("  ffn down");
         }
 
@@ -10648,6 +10989,8 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit,
                                 cfg.n_heads * d.head_dim, none);
     gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+    if (!tp_block_reduce(s.moe_y, size_t(H)))
+        throw std::runtime_error("MTP draft: TP block all-reduce failed");
 
     // ---- FFN ------------------------------------------------------------
     launch_rmsnorm_residual(q, mtp.x, s.moe_y, d.post_norm, s.h2, H, cfg.rms_eps, none);
@@ -10675,6 +11018,8 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         gemv_any(d.sh_gu, s.h2, s.sh_g, none);
         launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, none);
         gemv_any(d.sh_down, s.sh_g, s.moe_y, none);
+        if (!tp_block_reduce(s.moe_y, size_t(H)))
+            throw std::runtime_error("MTP draft: TP block all-reduce failed");
     }
 
     // ---- final norm + the model's own lm_head ---------------------------
@@ -10699,7 +11044,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
-    return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
+    return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
 }
 
 int Grimoire::argmax_token() {
@@ -10724,7 +11069,7 @@ int Grimoire::argmax_token() {
             q.memcpy(&val, s.d_val, sizeof(float)).wait();
             std::printf("    argmax -> id %d  logit %.4f\n", tok, val);
         }
-        return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
+        return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
     }
     launch_argmax(q, s.logits, cfg.vocab, s.d_tok, s.d_val, none);
     // ONE blocking round trip per token, not two. The logit value is only
@@ -10738,7 +11083,7 @@ int Grimoire::argmax_token() {
         std::printf("    argmax -> id %d  logit %.4f\n", tok, val);
         std::fflush(stdout);
     }
-    return pp_enabled() ? pp_sync_token(int(tok)) : int(tok);
+    return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
 }
 
 // Original DFlash: ingest any target taps not yet present in the six draft KV
@@ -13453,7 +13798,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         // configurations the per-run code below does not cover: the caller
         // admits one prompt at a time instead
-        bool unsupported = pp_enabled() || tp_enabled() || dflash2.ok ||
+        bool unsupported = pp_enabled() || tp_ranked() || dflash2.ok ||
                            cfg.is_qwen4_exp || dflash2.target_aux;
         for (const auto& d : L) unsupported = unsupported || d.k2_sparse || d.ple || d.tiered;
         if (unsupported) return false;
@@ -13863,7 +14208,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // normed copy, r1's per-layer zeroing and its re-read, and let the norm /
     // gate before an output projection write that GEMM's bf16 input directly.
     // GRIMOIRE_NO_DENSE_PURE=1 restores the general path.
-    const bool dense_pure = !tp_enabled() && !pp_enabled() && M >= 32 && !cfg.is_moe() &&
+    const bool dense_pure = !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && !cfg.is_moe() &&
         !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
         !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
         !std::getenv("GRIMOIRE_NO_DENSE_PURE");
@@ -15140,6 +15485,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             pp_mark("full attention");
         }
+        // Megatron TP: o_proj / out_proj ran on this rank's heads only.
+        if(!r0_in_h && !tp_block_reduce(r0,size_t(M)*H))
+            throw std::runtime_error("TP prefill attention all-reduce failed");
         const bool fused_ffn_quant=!exact_verify&&!d.moe_layer&&a8&&a8s&&
             xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4;
         auto post_bf_ready=exact_verify
@@ -15672,6 +16020,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
             }
             pp_mark("dense FFN");
+            // Megatron TP: down_proj ran on this rank's FFN columns only.
+            if(!r0_in_h && !tp_block_reduce(r0,size_t(M)*H))
+                throw std::runtime_error("TP prefill FFN all-reduce failed");
             if(!dense_pure) q.memset(r1,0,size_t(M)*H*sizeof(float));
         }
         if(prefill_host_progress){
@@ -15844,6 +16195,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             enq_ms = wait_ms = 0; nst = nrows = 0;
         }
     }
+    if (next_tokens && tp_mega && !tp_sync_tokens(*next_tokens)) {
+        std::fprintf(stderr, "TP rank %d: verified-token sync failed\n", tp_rank);
+        if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
+        return false;
+    }
     if (next_tokens && pp_enabled() && !pp_sync_tokens(*next_tokens)) {
         std::fprintf(stderr, "PP rank %d: verified-token sync failed\n", pp_rank);
         if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
@@ -15971,7 +16327,7 @@ namespace b70 {
 // ---------------------------------------------------------------------
 bool Grimoire::build_graph() {
     // Socket send/receive is deliberately outside SYCL graph capture.
-    if (pp_enabled() || tp_enabled()) return false;
+    if (pp_enabled() || tp_ranked()) return false;
     if (dag) return false;
     // Qwen4-Exp's decode is NOT capture-safe, and the way it fails is
     // the worst kind: capture bakes every host-side argument into the
@@ -16694,7 +17050,7 @@ void GrimoireScheduler::run() {
                     // 0's STEP COUNT matched to its peers. Off PP,
                     // cancellation still frees the card immediately,
                     // which is correct and unchanged there.
-                    const bool pp = e.pp_enabled() || e.tp_enabled();
+                    const bool pp = e.pp_enabled() || e.tp_ranked();
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
                         j->eot, [&](int32_t t){
                             const bool kept = push(j, t);
@@ -16821,7 +17177,7 @@ void GrimoireScheduler::run() {
         bool failed = false; std::string err;
         if (!toks.empty()) {
             try {
-                if (e.pp_enabled() || e.tp_enabled()) {
+                if (e.pp_enabled() || e.tp_ranked()) {
                     Grimoire::PPRequest request;
                     request.kind=3; request.prompt=toks;
                     request.slots.assign(slots.begin(),slots.end());
@@ -16999,7 +17355,7 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
 // what makes `docker stop` on the front end bring the workers down too
 // instead of leaving them holding a card.
 bool grimoire_is_pp_worker(Grimoire& e) {
-    return (e.pp_enabled() && e.pp_rank > 0) || (e.tp_enabled() && e.tp_rank > 0);
+    return (e.pp_enabled() && e.pp_rank > 0) || (e.tp_ranked() && e.tp_rank > 0);
 }
 
 // The front end tells the rest of the pipeline what it is about to run.
@@ -17013,7 +17369,7 @@ bool grimoire_is_pp_worker(Grimoire& e) {
 bool grimoire_pp_broadcast_request(Grimoire& e,
         const std::vector<int32_t>& prompt, int n_predict,
         int eos_id, int eot_id) {
-    if ((!e.pp_enabled() && !e.tp_enabled()) || e.comm_rank()!=0) return true;
+    if ((!e.pp_enabled() && !e.tp_ranked()) || e.comm_rank()!=0) return true;
     Grimoire::PPRequest req;
     req.prompt = prompt; req.budget = n_predict;
     req.eos = eos_id; req.eot = eot_id;
@@ -17025,7 +17381,7 @@ bool grimoire_pp_broadcast_request(Grimoire& e,
 // the next run wants that card is the difference between a restart and a
 // power cycle.
 void grimoire_pp_shutdown(Grimoire& e) {
-    if ((!e.pp_enabled() && !e.tp_enabled()) || e.comm_rank()!=0) return;
+    if ((!e.pp_enabled() && !e.tp_ranked()) || e.comm_rank()!=0) return;
     Grimoire::PPRequest req;
     req.shutdown = true;
     (void)e.pp_send_request(req);
@@ -17033,7 +17389,7 @@ void grimoire_pp_shutdown(Grimoire& e) {
 
 void grimoire_pp_worker_loop(Grimoire& e) {
     e.following_control = true;
-    const char* mode = e.tp_enabled() ? "TP" : "PP";
+    const char* mode = e.tp_ranked() ? "TP" : "PP";
     std::fprintf(stderr, "  %s rank %d: worker ready, waiting for requests\n",
                  mode, e.comm_rank());
     for (;;) {
