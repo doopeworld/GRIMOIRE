@@ -84,6 +84,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 namespace b70 {
 
@@ -2070,10 +2071,28 @@ struct Grimoire {
     bool tp_take_vec_rows(bf16_t*& v, int row_elems,
                           const std::vector<std::pair<int,int>>& blocks,
                           sycl::queue& owner, std::string& err);
+    // Megatron TP all-reduce through POSIX shared memory (tp_shm_setup):
+    // every rank owns two slots (alternating by call parity) in one segment
+    // all ranks map, plus a sequence flag.  A call copies this rank's partial
+    // into its slot, raises its flag, waits for every peer's, and sums the
+    // slots IN RANK ORDER itself -- on the CPU into a pinned buffer for
+    // decode-size blocks, on the device for prefill-size ones -- so every
+    // rank produces the same bits with no second exchange.  The socket path
+    // (tp_allreduce_sum) is the fallback.  GRIMOIRE_TP_SHM=0 disables it.
+    struct TpShm {
+        uint8_t* base = nullptr; size_t bytes = 0;
+        size_t slot_elems = 0;       // floats per slot; bigger calls go in pieces
+        uint64_t seq = 0;
+        float* res = nullptr;        // USM host: the CPU sum, copied to the device
+        float* dtmp = nullptr;       // device: a peer's slot, for the device add
+    } tshm;
+    bool tp_shm_setup(std::string& err);
+    bool tp_shm_allreduce(float* dev, size_t elems);
     // Megatron TP: sum this block's partial output over the ranks, in place.
     // A no-op on one GPU and under the legacy algorithm.
     bool tp_block_reduce(float* dev, size_t elems) {
-        return !tp_mega || tp_allreduce_sum(dev, int(elems));
+        if (!tp_mega) return true;
+        return tshm.base ? tp_shm_allreduce(dev, elems) : tp_allreduce_sum(dev, int(elems));
     }
     int  tp_sync_token(int token);
     bool tp_sync_tokens(std::vector<int32_t>& toks);
@@ -4177,6 +4196,123 @@ bool Grimoire::tp_sync_tokens(std::vector<int32_t>& toks){
     if(!fd_read_all(tp_peer_fd[0],&n,sizeof n))return false;
     toks.resize(n);
     return !n||fd_read_all(tp_peer_fd[0],toks.data(),n*sizeof(int32_t));
+}
+
+// One segment: a 4 KiB header (rank r's sequence flag in its own cache line
+// at byte 64*r), then slot (r, parity) of slot_elems floats at
+// 4096 + (2r + parity) * slot_elems * 4.  Rank 0 creates it and tells the
+// others over the TP socket; once everyone has mapped it the name is
+// unlinked, so it disappears with the processes however they exit.
+static constexpr size_t kTpShmHeader = 4096;
+bool Grimoire::tp_shm_setup(std::string& err){
+    if(!tp_mega||tp_peer_fd.empty())return true;
+    if(const char* e=std::getenv("GRIMOIRE_TP_SHM"); e&&*e=='0'){
+        std::printf("  TP all-reduce: socket (GRIMOIRE_TP_SHM=0)\n");return true;
+    }
+    const int W=tp_world;
+    size_t rows=1024;
+    if(const char* e=std::getenv("GRIMOIRE_TP_SHM_ROWS"); e&&*e)rows=size_t(std::max(1,std::atoi(e)));
+    tshm.slot_elems=rows*size_t(cfg.hidden);
+    tshm.bytes=kTpShmHeader+size_t(2*W)*tshm.slot_elems*sizeof(float);
+    // Named after rank 0's PID, which it sends with the go-ahead: unique per
+    // server even when several containers share the host's /dev/shm
+    // (--ipc=host).
+    uint32_t pid0=uint32_t(::getpid());
+    if(tp_rank!=0&&!fd_read_all(tp_peer_fd[0],&pid0,sizeof pid0)){err="TP shm handshake failed";return false;}
+    const std::string name="/grimoire-tpshm-"+std::to_string(pid0);
+    int fd=-1;
+    if(tp_rank==0){
+        ::shm_unlink(name.c_str());
+        fd=::shm_open(name.c_str(),O_CREAT|O_RDWR|O_EXCL,0600);
+        if(fd<0||::ftruncate(fd,off_t(tshm.bytes))!=0){
+            err=std::string("TP shared memory create failed: ")+std::strerror(errno)+
+                " (the container needs --ipc=host or a large enough --shm-size)";
+            if(fd>=0)::close(fd);::shm_unlink(name.c_str());return false;
+        }
+        for(int r=1;r<W;++r)if(!fd_write_all(tp_peer_fd[size_t(r)],&pid0,sizeof pid0)){err="TP shm handshake failed";return false;}
+    }else{
+        fd=::shm_open(name.c_str(),O_RDWR,0600);
+        if(fd<0){err=std::string("TP shared memory open failed: ")+std::strerror(errno);return false;}
+    }
+    void* m=::mmap(nullptr,tshm.bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    ::close(fd);
+    if(m==MAP_FAILED){err=std::string("TP shared memory map failed: ")+std::strerror(errno);return false;}
+    tshm.base=static_cast<uint8_t*>(m);
+    if(tp_rank==0)std::memset(tshm.base,0,kTpShmHeader);
+    // everyone mapped (and rank 0 zeroed the flags) before anyone uses it
+    int ready=1;
+    if(!tp_agree(ready)||ready!=1){err="TP shm handshake failed";return false;}
+    if(tp_rank==0)::shm_unlink(name.c_str());
+    // pin the mapping for direct DMA (the runtime would otherwise stage
+    // every copy through its own buffer)
+    try{ sycl::ext::oneapi::experimental::prepare_for_device_copy(tshm.base,tshm.bytes,q); }
+    catch(...){ std::printf("  TP all-reduce: shared memory not pinned (copies are staged)\n"); }
+    tshm.res=sycl::malloc_host<float>(tshm.slot_elems,q);
+    tshm.dtmp=sycl::malloc_device<float>(tshm.slot_elems,q);
+    if(!tshm.res||!tshm.dtmp){err="TP shm staging allocation failed";return false;}
+    std::printf("  TP all-reduce: shared memory, %zu rows x %d per call piece (%.0f MiB)\n",
+                rows,cfg.hidden,double(tshm.bytes)/1048576.0);
+    return true;
+}
+
+bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
+    const int W=tp_world;
+    auto flag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+64*size_t(r));};
+    auto slot=[&](int r,uint64_t s){
+        return reinterpret_cast<float*>(tshm.base+kTpShmHeader+
+            (size_t(2*r)+size_t(s&1))*tshm.slot_elems*sizeof(float));
+    };
+    static const size_t cpu_max=[]{const char* e=std::getenv("GRIMOIRE_TP_SHM_CPU_MAX");
+        return e&&*e?size_t(std::atoll(e)):size_t(65536);}();
+    for(size_t off=0;off<elems;off+=tshm.slot_elems){
+        const size_t n=std::min(tshm.slot_elems,elems-off);
+        const uint64_t s=++tshm.seq;
+        // My partial into my slot of this parity.  The wait also retires
+        // everything queued before it (the projection that produced it,
+        // and the previous call's copy back out of tshm.res).
+        q.memcpy(slot(tp_rank,s),dev+off,n*sizeof(float)).wait();
+        flag(tp_rank)->store(s,std::memory_order_release);
+        for(int r=0;r<W;++r){
+            if(r==tp_rank)continue;
+            auto* f=flag(r);
+            uint64_t spins=0;
+            auto t0=std::chrono::steady_clock::now();
+            while(f->load(std::memory_order_acquire)<s){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&std::chrono::steady_clock::now()-t0>std::chrono::seconds(120)){
+                    std::fprintf(stderr,"TP rank %d: all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,r);
+                    return false;
+                }
+            }
+        }
+        // Every rank sums the slots in RANK ORDER, so all get the same bits.
+        // A slot is not overwritten until its owner is two calls further on,
+        // and nobody passes call s+1 before everyone has finished call s.
+        if(n<=cpu_max){
+            float* out=tshm.res;
+            const float* s0=slot(0,s);
+            std::memcpy(out,s0,n*sizeof(float));
+            for(int r=1;r<W;++r){
+                const float* sr=slot(r,s);
+                for(size_t i=0;i<n;++i)out[i]+=sr[i];
+            }
+            // no wait: the queue is in order, and the next call's first
+            // wait retires this copy before tshm.res is written again
+            q.memcpy(dev+off,out,n*sizeof(float));
+        }else{
+            // device add in rank order: dev = slot 0, then += slot 1, 2, ...
+            // (rank 0's dev already holds slot 0's values)
+            if(tp_rank!=0)q.memcpy(dev+off,slot(0,s),n*sizeof(float));
+            for(int r=1;r<W;++r){
+                q.memcpy(tshm.dtmp,slot(r,s),n*sizeof(float));
+                launch_add(q,dev+off,tshm.dtmp,int(n),{});
+            }
+            // the host must not reuse this parity's slots before the copies
+            // out of them ran: wait (prefill-size blocks only)
+            q.wait_and_throw();
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------
@@ -6927,6 +7063,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         if (!pipe_host) { err = "multiprocess host staging allocation failed"; return false; }
         pipe_host_elems = size_t(H);
         if (!pp_connect(err)) return false;
+        if (!tp_shm_setup(err)) return false;
     }
 
     std::printf("ok\n  zeroing recurrent state ... ");
@@ -8237,6 +8374,12 @@ void Grimoire::release() {
         if (pipe_recv[i]) { sycl::free(pipe_recv[i], q); pipe_recv[i] = nullptr; pipe_recv_elems[i] = 0; }
     }
     if (tp_scratch) { sycl::free(tp_scratch, q); tp_scratch = nullptr; tp_scratch_elems = 0; }
+    if (tshm.res) { sycl::free(tshm.res, q); tshm.res = nullptr; }
+    if (tshm.dtmp) { sycl::free(tshm.dtmp, q); tshm.dtmp = nullptr; }
+    if (tshm.base) {
+        try { sycl::ext::oneapi::experimental::release_from_device_copy(tshm.base, q); } catch (...) {}
+        ::munmap(tshm.base, tshm.bytes); tshm.base = nullptr;
+    }
     if (tp_act) { sycl::free(tp_act, q); tp_act = nullptr; tp_act_elems = 0; }
     if(tp_expert){sycl::free(tp_expert,q);tp_expert=nullptr;}
     if(tp_weight){sycl::free(tp_weight,q);tp_weight=nullptr;}
