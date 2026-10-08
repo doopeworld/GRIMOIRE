@@ -72,7 +72,7 @@ ARG GRIM_TARGETS=intel_gpu_bmg_g31
 
 RUN bash tools/build_grimoire_only_b70.sh /grimoire \
     && bash tools/build_server_only_b70.sh /grimoire \
-    && strip --strip-unneeded bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so
+    && strip --strip-unneeded bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so bin/libgrimoire_attn.so
 
 # ---------------------------------------------------------------------
 # Stage 2: runtime.  Only what the three binaries actually need (checked
@@ -141,6 +141,7 @@ WORKDIR /grimoire
 COPY --from=builder /grimoire/bin/grimoire           bin/grimoire
 COPY --from=builder /grimoire/bin/grimoire-server     bin/grimoire-server
 COPY --from=builder /grimoire/bin/libgrimoire_gemm.so  bin/libgrimoire_gemm.so
+COPY --from=builder /grimoire/bin/libgrimoire_attn.so  bin/libgrimoire_attn.so
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh bin/grimoire bin/grimoire-server
 

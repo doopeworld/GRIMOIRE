@@ -40,6 +40,7 @@
 //  memcpy'd straight from the mmapped shard to VRAM.
 // =====================================================================
 #include "kernels.hpp"
+#include "attn_verify.hpp"
 #include "b70/engine.hpp"
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
@@ -7898,6 +7899,14 @@ long g_spec_batch_steps=0, g_spec_batch_proposals=0, g_spec_batch_accepted=0, g_
 // position fix and the faster INT4 verify).  vLLM's MTP recipe uses 4 too.
 constexpr int kMtpDefaultDepth = 4;
 
+// GRIMOIRE_SPEC_TIMING=1: host wall time of the three parts of a speculative step -- the
+// drafts, the target's verify pass, and the commit (state restore + the drafter's warm
+// passes over the accepted tokens) -- printed every 64 steps.  Off by default.  The only
+// sync it adds is after the drafts, which already end on a host read-back.
+struct SpecTiming { double draft=0, verify=0, commit=0; long steps=0, rows=0, cand=0, emitted=0, ctx=0; };
+static SpecTiming g_spec_t;
+static const bool g_spec_timing=std::getenv("GRIMOIRE_SPEC_TIMING")!=nullptr;
+
 bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         const std::vector<int>& slots, const std::vector<int>& positions,
         const std::vector<int>& remaining, std::vector<std::vector<int32_t>>& replies,
@@ -7906,6 +7915,9 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     if(n==0 || n>kSpecBatch || slots.size()!=tokens.size() ||
        positions.size()!=tokens.size() || remaining.size()!=tokens.size())
         throw std::invalid_argument("invalid speculative batch shape");
+    using spec_clock=std::chrono::steady_clock;
+    spec_clock::time_point st0,st1,st2;
+    if(g_spec_timing) { sync(); st0=spec_clock::now(); }
     init_draft_slots();
     std::vector<int32_t> candidates;
     std::vector<int> candidate_slots, candidate_positions, begin, lengths;
@@ -7948,9 +7960,11 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     SeqBatch batch{candidate_slots.data(),candidate_positions.data(),true};
     std::vector<int32_t> verified;
     spec_hidden_valid=false;
+    if(g_spec_timing) { sync(); st1=spec_clock::now(); }
     if(!prefill(candidates,&verified,&batch,false) ||
        verified.size()!=candidates.size() || !spec_hidden_valid)
         throw std::runtime_error("batched speculative target verification failed");
+    if(g_spec_timing) { sync(); st2=spec_clock::now(); }
     replies.assign(size_t(n),{}); consumed.assign(size_t(n),0);
     const size_t dn_n=size_t(cfg.lin_v_heads)*cfg.lin_v_dim*cfg.lin_k_dim;
     ++g_spec_batch_steps; g_spec_batch_sequences+=n;
@@ -7986,6 +8000,23 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         consumed[size_t(row)]=accepted;
     }
     sync();
+    if(g_spec_timing) {
+        const auto st3=spec_clock::now();
+        auto ms=[](spec_clock::time_point a,spec_clock::time_point b) {
+            return std::chrono::duration<double,std::milli>(b-a).count(); };
+        SpecTiming& t=g_spec_t;
+        t.draft+=ms(st0,st1); t.verify+=ms(st1,st2); t.commit+=ms(st2,st3);
+        ++t.steps; t.rows+=n; t.cand+=long(candidates.size());
+        for(int row=0;row<n;++row) { t.emitted+=consumed[size_t(row)]; t.ctx+=positions[size_t(row)]; }
+        if(t.steps==64) {
+            const double s=double(t.steps);
+            std::fprintf(stderr,"spec timing: %ld steps, %.2f seqs, %.2f verify rows, %.2f tokens/step,"
+                " ctx %.0f | per step: draft %.2f ms, verify %.2f ms, commit %.2f ms, total %.2f ms\n",
+                t.steps,t.rows/s,t.cand/s,t.emitted/s,t.ctx/double(t.rows),t.draft/s,t.verify/s,
+                t.commit/s,(t.draft+t.verify+t.commit)/s);
+            t=SpecTiming{};
+        }
+    }
     return true;
 }
 
@@ -15744,6 +15775,33 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 apr.head_dim=d.head_dim; apr.num_heads=cfg.n_heads; apr.num_kv_heads=d.kv_heads;
                 apr.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
                 apr.partials=s.part; apr.part_m=s.pm; apr.part_l=s.pl; apr.splits=GRAPH_SPLITS;
+                // Speculative verify: all rows of a conversation in one matrix-engine launch
+                // (src/attn_verify_dpas.cpp, bin/libgrimoire_attn.so).  MEASURED 2026-10-08,
+                // Qwen3.8-27B MTP K=6, one B70: the per-row loop below took 7.6 ms of a verify
+                // step at 2K context and 22.1 ms at 8K (16 layers x 7 rows); the kernel is
+                // 57 us per layer at 2K and 128 us at 8K in tools/bench_verify_attn.cpp
+                // (5x / 9.5x).  Not bit-identical to the per-row kernel: q and p are fp16,
+                // max error 2-5e-4 of the output scale -- so exact_verify (which promises
+                // decode's own arithmetic) keeps the loop.  GRIMOIRE_VERIFY_DPAS=0 = the loop.
+                static const bool verify_dpas = [] {
+                    const char* e = std::getenv("GRIMOIRE_VERIFY_DPAS"); return !(e && *e == '0'); }();
+                VerifyGroups vg{};
+                bool use_vdpas = verify_dpas && seqb->verify && !exact_verify && M<=kSpecBatch &&
+                                 verify_dpas_ok(apr);
+                int len_max = 1;
+                for(int r=0; use_vdpas && r<M; ++r){
+                    len_max = std::max(len_max, seqb->pos[r]+1);
+                    if(vg.n>0 && seqb->slot[r]==vg.slot[vg.n-1] && seqb->pos[r]==seqb->pos[r-1]+1){
+                        ++vg.nrows[vg.n-1]; continue;
+                    }
+                    if(vg.n==kMaxVerifyGroups){ use_vdpas=false; break; }
+                    vg.row0[vg.n]=r; vg.nrows[vg.n]=1; vg.slot[vg.n]=seqb->slot[r]; ++vg.n;
+                }
+                if(use_vdpas){
+                    const int smax=verify_dpas_splits(apr,vg,len_max);
+                    launch_verify_attn_dpas(q,apr,vg,int64_t(d.kv_slot),d_lens,smax);
+                    launch_verify_merge(q,apr,M,smax);
+                }else
                 if(rows_ok && d_lens==rows_len_dev && M<=kSpecBatch && flash_decode_rows_ok(apr)){
                     // every row in one launch (attention.cpp): each row's own
                     // cache, length and split count -- bit-identical per row
