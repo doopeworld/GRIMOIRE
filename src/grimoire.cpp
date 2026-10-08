@@ -748,6 +748,9 @@ namespace {
 // a null TensorRef, a zero-length span, or a byte count that is not a
 // whole number of elements. Previously a bad ref produced a segfault
 // with no indication of which of ~600 tensors was at fault.
+static size_t upload_piece_bytes();   // multi-GPU upload pacing, defined with dev_copy
+static void upload_pace(size_t n);
+
 template <typename T>
 T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
               const char* what, bool* ok) {
@@ -829,13 +832,14 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
     // OUT_OF_DEVICE_MEMORY (error 39) at the device boundary.  malloc_host is
     // DMA-able from either card.  Chunk it so the pinned buffer stays modest.
     {
-        const size_t CH = size_t(64) << 20;   // 64 MB pinned window
+        const size_t CH = upload_piece_bytes();   // pinned window (64 MB, 16 MB multi-GPU)
         uint8_t* pin = sycl::malloc_host<uint8_t>(std::min(bytes, CH), q);
         if (pin) {
             for (size_t off = 0; off < bytes; off += CH) {
                 const size_t n = std::min(CH, bytes - off);
                 std::memcpy(pin, stage.data() + off, n);
                 q.memcpy(reinterpret_cast<uint8_t*>(d) + off, pin, n).wait();
+                upload_pace(n);
             }
             sycl::free(pin, q);
         } else {
@@ -843,6 +847,34 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
         }
     }
     return d;
+}
+
+// Weight upload pacing for multi-GPU: a rank of several (GRIMOIRE_PP_RANK /
+// GRIMOIRE_TP_RANK set) uploads in 16 MB pieces at no more than
+// GRIMOIRE_UPLOAD_MBPS on average (default 2000; 0 = unpaced), instead of
+// 64 MB pieces back to back at full link speed.  A card on an external link
+// (OCuLink / USB4 dock) then never sees the whole model as one long burst.
+// One GPU: unchanged (64 MB pieces, unpaced).
+static bool upload_ranked() {
+    static const bool r = [] {
+        const char* a = std::getenv("GRIMOIRE_PP_RANK");
+        const char* b = std::getenv("GRIMOIRE_TP_RANK");
+        return (a && *a) || (b && *b); }();
+    return r;
+}
+static size_t upload_piece_bytes() { return upload_ranked() ? (size_t(16) << 20) : (size_t(64) << 20); }
+static void upload_pace(size_t n) {
+    static const double mbps = [] {
+        const char* e = std::getenv("GRIMOIRE_UPLOAD_MBPS");
+        if (e && *e) return std::atof(e);
+        return upload_ranked() ? 2000.0 : 0.0; }();
+    if (mbps <= 0) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    static double sent = 0;
+    sent += double(n);
+    const double due = sent / (mbps * 1e6);
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (due > now) std::this_thread::sleep_for(std::chrono::duration<double>(due - now));
 }
 
 template <typename T>
@@ -864,7 +896,7 @@ T* dev_copy(sycl::queue& q, const void* src, size_t bytes) {
     // DMA'd to a USB4/Thunderbolt-attached card (error 39 at the boundary).
     static const bool PDIAG = std::getenv("GRIMOIRE_PIPE_DIAG") != nullptr;
     if (PDIAG) { std::printf("[dc] malloc_device %.1f MiB OK; ", double(bytes)/1048576.0); std::fflush(stdout); }
-    const size_t CH = size_t(64) << 20;
+    const size_t CH = upload_piece_bytes();
     uint8_t* pin = nullptr;
     try { pin = sycl::malloc_host<uint8_t>(std::min(bytes, CH), q); }
     catch (sycl::exception& e) { if(PDIAG){std::printf("malloc_host THREW: %s\n", e.what());std::fflush(stdout);} throw; }
@@ -876,6 +908,7 @@ T* dev_copy(sycl::queue& q, const void* src, size_t bytes) {
             std::memcpy(pin, s8 + off, n);
             try { q.memcpy(reinterpret_cast<uint8_t*>(d) + off, pin, n).wait(); }
             catch (sycl::exception& e) { if(PDIAG){std::printf("memcpy THREW: %s\n", e.what());std::fflush(stdout);} throw; }
+            upload_pace(n);
         }
         if (PDIAG) { std::printf("memcpy OK\n"); std::fflush(stdout); }
         sycl::free(pin, q);
