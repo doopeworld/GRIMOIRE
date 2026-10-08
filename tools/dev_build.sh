@@ -13,4 +13,4 @@ case "${1:-all}" in
   *) echo "usage: dev_build.sh [grimoire|server|all]" >&2; exit 2 ;;
 esac
 docker image inspect "$IMG" >/dev/null 2>&1 || docker build --target builder -t "$IMG" -f "$REPO/Dockerfile" "$REPO"
-exec docker run --rm -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"
+exec docker run --rm -e GRIM_TARGETS="${GRIM_TARGETS:-}" -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"
