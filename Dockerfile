@@ -65,6 +65,11 @@ COPY tools/grimoire_main.cpp           tools/
 COPY tools/grimoire_server.cpp         tools/
 RUN mkdir -p bin
 
+# GPU targets for the AOT kernels (tools/build_*_only_b70.sh read it): the Arc Pro B70 by
+# default; --build-arg GRIM_TARGETS=intel_gpu_bmg_g31,intel_gpu_bmg_g21 adds the Arc B580
+# (e.g. a pipeline stage on a B580), at twice the device-compile time.
+ARG GRIM_TARGETS=intel_gpu_bmg_g31
+
 RUN bash tools/build_grimoire_only_b70.sh /grimoire \
     && bash tools/build_server_only_b70.sh /grimoire \
     && strip --strip-unneeded bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so
