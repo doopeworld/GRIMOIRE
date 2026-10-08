@@ -11444,7 +11444,16 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     if (dv < cfg.vocab && lm_head.has_i4() && !lm_head.tp_sharded())
         launch_gemv_int4sym(q, lm_head.i4, lm_head.i4s, mtp.h2, s.logits,
                             dv, H, none);
-    else
+    else if (dv < cfg.vocab && !lm_head.tp_sharded()) {
+        // Every format keeps whole rows together (payload, scales and zeros are all
+        // [N][...], b70/weights.hpp), so the first dv rows are the same weight with
+        // N = dv.  Before this only the int4-sym companion took the shortcut, and a
+        // GPTQ/INT4 head read all 248K rows for every draft: ~0.65 GB, 6 of the 10.4 ms
+        // of drafting per step at K=6 (Qwen3.8-27B GPTQ, 2026-10-08).
+        QuantWeight head = lm_head.w;
+        head.N = dv;
+        launch_gemv(q, head, mtp.h2, s.logits, none);
+    } else
         gemv_any(lm_head, mtp.h2, s.logits, none);
     launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
     int32_t tok = 0;
