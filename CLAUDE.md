@@ -28,7 +28,8 @@
 2. Context results are complete in `RESULTS-2026-10-09-CONTEXT.md`: GRIMOIRE prompt/decode
    at 4K/8K/16K/64K/128K = 1928/120.0, 1872/121.2, 1691/115.0, 1052/77.1, 678/66.8.
    All 10 answers PASS. Ian requested Wrapzii's PUBLISHED GitHub results; no local retry.
-   Published comparable coding rows are 8K/64K/128K only (two B60s, Swift checkpoint).
+   Published coding rows are 8K/64K/128K only (two B60s, Swift checkpoint); use the latest
+   128K wiring-fix row: 1255 prompt / 78.0 decode. 8K/64K are earlier published samples.
 3. For a future local comparison, the default k8v4 image contains a TP2-only library;
    its TP1 launch exits before loading. No GPU containers remain; gpu0 idle, AER zero.
 

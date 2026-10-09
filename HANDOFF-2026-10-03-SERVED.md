@@ -778,3 +778,13 @@ method. Do not combine historical forced-EOS fox rows with current coding rows.
 All GPU containers stopped, gpu0 0.02 GiB, all monitored correctable/nonfatal/fatal
 AER totals zero. Intel cloud key exists; asked Ian for How to Connect SSH line.
 Next: inspect cloud hardware only when the line arrives. Run nothing heavy there.
+
+
+### Table correction requested by Ian
+
+Ian pointed out that the table used the older 128K Wrapzii row despite mentioning
+his newer fix separately. Corrected `RESULTS-2026-10-09-CONTEXT.md`: Wrapzii 128K is
+now 1254.9 prompt / 78.02 decode (display 1255/78.0), from the W4A8 wiring confirmation.
+8K/64K remain the earlier published sweep because the wiring report does not provide
+fresh prompt throughput for those lengths. The report explicitly records these
+runtime/sampling differences. Do not present 1111/74.48 as his latest 128K result.
