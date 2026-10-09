@@ -2,7 +2,7 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-09: RESUMED by Ian; one-slot MTP fixed, 44-run sweep completed, long-context table RUNNING.**
+**2026-10-09: RESUMED by Ian; one-slot MTP fixed, 44-run sweep completed, context table complete; Intel cloud SSH line pending.**
 
 ### Findings
 - The first failing candidate is `1aa80fd`: fresh `97b56da` passes the 4K coding probe;
@@ -23,11 +23,14 @@
 - v1.9.0 remains affected; use >=2 slots for its MTP server. Warning added to README AND release notes.
 
 ### Next steps
-1. Finish the RUNNING foreground `bench-1003/lc_table.sh` (output `lc-table-resume.out`), both stacks
-   at targets 4096/8192/16384/65536/131072 (Ian: 4K/8K/16K/64K/128K). GRIMOIRE uses 2 slots,
-   ctx 135168, selected attention library; k8v4 uses max-model-len 135168. Count only tests=PASS.
-2. Deliver the table to Ian and record actual prompt counts and quality failures.
-3. Ask Ian for Intel cloud's How to Connect SSH line; use `~/.ssh/id_ed25519_intel_cloud`, inspect only.
+1. Obtain Ian's Intel cloud How to Connect SSH line, use `~/.ssh/id_ed25519_intel_cloud`,
+   and inspect hardware only. The key exists; no SSH line has been supplied.
+2. Context results are complete in `RESULTS-2026-10-09-CONTEXT.md`: GRIMOIRE prompt/decode
+   at 4K/8K/16K/64K/128K = 1928/120.0, 1872/121.2, 1691/115.0, 1052/77.1, 678/66.8.
+   All 10 answers PASS. Ian requested Wrapzii's PUBLISHED GitHub results; no local retry.
+   Published comparable coding rows are 8K/64K/128K only (two B60s, Swift checkpoint).
+3. For a future local comparison, the default k8v4 image contains a TP2-only library;
+   its TP1 launch exits before loading. No GPU containers remain; gpu0 idle, AER zero.
 
 **2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
 Historical state at the pause: no containers and gpu0 idle. Superseded by the resume above.

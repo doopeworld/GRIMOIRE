@@ -759,3 +759,22 @@ Ian explicitly resumed work after the pause in section 11. Tower is still on
 
 Next: deliver the complete GRIMOIRE/k8v4 table (PASS decode only), then ask for
 Intel cloud's How to Connect SSH line and inspect only.
+
+
+### Table completed; Ian changed comparison source to published GitHub results
+
+GRIMOIRE all 10/10 answers PASS, ctx 135168 and 2 slots. Prompt/decode tok/s at
+4K/8K/16K/64K/128K: 1928/120.0, 1872/121.2, 1691/115.0, 1052/77.1, 678/66.8.
+Fresh TTFT: 2.22/4.48/9.80/62.47/193.68 s. Actual counts and sources are in
+`RESULTS-2026-10-09-CONTEXT.md`; raw JSONL is `cmp-k8v4/grim-lc-1009-1818.jsonl`.
+
+The attempted local k8v4 launch exited itself: its image's native library expects
+TP2 local heads 12/2, not TP1 24/4. No local numbers were generated. Ian then said
+"take wrapzii results from his page on github". Use his October 2 published coding
+sweep for comparable 8K/64K/128K data; mark 4K/16K unreported in that sweep. His
+subsequent 128K W4A8 confirmation is also documented, with its different sample
+method. Do not combine historical forced-EOS fox rows with current coding rows.
+
+All GPU containers stopped, gpu0 0.02 GiB, all monitored correctable/nonfatal/fatal
+AER totals zero. Intel cloud key exists; asked Ian for How to Connect SSH line.
+Next: inspect cloud hardware only when the line arrives. Run nothing heavy there.
