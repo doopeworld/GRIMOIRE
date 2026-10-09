@@ -2,6 +2,26 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
+Nothing runs on the Tower (no containers, gpu0 idle).  This block is current; the blocks below are history.
+- v1.9.0 is PUBLISHED (tag = 78274a5).  The Ornith pp512 "regression" is a llama-benchy artifact (its time
+  to first response is +5 ms from v1.8.2 on; direct requests are identical v1.8 -> v1.9.0).
+- NEW BUG, from `bench-1003/ab_lc.sh` (4K coding answer, Qwen3.8 GPTQ-Int4-MTP, MTP K=6, DRAFT_VOCAB 65536):
+  with GRIMOIRE_SEQ_SLOTS=1 the answer is CORRUPTED (chunks skipped / repeated, 4.7-4.8 tokens per step,
+  ~90 tok/s); with 8 slots it passes (5.23 tokens per step, 120.7 tok/s).  The committed attention library
+  (v1.9.0) fails exactly like the new one and the context (16K or 135K) does not matter.  FIRST TASK
+  tomorrow: find why the one-slot MTP path breaks (bisect 97b56da / 1aa80fd / 78274a5; bin-prev holds an
+  older build; is the default K=4 affected?).  The README tells users to set SEQ_SLOTS=8.
+- Branch `longctx-attn-wip` (NOT merged): src/attn_verify_dpas.cpp, one work-group per KV head x split,
+  <= 1024 keys per split.  Passes at 4K with 8 slots; not yet measured against the committed kernel at the
+  same cache size.
+- Then Ian's table, GRIMOIRE vs the third-party k8v4-xpu stack at 4K / 8K / 16K / 64K / 131K
+  (`bench-1003/lc_table.sh`; 8 slots do not fit 135K context, 1 slot is broken until the bug is fixed).
+- Intel cloud GPU instance: Ian's is "in review"; I need the SSH line from its "How to Connect".
+- Rules unchanged: gpu0 only, never gpu1; stop every GPU container as soon as its test ends; run
+  benchmarks in the foreground (a queued watcher started the A/B behind my back today).
+- Full details: HANDOFF-2026-10-03-SERVED.md section 11.
+
 **2026-10-06 evening: PAUSED until 10-07 (Ian).**  Nothing runs on the Tower.
 - Image v1.8.3 (`grimoire-b70:v1.8.3`, 5e01d55a9c00, code 2840755: ESIMD FP8
   decode GEMV, FP8 small-M DPAS, one card per rank in `multi`) passed validation

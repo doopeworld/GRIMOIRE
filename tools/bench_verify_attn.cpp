@@ -50,11 +50,13 @@ static float e4m3_val(uint8_t b) {
 }
 
 int main(int argc, char** argv) {
-    const int H = 24, KVH = 4, HD = 256, CAP = 16384, G = H / KVH;
+    const int H = 24, KVH = 4, HD = 256, G = H / KVH;
     const float scale = 1.0f / 16.0f;
     std::vector<int> Ls;
     for (int i = 1; i < argc; ++i) Ls.push_back(std::atoi(argv[i]));
     if (Ls.empty()) Ls = {512, 2048, 8192};
+    int CAP = 16384;
+    for (int L : Ls) CAP = std::max(CAP, (L + 15) / 16 * 16);
     sycl::queue q{sycl::gpu_selector_v, {sycl::property::queue::in_order{}}};
     std::printf("device: %s   GRIMOIRE_VERIFY_KEYS_PER_SPLIT=%s\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str(),
@@ -114,10 +116,11 @@ int main(int argc, char** argv) {
             std::vector<int32_t> lens(M);
             for (int r = 0; r < M; ++r) lens[r] = L - M + 1 + r;
             q.memcpy(dlens, lens.data(), M * 4).wait();
-            // reference
+            // reference (fp64, up to 16K keys; longer contexts are timed only)
             std::vector<double> ref(size_t(M) * H * HD);
             double refmax = 0;
-            for (int r = 0; r < M; ++r)
+            const bool do_ref = L <= 16384;
+            for (int r = 0; do_ref && r < M; ++r)
                 for (int h = 0; h < H; ++h) {
                     const int kvh = h / G;
                     const float* qr = &hq[(size_t(r) * H + h) * HD];
@@ -139,6 +142,7 @@ int main(int argc, char** argv) {
                     for (int d = 0; d < HD; ++d) refmax = std::max(refmax, std::fabs(o[d]));
                 }
             auto err = [&]() {
+                if (!do_ref) return -1.0;
                 std::vector<float> got(size_t(M) * H * HD);
                 q.memcpy(got.data(), dout, got.size() * 4).wait();
                 double e = 0;

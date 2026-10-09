@@ -67,6 +67,7 @@ SYCL_ESIMD_FUNCTION inline es::simd<uint32_t, N> e4m3_h16(es::simd<uint8_t, N> b
 //   GRIMOIRE_VERIFY_THREADS=<n>          the target (default 768)
 //   GRIMOIRE_VERIFY_KEYS_PER_SPLIT=<k>   fixed keys per split instead (sweeps)
 constexpr int kMinKeysPerSplit = 32;
+constexpr int kMaxKeysPerSplit = 1024;
 int env_int(const char* name, int fallback) {
     const char* e = std::getenv(name);
     return e ? std::atoi(e) : fallback;
@@ -93,6 +94,9 @@ int verify_dpas_splits(const AttnParams& p, const VerifyGroups& g, int len_max) 
         n = (target + per_split - 1) / per_split;
         const int by_len = (len_max + kMinKeysPerSplit - 1) / kMinKeysPerSplit;
         if (n > by_len) n = by_len;
+        // long contexts: one thread walks at most kMaxKeysPerSplit keys
+        const int by_max = (len_max + kMaxKeysPerSplit - 1) / kMaxKeysPerSplit;
+        if (n < by_max) n = by_max;
     }
     if (n > MAX_SPLITS) n = MAX_SPLITS;
     return n > 0 ? n : 1;
@@ -113,11 +117,16 @@ sycl::event launch_verify_attn_dpas(sycl::queue& q, const AttnParams& p, const V
     const size_t nthreads = size_t(g.n) * KVH * tiles * smax;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<1>(nthreads, 1), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        // One work-group = the `tiles` threads of one (KV head, split): they read the same K/V
+        // blocks at the same time, so the blocks come from DRAM once and from L1 for the rest.
+        // MEASURED 2026-10-09: with every tile its own work-group (consecutive groups = other
+        // splits) each tile streamed K/V separately -- 6x the cache traffic at 7 rows, which
+        // the L2 hid at 8K and cannot at 64K+ (268 MB of K/V per layer at 131K).
+        h.parallel_for(sycl::nd_range<1>(nthreads, size_t(tiles)), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             constexpr float NINF = -std::numeric_limits<float>::infinity();
+            const int tile = int(it.get_local_id(0));
             int id = int(it.get_group(0));
             const int part = id % smax; id /= smax;
-            const int tile = id % tiles; id /= tiles;
             const int kvh = id % KVH;
             const int grp = id / KVH;
             const int row0 = vg.row0[grp], nrows = vg.nrows[grp];
