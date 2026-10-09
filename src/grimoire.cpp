@@ -4437,8 +4437,16 @@ static bool read_u64_file(const std::string& p, uint64_t& v) {
 
 void Grimoire::power_gov_init() {
     const char* e = std::getenv("GRIMOIRE_POWER_LIMIT_W");
-    pgov.limit_w = e && *e ? std::atof(e) : 240.0;
-    if (pgov.limit_w <= 0) { std::printf("  power governor: off (GRIMOIRE_POWER_LIMIT_W=0)\n"); return; }
+    // Default 240 W only for a rank of several GPUs: the governor is part of the
+    // multi-GPU stability work (2026-10-08).  On one GPU it is off by default -- the
+    // card's own firmware holds its 275 W rating, and the governor's pauses cost prompt
+    // speed (pp4096 1.97 -> 2.00 s on Qwen3.8 MXFP4; 14-18% on the heaviest prompts).
+    pgov.limit_w = e && *e ? std::atof(e) : (upload_ranked() ? 240.0 : 0.0);
+    if (pgov.limit_w <= 0) {
+        std::printf("  power governor: off (%s)\n",
+                    e && *e ? "GRIMOIRE_POWER_LIMIT_W=0" : "one GPU; GRIMOIRE_POWER_LIMIT_W=<watts> sets one");
+        return;
+    }
     std::string pci;
 #ifdef SYCL_EXT_INTEL_DEVICE_INFO
     const auto dev = q.get_device();
@@ -11450,8 +11458,23 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     ap.softmax_scale = cfg.attn_softmax_scale(d.head_dim);
     ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
     ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
-    launch_flash_decode(q, ap, none);
-    launch_flash_merge(q, ap, none);
+    // The draft's own attention layer through the matrix-engine kernel too (one row):
+    // tools/bench_verify_attn.cpp, 1 row, per layer: 2K 70 -> 44 us, 8K 246 -> 99 us --
+    // six drafts a step at 8K is ~0.9 ms.  Drafts are never graph-captured, so the
+    // host-side split count is safe; set_cursor() above wrote s.d_seq_len.
+    // GRIMOIRE_VERIFY_DPAS=0 = the decode kernel.
+    static const bool draft_dpas = [] {
+        const char* e = std::getenv("GRIMOIRE_VERIFY_DPAS"); return !(e && *e == '0'); }();
+    if (draft_dpas && verify_dpas_ok(ap)) {
+        VerifyGroups vg{};
+        vg.n = 1; vg.row0[0] = 0; vg.nrows[0] = 1; vg.slot[0] = 0;
+        const int smax = verify_dpas_splits(ap, vg, position + 1);
+        launch_verify_attn_dpas(q, ap, vg, 0, s.d_seq_len, smax);
+        launch_verify_merge(q, ap, 1, smax);
+    } else {
+        launch_flash_decode(q, ap, none);
+        launch_flash_merge(q, ap, none);
+    }
     if (gated)
         launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit,
                                 cfg.n_heads * d.head_dim, none);
