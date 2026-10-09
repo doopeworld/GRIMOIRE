@@ -2873,6 +2873,13 @@ struct Grimoire {
     float* spec_dn_state = nullptr;
     float* spec_conv_ring = nullptr;
     float* spec_dn_steps = nullptr;
+    // Fused verify (dn_verify_fused, the default): the DeltaNet state is not
+    // snapshotted per row; each verify row's k / v / a / beta are saved here
+    // ([DeltaNet layer][row][deltanet_saved_row_floats]) and the commit replays the
+    // accepted prefix (launch_deltanet_replay).  spec_dn_steps is then not allocated.
+    float* spec_dn_inputs = nullptr;
+    size_t spec_dn_row_floats = 0;
+    bool dn_verify_fused = false;
     float* spec_conv_inputs = nullptr;
     float* spec_hidden_steps = nullptr;
     // Whether spec_hidden_steps actually HOLDS this round's hidden states.
@@ -7048,7 +7055,23 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             spec_dn_state = sycl::malloc_device<float>(spec_dn_elems, q);
         if (spec_conv_elems)
             spec_conv_ring = sycl::malloc_device<float>(spec_conv_elems, q);
-        if (spec_dn_elems)
+        // GRIMOIRE_DN_VERIFY_FUSED=0: the old per-row step loop with a full state
+        // snapshot per row (kSpecBatch copies of every DeltaNet state, ~2.4 GB on
+        // Qwen3.8-27B).  Default: the fused verify + replay, ~25 MB of saved inputs.
+        {
+            static const bool fused_env = [] {
+                const char* e = std::getenv("GRIMOIRE_DN_VERIFY_FUSED"); return !(e && *e == '0'); }();
+            DeltaNetParams dp{};
+            dp.n_heads = cfg.lin_v_heads; dp.k_dim = cfg.lin_k_dim; dp.v_dim = cfg.lin_v_dim;
+            dp.n_k_heads = cfg.lin_k_heads;
+            dn_verify_fused = fused_env && spec_dn_elems && deltanet_verify_ok(dp);
+            spec_dn_row_floats = size_t(deltanet_saved_row_floats(dp));
+        }
+        const size_t dn_n_one = size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
+        const size_t dn_layers = dn_n_one ? spec_dn_elems / dn_n_one : 0;
+        if (spec_dn_elems && dn_verify_fused)
+            spec_dn_inputs = sycl::malloc_device<float>(dn_layers * kSpecBatch * spec_dn_row_floats, q);
+        if (spec_dn_elems && !dn_verify_fused)
             spec_dn_steps = sycl::malloc_device<float>(kSpecBatch * spec_dn_elems, q);
         if (spec_conv_input_elems)
             spec_conv_inputs = sycl::malloc_device<float>(kSpecBatch * spec_conv_input_elems, q);
@@ -7067,12 +7090,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
         if ((spec_dn_elems && !spec_dn_state) ||
             (spec_conv_elems && !spec_conv_ring) ||
-            (spec_dn_elems && !spec_dn_steps) ||
+            (spec_dn_elems && !dn_verify_fused && !spec_dn_steps) ||
+            (spec_dn_elems && dn_verify_fused && !spec_dn_inputs) ||
             (spec_conv_input_elems && !spec_conv_inputs) || !spec_hidden_steps) {
             err = "speculative rollback-state allocation failed";
             return false;
         }
-        acct((spec_dn_elems * (1 + kSpecBatch) + spec_conv_elems +
+        acct((spec_dn_elems * (dn_verify_fused ? 1 : 1 + kSpecBatch) +
+              (dn_verify_fused ? dn_layers * kSpecBatch * spec_dn_row_floats : 0) + spec_conv_elems +
               spec_conv_input_elems * kSpecBatch + size_t(kSpecBatch) * cfg.hidden) *
              sizeof(float));
     }
@@ -7976,15 +8001,43 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         g_spec_batch_proposals+=count-1; g_spec_batch_accepted+=accepted-1;
         bind_seq_slot(slots[size_t(row)]);
         const int last=first+accepted-1;
-        size_t doff=0,coff=0;
+        size_t doff=0,coff=0,xoff=0;
         for(auto& layer:L) {
             if(layer.dn_state) {
-                q.memcpy(layer.dn_state,spec_dn_steps+size_t(last)*spec_dn_elems+doff,
-                         dn_n*sizeof(float)); doff+=dn_n;
+                if(dn_verify_fused) {
+                    // replay this conversation's accepted rows on its (untouched) state
+                    DeltaNetParams dp{};
+                    dp.state=layer.dn_state; dp.n_heads=cfg.lin_v_heads; dp.k_dim=cfg.lin_k_dim;
+                    dp.v_dim=cfg.lin_v_dim; dp.n_k_heads=cfg.lin_k_heads;
+                    launch_deltanet_replay(q,dp,spec_dn_inputs+((doff/dn_n)*kSpecBatch+size_t(first))*
+                                           spec_dn_row_floats,accepted);
+                } else
+                    q.memcpy(layer.dn_state,spec_dn_steps+size_t(last)*spec_dn_elems+doff,
+                             dn_n*sizeof(float));
+                doff+=dn_n;
             }
             if(layer.conv_ring) {
-                q.memcpy(layer.conv_ring,batch_conv_steps+size_t(last)*spec_conv_elems+coff,
-                         layer.conv_slot*sizeof(float)); coff+=layer.conv_slot;
+                if(dn_verify_fused) {
+                    // the ring after `accepted` rows: the pre-verify ring (kept at this
+                    // conversation's first row) shifted by the accepted rows' inputs --
+                    // commit_spec_prefix's rebuild
+                    const int channels=2*cfg.lin_k_heads*cfg.lin_k_dim+cfg.lin_v_heads*cfg.lin_v_dim;
+                    const int hist=cfg.conv_kernel-1;
+                    float* dst=layer.conv_ring;
+                    const float* base=batch_conv_steps+size_t(first)*spec_conv_elems+coff;
+                    const float* inputs=spec_conv_inputs+xoff+size_t(first)*channels;
+                    const int cnt=accepted;
+                    q.parallel_for(sycl::range<1>(size_t(channels)*hist),[=](sycl::id<1> id){
+                        const int c=int(id[0])/hist, j=int(id[0])%hist;
+                        if(cnt>=hist) dst[int64_t(c)*hist+j]=inputs[int64_t(cnt-hist+j)*channels+c];
+                        else if(j<hist-cnt) dst[int64_t(c)*hist+j]=base[int64_t(c)*hist+j+cnt];
+                        else dst[int64_t(c)*hist+j]=inputs[int64_t(j-(hist-cnt))*channels+c];
+                    });
+                    xoff+=size_t(kSpecBatch)*channels;
+                } else
+                    q.memcpy(layer.conv_ring,batch_conv_steps+size_t(last)*spec_conv_elems+coff,
+                             layer.conv_slot*sizeof(float));
+                coff+=layer.conv_slot;
             }
         }
         if(mtp.ok && !dflash2.ok) for(int k=0;k<accepted;++k)
@@ -8518,9 +8571,17 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
     size_t doff = 0, coff = 0, xoff = 0;
     for (auto& d : L) {
         if (d.dn_state) {
-            q.memcpy(d.dn_state,
-                     spec_dn_steps + size_t(step) * spec_dn_elems + doff,
-                     dn_n * sizeof(float));
+            if (dn_verify_fused) {
+                // the verify left the state untouched: replay the accepted rows 0..step
+                DeltaNetParams dp{};
+                dp.state = d.dn_state; dp.n_heads = cfg.lin_v_heads; dp.k_dim = cfg.lin_k_dim;
+                dp.v_dim = cfg.lin_v_dim; dp.n_k_heads = cfg.lin_k_heads;
+                launch_deltanet_replay(q, dp, spec_dn_inputs + (doff / dn_n) * kSpecBatch *
+                                       spec_dn_row_floats, accepted);
+            } else
+                q.memcpy(d.dn_state,
+                         spec_dn_steps + size_t(step) * spec_dn_elems + doff,
+                         dn_n * sizeof(float));
             doff += dn_n;
         }
         if (d.conv_ring) {
@@ -8849,6 +8910,7 @@ void Grimoire::release() {
     if (spec_dn_state) sycl::free(spec_dn_state, q);
     if (spec_conv_ring) sycl::free(spec_conv_ring, q);
     if (spec_dn_steps) sycl::free(spec_dn_steps, q);
+    if (spec_dn_inputs) sycl::free(spec_dn_inputs, q);
     if (spec_conv_inputs) sycl::free(spec_conv_inputs, q);
     if (spec_hidden_steps) sycl::free(spec_hidden_steps, q);
     // Every slot, not just one.  N slots is N full copies of the KV and
@@ -15362,7 +15424,25 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(rows_ok && !capture_spec && causal_conv1d_rows_ok(cfg.conv_kernel))
                     launch_causal_conv1d_split_rows(q,t0,d.la_conv,d.conv_base,
                         int64_t(d.conv_slot),rslots,M,ch,cfg.conv_kernel,t1,t2,t3,qs,vs);
-                else
+                else if(capture_spec && dn_verify_fused){
+                    // speculative verify: one conv over each conversation's rows (its
+                    // ring holds the history), after keeping the pre-verify ring at the
+                    // conversation's first row of batch_conv_steps; the commit rebuilds
+                    // the ring from that copy and the accepted rows' inputs.  2 launches
+                    // per conversation and layer instead of 2 per row.
+                    for(int r=0;r<M;){
+                        int n=1;
+                        while(r+n<M && seqb->slot[r+n]==seqb->slot[r] &&
+                              seqb->pos[r+n]==seqb->pos[r+n-1]+1) ++n;
+                        float* ring=d.conv_base+size_t(seqb->slot[r])*d.conv_slot;
+                        q.memcpy(batch_conv_steps+size_t(r)*spec_conv_elems+spec_coff[li],ring,
+                                 d.conv_slot*sizeof(float));
+                        ConvParams cp{t0+int64_t(r)*ch,d.la_conv,ring,nullptr,ch,cfg.conv_kernel};
+                        launch_causal_conv1d_split_prefill(q,cp,n,
+                            t1+int64_t(r)*qs,t2+int64_t(r)*qs,t3+int64_t(r)*vs,nullptr,qs,vs);
+                        r+=n;
+                    }
+                }else
                 for(int r=0;r<M;++r){
                     float* ring=d.conv_base+size_t(seqb->slot[r])*d.conv_slot;
                     ConvParams cp{t0+int64_t(r)*ch,d.la_conv,ring,nullptr,
@@ -15455,6 +15535,24 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     sp.state=d.dn_base; sp.out=t0;
                     sp.n_heads=Hv; sp.k_dim=Dk; sp.v_dim=Dv; sp.n_k_heads=Hk;
                     launch_deltanet_step_rows(q,sp,M,rslots,int64_t(d.dn_slot),{});
+                }else if(capture_spec && dn_verify_fused){
+                    // every verify row in one launch, state read-only; the commit
+                    // replays the accepted prefix (deltanet.cpp, launch_deltanet_verify_rows)
+                    DeltaNetParams sp{};
+                    sp.q=t1; sp.k=t2; sp.v=t3; sp.a=alpha; sp.beta=beta; sp.out=t0;
+                    sp.n_heads=Hv; sp.k_dim=Dk; sp.v_dim=Dv; sp.n_k_heads=Hk;
+                    DnGroups g{};
+                    for(int t=0;t<M;++t){
+                        const int slot=seqb?seqb->slot[t]:0;
+                        if(g.n>0 && slot==g.slot[g.n-1] && (!seqb || seqb->pos[t]==seqb->pos[t-1]+1)){
+                            ++g.nrows[g.n-1]; continue;
+                        }
+                        g.row0[g.n]=t; g.nrows[g.n]=1; g.slot[g.n]=slot; ++g.n;
+                    }
+                    sp.state=seqb?d.dn_base:d.dn_state;
+                    const size_t dn_n=size_t(Hv)*Dv*Dk;
+                    float* saved=spec_dn_inputs+(spec_doff[li]/dn_n)*kSpecBatch*spec_dn_row_floats;
+                    launch_deltanet_verify_rows(q,sp,g,seqb?int64_t(d.dn_slot):0,saved,{});
                 }else if(seqb||M<=16){
                     for(int t=0;t<M;++t){
                         DeltaNetParams sp{};

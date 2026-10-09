@@ -534,6 +534,77 @@ sycl::event launch_rmsnorm_residual_batched(
                                       g_norm_weight_offset, deps);
     (void)weight_offset;
     constexpr int WG = 256;
+    // Rows up to 32 * WG wide keep each thread's elements in registers: every load is
+    // issued up front and the second pass does not re-read h.  Same elements per thread
+    // in the same order, so the result is bit-identical to the loop below.  MEASURED
+    // 2026-10-09, Qwen3.8-27B MTP verify (7 rows): the loop form was 21 us (input norm)
+    // and 16 us (post norm) per layer, latency-bound on one dependent load per element.
+    constexpr int EPT = 32;
+    if (hidden <= EPT * WG) {
+        return q.submit([&](sycl::handler& hd) {
+            hd.depends_on(deps);
+            sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);
+            hd.parallel_for(
+                sycl::nd_range<1>(size_t(tokens) * WG, WG),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    const auto sg = it.get_sub_group();
+                    const int t = int(it.get_group(0));
+                    const int lid = int(it.get_local_id(0));
+                    const int sgid = int(sg.get_group_id()[0]);
+                    const int lane = int(sg.get_local_id()[0]);
+                    float* ht = h + int64_t(t) * hidden;
+                    float* ot = out ? out + int64_t(t) * hidden : nullptr;
+                    sycl_bf16* obt = out_bf ? out_bf + int64_t(t) * hidden : nullptr;
+                    const float* a = r0 ? r0 + int64_t(t) * hidden : nullptr;
+                    const float* b = r1 ? r1 + int64_t(t) * hidden : nullptr;
+                    float vals[EPT];
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        vals[e] = i < hidden ? ht[i] : 0.0f;
+                    }
+                    if (a) {
+                        #pragma unroll
+                        for (int e = 0; e < EPT; ++e) {
+                            const int i = lid + e * WG;
+                            if (i < hidden) vals[e] += a[i];
+                        }
+                    }
+                    if (b) {
+                        #pragma unroll
+                        for (int e = 0; e < EPT; ++e) {
+                            const int i = lid + e * WG;
+                            if (i < hidden) vals[e] += b[i];
+                        }
+                    }
+                    float ss = 0.0f;
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        if (i < hidden) {
+                            if (a || b) ht[i] = vals[e];
+                            ss = sycl::fma(vals[e], vals[e], ss);
+                        }
+                    }
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    float* pt = partial.template get_multi_ptr<sycl::access::decorated::no>().get();
+                    if (lane == 0) pt[sgid] = ss;
+                    sycl::group_barrier(it.get_group());
+                    float total = 0.0f;
+                    for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
+                    const float scale = sycl::rsqrt(total / float(hidden) + eps);
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        if (i < hidden) {
+                            const float v = vals[e] * scale * (weight_offset + bf16_to_f32(weight[i]));
+                            if (ot) ot[i] = v;
+                            if (obt) obt[i] = sycl_bf16(v);
+                        }
+                    }
+                });
+        });
+    }
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);
         sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);

@@ -915,6 +915,28 @@ struct RowSlots { int32_t slot[kMaxRowSlots]; int32_t pos[kMaxRowSlots]; };
 sycl::event launch_deltanet_step_rows(sycl::queue& q, const DeltaNetParams& p, int rows,
                                       const RowSlots& rs, int64_t state_stride,
                                       const std::vector<sycl::event>& deps = {});
+// Speculative verify: every row of every conversation in ONE launch.  Group g is rows
+// row0[g] .. row0[g]+nrows[g]-1 of one conversation (consecutive positions), state
+// p.state + slot[g] * state_stride.  Each sub-group keeps its state row in registers
+// across the group's rows with dn_step_sg's arithmetic, so row t's output is
+// bit-identical to the per-row launch_deltanet_step loop -- but the state is only READ:
+// each row's k / v / a / beta go to saved + row * deltanet_saved_row_floats(p), and the
+// commit applies the accepted prefix with launch_deltanet_replay.
+struct DnGroups {
+    int32_t n = 0;
+    int32_t row0[kMaxRowSlots];
+    int32_t nrows[kMaxRowSlots];
+    int32_t slot[kMaxRowSlots];
+};
+bool deltanet_verify_ok(const DeltaNetParams& p);
+int64_t deltanet_saved_row_floats(const DeltaNetParams& p);
+sycl::event launch_deltanet_verify_rows(sycl::queue& q, const DeltaNetParams& p, const DnGroups& g,
+                                        int64_t state_stride, float* saved,
+                                        const std::vector<sycl::event>& deps = {});
+// p.state (in place) advanced by the n rows saved at `saved` (consecutive rows), in order:
+// the same arithmetic again, so the state equals the per-row loop's after those n rows.
+sycl::event launch_deltanet_replay(sycl::queue& q, const DeltaNetParams& p, const float* saved, int n,
+                                   const std::vector<sycl::event>& deps = {});
 // launch_causal_conv1d_split_prefill(tokens = 1) for `rows` rows in one
 // launch, kernel width 4 only: row r convolves x[r] over its own ring
 // (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.
