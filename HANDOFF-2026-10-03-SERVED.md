@@ -665,3 +665,56 @@ k8v4 stack, 4K-130K), ab_lc.sh, bisect_ornith.sh, bisect_hold.sh, tmplcount.sh, 
 3. Ian's table: GRIMOIRE vs the third-party k8v4 stack at 4K / 8K / 16K / 64K / 131K (bench-1003/lc_table.sh).
    8 slots do not fit 135K (4.1 GiB of KV per slot); use 2 slots if they fit, or fix item 1 first.
 4. Intel cloud instance once it is approved.
+
+
+## 12. 2026-10-09 resumed: one-slot speculative state commit
+
+Ian explicitly resumed work after the pause in section 11. Tower is still on
+`longctx-attn-wip`, starting from `2299a03`; gpu0 is PCI `03:00.0`, `[8086:e223]`,
+`renderD128`. No reboot or work on gpu1 occurred.
+
+### Findings
+
+- Reproduced run C: one-slot Qwen3.8 GPTQ/MTP K=6 at ctx 16384, 4K coding prompt,
+  syntax FAIL (unterminated string). Default K=4 and Ornith K=4 also fail.
+- Fresh builds with pinned oneAPI 2026.1.1: `97b56da` PASS, `1aa80fd` FAIL;
+  committed `78274a5` server/library FAIL. `bin-prev` contains the fused DeltaNet
+  code too, so it cannot serve as a pre-fusion baseline. Current build with
+  `GRIMOIRE_DN_VERIFY_FUSED=0` PASS.
+- Root cause: `launch_deltanet_verify_rows` reads live state without advancing it;
+  `generation.hpp` committed only after a rejection. Full acceptance silently lost
+  the block's recurrent state. The scheduler's `decode_spec_batch` already replayed
+  every accepted prefix, explaining the slot-dependent failure. Fix: commit every
+  successful batched recurrent verify, including full acceptance; declined verify
+  continues with a plain step and never commits unfilled buffers.
+- Host test makes recurrent state influence output and covers MTP/DFlash, K=4/6,
+  every rejection prefix, full acceptance and declined verify. It passes on Mac and
+  Linux; restoring only the old condition fails greedy parity. The pre-existing host
+  fake lacked PP stubs after the generation header changed; these are restored, and
+  `<cstdio>` is included explicitly.
+- Repaired served Qwen3.8 GPTQ/MTP one slot: K=6 4K fresh/repeat PASS (105.0/105.2
+  tok/s); 8K fresh/repeat PASS (79.3/79.3). K=4 4K/8K PASS (86.1/70.1). 8-slot K=6
+  control PASS (120.7 at 4K). These use ctx 16384; they are not the long-context table.
+- Ornith's repaired 4K answer used `bool` to reject boolean endpoints. The probe's
+  builtin allowlist omitted that harmless type, producing NameError on otherwise
+  valid code. Added `bool`, preserving all functional assertions; all four saved
+  repaired Ornith answers pass on recheck and the old corrupted one still fails.
+- Scripts remain outside git in `grimoire-runs/bench-1003`; the Mac copy of
+  `coding_probe.py` also includes the builtin fix. Original saved as
+  `coding_probe.py.before-bool-resume`. Raw JSONL evidence: `cmp-k8v4/grim-resume-*.jsonl`.
+- Server and CLI rebuilt in isolated worktrees, with no GPU mapped to build containers.
+  Repaired binaries and libraries installed into the main Tower checkout's `bin/`.
+  Original files preserved in `bench-1003/resume-original-bin/` (no archive).
+- v1.9.0's published image remains affected; README now warns to use >=2 slots for
+  serving with MTP, or disable MTP. No image or release asset was replaced.
+
+### Next steps
+
+1. Run `tools/regress_all_g0.sh`, and inspect its parity checks and generated text.
+2. Compare committed and work-group DPAS attention with identical cache capacity.
+   Committed library is preserved at `bin/attn-committed/libgrimoire_attn.so`.
+3. Run both sides of Ian's table via `bench-1003/lc_table.sh`; use ctx 135168 and
+   preferably 2 slots to exercise the faster scheduler verify path. Only PASS decode
+   numbers are valid. Record actual prompt token counts for both checkpoints.
+4. Ask Ian for Intel cloud's How to Connect SSH line; inspect with his cloud key,
+   run no heavy workload.

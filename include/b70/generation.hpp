@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <cstdlib>
@@ -370,7 +371,12 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 o.stats->drafted  += int(candidates.size())-1;   // anchor is not a draft
                 o.stats->accepted += accepted-1;
             }
-            if(accepted<int(candidates.size())) {
+            if(accepted<int(candidates.size()) ||
+               (batched_ok && e.has_recurrent_state())) {
+                // Fused recurrent verification leaves the live DeltaNet
+                // state unchanged. Finalize every accepted prefix, including
+                // a fully accepted block, before starting the next round.
+                // A degraded sequential round already advanced its state.
                 // commit_spec_prefix is exact whenever there is no
                 // recurrent state to rebuild, whichever verify ran.  When
                 // there IS recurrent state, only the batched verify writes

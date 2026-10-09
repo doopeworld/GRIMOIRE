@@ -64,6 +64,8 @@ struct Engine {
         snap=ids;
     }
     void sync(){}
+    bool pp_enabled()const{return false;}
+    void pp_expect_next_rows(int){}
     int argmax_token(){assert(!history.empty());return (history.back()+1)%cfg.vocab;}
     const float* forward(int t){
         if(fail_forward_after>=0&&forward_calls>=fail_forward_after)return nullptr;
@@ -92,11 +94,83 @@ struct Engine {
         for(int i=0;i<15;++i){t=(t+1+(i==reject_at?7:0))%cfg.vocab;block.push_back(t);}return true;
     }
 };
+// Fused DeltaNet verification computes per-row outputs while leaving the
+// live recurrent state untouched until commit. Make that state influence
+// the next token so skipping a full-accept commit breaks greedy parity.
+struct DeferredEngine : Engine {
+    int state=0, draft_state=0;
+    std::vector<int> verified_states;
+    DeferredEngine(){recurrent=true;}
+    void reset(){Engine::reset();state=0;verified_states.clear();}
+    int advance(int current,int token,int position)const{
+        return (3*current+token+position+1)%cfg.vocab;
+    }
+    int argmax_token(){return state;}
+    const float* forward(int token){
+        const int position=pos;
+        if(!Engine::forward(token))return nullptr;
+        state=advance(state,token,position);return &logits;
+    }
+    bool prefill(const std::vector<int32_t>& ids,std::vector<int32_t>* next=nullptr){
+        if(next&&decline_verify)return false;
+        const int saved=state;
+        verified_states.clear();
+        for(int token:ids){
+            if(!forward(token))return false;
+            if(next){next->push_back(argmax_token());verified_states.push_back(state);}
+        }
+        if(next){state=saved;++batch_verifies;}
+        batch_count=0;return true;
+    }
+    void commit_spec_prefix(int saved,int n){
+        assert(n>0&&size_t(n)<=verified_states.size());
+        Engine::commit_spec_prefix(saved,n);state=verified_states[size_t(n-1)];
+    }
+    int mtp_draft(int token,int position,bool from_draft){
+        ++draft_calls;
+        if(!from_draft)draft_state=state;
+        draft_state=advance(draft_state,token,position);
+        return (draft_state+(batch_count++==reject_at?7:0))%cfg.vocab;
+    }
+    bool dflash_draft(int token,int position,std::vector<int32_t>& block,bool context=false){
+        if(context)return true;
+        draft_state=state;
+        for(int i=0;i<15;++i){
+            draft_state=advance(draft_state,token,position+i);
+            token=(draft_state+(i==reject_at?7:0))%cfg.vocab;
+            block.push_back(token);
+        }
+        return true;
+    }
+};
 template<class F> void throws(F f){bool did=false;try{f();}catch(const std::exception&){did=true;}assert(did);}
 int main(){
     using namespace b70;
     std::vector<int32_t> out;FinishReason reason;
     const std::vector<int32_t> prompt{3,4,5,6};
+    for(bool df:{false,true})for(int depth:{4,6})for(int rejected=-1;rejected<depth;++rejected){
+        DeferredEngine plain;
+        GenerationOptions po{40,-1,-1,0,false,false,false};
+        std::vector<int32_t> want;
+        generate_tokens(plain,prompt,po,want,{},reason);
+        for(bool declined:{false,true}){
+            DeferredEngine spec;spec.reject_at=rejected;spec.decline_verify=declined;
+            SpecStats stats;
+            GenerationOptions so{40,-1,-1,depth,df,!df,false,&stats};
+            std::vector<int32_t> got;
+            generate_tokens(spec,prompt,so,got,{},reason);
+            assert(got==want);
+            int expected_state=0;
+            for(size_t i=0;i<spec.history.size();++i)
+                expected_state=spec.advance(expected_state,spec.history[i],int(i));
+            assert(spec.state==expected_state);
+            if(declined)assert(spec.commits==0&&spec.batch_verifies==0);
+            else{
+                assert(spec.commits==spec.batch_verifies&&spec.commits>1);
+                if(rejected<0)assert(stats.accepted==stats.drafted&&stats.accepted>0);
+            }
+        }
+    }
     for(bool df:{false,true})for(int depth=0;depth<=15;++depth)for(int rejected=-1;rejected<depth;++rejected) {
         Engine e;e.reject_at=rejected;
         GenerationOptions o{40,-1,-1,depth,df,!df,false};

@@ -2,8 +2,31 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-09: RESUMED by Ian; one-slot MTP state commit fixed, regression sweep next.**
+
+### Findings
+- The first failing candidate is `1aa80fd`: fresh `97b56da` passes the 4K coding probe;
+  fresh `1aa80fd` and committed `78274a5` fail. `bin-prev` also contains the fused code.
+- Fused DeltaNet verify leaves live state untouched. `generation.hpp` used to call
+  `commit_spec_prefix` only on rejection, losing every fully accepted block on the single-request
+  path. Every batched recurrent verification now commits its accepted prefix.
+- Qwen3.8 GPTQ, one slot: K=6 passes fresh/repeat 4K and 8K (4/4); default K=4 passes 4K/8K
+  (2/2). Ornith K=4 also exposed the original corruption; repaired output passes the same
+  checker after adding the missing Python `bool` builtin. The 8-slot Qwen control passes.
+- Host regression covers MTP and DFlash, full/partial acceptance and declined verify; restoring
+  the old commit condition makes greedy parity fail. Pinned oneAPI server and CLI rebuilt.
+- v1.9.0 remains affected; use >=2 slots for its MTP server. Warning added to README.
+
+### Next steps
+1. Finish `tools/regress_all_g0.sh` on the repaired build, gpu0 only.
+2. Benchmark the work-group attention change against committed DPAS at identical cache sizes;
+   retain it only if it wins.
+3. Run `bench-1003/lc_table.sh` for both stacks at 4K/8K/16K/64K/131K. Use 2 slots if they fit
+   to exercise the batched verify kernel; count only answers with tests=PASS.
+4. Ask Ian for Intel cloud's How to Connect SSH line; use `~/.ssh/id_ed25519_intel_cloud`, inspect only.
+
 **2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
-Nothing runs on the Tower (no containers, gpu0 idle).  This block is current; the blocks below are history.
+Historical state at the pause: no containers and gpu0 idle. Superseded by the resume above.
 - v1.9.0 is PUBLISHED (tag = 78274a5).  The Ornith pp512 "regression" is a llama-benchy artifact (its time
   to first response is +5 ms from v1.8.2 on; direct requests are identical v1.8 -> v1.9.0).
 - NEW BUG, from `bench-1003/ab_lc.sh` (4K coding answer, Qwen3.8 GPTQ-Int4-MTP, MTP K=6, DRAFT_VOCAB 65536):

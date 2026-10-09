@@ -53,6 +53,12 @@ docker run -d --name grimoire --init --stop-timeout 300 \
 Only three things change from one model to another: the `--model` folder, `--proj`, and the extra
 flags in the table. The server is OpenAI-compatible at `http://<host>:8000/v1`.
 
+**v1.9.0 correctness warning:** MTP with `GRIMOIRE_SEQ_SLOTS=1` can skip or repeat chunks
+of an answer, including at the default `GRIMOIRE_MTP_K=4`. This was reproduced on Qwen3.8
+and Ornith. When serving with that release, set `GRIMOIRE_SEQ_SLOTS` to at least 2
+(the command above uses 8), or disable MTP. The fix is in the source on `longctx-attn-wip`;
+the published v1.9.0 binary still contains the bug.
+
 - `--init` and `--stop-timeout 300` are required: killing a container with GPU work in flight can
   drop the card off the PCI bus until a power cycle.
 - `-e GRIMOIRE_SEQ_SLOTS=8` lets up to 8 requests decode together. Without it the server answers
