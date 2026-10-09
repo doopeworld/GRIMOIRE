@@ -788,3 +788,10 @@ now 1254.9 prompt / 78.02 decode (display 1255/78.0), from the W4A8 wiring confi
 8K/64K remain the earlier published sweep because the wiring report does not provide
 fresh prompt throughput for those lengths. The report explicitly records these
 runtime/sampling differences. Do not present 1111/74.48 as his latest 128K result.
+
+
+### Final pause requested by Ian — 2026-10-09
+
+The final 16K kernel diagnostic completed. Findings and tomorrow's order are in
+HANDOFF-2026-10-09-PAUSED.md. Tower idle, no GPU containers, gpu0 0.02 GiB and AER
+totals zero. No jobs queued; gpu1 untouched. Resume only when Ian asks.

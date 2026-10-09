@@ -2,36 +2,31 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-09: RESUMED by Ian; one-slot MTP fixed, 44-run sweep completed, context table complete; Intel cloud SSH line pending.**
+**2026-10-09: PAUSED by Ian after the final diagnostic; resume tomorrow only when asked.**
+No GPU containers, gpu0 idle (0.02 GiB), AER totals zero. GPU1 untouched; no queued jobs.
+Full checkpoint: `HANDOFF-2026-10-09-PAUSED.md`.
 
 ### Findings
-- The first failing candidate is `1aa80fd`: fresh `97b56da` passes the 4K coding probe;
-  fresh `1aa80fd` and committed `78274a5` fail. `bin-prev` also contains the fused code.
-- Fused DeltaNet verify leaves live state untouched. `generation.hpp` used to call
-  `commit_spec_prefix` only on rejection, losing every fully accepted block on the single-request
-  path. Every batched recurrent verification now commits its accepted prefix.
-- Qwen3.8 GPTQ, one slot: K=6 passes fresh/repeat 4K and 8K (4/4); default K=4 passes 4K/8K
-  (2/2). Ornith K=4 also exposed the original corruption; repaired output passes the same
-  checker after adding the missing Python `bool` builtin. The 8-slot Qwen control passes.
-- Host regression covers MTP and DFlash, full/partial acceptance and declined verify; restoring
-  the old commit condition makes greedy parity fail. Pinned oneAPI server and CLI rebuilt.
-- `regress-1009-1730`: 44/44 runs completed, ALL DONE, no gpu0 guard trip; Sherlock and hot-expert
-  text IDENTICAL. Speculative prose differs from plain, also observed in the pre-fix 13:15 sweep.
-- Equal-cache attention A/B: unconditional work-group grouping slows short contexts. Now retain
-  committed layout until the long-context split floor exceeds the thread target. At 131K cache,
-  7-row 4K/8K/16K = 67/229/450 us; 64K/128K = 832/1511 us (committed 1051/1850).
-- v1.9.0 remains affected; use >=2 slots for its MTP server. Warning added to README AND release notes.
+- One-slot MTP state commit fixed in dd286b3. Full regression 44/44 completed without a guard trip.
+- Selected attention 031a87b preserves short-context performance and improves isolated 64K/128K
+  verify attention 26%/22%. This did not improve prompt processing.
+- Validated table 10/10 PASS: prompt/decode at 4K/8K/16K/64K/128K = 1928/120.0, 1872/121.2,
+  1691/115.0, 1052/77.1, 678/66.8. Wrap latest published 128K = 1255/78.0; table corrected.
+- Earlier saved win was 2K/8K on one B70 per stack. It never established wins at every length.
+  Current published Wrap numbers use two B60s and Swift; distinguish those comparisons.
+- Final 16K diagnostic: FFN 4.490 s (46.4%), flash attention 2.315 s (23.9%) of 9.686 s timed
+  regions. Flash time grows 225/657/1084 ms across three equal 5120-token chunks.
+- gemm_fast.cpp defaults to joint_matrix prefill; its ESIMD alternative is not enabled.
+  Check actual GRF allocation before testing it. No new performance change adopted.
+- v1.9.0 release warning published; image unchanged. Intel key present, SSH line pending.
 
 ### Next steps
-1. Obtain Ian's Intel cloud How to Connect SSH line, use `~/.ssh/id_ed25519_intel_cloud`,
-   and inspect hardware only. The key exists; no SSH line has been supplied.
-2. Context results are complete in `RESULTS-2026-10-09-CONTEXT.md`: GRIMOIRE prompt/decode
-   at 4K/8K/16K/64K/128K = 1928/120.0, 1872/121.2, 1691/115.0, 1052/77.1, 678/66.8.
-   All 10 answers PASS. Ian requested Wrapzii's PUBLISHED GitHub results; no local retry.
-   Published coding rows are 8K/64K/128K only (two B60s, Swift checkpoint); use the latest
-   128K wiring-fix row: 1255 prompt / 78.0 decode. 8K/64K are earlier published samples.
-3. For a future local comparison, the default k8v4 image contains a TP2-only library;
-   its TP1 launch exits before loading. No GPU containers remain; gpu0 idle, AER zero.
+1. When Ian resumes, profile/optimize feed-forward GEMMs and prefill attention on gpu0 only,
+   preserving pure SYCL/Level Zero. Read the paused handoff before running anything.
+2. Evaluate existing ESIMD flash prefill with proper register allocation, in an isolated library,
+   at matching cache and chunk sizes. Keep only measured wins with passing text/behavior checks.
+3. Revalidate all five context lengths; claim wins only for controlled matching comparisons.
+4. Intel cloud: obtain How to Connect SSH line; inspect only, no heavy work.
 
 **2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
 Historical state at the pause: no containers and gpu0 idle. Superseded by the resume above.
