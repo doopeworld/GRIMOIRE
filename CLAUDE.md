@@ -2,7 +2,7 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-09: RESUMED by Ian; one-slot MTP state commit fixed, regression sweep next.**
+**2026-10-09: RESUMED by Ian; one-slot MTP fixed, 44-run sweep completed, long-context table RUNNING.**
 
 ### Findings
 - The first failing candidate is `1aa80fd`: fresh `97b56da` passes the 4K coding probe;
@@ -15,15 +15,19 @@
   checker after adding the missing Python `bool` builtin. The 8-slot Qwen control passes.
 - Host regression covers MTP and DFlash, full/partial acceptance and declined verify; restoring
   the old commit condition makes greedy parity fail. Pinned oneAPI server and CLI rebuilt.
-- v1.9.0 remains affected; use >=2 slots for its MTP server. Warning added to README.
+- `regress-1009-1730`: 44/44 runs completed, ALL DONE, no gpu0 guard trip; Sherlock and hot-expert
+  text IDENTICAL. Speculative prose differs from plain, also observed in the pre-fix 13:15 sweep.
+- Equal-cache attention A/B: unconditional work-group grouping slows short contexts. Now retain
+  committed layout until the long-context split floor exceeds the thread target. At 131K cache,
+  7-row 4K/8K/16K = 67/229/450 us; 64K/128K = 832/1511 us (committed 1051/1850).
+- v1.9.0 remains affected; use >=2 slots for its MTP server. Warning added to README AND release notes.
 
 ### Next steps
-1. Finish `tools/regress_all_g0.sh` on the repaired build, gpu0 only.
-2. Benchmark the work-group attention change against committed DPAS at identical cache sizes;
-   retain it only if it wins.
-3. Run `bench-1003/lc_table.sh` for both stacks at 4K/8K/16K/64K/131K. Use 2 slots if they fit
-   to exercise the batched verify kernel; count only answers with tests=PASS.
-4. Ask Ian for Intel cloud's How to Connect SSH line; use `~/.ssh/id_ed25519_intel_cloud`, inspect only.
+1. Finish the RUNNING foreground `bench-1003/lc_table.sh` (output `lc-table-resume.out`), both stacks
+   at targets 4096/8192/16384/65536/131072 (Ian: 4K/8K/16K/64K/128K). GRIMOIRE uses 2 slots,
+   ctx 135168, selected attention library; k8v4 uses max-model-len 135168. Count only tests=PASS.
+2. Deliver the table to Ian and record actual prompt counts and quality failures.
+3. Ask Ian for Intel cloud's How to Connect SSH line; use `~/.ssh/id_ed25519_intel_cloud`, inspect only.
 
 **2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
 Historical state at the pause: no containers and gpu0 idle. Superseded by the resume above.

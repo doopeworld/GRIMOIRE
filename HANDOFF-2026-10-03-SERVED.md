@@ -718,3 +718,44 @@ Ian explicitly resumed work after the pause in section 11. Tower is still on
    numbers are valid. Record actual prompt token counts for both checkpoints.
 4. Ask Ian for Intel cloud's How to Connect SSH line; inspect with his cloud key,
    run no heavy workload.
+
+
+### Resume checkpoint: full sweep and selected attention (table running)
+
+- `tools/regress_all_g0.sh`: 44/44 completed, ALL DONE, no gpu0 guard trip. Logs:
+  `/mnt/storage/isos/grimoire-runs/regress-1009-1730`, wrapper output
+  `bench-1003/regress-resume.out`. Sherlock matches its reference; hot-expert text
+  IDENTICAL. The printed MTP/DFlash prose comparisons differ from plain, as they
+  already did in the pre-fix `regress-1009-1315`; do not describe this as exact
+  speculative token parity across all real checkpoints.
+- A new Ornith launch passed both 4K answers but failed both 8K answers with a real
+  IndexError: interval endpoints were indexed before checking tuple length. The
+  source is coherent, unlike the pre-fix corruption. These two decode rates are
+  excluded; the preceding repaired launch's 4K/8K answers pass the corrected checker.
+- v1.9.0 release notes now include the published warning and link to `dd286b3`.
+  The image and asset are unchanged.
+- Same executable, random inputs, cache capacities 16384 and 131072, pinned toolchain,
+  gpu0: unconditional grouping LOSES at short context. 7 rows, 16K cache, committed
+  vs grouped at 4K/8K/16K: 66/131/233 -> 118/178/330 us. At 131K cache: 4K/8K/16K
+  67/230/451 -> 98/251/512; 64K/128K 1051/1850 -> 837/1525 us.
+- Equal split counts at 64K/128K (committed library with KEYS_PER_SPLIT=1024):
+  1552/3166 us vs grouped 837/1525. Thus grouping itself helps long context, whereas
+  the original 32-split policy is better than merely raising the split count.
+- Selected library: use committed tile layout until the long-context split floor
+  exceeds the ordinary thread target, then group the tiles. 16K cache, 7 rows:
+  4K/8K/16K = 66.8/127.5/231.0 us. 131K cache: 4K/8K/16K = 67.0/229.3/450.0,
+  64K/128K = 831.9/1510.8 (26.4%/22.4% faster than committed). One-row timings
+  preserved. Errors vs fp64 up to 16K unchanged; longer lengths timing only.
+- Files in bench-1003: `attn-committed-16k.out`, `attn-committed-131k.out`,
+  `attn-candidate-16k.out`, `attn-candidate-131k.out`,
+  `attn-committed-equalsplits.out`, `attn-adaptive-16k.out`, `attn-adaptive-131k.out`.
+- The selected library was rebuilt separately and installed without an active GPU
+  container. Only the library changed; the verified server/CLI ABI is unchanged.
+- Table is now RUNNING in foreground: `LENGTHS=4096,8192,16384,65536,131072
+  GRIM_SLOTS=2 bash lc_table.sh`, output `bench-1003/lc-table-resume.out`.
+  Both servers reserve 135168 context. Probe summary medians now exclude failed
+  answers. Removed outer timeouts from the table wrapper; k8v4 starts with --init.
+  Script updates also live in the Mac copy of bench-1003.
+
+Next: deliver the complete GRIMOIRE/k8v4 table (PASS decode only), then ask for
+Intel cloud's How to Connect SSH line and inspect only.

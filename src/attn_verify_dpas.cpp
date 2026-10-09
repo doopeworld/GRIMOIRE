@@ -115,6 +115,15 @@ sycl::event launch_verify_attn_dpas(sycl::queue& q, const AttnParams& p, const V
     const AttnParams pp = p;
     const VerifyGroups vg = g;
     const size_t nthreads = size_t(g.n) * KVH * tiles * smax;
+    static const int target = env_int("GRIMOIRE_VERIFY_THREADS", 768);
+    const int per_split = (g.n > 0 ? g.n : 1) * KVH * tiles;
+    const int short_splits = (target + per_split - 1) / per_split;
+    // Same-cache A/B: grouping loses at short context (7 rows, 16K cache,
+    // 4K keys: 66 -> 118 us), but wins when long context requires more
+    // splits (64K/128K keys: 1552/3166 -> 837/1525 us at equal split counts).
+    // Keep the committed layout until the long-context split floor exceeds
+    // the ordinary thread target. One-row drafting keeps its original layout.
+    const bool grouped = tiles > 1 && smax > short_splits;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         // One work-group = the `tiles` threads of one (KV head, split): they read the same K/V
@@ -122,11 +131,12 @@ sycl::event launch_verify_attn_dpas(sycl::queue& q, const AttnParams& p, const V
         // MEASURED 2026-10-09: with every tile its own work-group (consecutive groups = other
         // splits) each tile streamed K/V separately -- 6x the cache traffic at 7 rows, which
         // the L2 hid at 8K and cannot at 64K+ (268 MB of K/V per layer at 131K).
-        h.parallel_for(sycl::nd_range<1>(nthreads, size_t(tiles)), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        h.parallel_for(sycl::nd_range<1>(nthreads, grouped ? size_t(tiles) : 1), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             constexpr float NINF = -std::numeric_limits<float>::infinity();
-            const int tile = int(it.get_local_id(0));
             int id = int(it.get_group(0));
             const int part = id % smax; id /= smax;
+            const int tile = grouped ? int(it.get_local_id(0)) : id % tiles;
+            if (!grouped) id /= tiles;
             const int kvh = id % KVH;
             const int grp = id / KVH;
             const int row0 = vg.row0[grp], nrows = vg.nrows[grp];
