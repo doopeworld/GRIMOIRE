@@ -2,6 +2,26 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-10: RESUMED by Ian. Optimize measured prefill costs on gpu0 only.**
+
+### Findings
+- Starting at 6e66ca5, gpu0 is still 03:00.0 [8086:e223] / renderD128 after reboot;
+  no GPU containers initially, all monitored AER totals zero. GPU1 remains off limits.
+- Baseline validated context table and 44-run regression remain yesterday's checkpoint.
+- Fresh compiler report confirms 4544-byte spill in ESIMD flash prefill under cl-256-GRF.
+  doubleGRF alone removes it but drops joint_matrix kernels to 128 registers. Combined
+  flags remove the flash spill while preserving joint_matrix 256-register allocations.
+- Candidate libraries built in detached worktree grimoire-prefill-20261010, no GPU mapped.
+  Main bin/libgrimoire_gemm.so is unchanged. No performance win claimed yet.
+
+### Next steps
+1. Check production library flash outputs against sampled fp64 causal attention on ragged,
+   resumed and long-context shapes; compare joint_matrix, spilling ESIMD and combined flags.
+2. If the candidate wins, run controlled served coding A/B at equal cache and chunk sizes.
+3. Retain only end-to-end wins with passing answers, then revalidate all five contexts.
+
+**The 2026-10-09 pause below is historical; Ian resumed on 10-10.**
+
 **2026-10-09: PAUSED by Ian after the final diagnostic; resume tomorrow only when asked.**
 No GPU containers, gpu0 idle (0.02 GiB), AER totals zero. GPU1 untouched; no queued jobs.
 Full checkpoint: `HANDOFF-2026-10-09-PAUSED.md`.
