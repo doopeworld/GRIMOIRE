@@ -30,6 +30,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <limits>
 #include "kernels.hpp"
+#include "b70/int8_embedding.hpp"
 #include <climits>
 #include <cmath>
 #include <limits>
@@ -668,6 +669,32 @@ sycl::event launch_embed(sycl::queue& q, const bf16_t* table, int token,
         h.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
             const int i = int(id[0]);
             out[i] = bf16_to_f32(table[int64_t(token) * n + i]);
+        });
+    });
+}
+
+sycl::event launch_embed_int8(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, int token, float* out, int hidden,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(hidden)), [=](sycl::id<1> id) {
+            out[id[0]] = int8_embedding_value(table[int64_t(token) * hidden + id[0]], scales[token]);
+        });
+    });
+}
+
+sycl::event launch_embed_int8_batched(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, const int32_t* tokens, float* out, int count,
+    int hidden, int begin, int rows, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(count) * hidden), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const int row = tokens[i / hidden] - begin;
+            out[i] = row >= 0 && row < rows
+                ? int8_embedding_value(table[int64_t(row) * hidden + i % hidden], scales[row])
+                : 0.0f;
         });
     });
 }

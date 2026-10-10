@@ -818,6 +818,12 @@ sycl::event launch_dflash2_path_walk(
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_embed_int8(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, int token, float* out, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_embed_int8_batched(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, const int32_t* tokens, float* out, int count,
+    int hidden, int begin, int rows, const std::vector<sycl::event>& deps = {});
 // Row-sharded counterpart of launch_embed_batched, for tensor parallel.
 // Each rank holds vocabulary rows [begin, begin+rows) of the table; a token
 // outside that range contributes ZERO from this rank, and the caller sums

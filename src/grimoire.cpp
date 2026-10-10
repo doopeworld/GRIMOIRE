@@ -2675,6 +2675,8 @@ struct Grimoire {
     }
 
     bf16_t*  embed = nullptr;
+    int8_t*  embed_i8 = nullptr;
+    bf16_t*  embed_i8_scales = nullptr;
     int embed_begin = 0, embed_count = 0;
     bf16_t*  fnorm = nullptr;
     sycl::half* fnorm_f16 = nullptr;
@@ -3302,11 +3304,26 @@ struct Grimoire {
         return gemv_any(dq, x, y, deps);
     }
 
+    bool has_embed() const { return embed || embed_i8; }
+    sycl::event embed_single_event(int token, float* out,
+                                  const std::vector<sycl::event>& deps) {
+        return embed_i8
+            ? launch_embed_int8(q,embed_i8,embed_i8_scales,token,out,cfg.hidden,deps)
+            : launch_embed(q,embed,token,out,cfg.hidden,deps);
+    }
+    sycl::event embed_batch_event(const int32_t* tokens, float* out, int count,
+                                 const std::vector<sycl::event>& deps) {
+        return embed_i8
+            ? launch_embed_int8_batched(q,embed_i8,embed_i8_scales,tokens,out,count,
+                                       cfg.hidden,embed_begin,embed_count,deps)
+            : launch_embed_batched(q,embed,tokens,out,count,cfg.hidden,deps);
+    }
     bool embed_one(int token,float* out) {
         const std::vector<sycl::event> none{};
-        if(!tp_enabled()){launch_embed(q,embed,token,out,cfg.hidden,none);return true;}
+        if(!has_embed() || token<0 || token>=cfg.vocab) return false;
+        if(!tp_enabled()){embed_single_event(token,out,none);return true;}
         if(token>=embed_begin&&token<embed_begin+embed_count)
-            launch_embed(q,embed,token-embed_begin,out,cfg.hidden,none);
+            embed_single_event(token-embed_begin,out,none);
         else q.memset(out,0,size_t(cfg.hidden)*sizeof(float));
         return tp_allreduce_sum(out,cfg.hidden);
     }
@@ -3327,7 +3344,8 @@ struct Grimoire {
         // embedding table is uploaded only on the stages that need it.
         // Say so instead of faulting: on a GPU this dereference is a
         // DEVICE_LOST and a power cycle, not a SIGSEGV.
-        if(!table){
+        const bool target = table==embed;
+        if(!table && !(target && embed_i8)){
             std::fprintf(stderr,"  embed_rows: no embedding table on this "
                 "rank -- a drafter asked to embed %d token(s) where the "
                 "table was never uploaded\n",count);
@@ -3335,7 +3353,12 @@ struct Grimoire {
         }
         // Only the TARGET's table is sharded.  A drafter that ships its own
         // embed_tokens loaded it whole, so it must NOT be offset.
-        if(!tp_enabled()||table!=embed){
+        if(target && embed_i8){
+            launch_embed_int8_batched(q,embed_i8,embed_i8_scales,tokens,out,count,
+                                     cfg.hidden,embed_begin,embed_count,none);
+            return !tp_enabled() || tp_allreduce_sum(out,count*cfg.hidden);
+        }
+        if(!tp_enabled()||!target){
             launch_embed_batched(q,table,tokens,out,count,cfg.hidden,none);
             return true;
         }
@@ -4887,11 +4910,36 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     const bool tied_head = cfg.tie_embeddings && !ck.lm_head.ok();
     const bool need_embed = !pp_enabled() || pp_rank == 0 || last_stage_drafts
                          || (tied_head && pp_rank == pp_world - 1);
-    if(need_embed)
+    if(need_embed && ck.embed.int8_embedding){
+        if(tied_head || cfg.is_muse){
+            err="resident INT8 embedding requires an untied BF16 embedding path";
+            return false;
+        }
+        embed_begin=tp_enabled() ? (cfg.vocab*tp_rank)/tp_world : 0;
+        const int end=tp_enabled() ? (cfg.vocab*(tp_rank+1))/tp_world : cfg.vocab;
+        embed_count=end-embed_begin;
+        TensorRef codes=ck.embed;
+        codes.t.begin+=uint64_t(embed_begin)*H;
+        codes.t.end=codes.t.begin+uint64_t(embed_count)*H;
+        codes.t.shape={embed_count,H};
+        TensorRef scales;
+        scales.shard=ck.embed.scales_shard; scales.t=ck.embed.scales_t;
+        scales.t.begin+=uint64_t(embed_begin)*sizeof(uint16_t);
+        scales.t.end=scales.t.begin+uint64_t(embed_count)*sizeof(uint16_t);
+        scales.t.shape={embed_count,1};
+        embed_i8=dev_copy_t<int8_t>(q,ck,codes,"embed_tokens.INT8",&ok);
+        // Match the reference's .to(bfloat16) BEFORE its multiplication.
+        embed_i8_scales=dev_copy_t<bf16_t>(q,ck,scales,"embed_tokens.BF16_scales",&ok);
+        if(!ok){err="INT8 embedding upload failed";return false;}
+        acct(size_t(embed_count)*(size_t(H)+sizeof(bf16_t)));
+        std::printf("resident INT8 [%d,%d), BF16 lookup/output, %.2f GiB; ",
+                    embed_begin,embed_begin+embed_count,
+                    double(size_t(embed_count)*(size_t(H)+sizeof(bf16_t)))/1073741824.0);
+    }else if(need_embed)
         embed=dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
     if (!ok) { err = "embed upload failed"; return false; }
-    embed_begin=0;embed_count=cfg.vocab;
-    if(tp_enabled()){
+    if(!embed_i8){embed_begin=0;embed_count=cfg.vocab;}
+    if(tp_enabled() && !embed_i8){
         embed_begin=(cfg.vocab*tp_rank)/tp_world;
         const int end=(cfg.vocab*(tp_rank+1))/tp_world;
         embed_count=end-embed_begin;
@@ -5956,7 +6004,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 const std::string v = e ? e : "mxfp4";
                 return v == "bf16" ? Fmt::BF16 : v == "int4" ? Fmt::INT4 :
                        v == "fp8" ? Fmt::FP8_E4M3 : Fmt::MXFP4; }();
+            const char* requested_head_fmt=std::getenv("GRIMOIRE_MTP_HEAD_FMT");
+            const bool head_fmt_explicit=requested_head_fmt && *requested_head_fmt;
             auto mtp_fmt = [&](const TensorRef& r) {
+                // Preserve an already calibrated HF INT4 bake by default,
+                // just as native packed MTP weights keep their encoding.
+                if(!head_fmt_explicit && (r.gptq || r.compressed_int4)) return Fmt::INT4;
                 if(r.native && r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
                     QuantWeight w;std::string why;
                     if(!ck.native_view(r,w,why))throw std::invalid_argument(why);
@@ -6122,10 +6175,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // freeing it here leaves the output projection pointing at freed
         // device memory, which is rule 1's failure mode exactly.
         if (!(pp_enabled() && pp_rank == pp_world - 1 && pp_rank != 0) ||
-            mtp.ok || !embed || tied_lm_head) return;
-        const size_t freed = size_t(embed_count) * H * sizeof(bf16_t);
-        sycl::free(embed, q);
-        embed = nullptr;
+            mtp.ok || !has_embed() || tied_lm_head) return;
+        const size_t freed = size_t(embed_count) * (embed_i8 ? H+sizeof(bf16_t) : H*sizeof(bf16_t));
+        if(embed) sycl::free(embed, q);
+        if(embed_i8) sycl::free(embed_i8, q);
+        if(embed_i8_scales) sycl::free(embed_i8_scales, q);
+        embed = nullptr; embed_i8 = nullptr; embed_i8_scales = nullptr;
         bytes -= std::min(bytes, freed);
     };
     if (!dflash_configured) release_last_stage_embed();
@@ -8913,6 +8968,9 @@ void Grimoire::release() {
     if (tied_lm_head) { lm_head.payload = nullptr; lm_head.w.payload = nullptr; }
     lm_head.release(q);
     if (embed) sycl::free(embed, q);
+    if (embed_i8) sycl::free(embed_i8, q);
+    if (embed_i8_scales) sycl::free(embed_i8_scales, q);
+    embed=nullptr; embed_i8=nullptr; embed_i8_scales=nullptr;
     if (fnorm) sycl::free(fnorm, q);
     if (fnorm_f16) sycl::free(fnorm_f16, q);
     if (spec_dn_state) sycl::free(spec_dn_state, q);
@@ -9661,7 +9719,7 @@ const float* Grimoire::forward_dag(int token) {
         return std::vector<sycl::event>(es);
     };
 
-    sycl::event e_embed = launch_embed(q, embed, token, s.h, H, dag_tail);
+    sycl::event e_embed = embed_single_event(token,s.h,dag_tail);
     sycl::event e_moe = q.submit([&](sycl::handler& h) {
         h.depends_on(e_embed);
         h.memset(s.moe_y, 0, size_t(H) * sizeof(float));
@@ -9880,7 +9938,7 @@ const float* Grimoire::forward_muse(int token) {
         // graph replay on by default (7b0663e) Muse decoded nothing but
         // empty tokens; GRIMOIRE_DECODE_GRAPH=0 was coherent.
         if (recording && !tp_enabled())
-            launch_embed_batched(q, embed, s.d_tok, s.h2, 1, H, none);
+            embed_batch_event(s.d_tok,s.h2,1,none);
         else if(!embed_one(token,s.h2))return nullptr;
         launch_rmsnorm_residual(q, s.h2, nullptr, muse_zero, s.h, H, eps, none);
     } else {
@@ -10084,9 +10142,9 @@ const float* Grimoire::forward_gemma4(int token) {
             // token bakes that one token into every replay.  s.d_tok is
             // the buffer argmax_token() writes, which makes one recorded
             // graph valid for every token.
-            launch_embed_batched(q, embed, s.d_tok, s.h, 1, H, none);
+            embed_batch_event(s.d_tok,s.h,1,none);
         } else {
-            launch_embed(q, embed, token, s.h, H, none);
+            embed_single_event(token,s.h,none);
         }
         if (cfg.embed_scale != 1.0f)
             launch_scale(q, s.h, cfg.embed_scale, H, none);
@@ -10285,7 +10343,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
     // any deferred combine already applied.
     const bool pp_later = pp_enabled() && pp_rank > 0;
     const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
-    if (!pp_later) launch_embed(q, embed, token, s.h, H, none);
+    if (!pp_later) embed_single_event(token,s.h,none);
     // The n-gram hash walks backwards through the request's own tokens,
     // so the engine has to keep them.  One int per position.  Every stage
     // keeps them: its PLE layers hash them too.
@@ -10748,9 +10806,9 @@ const float* Grimoire::forward(int token) {
         // s.d_tok is the same buffer argmax_token() writes, so reading the
         // embedding through it makes one recorded graph valid for every
         // subsequent token.
-        launch_embed_batched(q, embed, s.d_tok, s.h, 1, H, none);
+        embed_batch_event(s.d_tok,s.h,1,none);
     } else {
-        launch_embed(q, embed, token, s.h, H, none);
+        embed_single_event(token,s.h,none);
     }
     // layer 0 has no previous block output to add
     q.memset(s.moe_y, 0, size_t(H) * sizeof(float));
@@ -13732,7 +13790,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             q.wait(); cleanup(); return false;
         }
     } else {
-    launch_embed_batched(q, embed, dtok, t0, M, H, none);
+    embed_batch_event(dtok,t0,M,none);
     // hidden = embed(ids).repeat(1, hc_count): the SAME row in every
     // stream, not a projection.
     for (int c = 0; c < HC; ++c)
@@ -16833,7 +16891,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         for(int i=0;i<M;++i)
             shifted[i]=next_tokens?(*next_tokens)[i]:(i+1<M?tokens[size_t(i)+1]:0);
         q.memcpy(dtok,shifted.data(),size_t(M)*sizeof(int32_t));
-        launch_embed_batched(q,embed,dtok,r0,M,H,{});
+        embed_batch_event(dtok,r0,M,{});
         launch_rmsnorm_residual_batched(q,r0,nullptr,nullptr,mtp.pre_e,bn,M,H,cfg.rms_eps);
         if(mtp_prenorm()) launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
         else {   // final norm first: see mtp_target_hidden
@@ -16870,7 +16928,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 shifted[size_t(run.row0+run.count-1)]=(*next_tokens)[r];
         }
         q.memcpy(dtok,shifted.data(),size_t(M)*sizeof(int32_t));
-        launch_embed_batched(q,embed,dtok,r0,M,H,{});
+        embed_batch_event(dtok,r0,M,{});
         launch_rmsnorm_residual_batched(q,r0,nullptr,nullptr,mtp.pre_e,bn,M,H,cfg.rms_eps);
         if(mtp_prenorm()) launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
         else {   // final norm first: see mtp_target_hidden

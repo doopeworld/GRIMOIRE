@@ -2,13 +2,41 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**LATEST: Ian said "dont use gpus for now" on 2026-10-10. CPU-only work.**
-No GPU model upload, benchmark or queued GPU job until Ian resumes GPU use.
-ComfyUI is his workload; preserve it. Next comparison should use Wrapzii's exact
-Swift bake, already downloaded. CPU inspection found its INT8 embedding side file
-supersedes the dense tensor while the loader ignores row scales. Fix before any
-Swift benchmark. See HANDOFF-2026-10-10-SWIFT.md. No GPU reproduction performed.
-The completed 44-run checkpoint below predates this new GPU-use pause.
+**2026-10-10 evening: PAUSED by Ian after Swift validation and backup.**
+
+All agent GPU jobs ended normally. No GPU containers, queued jobs or automatic
+restart. GPU1 untouched. Preserve ComfyUI. Resume only when Ian asks.
+
+### Findings
+- Swift loader fixed: select declared INT8 embedding side file and apply scales;
+  match BF16 scale rounding BEFORE multiplication, then BF16 output. Resident
+  INT8 + 16-bit scales uses1.18GiB versus2.37GiB dense, no framework dependency.
+- Decode/prefill/graph/MTP/shared-draft lookups route through resident format.
+  Saved HF INT4 MTP weights are preserved by default; explicit overrides remain.
+- CPU independent oracle51200 values PASS, meaningful negative controls fail;
+  loader malformed cases reject, real Swift resolves all nine baked projections.
+  Existing safetensors tests PASS. GPU single/batch/shard/dynamic graph lookup
+  is bit-exact atH256/H5120. Ten actual Swift coded answers PASS, natural EOS.
+- Matched Swift table: PP1967/2000/1853/1265/827, decode113.9/111.0/107.2/82.1/61.3
+  at4K/8K/16K/64K/128K. One B70; published Wrap two B60s, latest128K1255/78.0.
+  Model matches now; remaining hardware/config/sample differences are explicit.
+- Native INT4 drafting/65536 fastest tested: BF16 and full-vocab pilots slower,
+  all answers PASS. Do not claim Swift closed the performance gap.
+- Targeted legacy checks: GPTQ ordinary/exact/legacy96 IDs IDENTICAL; MXFP4
+  Sherlock n24 IDENTICAL. Earlier44-run sweep predates this Swift patch; no new
+  full44-run sweep or multi-GPU/release-image validation is claimed.
+- Validated bins installed while idle, oldfiles bench-swift-1010/main-before-swift.
+  Handoff HANDOFF-2026-10-10-SWIFT.md; report RESULTS-2026-10-10-SWIFT.md.
+  Mac backup results-20261010-swift; source backup via longctx-attn-wip GitHub push.
+  v1.9.0 release image unchanged, warning remains. Intel cloud review still pending28h.
+
+### Next steps after Ian resumes
+1. Read Swift handoff, verify GPU0 mapping after reboot, preserve GPU1/ComfyUI.
+2. Profile retained Swift128K costs with TIME_LAYER=all; choose measured target.
+3. Full post-Swift regression before release work; require oracle/real answers for
+   new changes. Commit bodies must include Findings and Next steps.
+
+**Completed earlier checkpoints below are historical; this pause takes priority.**
 
 **2026-10-10: validation complete; GPU resources released to Ian.**
 
