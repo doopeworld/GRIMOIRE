@@ -2,6 +2,14 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**LATEST: Ian said "dont use gpus for now" on 2026-10-10. CPU-only work.**
+No GPU model upload, benchmark or queued GPU job until Ian resumes GPU use.
+ComfyUI is his workload; preserve it. Next comparison should use Wrapzii's exact
+Swift bake, already downloaded. CPU inspection found its INT8 embedding side file
+supersedes the dense tensor while the loader ignores row scales. Fix before any
+Swift benchmark. See HANDOFF-2026-10-10-SWIFT.md. No GPU reproduction performed.
+The completed 44-run checkpoint below predates this new GPU-use pause.
+
 **2026-10-10: validation complete; GPU resources released to Ian.**
 
 ### Findings
