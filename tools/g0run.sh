@@ -13,7 +13,8 @@ aer() { for p in 0000:00:01.0 0000:01:00.0; do
 PCI=$(bash tools/gpunode.sh gpu0 2>&1 >/dev/null | grep -oE "0000:[0-9a-f:.]+")
 [ "$PCI" = 0000:03:00.0 ] || { echo "gpu0 is $PCI, expected 0000:03:00.0 -- refusing" >&2; exit 9; }
 before=$(aer); t0=$(date +%s)
-GPU=gpu0 LIM=${LIM:-600} EXTRA_ENV="${EXTRA_ENV:-}" bash tools/tune.sh "$NAME" "$BIN" "$@" >/dev/null 2>&1
+launcher_log="/tmp/grim-$NAME-launcher.log"
+GPU=gpu0 LIM=${LIM:-600} EXTRA_ENV="${EXTRA_ENV:-}" bash tools/tune.sh "$NAME" "$BIN" "$@" >"$launcher_log" 2>&1
 run_rc=$?
 after=$(aer)
 xerr=$(dmesg -T --since "@$t0" 2>/dev/null | grep -E "03:00.0|00:01.0|01:00.0" | grep -iE "error|wedge|reset|fail" | head -3)
@@ -27,5 +28,6 @@ if [ "$before" != "$after" ] || [ -n "$xerr" ]; then
 fi
 if [ "$run_rc" -ne 0 ]; then
     echo "STOP: workload failed (launcher exit $run_rc), log=/tmp/grim-$NAME.log" >&2
+    cat "$launcher_log" >&2
     exit "$run_rc"
 fi

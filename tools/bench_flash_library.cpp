@@ -25,15 +25,18 @@ static float fp8(uint8_t b) {
 }
 
 int main(int argc, char** argv) {
-    const int H = 24, KH = 4, D = 256, CAP = 135168;
+    const int H = argc > 4 ? std::atoi(argv[4]) : 24;
+    const int KH = argc > 5 ? std::atoi(argv[5]) : 4;
+    const int D = 256, CAP = 135168;
     const int T = argc > 1 ? std::atoi(argv[1]) : 1024;
     const int start = argc > 2 ? std::atoi(argv[2]) : 12288;
     const int rounds = argc > 3 ? std::atoi(argv[3]) : 5;
-    if (T < 1 || start < 0 || T > CAP - start || rounds < 1) return 2;
+    if (T < 1 || start < 0 || T > CAP - start || rounds < 1 ||
+        H < 7 || KH < 1 || H % KH != 0) return 2;
     sycl::queue q{sycl::gpu_selector_v, {sycl::property::queue::in_order{}}};
     std::printf("device=%s T=%d start=%d cap=%d esimd=%s\n",
         q.get_device().get_info<sycl::info::device::name>().c_str(), T, start, CAP,
-        std::getenv("GRIMOIRE_FLASH_ESIMD") ? std::getenv("GRIMOIRE_FLASH_ESIMD") : "0");
+        std::getenv("GRIMOIRE_FLASH_ESIMD") ? std::getenv("GRIMOIRE_FLASH_ESIMD") : "auto");
     std::vector<uint8_t> k(size_t(KH) * D * CAP), v(k.size());
     for (size_t i = 0; i < k.size(); ++i) {
         const auto a = mix(uint32_t(i) + 17), b = mix(uint32_t(i) + 193);

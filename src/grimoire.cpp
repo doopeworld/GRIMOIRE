@@ -15991,7 +15991,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     attention_bf=grouped_out;
                 else launch_bf16_to_f32(q,grouped_out,t3,qe);
             }else{
-                if(next_tokens && M<=kSpecBatch &&
+                static const bool solo_dpas = [] {
+                    const char* e = std::getenv("GRIMOIRE_SOLO_VERIFY_DPAS");
+                    return !(e && *e == '0'); }();
+                static const bool dpas_enabled = [] {
+                    const char* e = std::getenv("GRIMOIRE_VERIFY_DPAS");
+                    return !(e && *e == '0'); }();
+                AttnParams solo_ap{};
+                solo_ap.q=qv; solo_ap.k_cache=d.k_cache; solo_ap.v_cache=d.v_cache; solo_ap.out=t3;
+                solo_ap.seq_len=1; solo_ap.seq_cap=max_seq;
+                solo_ap.head_dim=d.head_dim; solo_ap.num_heads=cfg.n_heads; solo_ap.num_kv_heads=d.kv_heads;
+                solo_ap.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
+                solo_ap.partials=s.part; solo_ap.part_m=s.pm; solo_ap.part_l=s.pl; solo_ap.splits=GRAPH_SPLITS;
+                if(solo_dpas && dpas_enabled && next_tokens && M<=kSpecBatch && !exact_verify &&
+                   verify_dpas_ok(solo_ap)) {
+                    const int first=pos;
+                    q.parallel_for(sycl::range<1>(size_t(M)),[=](sycl::id<1> id){
+                        dtok[id[0]]=first+int(id[0])+1;
+                    });
+                    VerifyGroups vg{}; vg.n=1; vg.row0[0]=0; vg.nrows[0]=M; vg.slot[0]=0;
+                    const int splits=verify_dpas_splits(solo_ap,vg,pos+M);
+                    launch_verify_attn_dpas(q,solo_ap,vg,int64_t(d.kv_slot),dtok,splits);
+                    launch_verify_merge(q,solo_ap,M,splits);
+                }else if(next_tokens && M<=kSpecBatch &&
                    !std::getenv("GRIMOIRE_LEGACY_VERIFY_ATTN")){
                     // Split-K must track context depth here for the same
                     // reason it does in single-token decode: at 4778 tokens
@@ -16013,18 +16035,17 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     // split-K-bound.  Keep the proven floor.
                     const int vsplits = GRAPH_SPLITS;
                     launch_flash_decode_batched(q,qv,d.k_cache,d.v_cache,t3,
-                        M,pos,cfg.n_heads,d.kv_heads,d.head_dim,max_seq,
+                        M,pos+1,cfg.n_heads,d.kv_heads,d.head_dim,max_seq,
                         cfg.attn_softmax_scale(d.head_dim),s.part,s.pm,s.pl,
                         vsplits,{});
                 }else if(exact_verify){
                         const int start=pos;
                         q.submit([&](sycl::handler& h){
                             h.parallel_for(sycl::range<1>(size_t(M)),[=](sycl::id<1> id){
-                                // Match the live decode convention exactly. The
-                                // device length is the number of cache entries
-                                // visible to this query; row r sees preceding
-                                // speculative rows, but not its own KV entry.
-                                dtok[id[0]]=start+int(id[0]);
+                                // Include this row's own key, as set_cursor()
+                                // does for live decode: positions are zero-based,
+                                // lengths count all entries through that position.
+                                dtok[id[0]]=start+int(id[0])+1;
                             });
                         });
                         for(int r=0;r<M;++r){
@@ -16042,7 +16063,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                             launch_flash_merge(q,ap,{});
                         }
                 }else launch_flash_prefill(q,qv,d.k_cache,d.v_cache,t3,M,
-                    next_tokens ? pos - 1 : pos,cfg.n_heads,
+                    pos,cfg.n_heads,
                     d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
             }
             pp_mark("attn flash");

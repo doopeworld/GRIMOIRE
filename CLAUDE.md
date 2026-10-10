@@ -2,23 +2,37 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-10: RESUMED by Ian. Optimize measured prefill costs on gpu0 only.**
+**2026-10-10: RESUMED by Ian. Validated prefill improvement; full regression running foreground.**
 
 ### Findings
-- Starting at 6e66ca5, gpu0 is still 03:00.0 [8086:e223] / renderD128 after reboot;
-  no GPU containers initially, all monitored AER totals zero. GPU1 remains off limits.
-- Baseline validated context table and 44-run regression remain yesterday's checkpoint.
-- Fresh compiler report confirms 4544-byte spill in ESIMD flash prefill under cl-256-GRF.
-  doubleGRF alone removes it but drops joint_matrix kernels to 128 registers. Combined
-  flags remove the flash spill while preserving joint_matrix 256-register allocations.
-- Candidate libraries built in detached worktree grimoire-prefill-20261010, no GPU mapped.
-  Main bin/libgrimoire_gemm.so is unchanged. No performance win claimed yet.
+- gpu0 only: 03:00.0 [8086:e223] / renderD128 checked after reboot; monitored AER
+  remains zero. GPU1 untouched. GPU tests foreground, every server stopped after testing.
+- Combined cl-256-GRF + doubleGRF preserves joint_matrix register allocation and removes
+  ESIMD prefill spill. Eight query rows / 128 keys wins controlled two-slot chunk2048 A/B:
+  64K TTFT65.39->56.08s (+16.6% PP); 128K199.01->163.82s (+21.5% PP). All answers PASS.
+- New default ESIMD is restricted to validated H24/KVH4/D256. Ornith's H16/KVH2
+  keeps joint_matrix: broader ESIMD caused a real empty-list coding failure even without
+  MTP. Original prompt kernel restores all four 4K/8K answers with fast verify enabled.
+- Single-slot verify can use DPAS; no extra slot required. Also corrected legacy/exact
+  inclusive cache lengths (self key). Real 96-token Qwen fixture exact/legacy-exact IDs
+  match plain; old binary negative control fails. No universal greedy parity claim.
+- Five-context one-slot K6/vocab65536/auto-budget: 10/10 coding PASS. Fresh prompt/decode
+  repeat at4K/8K/16K/64K/128K:1975/119.4,2011/116.1,1868/114.2,1267/88.6,834/65.8.
+  Updated report RESULTS-2026-10-10-CONTEXT.md. Wrap latest128K1255/78.0 still faster.
+- Clean candidate built in grimoire-final-20261010; default numeric oracles PASS, same
+  Qwen hashes as winning prototype. Ornith default hashes match explicit joint_matrix.
+- Rejected: four-row flash, packed temporary keys, interleaved accumulators and blocked
+  BF16 weight panels. FFN remains the biggest measured prompt cost. No W4A8 claim.
+- Full detail and test receipts: HANDOFF-2026-10-10-PREFILL.md, bench-1010 outside git.
 
 ### Next steps
-1. Check production library flash outputs against sampled fp64 causal attention on ragged,
-   resumed and long-context shapes; compare joint_matrix, spilling ESIMD and combined flags.
-2. If the candidate wins, run controlled served coding A/B at equal cache and chunk sizes.
-3. Retain only end-to-end wins with passing answers, then revalidate all five contexts.
+1. Final default K4 Qwen+Ornith8/8 PASS. Binaries installed with GPU0 idle; originals
+   bench-1010/main-before-install. No release image changed.
+2. tools/regress_all_g0.sh RUNNING foreground, output bench-1010/regress-final.out.
+   Wait for completion; do not launch GPU work or modify installed binaries. Inspect
+   reference/parity/output checks before reporting broad validity.
+3. Save source/receipts/handoff and push longctx-attn-wip with Findings/Next steps.
+4. Further FFN optimization; Intel cloud SSH line pending, key present, no heavy cloud work.
 
 **The 2026-10-09 pause below is historical; Ian resumed on 10-10.**
 

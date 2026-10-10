@@ -13,11 +13,12 @@ GRF=()
 DGRF=()
 IFS=',' read -r -a TLIST <<< "$TARGETS"
 for t in "${TLIST[@]}"; do
-  GRF+=("-Xsycl-target-backend=$t" "-options -cl-intel-256-GRF-per-thread")
+  GRF+=("-Xsycl-target-backend=$t" "-options \"-cl-intel-256-GRF-per-thread -doubleGRF\"")
   DGRF+=("-Xsycl-target-backend=$t" "-options -doubleGRF")
 done
 # The large-M prompt GEMM lives in its own library so it alone gets 256
-# registers (see src/gemm_fast.cpp); rebuild it with the engine.
+# registers (see src/gemm_fast.cpp); rebuild it with the engine. Both options
+# are required: cl-256 for joint_matrix, doubleGRF for ESIMD flash prefill.
 icpx -fsycl -fsycl-targets="$TARGETS" "${GRF[@]}" \
   -O3 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
   -fPIC -shared -I include -I src src/gemm_fast.cpp -o bin/libgrimoire_gemm.so
