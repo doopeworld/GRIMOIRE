@@ -1,5 +1,14 @@
 # 2026-10-10 prefill work — checkpoint
 
+**CURRENT: validation complete; GPU resources released to Ian.**
+Source changes are in7250ac3 on longctx-attn-wip, final docs checkpoint follows.
+44/44 regression runs completed, ALL DONE, no GPU0 guard trip. Sherlock reference
+and hot-expert text IDENTICAL. Ten Qwen context coding answers and eight default
+K4 Qwen/Ornith answers PASS. General speculative prose parity remains unproven.
+All agent-owned GPU containers are gone. Ian's `comfyui` container is running;
+preserve it. No further GPU job is queued. Intel cloud still in review after28h.
+
+
 ## Findings
 
 - Ian resumed. Tower rebooted; 03:00.0 [8086:e223] remains renderD128. gpu0 only,
@@ -111,3 +120,57 @@
   bench-1010/installed-sha256.txt. No release image or asset changed.
 - tools/regress_all_g0.sh now running FOREGROUND; output bench-1010/regress-final.out.
   Never launch a second GPU job or overwrite these binaries until it completes.
+
+### Remaining performance investigation
+
+- Profile the retained build at128K before choosing another kernel target. Use
+  GRIMOIRE_TIME_LAYER=all, not PROFILE_PREFILL=1 for large M (event retention
+  stalled the prior diagnostic). Oct9 FFN46.4% applies to its16K diagnostic;
+  it does not establish the largest remaining cost at128K after these changes.
+- A possible next attention experiment is direct FP8 cache loads rather than
+  expanded temporary BF16 K/V. Preserve existing operand arithmetic and check
+  the production fp64 oracle plus actual served answers. This is unimplemented
+  and unmeasured; do not claim a bandwidth bottleneck or a gain from it.
+- Continue FFN work using the real2048x34816x5120 shape, not only the toy probe.
+  The blocked-weight-panel prototype lost and is outside the retained source.
+- Combined flags/new builders were built for g31 through the server/CLI-only
+  scripts. The full multi-target release-image build has not been run, and
+  published v1.9.0 remains unchanged.
+
+- Intel cloud: Ian confirmed on10-10 that review remains pending after28hours.
+  Connection inspection awaits approval/details. Key remains onMac; no cloud
+  connection, provisioning change or heavy job was performed.
+
+## Final regression and resource handoff
+
+- tools/regress_all_g0.sh returned0 with44 completion summaries and ALL DONE.
+  Directory `/mnt/storage/isos/grimoire-runs/regress-1010-1536` contains44 logs;
+  wrapper `/mnt/storage/isos/grimoire-runs/bench-1010/regress-final.out`.
+- Sherlock n24 matches ref-sherlock-5987-n24.txt; hot-expert text IDENTICAL.
+  MTP/exact-MTP/DFlash prose comparisons still differ from plain, as before.
+  Do not describe this sweep as universal token parity or44 behavioral passes.
+- Every saved model log has a completion summary; scan finds no generation
+  failure, SYCL exception, device-lost or segmentation-fault marker. Short
+  fixtures are limited smoke coverage, not a general model-quality evaluation.
+- GPU0 root-port correctable/nonfatal/fatal AER totals remain0/0/0 at completion.
+  GPU1 untouched. Ian asked to use the GPUs; the last K2 test finished normally,
+  all agent containers exited, and GPU ownership was released. His comfyui
+  container was already running; it was not stopped or changed.
+- Stronger solo fixture now requires all96 output IDs and positive MTP acceptance,
+  preventing disabled speculation from trivially passing. Its exact assertions
+  PASS on the captured real candidate logs; saved old-binary control fails.
+- Mac: `~/grimoire-work/results-20261010/` holds full44 logs, context JSONL,
+  final K4 raw results, oracle logs, source hashes and reproduction scripts.
+  `grimoire-resume-20261010` is the preserved experiment checkout; use Tower's
+  committed clean source, not rejected worktree experiments.
+- Published v1.9.0 image/asset unchanged, warning remains. Full multi-target image
+  build remains unrun. Intel cloud remains in review after28hours per Ian.
+
+### Next steps
+
+1. When GPU0 is available for further work, profile the retained build at128K
+   with TIME_LAYER=all, then select attention/FFN work from actual region costs.
+   Do not re-run rejected weight/key/four-row variants without new evidence.
+2. Preserve passing real coded answers at all five lengths for any new candidate;
+   compare matched cache/chunk/prompt settings and retain end-to-end wins only.
+3. Inspect Intel cloud only after approval and connection details; no heavy job.

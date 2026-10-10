@@ -79,3 +79,20 @@ Ornith controls prevented a broad prefill default: the candidate ESIMD 4K answer
 missed empty-list handling with and without MTP. Keeping its original joint_matrix
 prompt kernel restores 4K/8K behavior PASS with fast one-slot verify enabled.
 This is why the default is limited to the validated Qwen geometry.
+
+## Validation checkpoint
+
+Source7250ac3, Tower longctx-attn-wip. Final default dispatch numeric probes pass
+at one token, ragged/resumed/long Qwen shapes, and Ornith H16/KVH2. The latter's
+whole output hash equals explicit joint_matrix. Scoped default K4 served checks
+pass all eight Qwen/Ornith4K/8K answers. Actual 96-token GPTQ exact and legacy
+exact outputs match plain; the old binary fails the same engine fixture.
+Full model regression completed44/44 with ALL DONE and no GPU0 guard trip.
+Sherlock reference and hot-expert text are identical. Existing speculative prose
+comparisons still differ from plain; these44 smoke runs are not universal token
+parity or44 behavioral passes. General greedy parity is not established by the
+96-token GPTQ fixture.
+
+All agent-owned GPU containers exited; Ian resumed GPU use with his ComfyUI
+container. Source7250ac3 and validation handoff are saved on longctx-attn-wip.
+Intel cloud remains pending review after28hours; no cloud workload was run.

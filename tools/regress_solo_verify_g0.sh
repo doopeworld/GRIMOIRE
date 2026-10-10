@@ -36,6 +36,11 @@ for name in ['plain','exact','legacy-exact']:
  m=re.search(r'greedy ids \(\d+\):([^\n]+)',s)
  if not m: raise SystemExit(f'{name}: missing output token ids')
  ids[name]=[int(x) for x in m.group(1).split()]
+ if len(ids[name]) != 96: raise SystemExit(f'{name}: expected all 96 output IDs')
+ if name != 'plain':
+  accepted=re.search(r'spec: MTP depth 4 -- ([0-9.]+) accepted/step',s)
+  if not accepted or float(accepted.group(1)) <= 0:
+   raise SystemExit(f'{name}: speculative acceptance was not exercised')
 for name in ['exact','legacy-exact']:
  same=ids[name]==ids['plain']
  print(f'{name}: {len(ids[name])} tokens; identical to plain={same}')

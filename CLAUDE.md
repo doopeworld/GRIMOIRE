@@ -2,37 +2,41 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-10: RESUMED by Ian. Validated prefill improvement; full regression running foreground.**
+**2026-10-10: validation complete; GPU resources released to Ian.**
 
 ### Findings
-- gpu0 only: 03:00.0 [8086:e223] / renderD128 checked after reboot; monitored AER
-  remains zero. GPU1 untouched. GPU tests foreground, every server stopped after testing.
-- Combined cl-256-GRF + doubleGRF preserves joint_matrix register allocation and removes
-  ESIMD prefill spill. Eight query rows / 128 keys wins controlled two-slot chunk2048 A/B:
-  64K TTFT65.39->56.08s (+16.6% PP); 128K199.01->163.82s (+21.5% PP). All answers PASS.
-- New default ESIMD is restricted to validated H24/KVH4/D256. Ornith's H16/KVH2
-  keeps joint_matrix: broader ESIMD caused a real empty-list coding failure even without
-  MTP. Original prompt kernel restores all four 4K/8K answers with fast verify enabled.
-- Single-slot verify can use DPAS; no extra slot required. Also corrected legacy/exact
-  inclusive cache lengths (self key). Real 96-token Qwen fixture exact/legacy-exact IDs
-  match plain; old binary negative control fails. No universal greedy parity claim.
-- Five-context one-slot K6/vocab65536/auto-budget: 10/10 coding PASS. Fresh prompt/decode
-  repeat at4K/8K/16K/64K/128K:1975/119.4,2011/116.1,1868/114.2,1267/88.6,834/65.8.
-  Updated report RESULTS-2026-10-10-CONTEXT.md. Wrap latest128K1255/78.0 still faster.
-- Clean candidate built in grimoire-final-20261010; default numeric oracles PASS, same
-  Qwen hashes as winning prototype. Ornith default hashes match explicit joint_matrix.
-- Rejected: four-row flash, packed temporary keys, interleaved accumulators and blocked
-  BF16 weight panels. FFN remains the biggest measured prompt cost. No W4A8 claim.
-- Full detail and test receipts: HANDOFF-2026-10-10-PREFILL.md, bench-1010 outside git.
+- Source7250ac3 on longctx-attn-wip. gpu0 only03:00.0[8086:e223]/renderD128;
+  checked after reboot. All agent GPU containers exited normally. Ian's comfyui
+  container is running: preserve it. No agent GPU work or queued jobs remain.
+- Combined cl256GRF+doubleGRF removes prefill ESIMD spill, preserves joint_matrix
+  register allocation. Eight query rows/128 keys: controlled two-slot/chunk2048
+  PP gain+16.6%at64K,+21.5%at128K, all coded answers PASS.
+- New prefill default limited to validated H24/KVH4/D256. Ornith H16/KVH2 keeps
+  its original prompt kernel; broader ESIMD caused a real empty-list test failure.
+- Single-slot verify now uses fast DPAS. Corrected old inclusive cache lengths
+  (self key). GPTQ96-token exact/legacy-exact fixture matches plain, accepted
+  speculation exercised; old-binary negative control fails. No universal parity claim.
+- Qwen one-slot K6/vocab65536/ctx135168/auto-chunks: ten coded answers PASS.
+  4K/8K/16K/64K/128K fresh PP:1975/2011/1868/1267/834;
+  repeat decode:119.4/116.1/114.2/88.6/65.8. RESULTS-2026-10-10-CONTEXT.md.
+  Wrap latest128K1255/78.0 still ahead; hardware/checkpoint/sample methods differ.
+- Scoped default K4 Qwen+Ornith4K/8K:8/8 behavior PASS. Production fp64 library
+  checks pass on one-token, ragged/resumed/long shapes; retained Qwen hashes match
+  winning prototype and Ornith default equals explicit joint_matrix.
+- Full regress_all_g0.sh:44/44 completed, ALL DONE, no GPU0 guard trip. Sherlock
+  reference and hot-expert text IDENTICAL. Existing speculative prose comparisons
+  still differ from plain; this is not44 behavioral passes or universal parity.
+  Logs: regress-1010-1536, bench-1010/regress-final.out. Checked AER totals0/0/0.
+- Main bin installed; originals bench-1010/main-before-install. No release image
+  changed; v1.9.0 warning remains. Full multi-target release-image build unrun.
+- Rejected four-row flash, packed keys, interleaved output and blocked BF16 panels.
+  More details HANDOFF-2026-10-10-PREFILL.md. Intel cloud still in review after28h.
 
 ### Next steps
-1. Final default K4 Qwen+Ornith8/8 PASS. Binaries installed with GPU0 idle; originals
-   bench-1010/main-before-install. No release image changed.
-2. tools/regress_all_g0.sh RUNNING foreground, output bench-1010/regress-final.out.
-   Wait for completion; do not launch GPU work or modify installed binaries. Inspect
-   reference/parity/output checks before reporting broad validity.
-3. Save source/receipts/handoff and push longctx-attn-wip with Findings/Next steps.
-4. Further FFN optimization; Intel cloud SSH line pending, key present, no heavy cloud work.
+1. When GPU0 is available, profile retained128K costs with TIME_LAYER=all before
+   choosing another kernel target. Oct9 FFN46.4% applies only to its16K diagnostic.
+2. Continue verified attention/FFN work; require production oracle and real answers.
+3. Cloud inspection awaits approval/SSH details; key exists, no cloud work done.
 
 **The 2026-10-09 pause below is historical; Ian resumed on 10-10.**
 
