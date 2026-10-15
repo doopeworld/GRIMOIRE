@@ -5023,8 +5023,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // Experts: concatenate gate and up into one [E][2I][H] block
             // and copy the packed bytes verbatim. No dequantize, no
             // requantize -- the on-disk layout IS the kernel layout.
-            Fmt EF = ck.gguf_file ? PF :
-                ((!src.e_gate_p.empty() && src.e_gate_p[0].gptq) ? Fmt::INT4 : Fmt::MXFP4);
+            // A GGUF source gets exactly what its safetensors twin gets: MXFP4
+            // experts whatever --proj says (the grouped MoE prefill and the
+            // small-M grouped path are MXFP4-only -- docs/gguf/ARCHITECTURE.md
+            // section 5).  Following PF here sent `--proj int4` experts down the
+            // per-expert fallback and broke GGUF-vs-safetensors parity.
+            Fmt EF = (!ck.gguf_file && !src.e_gate_p.empty() && src.e_gate_p[0].gptq)
+                         ? Fmt::INT4 : Fmt::MXFP4;
             if (!ck.gguf_file && !src.e_gate_p.empty() && src.e_gate_p[0].native) {
                 QuantWeight view;
                 if (!ck.native_view(src.e_gate_p[0],view,err)) return false;
