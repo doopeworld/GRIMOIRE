@@ -203,12 +203,36 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if(!gguf_file->get_array("tokenizer.ggml.tokens",tv,err))return false;
             const auto* strings=std::get_if<std::vector<std::string>>(&tv->data);
             if(!strings){err="GGUF tokenizer.ggml.tokens is not a string array";return false;}
-            if(strings->size()!=tok.vocab_size()){
-                err="GGUF/tokenizer.json token count mismatch: "+std::to_string(strings->size())+
+            // llama.cpp writes the token list out to vocab_size: ids the sidecar
+            // tokenizer.json does not define appear as extra CONTROL tokens from
+            // tokenizer_config (e.g. <|audio_start|>) and then [PADnnn] UNUSED
+            // entries (Ornith: 248320 GGUF vs 248070 tokenizer.json, verified
+            // 2026-10-15).  Every id the sidecar defines must match exactly; an
+            // extra id is accepted only as CONTROL(3)/UNUSED(5), never as text.
+            if(strings->size()<tok.vocab_size()){
+                err="GGUF has fewer tokens than tokenizer.json: "+std::to_string(strings->size())+
                     " vs "+std::to_string(tok.vocab_size());return false;
             }
+            if(strings->size()>tok.vocab_size()){
+                const GGUFValue* ty=nullptr;
+                if(!gguf_file->get_array("tokenizer.ggml.token_type",ty,err))return false;
+                const auto* types=std::get_if<std::vector<int32_t>>(&ty->data);
+                if(!types||types->size()!=strings->size()){
+                    err="GGUF tokenizer.ggml.token_type missing or wrong length";return false;
+                }
+                size_t control=0,unused=0;
+                for(size_t i=tok.vocab_size();i<strings->size();++i){
+                    const int32_t t=(*types)[i];
+                    if(t==3)++control;else if(t==5)++unused;
+                    else{err="GGUF token "+std::to_string(i)+" ("+(*strings)[i]+
+                        ") is beyond tokenizer.json and has type "+std::to_string(t)+
+                        " (only CONTROL/UNUSED padding is accepted)";return false;}
+                }
+                std::printf("  GGUF tokens %zu = tokenizer.json %zu + %zu control + %zu unused (padding to vocab)\n",
+                            strings->size(),size_t(tok.vocab_size()),control,unused);
+            }
             int bad=0;std::string first;
-            for(size_t i=0;i<strings->size();++i)if((*strings)[i]!=tok.raw_token(i)){
+            for(size_t i=0;i<size_t(tok.vocab_size());++i)if((*strings)[i]!=tok.raw_token(i)){
                 if(bad<3){if(bad)first+="; ";first+="token "+std::to_string(i)+
                     " GGUF="+(*strings)[i]+" tokenizer.json="+tok.raw_token(i);}
                 ++bad;
