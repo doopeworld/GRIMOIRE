@@ -17,7 +17,7 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 OUTROOT=/mnt/user/isos/grimoire-runs/gguf-baseline/served
 B=/mnt/storage/isos/grimoire-runs/bench-1003
 TOK=/mnt/storage/Models/Ornith-1.5-35B-A3B      # one tokenizer for every engine (same model family)
-PORT=6950
+PORT=${PORT:-6950}
 PP="512 2048 4096 8192"; TG="32 128"; RUNS=${RUNS:-5}; CTX=16384
 
 NODE=$(bash "$REPO/tools/gpunode.sh" gpu0) || exit 2
