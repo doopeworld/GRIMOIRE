@@ -76,6 +76,10 @@ SYCL_CACHE_PERSISTENT=1
 SYCL_CACHE_DIR=/cache/sycl" \
       bash $B/srv2.sh up $NAME gpu0 $PORT "$GMODEL" "$GPROJ" | tee -a "$OUT/engine.txt" || { NAME=""; exit 5; } ;;
   vllm)
+    # my-vllm-xpu:latest (= :three-gpu, 2026-10-07) bakes VLLM_PP_LAYER_PARTITION=28,8,28 and
+    # ZE_AFFINITY_MASK=0,1,2 into its env and refuses a single GPU; the same vLLM 0.31.0 build without
+    # that profile is :v0.31.0-torch2.14.1 (= :before-three-gpu-profile).
+    VIMG=${VLLM_IMAGE:-my-vllm-xpu:v0.31.0-torch2.14.1}
     OUT=$OUTROOT/vllm-gptq-int4${TAG:+-$TAG}; mkdir -p "$OUT"; NAME=gguf-srv-vllm; M=Ornith-1.5-35B-A3B-GPTQ-Int4
     docker rm -f $NAME >/dev/null 2>&1
     docker run -d --name $NAME --ipc=host --shm-size=10g --network host --init --stop-timeout 300 \
@@ -83,10 +87,10 @@ SYCL_CACHE_DIR=/cache/sycl" \
       -e VLLM_WORKER_MULTIPROC_METHOD=spawn -e VLLM_XPU_ENABLE_XPU_GRAPH=1 -e VLLM_USE_V2_MODEL_RUNNER=1 -e ZE_AFFINITY_MASK=0 \
       -v $B/vllm/qwen3_dflash.resolved.py:/opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py:ro \
       -e LD_LIBRARY_PATH=/opt/venv/lib:/opt/intel/oneapi/ccl/latest/lib:/opt/intel/oneapi/mpi/latest/lib:/opt/intel/oneapi/tcm/1.5/lib:/opt/intel/oneapi/umf/1.1/lib:/opt/intel/oneapi/compiler/2026.1/lib:/opt/intel/oneapi/compiler/2026.1/opt/compiler/lib:/usr/local/lib \
-      my-vllm-xpu:latest /models/$M --dtype float16 --port $PORT --host 127.0.0.1 --max-model-len $CTX \
+      -e VLLM_PP_LAYER_PARTITION= "$VIMG" /models/$M --dtype float16 --port $PORT --host 127.0.0.1 --max-model-len $CTX \
       --max-num-seqs 8 --kv-cache-dtype fp8 --max-num-batched-tokens 16384 --block-size 64 \
       --no-enable-prefix-caching --language-model-only --trust-remote-code --gpu-memory-utilization 0.90 >/dev/null || exit 4
-    echo "image: my-vllm-xpu:latest $(docker image inspect my-vllm-xpu:latest --format '{{.Id}}') model: $M (cross-format: GPTQ-Int4 safetensors)" > "$OUT/engine.txt"
+    echo "image: $VIMG $(docker image inspect "$VIMG" --format '{{.Id}}') model: $M (cross-format: GPTQ-Int4 safetensors)" > "$OUT/engine.txt"
     wait_ready http://127.0.0.1:$PORT/v1/models 1500 || exit 5
     MODEL_ID=$(curl -s http://127.0.0.1:$PORT/v1/models | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])') ;;
   *) echo "unknown engine $ENGINE"; exit 2 ;;
