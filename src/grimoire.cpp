@@ -4846,8 +4846,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         // bf16 is exact, so packing it changes nothing.)
                         bool saved_precision = false;
                         for (const auto& r : refs)
-                            if (r.native || r.compressed_int4 || r.gptq ||
-                                r.row_scaled) { saved_precision = true; break; }
+                            if (!r.gguf && (r.native || r.compressed_int4 || r.gptq ||
+                                r.row_scaled)) { saved_precision = true; break; }
                         // Quantized per expert and appended: 64 experts
                         // held as f32 at once would be a 64x load-time
                         // spike on exactly the box that has no room.
@@ -4908,7 +4908,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // simply skipped: q/k/v stay separate, which is what every
             // other architecture uses, and prefill_muse's W4A16 path
             // already declines and falls back when qkv_proj is absent.
-            if(cfg.is_muse&&PF==Fmt::INT4&&!tp_enabled()&&
+            if(!ck.gguf_file&&cfg.is_muse&&PF==Fmt::INT4&&!tp_enabled()&&
                src.q_proj.compressed_int4&&src.k_proj.compressed_int4&&
                src.v_proj.compressed_int4){
                 d.qkv_proj=concat_upload_many_int4_t(lq,ck,
@@ -5025,7 +5025,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // requantize -- the on-disk layout IS the kernel layout.
             Fmt EF = ck.gguf_file ? PF :
                 ((!src.e_gate_p.empty() && src.e_gate_p[0].gptq) ? Fmt::INT4 : Fmt::MXFP4);
-            if (!src.e_gate_p.empty() && src.e_gate_p[0].native) {
+            if (!ck.gguf_file && !src.e_gate_p.empty() && src.e_gate_p[0].native) {
                 QuantWeight view;
                 if (!ck.native_view(src.e_gate_p[0],view,err)) return false;
                 EF=view.fmt;
@@ -5122,7 +5122,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         return false;
                     }
                     std::string rr;
-                    const bool direct=EF==Fmt::MXFP4&&!src.e_gate_p[e].gguf&&!src.e_gate_p[e].gptq&&!src.e_gate_p[e].row_scaled&&
+                    const bool direct=EF==Fmt::MXFP4&&!ck.gguf_file&&!src.e_gate_p[e].gguf&&!src.e_gate_p[e].gptq&&!src.e_gate_p[e].row_scaled&&
                                         !src.e_gate_p[e].nvfp4&&!src.e_up_p[e].nvfp4&&
                                         src.e_gate_p[e].t.name.find("weight_packed") != std::string::npos;
                     bool rok;
@@ -5396,7 +5396,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 return v == "bf16" ? Fmt::BF16 : v == "int4" ? Fmt::INT4 :
                        v == "fp8" ? Fmt::FP8_E4M3 : Fmt::MXFP4; }();
             auto mtp_fmt = [&](const TensorRef& r) {
-                if(r.native && r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
+                if(!r.gguf && r.native && r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
                     QuantWeight w;std::string why;
                     if(!ck.native_view(r,w,why))throw std::invalid_argument(why);
                     return w.fmt;
