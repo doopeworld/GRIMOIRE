@@ -24,7 +24,30 @@ test-correctness: bin/test_generation bin/test_http
 	./bin/test_http
 
 HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp
-tools: bin/grimoire-quantize bin/inspect_native_model
+tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect
+
+GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
+
+.PHONY: test_gguf test_gguf_asan gguf_inspect
+bin/test_gguf: tests/test_gguf.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf.cpp $(GGUF_SRC) -o $@
+
+test_gguf: bin/test_gguf
+	./bin/test_gguf
+
+bin/test_gguf_asan: tests/test_gguf.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+	@mkdir -p bin
+	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_gguf.cpp $(GGUF_SRC) -o $@
+
+test_gguf_asan: bin/test_gguf_asan
+	./bin/test_gguf_asan
+
+bin/gguf_inspect: tools/gguf_inspect.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tools/gguf_inspect.cpp $(GGUF_SRC) -o $@
+
+gguf_inspect: bin/gguf_inspect
 
 bin/grimoire-quantize: tools/b70_compile_model.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
 	@mkdir -p bin
@@ -102,10 +125,11 @@ bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
+	@echo ""; echo "=========== gguf ==========="; ./bin/test_gguf
 	@echo ""; echo "=========== moe ==========="; ./bin/test_moe
 	@echo ""; echo "=========== deltanet ==========="; ./bin/test_deltanet
 	@echo ""; echo "=========== ops ==========="; ./bin/test_ops
