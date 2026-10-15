@@ -74,15 +74,19 @@ fi
 # loaded.  The older torch-free grimoire:b70-native (built 09-06) segfaults
 # the model-matrix fixtures (exit 139, 4 of 4 runs) where this image runs
 # them clean, so it is not the default until it is rebuilt and re-tested.
-MOUNTS=(-v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro
-        -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro
+# GRIM_TREE (default: the grimoire-fuse checkout) picks whose bin/ and tools/
+# are mounted; GRIM_MODELS (default /mnt/storage/Models) what /models is --
+# e.g. /mnt/models for the GGUF pool.  Defaults are unchanged.
+GRIM_TREE="${GRIM_TREE:-/mnt/storage/isos/grimoire-fuse}"
+MOUNTS=(-v "$GRIM_TREE/bin:/grimoire/bin:ro"
+        -v "$GRIM_TREE/tools:/grimoire/tools:ro"
         --tmpfs /opt/grimoire/lib)
 CID=$(docker run -d --name "$CNAME" -w /grimoire \
     --init \
     --stop-timeout 300 \
     --device "/dev/dri/$NODE" \
     "${MOUNTS[@]}" \
-    -v /mnt/storage/Models:/models \
+    -v "${GRIM_MODELS:-/mnt/storage/Models}:/models" \
     "${ENVARGS[@]}" \
     --entrypoint /usr/bin/timeout \
     "$IMAGE" \
