@@ -39,6 +39,7 @@
 //     text, and is not this model.
 // =====================================================================
 #include "b70/qwen35.hpp"
+#include <unistd.h>
 #include <cstdio>
 #include <cmath>
 #include <filesystem>
@@ -175,9 +176,9 @@ static void write_stub(const fs::path& dir, const std::string& cfg) {
 
 int main() {
     std::printf("=== Agnes-3.0-Flash config parse (real checkpoint config.json) ===\n\n");
-    char tmpl[] = "/tmp/grimoire-agnescfg-XXXXXX";
-    if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
-    const fs::path root = tmpl;
+    const fs::path root = fs::temp_directory_path() /
+        ("grimoire-agnescfg-" + std::to_string(::getpid()));
+    fs::create_directory(root);
 
     // ---- the real config, exactly as the checkpoint ships it ----------
     {

@@ -23,7 +23,7 @@ test-correctness: bin/test_generation bin/test_http
 	./bin/test_generation
 	./bin/test_http
 
-HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp
+HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp
 tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect
 
 GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
@@ -32,6 +32,14 @@ GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
 bin/test_gguf: tests/test_gguf.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tests/test_gguf.cpp $(GGUF_SRC) -o $@
+
+bin/test_gguf_qwen35: tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) include/b70/gguf_qwen35.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) -o $@
+
+.PHONY: test_gguf_qwen35
+test_gguf_qwen35: bin/test_gguf_qwen35
+	./bin/test_gguf_qwen35
 
 test_gguf: bin/test_gguf
 	./bin/test_gguf
@@ -125,11 +133,12 @@ bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
 	@echo ""; echo "=========== gguf ==========="; ./bin/test_gguf
+	@echo ""; echo "=========== gguf qwen35 ==========="; ./bin/test_gguf_qwen35
 	@echo ""; echo "=========== moe ==========="; ./bin/test_moe
 	@echo ""; echo "=========== deltanet ==========="; ./bin/test_deltanet
 	@echo ""; echo "=========== ops ==========="; ./bin/test_ops
@@ -158,7 +167,7 @@ COMMA := ,
 NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
-NATIVE_SRC = grimoire qwen35_loader native_model safetensors quantize gptq \
+NATIVE_SRC = grimoire qwen35_loader native_model safetensors gguf gguf_decode gguf_qwen35 quantize gptq \
  gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer
 NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
 

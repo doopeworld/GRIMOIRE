@@ -50,6 +50,7 @@
 #include "safetensors.hpp"
 #include "weights.hpp"
 #include "native_model.hpp"
+#include "gguf.hpp"
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -288,6 +289,13 @@ struct Qwen35Config {
 // A resolved tensor: which shard holds it, and where.
 struct TensorRef {
     int      shard = -1;
+    // GGUF is a distinct source. t supplies only the logical name/shape;
+    // its dtype is deliberately UNKNOWN and is never used for GGUF reads.
+    const GGUFTensor* gguf = nullptr;
+    enum class GGUFInverse { NONE, NORM, A_LOG, V_ROWS, QKV_ROWS,
+                             V_COLS, CONV_ROWS, V_VECTOR } gguf_inverse = GGUFInverse::NONE;
+    int gguf_expert = -1;
+    int gguf_half = -1; // 0 gate, 1 up; GGUF stores these as separate tensors
     const NativeTensorRecord* native = nullptr;
     uint64_t native_payload_offset = 0;
     uint64_t native_scale_offset = 0;
@@ -323,7 +331,7 @@ struct TensorRef {
     int      qzeros_shard = -1, scales_shard = -1;
     STTensor qzeros_t, scales_t;
     int      gptq_group = 0;
-    bool     ok() const { return shard >= 0 || native != nullptr; }
+    bool     ok() const { return shard >= 0 || native != nullptr || gguf != nullptr; }
 };
 
 // One transformer layer's weights, as references into the mmapped
@@ -413,6 +421,11 @@ struct Qwen35Model {
 
     std::vector<std::unique_ptr<SafeTensors>> shards;
     std::unique_ptr<NativeModel> native_model;
+    std::unique_ptr<GGUFFile> gguf_file;
+    std::string gguf_path;
+    mutable uint64_t gguf_norm_checks = 0, gguf_norm_mismatches = 0;
+    mutable uint64_t gguf_a_checks = 0, gguf_a_mismatches = 0;
+    mutable uint64_t gguf_bf16_checks = 0, gguf_bf16_mismatches = 0;
     std::map<std::string, TensorRef>          index;
 
     TensorRef embed, final_norm, lm_head;
@@ -433,8 +446,11 @@ struct Qwen35Model {
               bool index_only = false);
     bool native_view(const TensorRef& r, QuantWeight& out, std::string& err) const;
     bool read_native_f32(const TensorRef& r, float* dst, std::string& err) const;
+    bool read_gguf_f32(const TensorRef& r, float* dst, std::string& err,
+                       uint64_t first_row = 0, uint64_t row_count = 0) const;
 
     const void* data(const TensorRef& r) const {
+        if(r.gguf)return nullptr;
         if(r.native)return static_cast<const uint8_t*>(native_model->payload(*r.native))+
                            r.native_payload_offset;
         return r.ok() ? shards[r.shard]->data(r.t) : nullptr;
@@ -442,6 +458,7 @@ struct Qwen35Model {
     // Raw byte read that never dereferences the mapping.
     bool read_raw(const TensorRef& r, void* dst, std::string& err) const {
         if (!r.ok()) { err = "tensor not resolved"; return false; }
+        if (r.gguf) { err = "GGUF tensors require decode and inverse transform"; return false; }
         if (r.native) {
             if (r.native->encoding != uint32_t(NativeEncoding::RAW)) {
                 err = "packed native tensor requested as raw"; return false;
@@ -467,6 +484,8 @@ struct Qwen35Model {
     void unmap_all() { for (auto& s : shards) if (s) s->unmap(); }
 
     int64_t bytes(const TensorRef& r) const {
+        if(r.gguf)return int64_t(r.gguf_expert>=0 ?
+            r.gguf->nbytes/r.gguf->ne[2] : r.gguf->nbytes);
         return r.ok() ? int64_t(r.t.end - r.t.begin) : 0;
     }
 

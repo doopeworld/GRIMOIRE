@@ -755,6 +755,41 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
         *ok = false;
         return nullptr;
     }
+    if (r.gguf) {
+        // GGUF is decoded in bounded row batches. Large embedding/head
+        // tables never allocate their full f32 form on the host.
+        const size_t K=size_t(r.t.shape.back());
+        const size_t N=size_t(r.t.numel())/K;
+        const size_t elems=size_t(r.t.numel());
+        const size_t bytes=elems*sizeof(bf16_t);
+        T* d=sycl::malloc_device<T>(bytes/sizeof(T),q);
+        if(!d){std::printf("\n  GGUF device alloc failed: %s\n",what);*ok=false;return nullptr;}
+        const size_t batch=std::max<size_t>(1,(size_t(1)<<20)/K);
+        bf16_t* stage=sycl::malloc_host<bf16_t>(batch*K,q);
+        if(!stage){sycl::free(d,q);*ok=false;return nullptr;}
+        std::vector<float> f32(batch*K);
+        std::string rr;
+        uint64_t nonexact=0;
+        const bool expect_bf16_exact=r.gguf->type==30 || r.gguf->type==0;
+        for(size_t row=0;row<N;row+=batch){
+            const size_t nr=std::min(batch,N-row);
+            if(!ck.read_gguf_f32(r,f32.data(),rr,row,nr)){
+                std::printf("\n  GGUF decode failed for %s: %s\n",what,rr.c_str());
+                sycl::free(stage,q);sycl::free(d,q);*ok=false;return nullptr;
+            }
+            for(size_t i=0;i<nr*K;++i){
+                stage[i]=f32_to_bf16(f32[i]);
+                if(expect_bf16_exact && bf16_to_f32(stage[i])!=f32[i])++nonexact;
+            }
+            q.memcpy(reinterpret_cast<uint8_t*>(d)+row*K*sizeof(bf16_t),
+                     stage,nr*K*sizeof(bf16_t)).wait();
+        }
+        sycl::free(stage,q);
+        if(expect_bf16_exact){ck.gguf_bf16_checks+=elems;ck.gguf_bf16_mismatches+=nonexact;}
+        if(nonexact)std::printf("  GGUF bf16 copy %s: %llu nonrepresentable values\n",
+                               what,(unsigned long long)nonexact);
+        return d;
+    }
     const size_t src_bytes = size_t(ck.bytes(r));
     const size_t count = std::is_same_v<T, bf16_t> ? size_t(r.t.numel())
                                                     : src_bytes / sizeof(T);
@@ -951,7 +986,7 @@ bool read_scalar_f32(const Qwen35Model& ck, const TensorRef& r,
 // (modelopt).  Reading a scalar as "N floats" filled row 0 and left rows
 // 1..N-1 at zero -- a model that loads and is mostly zeros.
 static bool row_scales_ok(const TensorRef& r, int N) {
-    return r.row_scaled && (r.scales_t.numel() == N || r.scales_t.numel() == 1);
+    return !r.gguf && r.row_scaled && (r.scales_t.numel() == N || r.scales_t.numel() == 1);
 }
 static bool read_row_scales(const Qwen35Model& ck, const TensorRef& r, int N,
                             float* out, std::string& err) {
@@ -971,13 +1006,14 @@ static bool read_row_scales(const Qwen35Model& ck, const TensorRef& r, int N,
 // [N][K/32] E8M0.  The loader's packed() rewrites the LOGICAL shape to
 // [N][K] without a format flag, so this recognizes it from the source.
 static bool packed_mxfp4_src(const TensorRef& r) {
-    return r.t.name.find("weight_packed") != std::string::npos && !r.native &&
+    return !r.gguf && r.t.name.find("weight_packed") != std::string::npos && !r.native &&
            !r.nvfp4 && !r.compressed_int4 && r.t.dtype == STDtype::U8 &&
            r.scales_t.dtype == STDtype::U8 && r.t.shape.size() == 2;
 }
 
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
+    if (r.gguf) return ck.read_gguf_f32(r,dst,err);
     if (r.native) return ck.read_native_f32(r,dst,err);
     // Packed MXFP4 must be DECODED, for compressed INT4's reason below: the
     // plain read asked for N*K U8 values from a K/2-bytes-per-row payload --
@@ -1222,7 +1258,7 @@ DevQuant concat4_native_mxfp4_t(sycl::queue& q,const Qwen35Model& ck,
     a.t.shape[1]!=c.t.shape[1]||a.t.shape[1]!=e.t.shape[1]){
   std::printf("\n  cannot concatenate %s (shape mismatch)\n",what);*ok=false;return d;}
  const int K=int(a.t.shape[1]);int N=0;size_t pb=0,sb=0;
- for(auto*x:r){if(!x->native||x->native->encoding!=uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2)){
+ for(auto*x:r){if(x->gguf||!x->native||x->native->encoding!=uint32_t(NativeEncoding::MXFP4_GRIMOIRE_XE2)){
    std::printf("\n  %s requires native MXFP4 inputs\n",what);*ok=false;return d;}
   int n=int(x->t.shape[0]);N+=n;pb+=size_t(n)*K/2;sb+=size_t(n)*K/kMXBlock;}
  std::vector<uint8_t>hp(pb),hs(sb);size_t po=0,so=0;
@@ -1237,7 +1273,7 @@ DevQuant concat4_native_mxfp4_t(sycl::queue& q,const Qwen35Model& ck,
 
 bool repack_gptq_ref(const Qwen35Model& ck, const TensorRef& r,
                      PackedWeight& p, std::string& err) {
-    if (!r.gptq) return false;
+    if (r.gguf || !r.gptq) return false;
     std::vector<uint8_t> qw(size_t(r.t.end - r.t.begin));
     std::vector<uint8_t> qz(size_t(r.qzeros_t.end - r.qzeros_t.begin));
     std::vector<uint8_t> sc(size_t(r.scales_t.end - r.scales_t.begin));
@@ -1261,11 +1297,10 @@ static bool int4_group_ok(int g) { return g == 64 || g == 128; }
 
 bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
                               PackedWeight& p, std::string& err) {
-    if (!r.compressed_int4 || r.t.shape.size() != 2 || r.gptq_group <= 0)
+    if (r.gguf || !r.compressed_int4 || r.t.shape.size() != 2 || r.gptq_group <= 0)
         return false;
     const int N = int(r.t.shape[0]);
     const int K = int(r.t.shape[1]);
-
     if (K % r.gptq_group) { err = "compressed INT4 group mismatch"; return false; }
     const int groups = K / r.gptq_group;
     const size_t payload_bytes = size_t(N) * K / 2;
@@ -1317,6 +1352,34 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     }
     const int N = int(r.t.shape[0]);
     const int K = int(r.t.shape[1]);
+    if(r.gguf){
+        Fmt use=fmt;
+        const int blk=(fmt==Fmt::INT4)?kInt4Group:
+                      (fmt==Fmt::MXFP4||fmt==Fmt::MXFP8)?kMXBlock:1;
+        if(K%blk)use=Fmt::BF16;
+        PackedWeight out;out.fmt=use;out.N=N;out.K=K;
+        std::string rr;
+        const int batch=std::max(1,(1<<20)/K);
+        std::vector<float> f32(size_t(batch)*K);
+        for(int row=0;row<N;row+=batch){
+            const int nr=std::min(batch,N-row);
+            if(!ck.read_gguf_f32(r,f32.data(),rr,row,nr)){
+                std::printf("\n  GGUF decode failed for %s: %s\n",what,rr.c_str());
+                *ok=false;return d;
+            }
+            PackedWeight part=quantize(f32.data(),nr,K,use);
+            if(row==0){
+                out.row_bytes=part.row_bytes;out.row_scales=part.row_scales;
+                out.payload.reserve(size_t(N)*part.row_bytes);
+                out.scales_raw.reserve(size_t(N)*part.scales_raw.size()/nr);
+                out.zeros.reserve(size_t(N)*part.zeros.size()/nr);
+            }
+            out.payload.insert(out.payload.end(),part.payload.begin(),part.payload.end());
+            out.scales_raw.insert(out.scales_raw.end(),part.scales_raw.begin(),part.scales_raw.end());
+            out.zeros.insert(out.zeros.end(),part.zeros.begin(),part.zeros.end());
+        }
+        return upload_packed(q,out);
+    }
     const bool direct_fp8=row_scales_ok(r,N)&&
         ((fmt==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
          (fmt==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2));
@@ -1335,7 +1398,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // is K/2 bytes per row, so a straight BF16 read would ask for 4x the
     // bytes that exist.  The dtype test alone should already exclude it;
     // one more term costs nothing and removes the whole class.
-    if(fmt==Fmt::BF16&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16){
+    if(fmt==Fmt::BF16&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16){
         std::vector<uint8_t> hp(size_t(N)*K*sizeof(bf16_t));std::string rr;
         if(!ck.read_raw(r,hp.data(),rr)){std::printf("\n  direct BF16 read failed for %s: %s\n",what,rr.c_str());*ok=false;return d;}
         d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
@@ -1355,7 +1418,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // precision is authoritative): Muse asks for INT4, and re-quantizing
     // already-4-bit weights to INT4 would only lose precision.  BF16 still
     // decodes through read_matrix_f32.
-    if (r.t.name.find("weight_packed") != std::string::npos && !r.native &&
+    if (!r.gguf && r.t.name.find("weight_packed") != std::string::npos && !r.native &&
         !r.nvfp4 && (fmt == Fmt::MXFP4 ||
                      (fmt != Fmt::BF16 && packed_mxfp4_src(r)))) {
         DevQuant d;
@@ -1388,7 +1451,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     std::string rerr;
     PackedWeight p;
-    if (r.native && (r.native->encoding!=uint32_t(NativeEncoding::RAW) ||
+    if (!r.gguf && r.native && (r.native->encoding!=uint32_t(NativeEncoding::RAW) ||
                      ck.native_model->header().version>=3)) {
         QuantWeight w;
         if (!ck.native_view(r,w,rerr) || (keep_qwen_bf16(r.t.name) && w.fmt!=Fmt::BF16 &&
@@ -1397,13 +1460,13 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
             *ok=false; return d;
         }
         p=copy_packed(w); // Saved precision is authoritative; no second quantization.
-    } else if (r.compressed_int4 && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
+    } else if (!r.gguf && r.compressed_int4 && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
         if (!read_compressed_int4_ref(ck, r, p, rerr)) {
             std::printf("\n  direct compressed INT4 read failed for %s: %s\n",
                         what, rerr.c_str());
             *ok = false; return d;
         }
-    } else if (r.gptq && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
+    } else if (!r.gguf && r.gptq && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
         if (!repack_gptq_ref(ck, r, p, rerr)) {
             std::printf("\n  direct GPTQ read failed for %s: %s\n", what, rerr.c_str());
             *ok = false; return d;
@@ -1633,7 +1696,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const int K  = int(ra.t.shape[1]);
     const int N  = Na + Nb;
 
-    if(fmt==Fmt::BF16&&!ra.row_scaled&&!rb.row_scaled&&!ra.native&&!rb.native&&
+    if(fmt==Fmt::BF16&&!ra.gguf&&!rb.gguf&&!ra.row_scaled&&!rb.row_scaled&&!ra.native&&!rb.native&&
        ra.t.dtype==STDtype::BF16&&rb.t.dtype==STDtype::BF16){
         std::vector<uint8_t> hp(size_t(N)*K*sizeof(bf16_t));std::string rr;
         if(!ck.read_raw(ra,hp.data(),rr)||
@@ -1643,7 +1706,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         d.w=QuantWeight{Fmt::BF16,N,K,d.payload,nullptr,nullptr,int64_t(K*2),0};
         if(!d.payload)*ok=false;return d;
     }
-    const bool direct_fp8=
+    const bool direct_fp8=!ra.gguf&&!rb.gguf&&
        ((fmt==Fmt::FP8_E4M3&&ra.t.dtype==STDtype::F8_E4M3&&rb.t.dtype==STDtype::F8_E4M3)||
         (fmt==Fmt::FP8_E5M2&&ra.t.dtype==STDtype::F8_E5M2&&rb.t.dtype==STDtype::F8_E5M2))&&
        row_scales_ok(ra,Na)&&row_scales_ok(rb,Nb);
@@ -1675,7 +1738,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // read_matrix_f32 -- with its own global scale -- before they are
     // concatenated, which is what makes that correct by construction
     // rather than by care.  b70/nvfp4.hpp.
-    const bool hf_packed = !ra.native && !rb.native &&
+    const bool hf_packed = !ra.gguf && !rb.gguf && !ra.native && !rb.native &&
         !ra.nvfp4 && !rb.nvfp4 &&
         ra.t.name.find("weight_packed") != std::string::npos &&
         rb.t.name.find("weight_packed") != std::string::npos &&
@@ -1703,7 +1766,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
 
     std::string rerr;
     PackedWeight p;
-    if (ra.native && rb.native && (ck.native_model->header().version>=3 ||
+    if (!ra.gguf && !rb.gguf && ra.native && rb.native && (ck.native_model->header().version>=3 ||
         (ra.native->encoding!=0 && rb.native->encoding!=0))) {
         QuantWeight a,b;
         if (!ck.native_view(ra,a,rerr) || !ck.native_view(rb,b,rerr) || a.fmt!=b.fmt ||
@@ -1715,7 +1778,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.payload.insert(p.payload.end(),tail.payload.begin(),tail.payload.end());
         p.scales_raw.insert(p.scales_raw.end(),tail.scales_raw.begin(),tail.scales_raw.end());
         p.zeros.insert(p.zeros.end(),tail.zeros.begin(),tail.zeros.end());
-    } else if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4 &&
+    } else if (!ra.gguf && !rb.gguf && ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4 &&
                int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
         PackedWeight a,b;
         if(!read_compressed_int4_ref(ck,ra,a,rerr)||
@@ -1732,7 +1795,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.payload.insert(p.payload.end(),b.payload.begin(),b.payload.end());
         p.scales_raw.insert(p.scales_raw.end(),b.scales_raw.begin(),b.scales_raw.end());
         p.zeros.insert(p.zeros.end(),b.zeros.begin(),b.zeros.end());
-    } else if (ra.gptq && rb.gptq && use == Fmt::INT4 &&
+    } else if (!ra.gguf && !rb.gguf && ra.gptq && rb.gptq && use == Fmt::INT4 &&
                int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
         PackedWeight a,b;
         if(!repack_gptq_ref(ck,ra,a,rerr)||!repack_gptq_ref(ck,rb,b,rerr)){
@@ -1787,7 +1850,7 @@ DevQuant concat_upload_many_int4_t(sycl::queue& q,const Qwen35Model& ck,
     std::string err;
     for(size_t i=0;i<refs.size();++i){
         PackedWeight part;
-        if(!refs[i].ok()||refs[i].t.shape.size()!=2||
+        if(!refs[i].ok()||refs[i].gguf||refs[i].t.shape.size()!=2||
            !read_compressed_int4_ref(ck,refs[i],part,err)){
             std::printf("\n  direct compressed INT4 concatenate failed for %s: %s\n",
                 what,err.c_str());*ok=false;return d;
@@ -3942,6 +4005,8 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
+    if(ck.gguf_file && mtp_enabled())
+        return "GGUF qwen35moe MTP (GRIMOIRE_MTP) is not mapped: blk.40.* and nextn.*";
     // Qwen4-Exp / Qwen3.8-Flash-Next.  The loader resolves this config
     // (rule 10: the loader says what the file IS), and the engine says
     // here what it cannot RUN.  Its Qwen3-Next base -- Gated DeltaNet
@@ -4146,6 +4211,23 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     }
     if (!ck.load(dir, err)) return false;
     cfg = ck.cfg;
+    if(ck.gguf_file){
+        std::map<std::string,size_t> counts;bool quantized=false;
+        for(const auto& t:ck.gguf_file->tensors()){
+            const auto* ty=gguf_type_info(t.type);
+            const std::string name=ty?ty->name:"unknown";
+            ++counts[name];
+            if(name!="F32"&&name!="F16"&&name!="BF16")quantized=true;
+        }
+        std::printf("  GGUF source %s | ",ck.gguf_path.c_str());
+        bool first=true;
+        for(const auto& item:counts){if(!first)std::printf(", ");first=false;
+            std::printf("%s %zu",item.first.c_str(),item.second);}
+        std::printf(" | decode at load (Strategy A) -> --proj %s\n",fmt_name(opt.lm_head_fmt));
+        if(quantized&&opt.lm_head_fmt!=Fmt::BF16)
+            std::printf("  WARNING: LOSSY REQUANT from quantized GGUF to --proj %s\n",
+                        fmt_name(opt.lm_head_fmt));
+    }
     // The loader is a pure reader: it says what the checkpoint IS.  Whether
     // a forward path in this engine can execute it is a separate question,
     // and answering it wrongly is the silent-output class this project
@@ -4309,7 +4391,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         const int V = int(ck.lm_head.t.shape[0]);
         // A quantized head (NVFP4 / scaled FP8) must be DECODED even when
         // the target is bf16 -- the raw copy below is for a bf16 tensor.
-        const bool head_quantized = ck.lm_head.nvfp4 || ck.lm_head.row_scaled ||
+        const bool head_quantized = ck.lm_head.gguf || ck.lm_head.nvfp4 || ck.lm_head.row_scaled ||
                                     ck.lm_head.block_scaled;
         if (!preserve_muse_lm_head && opt.quantize_lm_head &&
             opt.lm_head_fmt != Fmt::BF16) {
@@ -4670,7 +4752,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // Experimental only: the single wider GEMM measured slower on B70
             // than the three specialized shapes.  Do not spend VRAM on the
             // concatenated copy in the production path.
-            if(!tp_enabled()&&PF==Fmt::MXFP4&&std::getenv("GRIMOIRE_FUSE_DN_PROJECTIONS"))
+            if(!ck.gguf_file&&!tp_enabled()&&PF==Fmt::MXFP4&&std::getenv("GRIMOIRE_FUSE_DN_PROJECTIONS"))
                 d.la_all=concat4_native_mxfp4_t(lq,ck,src.la_in_qkv,src.la_in_z,
                     src.la_in_a,src.la_in_b,"la.in_proj_qkv_z_ab",&ok);
             d.la_conv = dev_copy_t<bf16_t>(lq, ck, src.la_conv1d, "la.conv1d", &ok);
@@ -4941,7 +5023,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // Experts: concatenate gate and up into one [E][2I][H] block
             // and copy the packed bytes verbatim. No dequantize, no
             // requantize -- the on-disk layout IS the kernel layout.
-            Fmt EF = (!src.e_gate_p.empty() && src.e_gate_p[0].gptq) ? Fmt::INT4 : Fmt::MXFP4;
+            Fmt EF = ck.gguf_file ? PF :
+                ((!src.e_gate_p.empty() && src.e_gate_p[0].gptq) ? Fmt::INT4 : Fmt::MXFP4);
             if (!src.e_gate_p.empty() && src.e_gate_p[0].native) {
                 QuantWeight view;
                 if (!ck.native_view(src.e_gate_p[0],view,err)) return false;
@@ -4983,7 +5066,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                         uint8_t* scales, uint8_t* zeros, int N, int K,
                                         size_t row_bytes, size_t scale_bytes, size_t zero_bytes,
                                         std::string& rr) {
-                    if(row_scales_ok(r,N)&&
+                    if(!r.gguf&&row_scales_ok(r,N)&&
                        ((EF==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
                         (EF==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2))){
                         std::vector<float> hs(size_t(N),0.0f);
@@ -4991,13 +5074,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                            !read_row_scales(ck,r,N,hs.data(),rr))return false;
                         std::memcpy(scales,hs.data(),size_t(N)*sizeof(float));return true;
                     }
-                    if(EF==Fmt::BF16&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
+                    if(EF==Fmt::BF16&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
                         return ck.read_raw(r,payload,rr);
                     // !r.nvfp4: an NVFP4 expert is also called
                     // weight_packed and also holds E2M1 nibbles; reading
                     // it straight would hand E4M3 per-16 scales to a
                     // kernel expecting E8M0 per-32.  b70/nvfp4.hpp.
-                    const bool packed = EF==Fmt::MXFP4&&!r.gptq&&!r.row_scaled&&!r.nvfp4&&
+                    const bool packed = EF==Fmt::MXFP4&&!r.gguf&&!r.gptq&&!r.row_scaled&&!r.nvfp4&&
                                         r.t.name.find("weight_packed") != std::string::npos;
                     if (packed) return ck.read_raw(r, payload, rr);
                     PackedWeight pw;
@@ -5039,7 +5122,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                         return false;
                     }
                     std::string rr;
-                    const bool direct=EF==Fmt::MXFP4&&!src.e_gate_p[e].gptq&&!src.e_gate_p[e].row_scaled&&
+                    const bool direct=EF==Fmt::MXFP4&&!src.e_gate_p[e].gguf&&!src.e_gate_p[e].gptq&&!src.e_gate_p[e].row_scaled&&
                                         !src.e_gate_p[e].nvfp4&&!src.e_up_p[e].nvfp4&&
                                         src.e_gate_p[e].t.name.find("weight_packed") != std::string::npos;
                     bool rok;
@@ -6748,6 +6831,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                   "checkpoint)"
                 : "per-layer checkpoint k_norm");
     }
+    if(ck.gguf_file)
+        std::printf("  GGUF round-trip checks: A_log %llu mismatches/%llu, norms %llu mismatches/%llu; bf16 source %llu nonrepresentable/%llu\n",
+            (unsigned long long)ck.gguf_a_mismatches,(unsigned long long)ck.gguf_a_checks,
+            (unsigned long long)ck.gguf_norm_mismatches,(unsigned long long)ck.gguf_norm_checks,
+            (unsigned long long)ck.gguf_bf16_mismatches,(unsigned long long)ck.gguf_bf16_checks);
     return true;
 }
 

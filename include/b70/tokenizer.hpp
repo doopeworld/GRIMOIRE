@@ -78,6 +78,7 @@ public:
     int32_t bos() const { return bos_; }
     int32_t eos() const { return eos_; }
     size_t  vocab_size() const { return id_to_tok_.size(); }
+    const std::string& raw_token(size_t id) const { return id_to_tok_.at(id); }
     size_t  merge_count() const { return merge_rank_.size(); }
     size_t  bad_merges()  const { return bad_merges_; }
     bool    has_merge(const std::string& a, const std::string& b) const {

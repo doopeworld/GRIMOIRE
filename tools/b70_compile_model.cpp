@@ -30,6 +30,9 @@
 #include <vector>
 #include <fcntl.h>
 #include <sys/syscall.h>
+#if defined(__APPLE__)
+#include <sys/stdio.h>
+#endif
 #include <unistd.h>
 
 namespace {
@@ -239,9 +242,14 @@ int main(int argc,char** argv){
                 <<"\",\n  \"policy\": \""<<o.policy<<"\",\n  \"method\": \"round-to-nearest, no activation calibration\",\n"
                 <<"  \"quantized_tensors\": "<<s.quantized<<",\n  \"raw_tensors\": "<<s.raw<<"\n}\n";
             manifest.close();require(bool(manifest),"cannot write quantization manifest");
-            // Linux no-replace rename protects even an existing empty directory.
+            // Publish without replacing an existing bundle on either host.
+#if defined(__APPLE__)
+            require(::renamex_np(tmp.path.c_str(),output.c_str(),RENAME_EXCL)==0,
+                    "cannot publish bundle (destination exists or rename unsupported)");
+#else
             require(::syscall(SYS_renameat2,AT_FDCWD,tmp.path.c_str(),AT_FDCWD,output.c_str(),1)==0,
                     "cannot publish bundle (destination exists or rename unsupported)");
+#endif
             tmp.path.clear();
         }
         std::printf("Output: %s\n",output.c_str());return 0;

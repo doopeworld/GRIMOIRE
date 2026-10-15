@@ -24,10 +24,14 @@
 #include <cctype>
 #include <algorithm>
 #include "b70/tensor_layout.hpp"
+#include "b70/gguf_qwen35.hpp"
+#include "b70/tokenizer.hpp"
+#include "b70/json.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
+#include <dirent.h>
 
 namespace b70 {
 namespace {
@@ -156,8 +160,78 @@ bool keep_qwen_bf16(const std::string& name) {
 bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                        bool index_only) {
     dir = d;
-    const std::string j = read_file(dir + "/config.json");
-    if (j.empty()) { err = "cannot read " + dir + "/config.json"; return false; }
+    gguf_file.reset(); gguf_path.clear();
+    std::vector<std::string> ggufs;
+    if (DIR* dp=::opendir(dir.c_str())) {
+        while (dirent* e=::readdir(dp)) {
+            std::string name=e->d_name;
+            if(name.size()>=5&&name.compare(name.size()-5,5,".gguf")==0)
+                ggufs.push_back(dir+"/"+name);
+        }
+        ::closedir(dp);
+    }
+    std::sort(ggufs.begin(),ggufs.end());
+    if(ggufs.size()>1){
+        err="multiple GGUF files in "+dir+":";
+        for(const auto& p:ggufs)err+=" "+p;
+        return false;
+    }
+    const std::string sidecar=read_file(dir+"/config.json");
+    bool other=false;
+    if(DIR* dp=::opendir(dir.c_str())){
+        while(dirent* e=::readdir(dp)){
+            std::string n=e->d_name;
+            if((n.size()>=12&&n.compare(n.size()-12,12,".safetensors")==0)||
+               (n.rfind("model-v",0)==0&&n.size()>=4&&
+                n.compare(n.size()-4,4,".b70")==0))other=true;
+        }
+        ::closedir(dp);
+    }
+    const bool use_gguf=ggufs.size()==1&&!other;
+    std::string j=sidecar;
+    if(use_gguf){
+        if(sidecar.empty()&&::access((dir+"/config.json").c_str(),F_OK)==0){
+            err="cannot read or empty "+dir+"/config.json";return false;
+        }
+        gguf_path=ggufs[0];gguf_file=std::make_unique<GGUFFile>();
+        if(!gguf_file->open(gguf_path,err))return false;
+        if(!gguf_qwen35_config(*gguf_file,sidecar,j,err))return false;
+        {
+            Tokenizer tok;
+            if(!tok.load(dir,err))return false;
+            const GGUFValue* tv=nullptr;
+            if(!gguf_file->get_array("tokenizer.ggml.tokens",tv,err))return false;
+            const auto* strings=std::get_if<std::vector<std::string>>(&tv->data);
+            if(!strings){err="GGUF tokenizer.ggml.tokens is not a string array";return false;}
+            if(strings->size()!=tok.vocab_size()){
+                err="GGUF/tokenizer.json token count mismatch: "+std::to_string(strings->size())+
+                    " vs "+std::to_string(tok.vocab_size());return false;
+            }
+            int bad=0;std::string first;
+            for(size_t i=0;i<strings->size();++i)if((*strings)[i]!=tok.raw_token(i)){
+                if(bad<3){if(bad)first+="; ";first+="token "+std::to_string(i)+
+                    " GGUF="+(*strings)[i]+" tokenizer.json="+tok.raw_token(i);}
+                ++bad;
+            }
+            if(bad){err="GGUF/tokenizer.json mismatch ("+std::to_string(bad)+"): "+first;return false;}
+            uint32_t ge=0,gb=0;
+            if(!gguf_file->get_u32("tokenizer.ggml.eos_token_id",ge,err)||
+               !gguf_file->get_u32("tokenizer.ggml.bos_token_id",gb,err))return false;
+            std::printf("  GGUF tokenizer eos/bos %u/%u; tokenizer.json eos/bos %d/%d\n",
+                        ge,gb,tok.eos(),tok.bos());
+            if(!sidecar.empty()){
+                try{
+                    Json hf=Json::parse(sidecar);
+                    const Json* tc=hf.find("text_config");if(!tc)tc=&hf;
+                    const Json* he=tc->find("eos_token_id");
+                    const Json* hb=tc->find("bos_token_id");
+                    if(he||hb)std::printf("  GGUF eos/bos %u/%u; HF config.json text_config eos/bos %s/%s\n",
+                        ge,gb,he?he->dump().c_str():"<missing>",hb?hb->dump().c_str():"<missing>");
+                }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
+            }
+        }
+    }
+    if(j.empty()) { err="cannot read "+dir+"/config.json";return false; }
 
     // ---- config -----------------------------------------------------
     // Muse Glimmer nests the text dims under "text_config"; parse from there.
@@ -743,6 +817,15 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 i, cfg.mlp_only_layers.empty() ? nullptr : cfg.mlp_only_layers.data(),
                 int(cfg.mlp_only_layers.size()), cfg.n_experts, cfg.sparse_step);
     }
+    if(use_gguf){
+        // Qwen text-only mRoPE uses the same position in every section.
+        // Keep the derived sections in the model description; only Agnes
+        // previously populated this field, and no execution path reads it.
+        const Json tc=Json::parse(j).at("text_config");
+        const Json& sections=tc.at("rope_parameters").at("mrope_section");
+        cfg.mrope=true;cfg.mrope_section.clear();
+        for(const Json& x:sections.array)cfg.mrope_section.push_back(x.integer());
+    }
 
     // ---- shards ------------------------------------------------------
     shards.clear();
@@ -750,7 +833,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     native_model.reset();
     std::string native_path=dir+"/model-v3.b70";
     if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
-    if (::access(native_path.c_str(),F_OK)==0) {
+    if(use_gguf) {
+        if(!gguf_qwen35_index(*this,err))return false;
+    } else if (::access(native_path.c_str(),F_OK)==0) {
         native_model=std::make_unique<NativeModel>();
         if(!native_model->open(native_path,err))return false;
         const auto* rec=native_model->records();
