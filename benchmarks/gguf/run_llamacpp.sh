@@ -93,9 +93,11 @@ for UB in 512 2048; do
   echo "rc=$?"
   python3 - "$OUT/bench_ub$UB.raw" "$OUT/bench_ub$UB.json" <<'EOF'
 import json, sys
-raw = open(sys.argv[1]).read()
-s, e = raw.find("["), raw.rfind("]")
-rows = json.loads(raw[s:e + 1]) if s >= 0 else []
+lines = open(sys.argv[1]).read().splitlines()
+# the JSON array starts at a line that is exactly "[" (log lines before it may contain '[')
+starts = [i for i, l in enumerate(lines) if l.strip() == "["]
+ends = [i for i, l in enumerate(lines) if l.strip() == "]"]
+rows = json.loads("\n".join(lines[starts[0]:ends[-1] + 1])) if starts and ends else []
 json.dump(rows, open(sys.argv[2], "w"), indent=1)
 for r in rows:
     test = f"pp{r['n_prompt']}" if r["n_prompt"] else f"tg{r['n_gen']}"
