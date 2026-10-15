@@ -1380,7 +1380,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         }
         return upload_packed(q,out);
     }
-    const bool direct_fp8=row_scales_ok(r,N)&&
+    const bool direct_fp8=!r.gguf&&row_scales_ok(r,N)&&
         ((fmt==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
          (fmt==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2));
     if(direct_fp8){
@@ -5014,7 +5014,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // (GRIMOIRE_TIERED_MOE=1), where it also means NVFP4 is run
             // natively instead of being re-quantized to MXFP4.
             const char* tme = std::getenv("GRIMOIRE_TIERED_MOE");
-            const bool tiered = !tp_enabled() && !src.e_gate_p.empty() &&
+            const bool tiered = !ck.gguf_file && !tp_enabled() && !src.e_gate_p.empty() &&
                 src.e_gate_p[0].nvfp4 && !(tme && *tme == '0') &&
                 (cfg.is_qwen4_exp || (tme && *tme == '1'));
             if (tiered) {
@@ -5084,14 +5084,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                                         r.t.name.find("weight_packed") != std::string::npos;
                     if (packed) return ck.read_raw(r, payload, rr);
                     PackedWeight pw;
-                    if (r.native) {
+                    if (!r.gguf && r.native) {
                         QuantWeight view;
                         if (!ck.native_view(r,view,rr)) return false;
                         if (view.fmt!=EF || view.N!=N || view.K!=K) {
                             rr="native expert format or shape differs within layer"; return false;
                         }
                         pw=copy_packed(view);
-                    } else if (r.gptq) {
+                    } else if (!r.gguf && r.gptq) {
                         if (!repack_gptq_ref(ck, r, pw, rr)) return false;
                     } else {
                         std::vector<float> f32(size_t(N) * K);

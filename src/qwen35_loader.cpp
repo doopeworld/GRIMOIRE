@@ -296,6 +296,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     };
     cfg.hidden        = cfg_i(cj, "hidden_size", 0);
     cfg.n_layers      = cfg_i(cj, "num_hidden_layers", 0);
+    if (use_gguf) cfg.mtp_n_layers = cfg_i(cj, "mtp_num_hidden_layers", 0);
     cfg.vocab         = cfg_i(cj, "vocab_size", 0);
     cfg.n_heads       = cfg_i(cj, "num_attention_heads", 0);
     cfg.n_kv_heads    = cfg_i(cj, "num_key_value_heads", 0);

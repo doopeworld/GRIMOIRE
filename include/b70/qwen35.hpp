@@ -71,6 +71,7 @@ struct Qwen35Config {
     // core dims
     int hidden          = 0;
     int n_layers        = 0;
+    int mtp_n_layers    = 0;      // GGUF next-token predictor layers (not loaded)
     int vocab           = 0;
     int n_heads         = 0;      // full-attention query heads
     int n_kv_heads      = 0;

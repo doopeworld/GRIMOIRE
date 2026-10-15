@@ -150,6 +150,7 @@ static void small_loader(){
     Qwen35Model m;err.clear();CHECK(m.load(dir,err));if(!err.empty())std::fprintf(stderr,"loader: %s\n",err.c_str());
     CHECK(m.gguf_file&&m.layers.size()==2&&m.layers[0].la_in_qkv.gguf&&m.layers[1].q_proj.gguf);
     CHECK(m.cfg.mrope&&m.cfg.mrope_section==std::vector<int>({1,1,0}));
+    CHECK(m.cfg.mtp_n_layers==1);
     CHECK(m.layers[0].e_gate_p[1].gguf_expert==1);
     std::vector<float> v(size_t(inter)*h);CHECK(m.read_gguf_f32(m.layers[0].e_gate_p[1],v.data(),err));
     CHECK(v[0]==10+float(inter*h)/8);
