@@ -1,6 +1,6 @@
 # GGUF format support — Ornith-1.5-35B-A3B (`qwen35moe`)
 
-Status: **specification, partially verified.** Everything marked *(header)* was read from
+Status: **specification; transforms VERIFIED against real tensor values (2026-10-15, §7).** Everything marked *(header)* was read from
 the real GGUF headers (first 16 MiB of each file, fetched by HTTP range request on
 2026-10-15). Everything marked *(converter)* was read from llama.cpp's converter source at
 `ggml-org/llama.cpp@711780ffc75b` (`conversion/qwen.py`). Items marked **UNVERIFIED** must be
@@ -88,7 +88,7 @@ weights. Every K dimension (2048, 4096, 512) is a multiple of the 256-element su
 | `qwen35moe.ssm.state_size` | 128 | `linear_key_head_dim` |
 | `qwen35moe.ssm.inner_size` | 4096 | `linear_value_head_dim × linear_num_value_heads` → 128 |
 | `qwen35moe.ssm.conv_kernel` | 4 | `linear_conv_kernel_dim` |
-| `qwen35moe.full_attention_interval` | 4 | `layer_types`: layer *i* is full attention iff `(i+1) % 4 == 0` → 10 full, 30 linear **UNVERIFIED vs config.json** |
+| `qwen35moe.full_attention_interval` | 4 | `layer_types`: layer *i* is full attention iff `(i+1) % 4 == 0` → 10 full, 30 linear; **matches HF config.json** (full at 3,7,…,39) |
 | `qwen35moe.nextn_predict_layers` | 1 | MTP head present at `blk.40` |
 | `tokenizer.ggml.*` | gpt2 BPE, pre `qwen35`, 248,320 tokens, 247,587 merges, eos 248046, bos/pad 248044, add_bos false | see §6 |
 
@@ -108,8 +108,8 @@ and `Qwen2MoeModel.modify_tensors`.
 
 | # | Transform *(converter, `conversion/qwen.py`)* | Applies to | Inverse / handling |
 |---|---|---|---|
-| T1 | `A = -exp(A_log)` (l.396-397) | `ssm_a` | Engine needs `-exp(A_log)` anyway: feed `A` directly instead of recomputing; or `A_log = log(-A)` (not bit-exact). **UNVERIFIED which GRIMOIRE consumes.** |
-| T2 | `w + 1` for every `*norm.weight` **except** `linear_attn.norm.weight` (l.402-403), computed in the **source dtype** before the F32 cast | `attn_norm`, `post_attention_norm`, `output_norm`, `attn_q_norm`, `attn_k_norm`, `nextn.{enorm,hnorm,shared_head_norm}` | GRIMOIRE applies `(1 + w)` (CLAUDE.md rule 11): use the GGUF value with the plain-`w` convention for these norms, or subtract 1. If the HF norms are BF16, `round_bf16(1 + w) ≠ 1 + w` in f32 — **exact token equality with the safetensors path may not hold; measure.** `ssm_norm` is NOT shifted. |
+| T1 | `A = -exp(A_log)` (l.396-397), stored F32; **verified exact** vs f32(-exp(bf16 A_log)) | `ssm_a` | Feed `A` directly where the engine computes `-exp(A_log)`; `A_log = log(-A)` is not bit-exact. Which form GRIMOIRE's DeltaNet consumes is checked in the adapter task. |
+| T2 | `w + 1` for every `*norm.weight` **except** `linear_attn.norm.weight` (l.402-403). **Verified: stored as exact f32(1 + w)** — NOT bf16-rounded (that hypothesis differs by up to 7.8e-3 and is the control) | `attn_norm`, `post_attention_norm`, `output_norm`, `attn_q_norm`, `attn_k_norm`, `nextn.{enorm,hnorm,shared_head_norm}` | GRIMOIRE applies `(1 + w)` in f32 (CLAUDE.md rule 11): use the GGUF value under the plain-`w` convention for these norms. Since f32(1+w) is exactly what the engine forms from the bf16 `w`, **exact token equality with the safetensors path is possible.** `ssm_norm` is NOT shifted (verified). |
 | T3 | `conv1d` squeezed `[C,1,4] → [C,4]` (l.400-401) | `ssm_conv1d` | ne = [4, 8192]: row per channel, 4 taps contiguous. |
 | T4 | **V-head reorder grouped → tiled** (`_reorder_v_heads`, l.454-646); applies because `num_k_heads (16) ≠ num_v_heads (32)`, `num_v_per_k = 2` | V rows of `attn_qkv` (rows 4096..8191); rows of `attn_gate` (z); rows of `ssm_alpha`, `ssm_beta`; `ssm_a`; `ssm_dt.bias`; V channels of `ssm_conv1d` (4096..8191); **columns** of `ssm_out` | Row-side (all but `ssm_out`): exact inverse = row permutation; for quantized tensors whole rows (blocks along K) move, lossless. **Column-side (`ssm_out`) cannot be undone on quantized blocks** (a 256-element block spans two 128-wide V heads). Options: (a) decode to f32 then permute (Strategy A only), or (b) run DeltaNet in tiled order — v-head `h` uses k-head `h % 16` instead of `h / 2` — and keep every tensor as stored. (b) needs a DeltaNet kernel flag. |
 | T5 | `dt_bias` renamed to `dt_proj.bias` → GGUF `ssm_dt.bias` (l.398-399) | | name only (plus T4 permutation) |
@@ -135,14 +135,14 @@ and must be checked against values (§7), not assumed.
 | `blk.L.post_attention_norm.weight` | `P layers.L.post_attention_layernorm.weight` | T2 |
 | `blk.L.attn_qkv.weight` | `… linear_attn.in_proj_qkv.weight` | T4 on V rows |
 | `blk.L.attn_gate.weight` | `… linear_attn.in_proj_z.weight` | T4 |
-| `blk.L.ssm_alpha.weight` | `… linear_attn.in_proj_a.weight` | T4 (width 1) — **UNVERIFIED alpha=a / beta=b** |
+| `blk.L.ssm_alpha.weight` | `… linear_attn.in_proj_a.weight` | T4 (width 1); alpha=a / beta=b verified (swap control fails) |
 | `blk.L.ssm_beta.weight` | `… linear_attn.in_proj_b.weight` | T4 (width 1) |
 | `blk.L.ssm_conv1d.weight` | `… linear_attn.conv1d.weight` | T3, T4 on V channels |
 | `blk.L.ssm_a` | `… linear_attn.A_log` | T1, T4 |
 | `blk.L.ssm_dt.bias` | `… linear_attn.dt_bias` | T5, T4 |
 | `blk.L.ssm_norm.weight` | `… linear_attn.norm.weight` | no T2 |
 | `blk.L.ssm_out.weight` | `… linear_attn.out_proj.weight` | T4 on columns |
-| `blk.L.attn_q.weight` | `… self_attn.q_proj.weight` | q+gate, 8192 rows — **UNVERIFIED interleave unchanged** |
+| `blk.L.attn_q.weight` | `… self_attn.q_proj.weight` | q+gate, 8192 rows, verified bit-identical (no reorder) |
 | `blk.L.attn_k.weight` / `attn_v.weight` | `… self_attn.k_proj` / `v_proj` | |
 | `blk.L.attn_output.weight` | `… self_attn.o_proj.weight` | |
 | `blk.L.attn_q_norm` / `attn_k_norm` | `… self_attn.q_norm` / `k_norm` | T2 |
@@ -181,3 +181,23 @@ Using the BF16 GGUF and `/mnt/storage/Models/Ornith-1.5-35B-A3B` (BF16 safetenso
 2. Confirm `layer_types` from `config.json` equals the `full_attention_interval` rule.
 3. Confirm the `ssm_alpha ↔ in_proj_a` assignment and the `attn_q` q/gate interleave.
 4. Confirm the sidecar tokenizer equals the GGUF tokenizer arrays.
+
+## 8. Verification results (2026-10-15)
+
+`tests/gguf/verify_transforms.py` fetched byte ranges of the published BF16 GGUF
+(`@12393612`) and of the original HF checkpoint `ornith-ai/Ornith-1.5-35B-A3B@10fbf86f`
+(BF16 safetensors) and compared values after applying llama.cpp's forward transforms to the HF
+side. **44 comparisons, 0 unexpected** — every transform row is bit-exact, every control
+(no reorder; alpha/beta swapped; bf16-rounded norm) differs:
+
+- T1+T4 `ssm_a`, T5+T4 `ssm_dt.bias`, T3+T4 `ssm_conv1d`, T4 `ssm_alpha`/`ssm_beta`/
+  `attn_gate`/`attn_qkv` (V rows) and `ssm_out` (columns): exact.
+- T2 norms (`attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm`, `output_norm`):
+  exact as f32(1+w); `ssm_norm` exact with no shift.
+- Full attention q/k/v/o, router, shared expert gate/gate/down, routed experts 0/137/255
+  (gate, up, down), embedding and head rows 0/151643/248319: bit-identical.
+
+Not covered by this check: MTP (`blk.40.nextn.*`) names/transforms, and Q4_K_M-specific
+behaviour (the quantizer may change which rows/types are used — the inventory in §2 is from the
+real header). HF `config.json` says `eos_token_id = 248044`; the GGUF says 248046
+(`<|im_end|>`) — resolve in the tokenizer check.
