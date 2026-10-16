@@ -75,6 +75,24 @@ UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
 SYCL_CACHE_PERSISTENT=1
 SYCL_CACHE_DIR=/cache/sycl" \
       bash $B/srv2.sh up $NAME gpu0 $PORT "$GMODEL" "$GPROJ" | tee -a "$OUT/engine.txt" || { NAME=""; exit 5; } ;;
+  grimoire-host:*)
+    # This branch's own bin/ (GGUF support), any models root:  grimoire-host:<models root>:<dir>:<proj>
+    # Same container pattern as srv.sh hostbin mode (runtime image only supplies oneAPI/L0 libraries;
+    # bin/ and tools/ mounted read-only, plug-in dir hidden -- CLAUDE.md, PURE-B70 handoff).
+    IFS=: read -r _ GROOT GMODEL GPROJ <<< "$ENGINE"
+    OUT=$OUTROOT/grimoire-branch-$(git -C "$REPO" rev-parse --short HEAD)-${GMODEL}-${GPROJ}${TAG:+-$TAG}; mkdir -p "$OUT"
+    NAME=gguf-srv-grimhost; MODEL_ID=/models/$GMODEL; RIMG=grimoire-b70:latest
+    docker rm -f $NAME >/dev/null 2>&1
+    docker run -d --name $NAME --network host -w /grimoire --init --stop-timeout 300 --device /dev/dri/$NODE \
+      -v "$REPO/bin:/grimoire/bin:ro" -v "$REPO/tools:/grimoire/tools:ro" --tmpfs /opt/grimoire/lib \
+      -v "$GROOT:/models:ro" -v /mnt/storage/isos/grimoire-cache:/cache \
+      -e ONEAPI_DEVICE_SELECTOR=level_zero:gpu -e ZE_AFFINITY_MASK=0 -e UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 \
+      -e SYCL_CACHE_PERSISTENT=1 -e SYCL_CACHE_DIR=/cache/sycl \
+      --entrypoint /grimoire/bin/grimoire-server "$RIMG" \
+      --model "/models/$GMODEL" --proj "$GPROJ" --ctx $CTX --host 127.0.0.1 --port $PORT >/dev/null || exit 4
+    echo "binary: branch $(git -C "$REPO" rev-parse --short HEAD) bin/grimoire-server, runtime $RIMG $(docker image inspect $RIMG --format '{{.Id}}'), model $GROOT/$GMODEL" > "$OUT/engine.txt"
+    wait_ready http://127.0.0.1:$PORT/health 1800 || exit 5
+    docker logs $NAME 2>&1 | grep -E "GGUF (source|round-trip)|LOSSY" >> "$OUT/engine.txt" ;;
   vllm)
     # my-vllm-xpu:latest (= :three-gpu, 2026-10-07) bakes VLLM_PP_LAYER_PARTITION=28,8,28 and
     # ZE_AFFINITY_MASK=0,1,2 into its env and refuses a single GPU; the same vLLM 0.31.0 build without
