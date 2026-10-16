@@ -103,15 +103,17 @@ std::string shape(const GGUFTensor& t) {
 }
 }
 int main(int argc,char** argv) {
-    if(argc<2) {std::cerr<<"usage: gguf_inspect <file.gguf> [--header-only] [--json out.json] [--decode-check name]\n";return 2;}
-    std::string path=argv[1],json_path,decode_name;bool header_only=false;
+    if(argc<2) {std::cerr<<"usage: gguf_inspect <file.gguf> [--header-only] [--json out.json] [--decode-check name] [--decode-all-check]\n";return 2;}
+    std::string path=argv[1],json_path,decode_name;bool header_only=false,decode_all=false;
     for(int i=2;i<argc;++i) {
         std::string a=argv[i];
         if(a=="--header-only") header_only=true;
         else if(a=="--json" && i+1<argc) json_path=argv[++i];
         else if(a=="--decode-check" && i+1<argc) decode_name=argv[++i];
+        else if(a=="--decode-all-check") decode_all=true;
         else {std::cerr<<"unknown or incomplete option: "<<a<<'\n';return 2;}
     }
+    if(header_only && (decode_all || !decode_name.empty())) {std::cerr<<"decode checks require tensor data\n";return 2;}
     GGUFFile file;std::string err;
     if(!file.open(path,err,header_only)) {std::cerr<<err<<'\n';return 1;}
     std::cout<<"GGUF version: "<<file.version()<<'\n';
@@ -143,11 +145,27 @@ int main(int argc,char** argv) {
         std::vector<uint8_t> raw(static_cast<size_t>(t->row_bytes));
         if(!file.read_raw_row(*t,0,raw.data(),err)) {std::cerr<<err<<'\n';return 1;}
         std::vector<float> out(static_cast<size_t>(t->ne[0]));
-        if(!gguf_dequantize(t->type,raw.data(),t->ne[0],out.data(),err)) {std::cerr<<err<<'\n';return 1;}
+        if(!gguf_dequantize(t->type,raw.data(),t->ne[0],out.data(),err,t->name)) {std::cerr<<err<<'\n';return 1;}
         float lo=std::numeric_limits<float>::infinity(),hi=-lo;double sum=0;uint64_t finite=0;
         for(float v:out) if(std::isfinite(v)) {lo=std::min(lo,v);hi=std::max(hi,v);sum+=v;++finite;}
         std::cout<<"Decode "<<decode_name<<" first row: min="<<lo<<" max="<<hi
                  <<" mean="<<(finite?sum/double(finite):0)<<" finite="<<finite<<"/"<<out.size()<<'\n';
+    }
+    if(decode_all) {
+        struct Counts {uint64_t tensors=0,finite=0,values=0;};
+        std::map<std::string,Counts> totals;
+        for(const auto& t:file.tensors()) {
+            if(t.row_bytes>SIZE_MAX || t.ne[0]>SIZE_MAX/sizeof(float)) {std::cerr<<"row too large: "<<t.name<<'\n';return 1;}
+            std::vector<uint8_t> raw(static_cast<size_t>(t.row_bytes));
+            if(!file.read_raw_row(t,0,raw.data(),err)) {std::cerr<<t.name<<": "<<err<<'\n';return 1;}
+            std::vector<float> out(static_cast<size_t>(t.ne[0]));
+            if(!gguf_dequantize(t.type,raw.data(),t.ne[0],out.data(),err,t.name)) {std::cerr<<t.name<<": "<<err<<'\n';return 1;}
+            auto& c=totals[gguf_type_info(t.type)->name];++c.tensors;c.values+=out.size();
+            for(float v:out) if(std::isfinite(v)) ++c.finite;
+        }
+        std::cout<<"First-row decode, every tensor:\n";
+        for(const auto& kv:totals) std::cout<<"  "<<kv.first<<": "<<kv.second.tensors<<" tensors, "
+            <<kv.second.finite<<"/"<<kv.second.values<<" finite values\n";
     }
     if(!json_path.empty()) {
         std::ofstream o(json_path);

@@ -27,9 +27,10 @@ HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/
 tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect bin/tok_dump
 
 GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
+GGUF_DECODE_HEADERS = include/b70/gguf.hpp include/b70/gguf_decode.hpp src/gguf_decode_grids.hpp
 
 .PHONY: test_gguf test_gguf_asan gguf_inspect
-bin/test_gguf: tests/test_gguf.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+bin/test_gguf: tests/test_gguf.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tests/test_gguf.cpp $(GGUF_SRC) -o $@
 
@@ -52,14 +53,14 @@ test_gguf_native: bin/test_gguf_native
 test_gguf: bin/test_gguf
 	./bin/test_gguf
 
-bin/test_gguf_asan: tests/test_gguf.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+bin/test_gguf_asan: tests/test_gguf.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
 	@mkdir -p bin
 	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_gguf.cpp $(GGUF_SRC) -o $@
 
 test_gguf_asan: bin/test_gguf_asan
 	./bin/test_gguf_asan
 
-bin/gguf_inspect: tools/gguf_inspect.cpp $(GGUF_SRC) include/b70/gguf.hpp include/b70/gguf_decode.hpp
+bin/gguf_inspect: tools/gguf_inspect.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tools/gguf_inspect.cpp $(GGUF_SRC) -o $@
 

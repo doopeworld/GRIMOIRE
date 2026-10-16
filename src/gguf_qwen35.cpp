@@ -342,7 +342,7 @@ bool Qwen35Model::read_gguf_f32(const TensorRef& r,float* dst,std::string& err,
         if(r.gguf_expert>=0)physical+=uint64_t(r.gguf_expert)*N;
         if(physical>=t.n_rows){err="GGUF row permutation out of bounds: "+t.name;return false;}
         if(!gguf_file->read_raw_row(t,physical,raw.data(),err)||
-           !gguf_dequantize(t.type,raw.data(),K,decoded.data(),err))return false;
+           !gguf_dequantize(t.type,raw.data(),K,decoded.data(),err,t.name))return false;
         float* out=dst+i*K;
         if(inv==TensorRef::GGUFInverse::V_COLS || inv==TensorRef::GGUFInverse::V_VECTOR ||
            inv==TensorRef::GGUFInverse::A_LOG) {
