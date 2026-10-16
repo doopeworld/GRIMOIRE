@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
@@ -20,6 +21,7 @@ struct GGUFTensor {
     uint32_t n_dims = 0, type = 0;
     uint64_t offset = 0; // absolute file offset
     uint64_t nbytes = 0, n_rows = 0, row_bytes = 0;
+    uint32_t shard = 0;
 };
 
 struct GGUFTypeInfo {
@@ -27,6 +29,9 @@ struct GGUFTypeInfo {
     const char* name;
 };
 const GGUFTypeInfo* gguf_type_info(uint32_t id);
+// Select one text model in a directory, or retain an explicitly named file.
+// An empty result means the directory contains no text GGUF.
+bool gguf_model_path(const std::string& input, std::string& selected, std::string& err);
 
 // Values retain their GGUF type, including the element type of arrays.
 // bool arrays use uint8_t values (0 or 1), avoiding vector<bool> proxies.
@@ -70,12 +75,14 @@ public:
     bool read_raw_row(const GGUFTensor& tensor, uint64_t row, void* dst, std::string& err) const;
 
 private:
+    bool open_single(const std::string& path, std::string& err, bool header_only);
     int fd_ = -1;
     uint64_t size_ = 0, alignment_ = 32, data_start_ = 0;
     uint32_t version_ = 0;
     std::map<std::string, GGUFValue> metadata_;
     std::vector<GGUFTensor> tensors_;
     std::map<std::string, size_t> tensor_index_;
+    std::vector<std::unique_ptr<GGUFFile>> shards_;
 };
 
 } // namespace b70

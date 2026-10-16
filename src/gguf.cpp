@@ -6,12 +6,33 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <regex>
+#include <dirent.h>
+#include <set>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace b70 {
 namespace {
+bool split_name(const std::string& path, std::string& prefix, unsigned& part, unsigned& count) {
+    static const std::regex re(R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$)");
+    std::smatch m;
+    if (!std::regex_match(path,m,re)) return false;
+    prefix=m[1]; part=unsigned(std::stoul(m[2])); count=unsigned(std::stoul(m[3]));
+    return part>0 && count>0 && part<=count;
+}
+std::string shard_name(const std::string& prefix, unsigned part, unsigned count) {
+    char suffix[40]; std::snprintf(suffix,sizeof suffix,"-%05u-of-%05u.gguf",part,count);
+    return prefix+suffix;
+}
+uint64_t unsigned_meta(const GGUFValue* v, const char* name) {
+    if (!v) throw std::runtime_error(std::string("missing GGUF metadata: ")+name);
+    if (v->type==2) return std::get<uint16_t>(v->data);
+    if (v->type==4) return std::get<uint32_t>(v->data);
+    if (v->type==10) return std::get<uint64_t>(v->data);
+    throw std::runtime_error(std::string("wrong GGUF metadata type: ")+name);
+}
 constexpr uint64_t MAX_STRING = 1ull << 26;
 constexpr uint64_t MAX_HEADER = 1ull << 30;
 constexpr uint64_t MAX_TENSORS = 1ull << 20;
@@ -133,6 +154,34 @@ GGUFValue read_value(Reader& r, uint32_t type) {
 }
 } // namespace
 
+bool gguf_model_path(const std::string& input, std::string& selected, std::string& err) {
+    selected.clear(); err.clear();
+    if (input.size()>=5 && input.compare(input.size()-5,5,".gguf")==0) {
+        selected=input; return true;
+    }
+    DIR* dp=::opendir(input.c_str());
+    if (!dp) {err="cannot open model directory: "+input;return false;}
+    std::set<std::string> models;
+    while (dirent* e=::readdir(dp)) {
+        const std::string name=e->d_name;
+        if (name.size()<5 || name.compare(name.size()-5,5,".gguf")!=0) continue;
+        if (name.rfind("mmproj-",0)==0 || name.rfind("imatrix",0)==0) {
+            std::printf("  ignoring auxiliary GGUF %s\n",name.c_str()); continue;
+        }
+        std::string prefix; unsigned part=0,count=0;
+        if (split_name(name,prefix,part,count)) models.insert(shard_name(prefix,1,count));
+        else models.insert(name);
+    }
+    ::closedir(dp);
+    if (models.size()>1) {
+        err="multiple GGUF models in "+input+":";
+        for (const auto& name:models) err+=" "+name;
+        return false;
+    }
+    if (!models.empty()) selected=input+"/"+*models.begin();
+    return true;
+}
+
 const GGUFTypeInfo* gguf_type_info(uint32_t id) {
     static const GGUFTypeInfo types[] = {
         {0,1,4,"F32"},{1,1,2,"F16"},{2,32,18,"Q4_0"},{3,32,20,"Q4_1"},
@@ -167,12 +216,13 @@ uint64_t GGUFValue::array_size() const {
 
 GGUFFile::~GGUFFile() { close(); }
 void GGUFFile::close() {
+    shards_.clear();
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1; size_ = data_start_ = version_ = 0; alignment_ = 32;
     metadata_.clear(); tensors_.clear(); tensor_index_.clear();
 }
 
-bool GGUFFile::open(const std::string& path, std::string& err, bool header_only) {
+bool GGUFFile::open_single(const std::string& path, std::string& err, bool header_only) {
     close(); err.clear();
     try {
         fd_ = ::open(path.c_str(), O_RDONLY);
@@ -210,12 +260,7 @@ bool GGUFFile::open(const std::string& path, std::string& err, bool header_only)
         }
         if (alignment_ == 0 || (alignment_ & (alignment_-1)) != 0)
             throw std::runtime_error("general.alignment must be a nonzero power of two");
-        if (auto p=get("split.count")) {
-            if (p->type != 4 && p->type != 10)
-                throw std::runtime_error("split.count has wrong type");
-            uint64_t n = p->type==4 ? std::get<uint32_t>(p->data) : std::get<uint64_t>(p->data);
-            if (n > 1) throw std::runtime_error("split GGUF not supported yet");
-        }
+        if (auto p=get("split.count")) (void)unsigned_meta(p,"split.count");
         tensors_.reserve(static_cast<size_t>(tensor_count));
         std::vector<uint64_t> relative;
         relative.reserve(static_cast<size_t>(tensor_count));
@@ -265,6 +310,56 @@ bool GGUFFile::open(const std::string& path, std::string& err, bool header_only)
     }
 }
 
+bool GGUFFile::open(const std::string& path, std::string& err, bool header_only) {
+    std::string prefix; unsigned part=0,named_count=0;
+    const bool named=split_name(path,prefix,part,named_count);
+    const std::string first=named ? shard_name(prefix,1,named_count) : path;
+    if (!open_single(first,err,header_only)) return false;
+    try {
+        const GGUFValue* count_v=get("split.count");
+        if (!count_v) {
+            if (named && named_count>1) throw std::runtime_error("split filename has no split.count");
+            return true;
+        }
+        const uint64_t count=unsigned_meta(count_v,"split.count");
+        if (count<1 || count>99999) throw std::runtime_error("invalid split.count");
+        if (count==1 && !named) return true;
+        if (!named || named_count!=count)
+            throw std::runtime_error("split.count disagrees with split filename");
+        const uint64_t total=unsigned_meta(get("split.tensors.count"),"split.tensors.count");
+        if (unsigned_meta(get("split.no"),"split.no")!=0)
+            throw std::runtime_error("first shard split.no is not 0");
+        std::set<uint64_t> seen{0};
+        for (unsigned i=2;i<=count;++i) {
+            auto shard=std::make_unique<GGUFFile>();
+            const std::string next=shard_name(prefix,i,unsigned(count));
+            std::string why;
+            if (!shard->open_single(next,why,header_only))
+                throw std::runtime_error("missing or invalid shard "+next+": "+why);
+            if (unsigned_meta(shard->get("split.count"),"split.count")!=count ||
+                unsigned_meta(shard->get("split.tensors.count"),"split.tensors.count")!=total ||
+                shard->alignment()!=alignment_ || shard->version()!=version_)
+                throw std::runtime_error("inconsistent split.count, split.tensors.count, alignment, or version in "+next);
+            const uint64_t no=unsigned_meta(shard->get("split.no"),"split.no");
+            if (no>=count || !seen.insert(no).second)
+                throw std::runtime_error("duplicate or out-of-range split.no in "+next);
+            for (auto t:shard->tensors_) {
+                if (tensor_index_.count(t.name))
+                    throw std::runtime_error("duplicate GGUF tensor across shards: "+t.name);
+                t.shard=uint32_t(shards_.size()+1);
+                tensor_index_[t.name]=tensors_.size();
+                tensors_.push_back(std::move(t));
+            }
+            shards_.push_back(std::move(shard));
+        }
+        if (seen.size()!=count || tensors_.size()!=total)
+            throw std::runtime_error("split.tensors.count mismatch");
+        return true;
+    } catch (const std::exception& e) {
+        err=first+": "+e.what();close();return false;
+    }
+}
+
 const GGUFValue* GGUFFile::get(const std::string& key) const {
     auto it=metadata_.find(key); return it==metadata_.end()?nullptr:&it->second;
 }
@@ -287,6 +382,11 @@ const GGUFTensor* GGUFFile::find(const std::string& name) const {
     auto it=tensor_index_.find(name);return it==tensor_index_.end()?nullptr:&tensors_[it->second];
 }
 bool GGUFFile::read_raw(const GGUFTensor& t,void* dst,std::string& err) const {
+    if (t.shard) {
+        if (t.shard>shards_.size()) {err="invalid GGUF tensor shard: "+t.name;return false;}
+        GGUFTensor local=t;local.shard=0;
+        return shards_[t.shard-1]->read_raw(local,dst,err);
+    }
     if (fd_<0 || t.offset > size_ || t.nbytes > size_-t.offset) {
         err="tensor data past EOF or GGUF file closed: "+t.name;return false;
     }

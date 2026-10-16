@@ -242,7 +242,7 @@ icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
   || echo "warn: count_launches_probe failed to build"
 
 icpx -O2 -std=c++17 -I include \
-     tools/verify_tokenizer.cpp src/tokenizer.cpp -o bin/b70-verify-tok \
+     tools/verify_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp -o bin/b70-verify-tok \
   && echo "built  : bin/b70-verify-tok" || echo "warn: verify-tok failed"
 
 # Offline BF16 -> B70-native execution-format compiler. Host-only: model

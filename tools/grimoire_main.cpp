@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "-m" && i + 1 < argc) model = argv[++i];
+        if ((a == "-m" || a == "--model") && i + 1 < argc) model = argv[++i];
         else if (a == "--proj" && i + 1 < argc) {
             const std::string v = argv[++i];
             proj_explicit = true;
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         else if (a == "-h" || a == "--help") {
             std::printf(
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
-              "  grimoire -m <model_dir> [--proj FORMAT] [--ctx N]\n\n"
+              "  grimoire -m <model_dir_or_gguf> [--proj FORMAT] [--ctx N]\n\n"
               "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16, native (GGUF)\n"
               "  --proj   format for projections converted from safetensors at load.\n"
               "           native keeps GGUF Q4_K/Q6_K; other projections use MXFP4.\n"
@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
         }
         pf = b70::Fmt::MXFP4;
     }
-    if (model.empty()) { std::printf("need -m <model_dir>; see --help\n"); return 1; }
+    if (model.empty()) { std::printf("need -m/--model <model_dir_or_gguf>; see --help\n"); return 1; }
     if (!ppl_file.empty() || !ppl_kld_base.empty()) {
         if ((ppl_ctx && ppl_ctx < 4) || ctx_given || !prompt.empty() || prefill_only || prefix_cache_test ||
             n_predict != 128) {

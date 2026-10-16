@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 namespace gguf_test_writer {
 using Bytes=std::vector<uint8_t>;
@@ -15,6 +16,13 @@ struct TS {std::string name;std::vector<uint64_t> ne;uint32_t type;uint64_t offs
 inline KV kv_string(std::string k,std::string s) {Bytes b;str(b,s);return {k,8,b};}
 inline KV kv_array_strings(std::string k,std::vector<std::string> items) {
     Bytes b;put(b,8,4);put(b,items.size(),8);for(auto& s:items)str(b,s);return {k,9,b};
+}
+inline KV kv_array_i32(std::string k,std::vector<int32_t> items) {
+    Bytes b;put(b,5,4);put(b,items.size(),8);for(int32_t x:items)put(b,uint32_t(x),4);return {k,9,b};
+}
+inline KV kv_array_f32(std::string k,std::vector<float> items) {
+    Bytes b;put(b,6,4);put(b,items.size(),8);
+    for(float x:items){uint32_t bits;std::memcpy(&bits,&x,4);put(b,bits,4);}return {k,9,b};
 }
 inline Bytes build_file(const std::vector<KV>& kvs,const std::vector<TS>& ts,uint32_t align=64) {
     Bytes b={'G','G','U','F'};put(b,3,4);put(b,ts.size(),8);put(b,kvs.size(),8);

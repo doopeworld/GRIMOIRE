@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--tokenizer-dir", default=os.getenv("GRIMOIRE_TOKENIZER_DIR", "/tmp/toktest"))
     parser.add_argument("--hf-python", default="/tmp/gguf-golden-venv/bin/python")
     parser.add_argument("--dump", default="bin/tok_dump")
+    parser.add_argument("--gguf", type=Path,
+                        help="build GRIMOIRE tokenizer from this GGUF (header slices accepted)")
     parser.add_argument("--expected-count", type=int,
                         help="required token count (defaults to 297193 for wiki.test.raw)")
     args = parser.parse_args()
@@ -34,8 +36,9 @@ def main():
         check=True, capture_output=True, text=True,
     )
     reference = json.loads(hf.stdout)
+    command = [args.dump, "--gguf", str(args.gguf), str(source)] if args.gguf else [args.dump, args.tokenizer_dir, str(source)]
     ours = subprocess.run(
-        [args.dump, args.tokenizer_dir, str(source)],
+        command,
         check=True, capture_output=True, text=True,
     )
     actual = [int(line) for line in ours.stdout.splitlines()]

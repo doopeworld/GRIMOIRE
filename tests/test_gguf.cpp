@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
 
 using namespace b70;
 static int failures=0, cases=0;
@@ -97,8 +98,55 @@ static void parse_tests() {
         if(auto* t=h.find("x")) {Bytes row(t->row_bytes);CHECK(!h.read_raw_row(*t,0,row.data(),err));}
     }
     for(uint32_t a:{0u,3u}) {auto v=smallkv;v[0].payload=num(a,4);rejected(build_file(v,smallts),"power of two");}
-    {auto v=smallkv;v.push_back({"split.count",4,num(2,4)});rejected(build_file(v,smallts),"split GGUF not supported yet");}
+    {auto v=smallkv;v.push_back({"split.count",4,num(2,4)});rejected(build_file(v,smallts),"split filename");}
     ::unlink(temp_path().c_str());
+}
+static void split_tests() {
+    const std::string prefix="/tmp/grimoire-test-split-"+std::to_string(getpid());
+    const std::string one=prefix+"-00001-of-00002.gguf",two=prefix+"-00002-of-00002.gguf";
+    auto write=[&](const std::string& p,const Bytes& b){
+        std::ofstream o(p,std::ios::binary);o.write(reinterpret_cast<const char*>(b.data()),b.size());
+    };
+    auto shard=[&](uint32_t no,const std::string& name,uint32_t total=2,uint32_t align=64){
+        std::vector<KV> kv={{"general.alignment",4,num(align,4)},
+            {"split.count",4,num(2,4)},{"split.no",4,num(no,4)},
+            {"split.tensors.count",4,num(total,4)}};
+        return build_file(kv,{{name,{2,2},0,0,Bytes(16,uint8_t(no+1))}},align);
+    };
+    std::string err; GGUFFile f;
+    write(one,shard(0,"first"));write(two,shard(1,"second"));
+    CHECK(f.open(two,err));
+    CHECK(f.tensors().size()==2 && f.find("first") && f.find("second"));
+    if (const auto* t=f.find("second")) {
+        Bytes bytes(t->nbytes);CHECK(f.read_raw(*t,bytes.data(),err));CHECK(bytes==Bytes(16,2));
+        Bytes row(t->row_bytes);CHECK(f.read_raw_row(*t,1,row.data(),err));CHECK(row==Bytes(8,2));
+    }
+    f.close();::unlink(two.c_str());
+    CHECK(!f.open(one,err) && err.find("missing or invalid shard")!=std::string::npos);
+    write(two,shard(0,"second"));
+    CHECK(!f.open(one,err) && err.find("split.no")!=std::string::npos);
+    write(two,shard(1,"first"));
+    CHECK(!f.open(one,err) && err.find("duplicate GGUF tensor")!=std::string::npos);
+    write(two,shard(1,"second",3));
+    CHECK(!f.open(one,err) && err.find("split.tensors.count")!=std::string::npos);
+    write(one,shard(0,"first",3));
+    CHECK(!f.open(one,err) && err.find("split.tensors.count mismatch")!=std::string::npos);
+    write(one,shard(0,"first"));
+    write(two,shard(1,"second",2,32));
+    CHECK(!f.open(one,err) && err.find("alignment")!=std::string::npos);
+    const std::string dir=prefix+"-dir";::mkdir(dir.c_str(),0700);
+    const std::string a=dir+"/model-00001-of-00002.gguf";
+    const std::string b=dir+"/model-00002-of-00002.gguf";
+    write(a,shard(0,"first"));write(b,shard(1,"second"));
+    write(dir+"/mmproj-vision.gguf",shard(0,"projector"));
+    write(dir+"/imatrix.gguf",shard(0,"imatrix"));
+    std::string selected;
+    CHECK(gguf_model_path(dir,selected,err) && selected==a);
+    CHECK(gguf_model_path(b,selected,err) && selected==b);
+    write(dir+"/other.gguf",shard(0,"other"));
+    CHECK(!gguf_model_path(dir,selected,err) && err.find("multiple GGUF models")!=std::string::npos);
+    for (const auto& p:{one,two,a,b,dir+"/mmproj-vision.gguf",dir+"/imatrix.gguf",dir+"/other.gguf"})::unlink(p.c_str());
+    ::rmdir(dir.c_str());
 }
 static uint32_t get32(const Bytes& b,size_t i) {return uint32_t(b[i])|(uint32_t(b[i+1])<<8)|(uint32_t(b[i+2])<<16)|(uint32_t(b[i+3])<<24);}
 static void golden_tests() {
@@ -130,4 +178,4 @@ static void golden_tests() {
     CHECK(!gguf_dequantize(99,bytes,32,out,err) && err.find("unknown")!=std::string::npos);
     CHECK(!gguf_dequantize(24,bytes,1,out,err,"tokenizer.ids") && err.find("tokenizer.ids")!=std::string::npos);
 }
-int main() {parse_tests();golden_tests();std::printf("GGUF: %d assertions, %d failures\n",cases,failures);return failures?1:0;}
+int main() {parse_tests();split_tests();golden_tests();std::printf("GGUF: %d assertions, %d failures\n",cases,failures);return failures?1:0;}

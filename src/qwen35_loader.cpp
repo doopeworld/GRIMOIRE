@@ -159,23 +159,11 @@ bool keep_qwen_bf16(const std::string& name) {
 
 bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                        bool index_only) {
-    dir = d;
+    const bool explicit_gguf=d.size()>=5 && d.compare(d.size()-5,5,".gguf")==0;
+    dir = explicit_gguf ? (d.find_last_of('/')==std::string::npos ? "." :
+           d.substr(0,d.find_last_of('/'))) : d;
     gguf_file.reset(); gguf_path.clear();
-    std::vector<std::string> ggufs;
-    if (DIR* dp=::opendir(dir.c_str())) {
-        while (dirent* e=::readdir(dp)) {
-            std::string name=e->d_name;
-            if(name.size()>=5&&name.compare(name.size()-5,5,".gguf")==0)
-                ggufs.push_back(dir+"/"+name);
-        }
-        ::closedir(dp);
-    }
-    std::sort(ggufs.begin(),ggufs.end());
-    if(ggufs.size()>1){
-        err="multiple GGUF files in "+dir+":";
-        for(const auto& p:ggufs)err+=" "+p;
-        return false;
-    }
+    std::string selected;
     const std::string sidecar=read_file(dir+"/config.json");
     bool other=false;
     if(DIR* dp=::opendir(dir.c_str())){
@@ -187,18 +175,21 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
         ::closedir(dp);
     }
-    const bool use_gguf=ggufs.size()==1&&!other;
+    if((explicit_gguf || !other) && !gguf_model_path(d,selected,err))return false;
+    const bool use_gguf=!selected.empty()&&(explicit_gguf||!other);
     std::string j=sidecar;
     if(use_gguf){
         if(sidecar.empty()&&::access((dir+"/config.json").c_str(),F_OK)==0){
             err="cannot read or empty "+dir+"/config.json";return false;
         }
-        gguf_path=ggufs[0];gguf_file=std::make_unique<GGUFFile>();
+        gguf_path=selected;gguf_file=std::make_unique<GGUFFile>();
         if(!gguf_file->open(gguf_path,err))return false;
         if(!gguf_qwen35_config(*gguf_file,sidecar,j,err))return false;
         {
             Tokenizer tok;
-            if(!tok.load(dir,err))return false;
+            const bool has_sidecar=::access((dir+"/tokenizer.json").c_str(),F_OK)==0;
+            if(has_sidecar ? !tok.load(dir,err) : !tok.load_gguf(*gguf_file,err))return false;
+            if(has_sidecar) {
             const GGUFValue* tv=nullptr;
             if(!gguf_file->get_array("tokenizer.ggml.tokens",tv,err))return false;
             const auto* strings=std::get_if<std::vector<std::string>>(&tv->data);
@@ -238,6 +229,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 ++bad;
             }
             if(bad){err="GGUF/tokenizer.json mismatch ("+std::to_string(bad)+"): "+first;return false;}
+            if (const GGUFValue* merges=gguf_file->get("tokenizer.ggml.merges")) {
+                const auto* list=std::get_if<std::vector<std::string>>(&merges->data);
+                if (!list || list->size()!=tok.merge_count()) {
+                    err="GGUF/tokenizer.json merge count mismatch";return false;
+                }
+                for (size_t i=0;i<list->size();++i)
+                    if (tok.merge_rank((*list)[i])!=int32_t(i)) {
+                        err="GGUF/tokenizer.json merge rank mismatch at "+std::to_string(i);return false;
+                    }
+            }
             uint32_t ge=0,gb=0;
             if(!gguf_file->get_u32("tokenizer.ggml.eos_token_id",ge,err)||
                !gguf_file->get_u32("tokenizer.ggml.bos_token_id",gb,err))return false;
@@ -252,6 +253,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     if(he||hb)std::printf("  GGUF eos/bos %u/%u; HF config.json text_config eos/bos %s/%s\n",
                         ge,gb,he?he->dump().c_str():"<missing>",hb?hb->dump().c_str():"<missing>");
                 }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
+            }
             }
         }
     }

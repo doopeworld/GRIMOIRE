@@ -169,11 +169,16 @@ blocks in device memory and decodes them in projection kernels. See
 
 ## 6. Tokenizer
 
-The GGUF embeds a gpt2-style BPE (`tokenizer.ggml.model = gpt2`, `pre = qwen35`). GRIMOIRE's
-tokenizer requires `tokenizer.json` (ARCHITECTURE.md §6). First milestone: use the sidecar
-`tokenizer.json` from the matching HF checkpoint and **verify** that its vocab/merges/special
-IDs equal the GGUF's arrays (token count 248,320, merges 247,587, eos 248046) before trusting
-it. A GGUF-native tokenizer adapter is later work.
+The GGUF embeds a gpt2-style BPE (`tokenizer.ggml.model = gpt2`, `pre = qwen35`).
+GRIMOIRE now builds its tokenizer from GGUF metadata when `tokenizer.json` is absent.
+The supported GGUF pre-tokenizer is `qwen35`; unknown pre names are refused by name.
+`llama` SentencePiece BPE uses scores, the `▁` marker and byte fallback; its
+synthetic host fixture has hand-checked expectations. If `tokenizer.json` is
+present it remains the source, with GGUF vocabulary and ordered merges checked.
+The Qwen3.8 header's first 248,070 IDs and all 247,587 merge ranks match the
+Ornith HF tokenizer; its 250 additional IDs are CONTROL/UNUSED. The GGUF-built
+tokenizer matches all 297,193 HF IDs for `wiki.test.raw` and the golden cases.
+B70 compilation and real GGUF generation remain to be checked on the card.
 
 ## 7. Verification plan (Tower, before any adapter code is trusted)
 

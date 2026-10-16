@@ -16560,7 +16560,7 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         std::fprintf(stderr,"load: %s\n",err.c_str());e.release();return 1;
     }
     try {
-        auto ids=tk.encode(tk.apply_chat_template(prompt));
+        auto ids=tk.encode(tk.apply_chat_template(prompt),true);
         // GRIMOIRE_PROMPT_IDS="1,2,3": run exactly these token ids (skips the
         // tokenizer and chat template) -- to compare against a reference
         // model on identical input.  GRIMOIRE_PRINT_IDS=1 prints the ids used.
