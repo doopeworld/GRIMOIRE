@@ -4,6 +4,7 @@
 
 #include "b70/json.hpp"
 #include "b70/tokenizer.hpp"
+#include "b70/gguf.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,59 @@ int main() {
         std::fprintf(stderr, "tokenizer load failed: %s\n", error.c_str());
         return 1;
     }
+    b70::Tokenizer gguf_tokenizer;
+    b70::GGUFFile gguf;
+    const char* header_env=std::getenv("GRIMOIRE_GGUF_HEADER");
+    const char* home=std::getenv("HOME");
+    const std::string header=header_env&&*header_env ? header_env :
+        (home ? std::string(home) : std::string("/tmp"))+
+        "/Desktop/gguf-ref/hdr/q38-UD-Q4_K_XL.bin";
+    const bool have_gguf=std::ifstream(header,std::ios::binary).good();
+    if (have_gguf) {
+        if (!gguf.open(header,error,true) || !gguf_tokenizer.load_gguf(gguf,error)) {
+            std::fprintf(stderr,"GGUF tokenizer load failed: %s\n",error.c_str());return 1;
+        }
+        const b70::GGUFValue* v=nullptr;
+        if (!gguf.get_array("tokenizer.ggml.tokens",v,error)) return 1;
+        const auto& tokens=std::get<std::vector<std::string>>(v->data);
+        bool same=tokens.size()>=tokenizer.vocab_size();
+        for (size_t i=0;same && i<tokenizer.vocab_size();++i)
+            same=tokens[i]==tokenizer.raw_token(i);
+        if (!same) {
+            std::fprintf(stderr,"GGUF vocabulary differs from Ornith tokenizer.json\n");return 1;
+        }
+        if (!gguf.get_array("tokenizer.ggml.token_type",v,error)) return 1;
+        const auto& types=std::get<std::vector<int32_t>>(v->data);
+        for (size_t i=tokenizer.vocab_size();i<tokens.size();++i)
+            if (types[i]!=3 && types[i]!=5) {
+                std::fprintf(stderr,"GGUF extra token %zu is not CONTROL/UNUSED\n",i);return 1;
+            }
+        if (gguf_tokenizer.merge_count()!=tokenizer.merge_count()) {
+            std::fprintf(stderr,"GGUF merge count differs from Ornith tokenizer.json\n");return 1;
+        }
+        if (!gguf.get_array("tokenizer.ggml.merges",v,error)) return 1;
+        const auto& merges=std::get<std::vector<std::string>>(v->data);
+        for (size_t i=0;i<merges.size();++i)
+            if (tokenizer.merge_rank(merges[i])!=int32_t(i)) {
+                std::fprintf(stderr,"GGUF merge differs from Ornith tokenizer.json at %zu\n",i);return 1;
+            }
+        size_t bad_decode=0;
+        for (size_t i=0;i<tokenizer.vocab_size();++i)
+            if (gguf_tokenizer.decode_one(int32_t(i))!=tokenizer.decode_one(int32_t(i))) {
+                if (bad_decode<30)std::fprintf(stderr,"GGUF decode differs at id %zu (%s), type %d: GGUF %s, HF %s\n",
+                    i,tokens[i].c_str(),types[i],
+                    b70::json_dump_string(gguf_tokenizer.decode_one(int32_t(i))).c_str(),
+                    b70::json_dump_string(tokenizer.decode_one(int32_t(i))).c_str());
+                ++bad_decode;
+            }
+        if (bad_decode) {std::fprintf(stderr,"GGUF decode mismatches: %zu\n",bad_decode);return 1;}
+        if (gguf_tokenizer.supports_tools()!=tokenizer.supports_tools() ||
+            gguf_tokenizer.apply_chat_template("hello")!=tokenizer.apply_chat_template("hello")) {
+            std::fprintf(stderr,"GGUF chat template family differs from Ornith sidecar\n");return 1;
+        }
+        std::printf("PASS GGUF/Ornith vocabulary: %zu common ids, %zu merges\n",
+                    tokenizer.vocab_size(),tokenizer.merge_count());
+    }
     std::ifstream f("tests/tokenizer_golden/ornith_hf_golden.json", std::ios::binary);
     if (!f) { std::fprintf(stderr, "HF golden fixture absent\n"); return 1; }
     const std::string raw((std::istreambuf_iterator<char>(f)), {});
@@ -37,6 +91,9 @@ int main() {
         std::vector<int32_t> expected;
         for (const b70::Json& id : test.at("ids").array) expected.push_back(id.integer());
         const std::vector<int32_t> actual = tokenizer.encode(input);
+        if (have_gguf && gguf_tokenizer.encode(input)!=expected) {
+            std::fprintf(stderr,"FAIL GGUF HF golden %s\n",name.c_str());return 1;
+        }
         size_t i = 0;
         while (i < expected.size() && i < actual.size() && expected[i] == actual[i]) ++i;
         if (i != expected.size() || i != actual.size()) {

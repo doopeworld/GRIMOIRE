@@ -277,6 +277,14 @@ Q4_K/Q8_0 path would need a new descriptor/dispatch representation because `Fmt`
 
 ## 6. Tokenizer
 
+The inventory below describes the original sidecar-only implementation. The
+GGUF adapter now uses `tokenizer.ggml.*` when the sidecar is absent, and the
+same chat-template family detection reads `tokenizer.chat_template`. It accepts
+`gpt2` with `pre=qwen35` and `llama` SentencePiece BPE; other model/pre names
+fail explicitly. A directory with one text GGUF or a complete split set can
+load without sidecars, as can an explicit `.gguf` path. When both sources exist,
+the sidecar wins and the loader checks vocabulary and ordered merge ranks.
+
 - `Tokenizer::load(dir)` requires `dir/tokenizer.json`; missing file or missing `vocab` is an error
   (`src/tokenizer.cpp:143-156`). It parses vocabulary IDs, ordered BPE merges, and `added_tokens`,
   extending its ID table for specials outside the base vocabulary (`src/tokenizer.cpp:159-219`,

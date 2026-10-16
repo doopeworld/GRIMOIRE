@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--model" && i + 1 < argc) model_dir = argv[++i];
+        if ((a == "--model" || a == "-m") && i + 1 < argc) model_dir = argv[++i];
         else if (a == "--proj" && i + 1 < argc) {
             const std::string v = argv[++i];
             proj_explicit = true;
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
         else if (a == "-h" || a == "--help") {
             std::printf(
                 "grimoire-server -- OpenAI-compatible front end\n\n"
-                "  grimoire-server --model <dir> [--proj FORMAT] [--ctx N]\n"
+                "  grimoire-server --model <dir_or_gguf> [--proj FORMAT] [--ctx N]\n"
                 "                  FORMAT includes native (GGUF Q4_K/Q6_K, MXFP4 base)\n"
                 "                  [--port N] [--host ADDR]\n"
                 "                  [--dflash-model <dir>]         speculative decode drafter\n"
@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
         const std::string prompt=chat?tk.apply_chat_template(request.messages,request.chat):request.prompt;
         const bool think=chat&&!harmony_model&&request.chat.enable_thinking;
         const std::vector<b70::Json> tools=request.tools;
-        const auto ids=tk.encode(prompt);
+        const auto ids=tk.encode(prompt,true);
         const int budget=b70::generation_budget(ids,request.max_tokens,max_seq,int(tk.vocab_size()));
         const std::string model=json_escape(model_dir);
         const auto request_id=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());

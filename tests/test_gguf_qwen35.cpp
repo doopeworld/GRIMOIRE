@@ -2,6 +2,7 @@
 // Independent forward permutation from conversion/qwen.py:454-646, documented
 // as T4 in docs/gguf/FORMAT_SUPPORT.md. T1/T2 forward use lines 396-403.
 #include "b70/gguf_qwen35.hpp"
+#include "b70/tokenizer.hpp"
 #include "b70/json.hpp"
 #include "b70/formats.hpp"
 #include "gguf/test_writer.hpp"
@@ -37,6 +38,9 @@ static std::vector<KV> metadata(int nk,int nv,int h,int hd,int layers,int expert
       u32(p+"ssm.state_size",2),u32(p+"ssm.inner_size",nv*2),
       u32(p+"ssm.conv_kernel",4),u32(p+"full_attention_interval",2),
       kv_array_strings("tokenizer.ggml.tokens",{"a","b","c","d"}),
+      kv_string("tokenizer.ggml.model","gpt2"),kv_string("tokenizer.ggml.pre","qwen35"),
+      kv_array_i32("tokenizer.ggml.token_type",{1,1,1,1}),
+      kv_array_strings("tokenizer.ggml.merges",{}),
       u32("tokenizer.ggml.eos_token_id",3),u32("tokenizer.ggml.bos_token_id",2)};
 }
 static void add(std::vector<TS>& ts,std::string name,std::vector<uint64_t> dims,std::vector<float> v){
@@ -185,9 +189,48 @@ static void small_loader(){
     Qwen35Model multiple;err.clear();CHECK(!multiple.load(dir,err));
     CHECK(err.find("tiny.gguf")!=std::string::npos&&err.find("second.gguf")!=std::string::npos);
     ::unlink((dir+"/second.gguf").c_str());
+    ::unlink((dir+"/tokenizer.json").c_str());
+    write(dir+"/mmproj-vision.gguf",build_file({},{}));
+    write(dir+"/imatrix-test.gguf",build_file({},{}));
+    Qwen35Model standalone;err.clear();CHECK(standalone.load(file,err));
+    if(!err.empty())std::fprintf(stderr,"standalone GGUF: %s\n",err.c_str());
+    CHECK(standalone.gguf_file&&standalone.gguf_path==file&&standalone.layers.size()==2);
+    Qwen35Model scanned;err.clear();CHECK(scanned.load(dir,err));
+    CHECK(scanned.gguf_file&&scanned.gguf_path==file);
+    Tokenizer gguf_tok;err.clear();CHECK(gguf_tok.load(file,err));
+    CHECK(gguf_tok.vocab_size()==4);
+    // The same complete model split across two GGUF files: test loader index
+    // and a late expert read, not just the parser's raw shard dispatch.
+    const std::string first=dir+"/split-00001-of-00002.gguf";
+    const std::string second=dir+"/split-00002-of-00002.gguf";
+    auto split_part=[&](size_t lo,size_t hi,uint32_t no){
+        auto kv=no==0 ? metadata(nk,nv,h,dk,2,experts,inter) :
+            std::vector<KV>{u32("general.alignment",64)};
+        kv.push_back(u32("split.count",2));kv.push_back(u32("split.no",no));
+        kv.push_back(u32("split.tensors.count",uint32_t(ts.size())));
+        std::vector<TS> part;uint64_t offset=0;
+        for(size_t i=lo;i<hi;++i){TS x=ts[i];x.offset=offset;part.push_back(x);
+            offset=(offset+x.raw.size()+63)&~uint64_t(63);}
+        return build_file(kv,part);
+    };
+    write(first,split_part(0,ts.size()/2,0));
+    write(second,split_part(ts.size()/2,ts.size(),1));
+    Qwen35Model split_model;err.clear();CHECK(split_model.load(second,err));
+    if(!err.empty())std::fprintf(stderr,"split loader: %s\n",err.c_str());
+    if(split_model.gguf_file && split_model.layers.size()==2){
+        std::vector<float> expert(size_t(inter)*h);
+        CHECK(split_model.read_gguf_f32(split_model.layers[1].e_down_p[1],expert.data(),err));
+        CHECK(expert[0]==30+float(inter*h)/8);
+    }
+    ::unlink(first.c_str());::unlink(second.c_str());
+    ::unlink((dir+"/mmproj-vision.gguf").c_str());
+    ::unlink((dir+"/imatrix-test.gguf").c_str());
     {std::ofstream f(dir+"/tokenizer.json");f<<"{\"model\":{\"vocab\":{\"a\":0,\"wrong\":1,\"c\":2,\"d\":3}}}";}
     Qwen35Model mismatch;err.clear();CHECK(!mismatch.load(dir,err));
     CHECK(err.find("token 1")!=std::string::npos);
+    err.clear();CHECK(!mismatch.load(file,err) && err.find("token 1")!=std::string::npos);
+    Tokenizer sidecar_wins;err.clear();CHECK(sidecar_wins.load(file,err));
+    CHECK(sidecar_wins.raw_token(1)=="wrong");
     ::unlink((dir+"/tokenizer.json").c_str());::unlink(file.c_str());::rmdir(dir.c_str());
 }
 static void real_headers(){

@@ -20,6 +20,7 @@
 //  tokenizer.cpp
 // =====================================================================
 #include "b70/tokenizer.hpp"
+#include "b70/gguf.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
+#include <limits>
 
 namespace b70 {
 namespace {
@@ -103,6 +105,14 @@ void skip_ws(const std::string& s, size_t& i) {
 
 } // namespace
 
+void Tokenizer::set_chat_family(const std::string& tmpl) {
+    tmpl_xml_tools_ = tmpl.find("<function=example_function_name>") != std::string::npos &&
+                      tmpl.find("do not tell the user about function calls") != std::string::npos &&
+                      tmpl.find("multi_step_tool=true") != std::string::npos;
+    tmpl_effort_ = tmpl_xml_tools_ && tmpl.find("Reasoning effort is set to xhigh.") != std::string::npos;
+    tmpl_think_split_ = tmpl_xml_tools_ && tmpl.find("content.split('</think>')") != std::string::npos;
+}
+
 // ---------------------------------------------------------------------
 // GPT-2 bytes_to_unicode: every one of the 256 byte values gets a
 // printable codepoint so BPE can operate on text. Bytes that are already
@@ -141,11 +151,24 @@ void Tokenizer::build_byte_tables() {
 }
 
 bool Tokenizer::load(const std::string& dir, std::string& err) {
+    const bool direct=dir.size()>=5 && dir.compare(dir.size()-5,5,".gguf")==0;
+    const std::string root=direct ? (dir.find_last_of('/')==std::string::npos ? "." :
+                           dir.substr(0,dir.find_last_of('/'))) : dir;
+    const std::string sidecar = root + "/tokenizer.json";
+    if (std::FILE* probe=std::fopen(sidecar.c_str(),"rb")) std::fclose(probe);
+    else {
+        std::string selected;
+        if (!gguf_model_path(dir,selected,err)) return false;
+        if (selected.empty()) { err="cannot read "+sidecar+" and no GGUF model found";return false; }
+        GGUFFile file;
+        if (!file.open(selected,err)) return false;
+        return load_gguf(file,err);
+    }
     build_byte_tables();
     add_bos_token_ = false;
     // Raw-text scoring follows the checkpoint's tokenizer setting, not the
     // presence of a BOS id. Qwen-family tokenizers normally set this false.
-    const std::string tokenizer_cfg = read_file(dir + "/tokenizer_config.json");
+    const std::string tokenizer_cfg = read_file(root + "/tokenizer_config.json");
     const size_t bos_key = tokenizer_cfg.find("\"add_bos_token\"");
     if (bos_key != std::string::npos) {
         size_t value = tokenizer_cfg.find(':', bos_key);
@@ -157,8 +180,8 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
         else { err = "invalid add_bos_token"; return false; }
     }
 
-    const std::string js = read_file(dir + "/tokenizer.json");
-    if (js.empty()) { err = "cannot read " + dir + "/tokenizer.json"; return false; }
+    const std::string js = read_file(sidecar);
+    if (js.empty()) { err = "cannot read " + sidecar; return false; }
 
     // ---- vocab -------------------------------------------------------
     // Scanning for the key rather than parsing the whole document: the
@@ -238,15 +261,9 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
     // (Qwen3.8 / Agnes / Ornith) has -- the Qwen3.6 template words its tool
     // block differently and keeps its own (legacy) rendering here.
     {
-        std::string tmpl = read_file(dir + "/chat_template.jinja");
-        if (tmpl.empty()) tmpl = read_file(dir + "/tokenizer_config.json");
-        tmpl_xml_tools_ = tmpl.find("<function=example_function_name>") != std::string::npos &&
-                          tmpl.find("do not tell the user about function calls") != std::string::npos &&
-                          tmpl.find("multi_step_tool=true") != std::string::npos;
-        tmpl_effort_ = tmpl_xml_tools_ &&
-                       tmpl.find("Reasoning effort is set to xhigh.") != std::string::npos;
-        tmpl_think_split_ = tmpl_xml_tools_ &&
-                            tmpl.find("content.split('</think>')") != std::string::npos;
+        std::string tmpl = read_file(root + "/chat_template.jinja");
+        if (tmpl.empty()) tmpl = read_file(root + "/tokenizer_config.json");
+        set_chat_family(tmpl);
     }
 
     // ---- special tokens ----------------------------------------------
@@ -349,6 +366,121 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
     return true;
 }
 
+bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
+    *this=Tokenizer{};
+    build_byte_tables();
+    std::string model, pre;
+    if (!file.get_string("tokenizer.ggml.model",model,err)) return false;
+    if (model!="gpt2" && model!="llama") {
+        err="unsupported tokenizer.ggml.model: "+model; return false;
+    }
+    sentencepiece_=model=="llama";
+    if (sentencepiece_) add_bos_token_=true; // llama.cpp SPM default
+    if (const GGUFValue* p=file.get("tokenizer.ggml.pre")) {
+        if (p->type!=8) {err="wrong tokenizer.ggml.pre type";return false;}
+        pre=std::get<std::string>(p->data);
+    }
+    // llama.cpp 711780ffc75b, llama-vocab.cpp QWEN35: the existing Unicode
+    // splitter implements its Split expression exactly (including marks and
+    // single-codepoint numbers). Other pre names select different regexes.
+    if ((!sentencepiece_ && pre!="qwen35") ||
+        (sentencepiece_ && !pre.empty() && pre!="default")) {
+        err="unsupported tokenizer.ggml.pre: "+(pre.empty()?"<missing>":pre); return false;
+    }
+    const GGUFValue *v=nullptr,*types=nullptr;
+    if (!file.get_array("tokenizer.ggml.tokens",v,err)) return false;
+    const auto* strings=std::get_if<std::vector<std::string>>(&v->data);
+    if (!strings || strings->empty()) {err="tokenizer.ggml.tokens must be a nonempty string array";return false;}
+    if (!file.get_array("tokenizer.ggml.token_type",types,err)) return false;
+    const auto* kind=std::get_if<std::vector<int32_t>>(&types->data);
+    if (!kind || kind->size()!=strings->size()) {
+        err="tokenizer.ggml.token_type must be an i32 array matching tokens";return false;
+    }
+    id_to_tok_=*strings; token_type_=*kind;
+    for (size_t i=0;i<strings->size();++i) {
+        const int32_t t=(*kind)[i];
+        if (t<1 || t>6) {err="invalid tokenizer.ggml.token_type at "+std::to_string(i);return false;}
+        const std::string& s=(*strings)[i];
+        if (t!=5 && !s.empty()) tok_to_id_.emplace(s,int32_t(i));
+        if ((t==2 || t==3 || t==4) && !s.empty()) {
+            special_by_text_.emplace(s,int32_t(i));
+            // Qwen3.5's GGUF marks the six FIM/repository delimiters as
+            // CONTROL, although the HF added_tokens entries set special=false.
+            // They must remain atomic on encode and visible on decode.
+            const bool visible_qwen_control=!sentencepiece_ &&
+                (s=="<|fim_prefix|>" || s=="<|fim_middle|>" ||
+                 s=="<|fim_suffix|>" || s=="<|fim_pad|>" ||
+                 s=="<|repo_name|>" || s=="<|file_sep|>");
+            if (t==2 || (t==3 && !visible_qwen_control)) special_ids_[int32_t(i)]=1;
+        }
+    }
+    if (sentencepiece_) {
+        const GGUFValue* sv=nullptr;
+        if (!file.get_array("tokenizer.ggml.scores",sv,err)) return false;
+        const auto* scores=std::get_if<std::vector<float>>(&sv->data);
+        if (!scores || scores->size()!=strings->size()) {
+            err="tokenizer.ggml.scores must match tokens";return false;
+        }
+        scores_=*scores;
+    } else {
+        const GGUFValue* mv=nullptr;
+        if (!file.get_array("tokenizer.ggml.merges",mv,err)) return false;
+        const auto* merges=std::get_if<std::vector<std::string>>(&mv->data);
+        if (!merges) {err="tokenizer.ggml.merges must be a string array";return false;}
+        for (size_t i=0;i<merges->size();++i) {
+            if ((*merges)[i].find(' ')==std::string::npos) {
+                err="invalid tokenizer.ggml.merges entry "+std::to_string(i);return false;
+            }
+            merge_rank_.emplace((*merges)[i],int32_t(i));
+        }
+    }
+    auto id=[&](const char* key, int32_t& target)->bool {
+        const GGUFValue* p=file.get(key);
+        if (!p) return true;
+        uint64_t n=0;
+        if (p->type==4) n=std::get<uint32_t>(p->data);
+        else if (p->type==2) n=std::get<uint16_t>(p->data);
+        else {err=std::string("wrong GGUF token id type: ")+key;return false;}
+        if (n>=id_to_tok_.size()) {err=std::string("GGUF token id out of range: ")+key;return false;}
+        target=int32_t(n);return true;
+    };
+    if (!id("tokenizer.ggml.bos_token_id",bos_) || !id("tokenizer.ggml.eos_token_id",eos_) ||
+        !id("tokenizer.ggml.eot_token_id",eot_) || !id("tokenizer.ggml.padding_token_id",pad_) ||
+        !id("tokenizer.ggml.unknown_token_id",unk_)) return false;
+    if (sentencepiece_ && unk_<0) {
+        for (size_t i=0;i<token_type_.size();++i)
+            if (token_type_[i]==2) {unk_=int32_t(i);break;}
+        if (unk_<0) {
+            for (unsigned c=0;c<256;++c) {
+                char byte[7];std::snprintf(byte,sizeof byte,"<0x%02X>",c);
+                auto it=tok_to_id_.find(byte);
+                if (it==tok_to_id_.end() || token_type_[it->second]!=6) {
+                    err="llama tokenizer lacks unknown id and complete byte fallback";return false;
+                }
+            }
+        }
+    }
+    auto flag=[&](const char* key, bool& dst)->bool {
+        const GGUFValue* p=file.get(key);
+        if (!p) return true;
+        if (p->type!=7) {err=std::string("wrong GGUF bool type: ")+key;return false;}
+        dst=std::get<bool>(p->data);return true;
+    };
+    if (!flag("tokenizer.ggml.add_bos_token",add_bos_token_) ||
+        !flag("tokenizer.ggml.add_eos_token",add_eos_token_) ||
+        !flag("tokenizer.ggml.add_space_prefix",spm_add_prefix_)) return false;
+    if (eot_>=0 && eot_!=eos_) eos2_=eot_;
+    else for (const char* s:{"<|eot|>","<|ifm|endoftext|>","<|endoftext|>"}) {
+        auto it=special_by_text_.find(s);
+        if (it!=special_by_text_.end() && it->second!=eos_) {eos2_=it->second;break;}
+    }
+    if (const GGUFValue* p=file.get("tokenizer.chat_template")) {
+        if (p->type!=8) {err="wrong tokenizer.chat_template type";return false;}
+        set_chat_family(std::get<std::string>(p->data));
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------
 // BPE over one pre-tokenized word, expressed in placeholder characters.
 // Repeatedly merge the adjacent pair with the LOWEST rank.
@@ -383,6 +515,41 @@ std::vector<std::string> Tokenizer::bpe_word(const std::string& word) const {
         if (sym.size() == 1) break;
     }
     return sym;
+}
+
+std::vector<int32_t> Tokenizer::spm_word(const std::string& text) const {
+    std::string normalized;
+    if (!text.empty() && spm_add_prefix_) normalized="\xE2\x96\x81";
+    for (char c:text) normalized += c==' ' ? "\xE2\x96\x81" : std::string(1,c);
+    std::vector<std::string> parts;
+    for (size_t i=0;i<normalized.size();) {
+        const unsigned char c=normalized[i];
+        const size_t width=(c&0xF8)==0xF0?4:(c&0xF0)==0xE0?3:(c&0xE0)==0xC0?2:1;
+        const size_t n=std::min(width,normalized.size()-i);
+        parts.push_back(normalized.substr(i,n)); i+=n;
+    }
+    for (;;) {
+        float best=-std::numeric_limits<float>::infinity(); size_t at=parts.size();
+        for (size_t i=0;i+1<parts.size();++i) {
+            auto it=tok_to_id_.find(parts[i]+parts[i+1]);
+            if (it==tok_to_id_.end() || token_type_[it->second]!=1) continue;
+            if (scores_[it->second]>best) {best=scores_[it->second];at=i;}
+        }
+        if (at==parts.size()) break;
+        parts[at]+=parts[at+1];parts.erase(parts.begin()+long(at)+1);
+    }
+    std::vector<int32_t> result;
+    for (const auto& p:parts) {
+        auto it=tok_to_id_.find(p);
+        if (it!=tok_to_id_.end() && token_type_[it->second]!=5) {result.push_back(it->second);continue;}
+        for (unsigned char c:p) {
+            char byte[7];std::snprintf(byte,sizeof byte,"<0x%02X>",unsigned(c));
+            auto b=tok_to_id_.find(byte);
+            if (b!=tok_to_id_.end() && token_type_[b->second]==6) result.push_back(b->second);
+            else if (unk_>=0) result.push_back(unk_);
+        }
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------
@@ -1453,8 +1620,9 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
     return out;
 }
 
-std::vector<int32_t> Tokenizer::encode(const std::string& text, bool) const {
+std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_special) const {
     std::vector<int32_t> out;
+    if (add_special && add_bos_token_ && bos_>=0) out.push_back(bos_);
 
     size_t i = 0;
     while (i < text.size()) {
@@ -1484,6 +1652,10 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool) const {
         }
 
         const std::string run = text.substr(i, stop - i);
+        if (sentencepiece_) {
+            auto ids=spm_word(run);out.insert(out.end(),ids.begin(),ids.end());
+            i=stop;continue;
+        }
         for (const std::string& piece : pre_tokenize(run)) {
             std::string mapped;
             for (unsigned char ch : piece) mapped += byte_to_uni_[ch];
@@ -1503,6 +1675,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool) const {
         }
         i = stop;
     }
+    if (add_special && add_eos_token_ && eos_>=0) out.push_back(eos_);
     return out;
 }
 
@@ -1510,6 +1683,16 @@ std::string Tokenizer::decode_one(int32_t id) const {
     if (id < 0 || size_t(id) >= id_to_tok_.size()) return {};
     const std::string& t = id_to_tok_[size_t(id)];
     if (special_ids_.count(id)) return {};        // don't print control tokens
+
+    if (sentencepiece_) {
+        if (token_type_[size_t(id)]==6 && t.size()==6 && t.substr(0,3)=="<0x" && t[5]=='>') {
+            char* end=nullptr;long value=std::strtol(t.substr(3,2).c_str(),&end,16);
+            if (end && *end==0) return std::string(1,char(value));
+        }
+        std::string out=t;const std::string marker="\xE2\x96\x81";
+        for(size_t p=0;(p=out.find(marker,p))!=std::string::npos;) {out.replace(p,marker.size()," ");++p;}
+        return out;
+    }
 
     std::string out;
     for (size_t i = 0; i < t.size();) {
@@ -1529,6 +1712,7 @@ std::string Tokenizer::decode_one(int32_t id) const {
 std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     std::string out;
     for (int32_t id : ids) out += decode_one(id);
+    if (sentencepiece_ && spm_add_prefix_ && !out.empty() && out[0]==' ') out.erase(0,1);
     return out;
 }
 
