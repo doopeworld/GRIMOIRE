@@ -51,6 +51,7 @@
 #include "b70/cpu_experts.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
+#include "b70/kld.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <memory>
 #include <functional>
@@ -16157,20 +16158,39 @@ namespace b70 {
 
 int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
                        const std::string& path, int ctx, int chunks,
-                       const std::string& dump, bool selfcheck) {
+                       const std::string& dump, bool selfcheck,
+                       const std::string& kld_base) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::ifstream input(path, std::ios::binary);
-    if (!input) { std::fprintf(stderr, "--ppl: cannot open %s\n", path.c_str()); return 1; }
-    const std::string text((std::istreambuf_iterator<char>(input)), {});
-    if (input.bad()) { std::fprintf(stderr, "--ppl: failed reading %s\n", path.c_str()); return 1; }
+    std::unique_ptr<KldBaseReader> base;
+    try {
+        if (!kld_base.empty()) {
+            base = std::make_unique<KldBaseReader>(kld_base);
+            if (ctx && ctx != base->ctx())
+                throw std::runtime_error("--ppl-ctx must equal --ppl-kld-base n_ctx (" + std::to_string(base->ctx()) + ")");
+            ctx = base->ctx();
+            if (chunks > base->chunks())
+                throw std::runtime_error("--ppl-chunks exceeds --ppl-kld-base n_chunk (" + std::to_string(base->chunks()) + ")");
+        }
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "%s\n", ex.what()); return 1;
+    }
     Tokenizer tk; std::string err;
     if (!tk.load(dir, err)) { std::fprintf(stderr, "tokenizer: %s\n", err.c_str()); return 1; }
-    auto ids = tk.encode(text);
-    if (tk.add_bos_token()) {
-        if (tk.bos() < 0) { std::fprintf(stderr, "--ppl: tokenizer requests BOS but has no BOS id\n"); return 1; }
-        ids.insert(ids.begin(), tk.bos());
+    std::vector<int32_t> ids;
+    if (!base) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) { std::fprintf(stderr, "--ppl: cannot open %s\n", path.c_str()); return 1; }
+        const std::string text((std::istreambuf_iterator<char>(input)), {});
+        if (input.bad()) { std::fprintf(stderr, "--ppl: failed reading %s\n", path.c_str()); return 1; }
+        ids = tk.encode(text);
+        if (tk.add_bos_token()) {
+            if (tk.bos() < 0) { std::fprintf(stderr, "--ppl: tokenizer requests BOS but has no BOS id\n"); return 1; }
+            ids.insert(ids.begin(), tk.bos());
+        }
+    } else if (tk.add_bos_token() && tk.bos() < 0) {
+        std::fprintf(stderr, "--ppl-kld-base: tokenizer requests BOS but has no BOS id\n"); return 1;
     }
-    const size_t available = ids.size() / size_t(ctx);
+    const size_t available = base ? size_t(base->chunks()) : ids.size() / size_t(ctx);
     const size_t count = chunks ? std::min(available, size_t(chunks)) : available;
     if (!count) {
         std::fprintf(stderr, "--ppl: %zu tokens, no complete %d-token chunk\n", ids.size(), ctx);
@@ -16185,19 +16205,30 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
         std::fprintf(stderr, "load: %s\n", err.c_str()); e.release(); return 1;
     }
     try {
+        if (base && base->vocab() != e.cfg.vocab)
+            throw std::runtime_error("--ppl-kld-base cannot score " + dir + ": vocabulary mismatch (base " +
+                                     std::to_string(base->vocab()) + ", model " + std::to_string(e.cfg.vocab) + ")");
         if (!dump.empty() && e.cfg.vocab < 8)
             throw std::runtime_error("--ppl-dump cannot score " + dir + ": fewer than eight vocabulary entries");
-        for (size_t i = 0; i < count * size_t(ctx); ++i)
-            if (ids[i] < 0 || ids[i] >= e.cfg.vocab)
-                throw std::runtime_error("--ppl cannot score " + dir + ": tokenizer id outside model vocabulary");
+        if (!base)
+            for (size_t i = 0; i < count * size_t(ctx); ++i)
+                if (ids[i] < 0 || ids[i] >= e.cfg.vocab)
+                    throw std::runtime_error("--ppl cannot score " + dir + ": tokenizer id outside model vocabulary");
         std::ofstream out;
         if (!dump.empty()) {
             out.open(dump, std::ios::binary | std::ios::trunc);
             if (!out) throw std::runtime_error("--ppl-dump cannot open " + dump);
             out << std::setprecision(12);
         }
-        std::printf("--ppl: %zu raw tokens, %zu complete chunks of %d, %zu dropped; teacher-forced per-token decode\n",
-                    ids.size(), count, ctx, ids.size() - available * size_t(ctx));
+        if (base)
+            std::printf("--ppl-kld-base: %zu chunks of %d, vocabulary %d; teacher-forced per-token decode\n",
+                        count, ctx, base->vocab());
+        else
+            std::printf("--ppl: %zu raw tokens, %zu complete chunks of %d, %zu dropped; teacher-forced per-token decode\n",
+                        ids.size(), count, ctx, ids.size() - available * size_t(ctx));
+        KldStats kld;
+        std::vector<int32_t> chunk_ids;
+        std::vector<uint16_t> base_probs;
         std::vector<float> logits(static_cast<size_t>(e.cfg.vocab));
         std::vector<float> check_logits;
         if (selfcheck) check_logits.resize(logits.size());
@@ -16205,10 +16236,21 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
         double mean = 0.0, m2 = 0.0;
         const auto start = std::chrono::steady_clock::now();
         for (size_t chunk = 0; chunk < count; ++chunk) {
+            if (base) {
+                base->read_chunk(int(chunk), chunk_ids, base_probs);
+                for (int32_t id : chunk_ids)
+                    if (id < 0 || id >= e.cfg.vocab)
+                        throw std::runtime_error("--ppl-kld-base cannot score " + dir + ": token outside model vocabulary in chunk " + std::to_string(chunk + 1));
+                // llama.cpp replaces the first token of every chunk with BOS
+                // when the vocabulary requests it, while targets stay on file.
+                if (tk.add_bos_token()) chunk_ids[0] = tk.bos();
+            } else {
+                const auto first = ids.begin() + static_cast<std::ptrdiff_t>(chunk * size_t(ctx));
+                chunk_ids.assign(first, first + ctx);
+            }
             e.reset(); // resets the KV cursor and clears DeltaNet/conv state.
-            const size_t offset = chunk * size_t(ctx);
             for (int pos = 0; pos < ctx; ++pos) {
-                if (!e.forward(ids[offset + size_t(pos)]))
+                if (!e.forward(chunk_ids[size_t(pos)]))
                     throw std::runtime_error("--ppl decode cannot score " + dir + " at position " + std::to_string(pos));
                 if (pos < ctx / 2 || pos == ctx - 1) continue;
                 e.q.memcpy(logits.data(), e.s.logits, logits.size() * sizeof(float)).wait();
@@ -16232,13 +16274,16 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
                 double sum = 0.0;
                 for (float value : logits) sum += std::exp(double(value) - largest);
                 const double logz = largest + std::log(sum);
-                const int target = ids[offset + size_t(pos + 1)];
+                const int target = chunk_ids[size_t(pos + 1)];
                 const double logprob = double(logits[size_t(target)]) - logz;
                 const double nll = -logprob;
                 ++scored;
                 const double delta = nll - mean;
                 mean += delta / double(scored);
                 m2 += delta * (nll - mean);
+                if (base)
+                    kld.add(e.cfg.vocab, logits.data(),
+                            base_probs.data() + size_t(pos - ctx/2)*base->row_words(), target);
                 if (out.is_open()) {
                     out << chunk + 1 << '\t' << pos << '\t' << target << '\t'
                         << logprob << '\t' << best << '\t'
@@ -16249,11 +16294,14 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
                 }
                 if (selfcheck && chunk == 0 && pos == ctx - 2) check_logits = logits;
             }
-            std::printf("[%zu]%.4f%s", chunk + 1, std::exp(mean),
-                        chunk + 1 == count ? "\n" : ",");
+            if (!base)
+                std::printf("[%zu]%.4f%s", chunk + 1, std::exp(mean),
+                            chunk + 1 == count ? "\n" : ",");
+            else
+                std::printf("KLD chunk %zu/%zu: %.6f\n", chunk + 1, count, kld.sum_kld/kld.count);
             if (selfcheck && chunk == 0) {
                 e.reset();
-                const std::vector<int32_t> prefix(ids.begin(), ids.begin() + long(ctx - 1));
+                const std::vector<int32_t> prefix(chunk_ids.begin(), chunk_ids.begin() + long(ctx - 1));
                 if (!e.prefill(prefix, nullptr, nullptr, false))
                     throw std::runtime_error("--ppl-selfcheck batched prefill cannot score " + dir);
                 e.q.memcpy(logits.data(), e.s.logits, logits.size() * sizeof(float)).wait();
@@ -16268,8 +16316,13 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
         const double ppl = std::exp(mean);
         const double stderr_nll = scored > 1 ? std::sqrt(m2 / double(scored - 1) / double(scored)) : 0.0;
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::printf("PPL: %.6f +/- %.6f; scored tokens: %zu; wall time: %.3fs\n",
-                    ppl, ppl * stderr_nll, scored, seconds);
+        if (base) {
+            std::printf("\n");
+            print_kld_statistics(kld);
+        } else {
+            std::printf("PPL: %.6f +/- %.6f; scored tokens: %zu; wall time: %.3fs\n",
+                        ppl, ppl * stderr_nll, scored, seconds);
+        }
         e.release(); return 0;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "perplexity failed: %s\n", ex.what());
