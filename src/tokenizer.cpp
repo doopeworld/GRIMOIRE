@@ -386,36 +386,21 @@ std::vector<std::string> Tokenizer::bpe_word(const std::string& word) const {
 }
 
 // ---------------------------------------------------------------------
-// Pre-tokenizer. The checkpoint specifies this Split regex:
+// Pre-tokenizer. Alternatives are attempted in order at each codepoint,
+// exactly as the checkpoint's Split(Isolated) regex specifies:
 //
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
-//   |[^\r\n\p{L}\p{N}]?\p{L}+
-//   |\p{N}{1,3}
-//   | ?[^\s\p{L}\p{N}]+[\r\n]*
+//   |[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+//   |\p{N}
+//   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
 //   |\s*[\r\n]+
 //   |\s+(?!\S)
 //   |\s+
 //
-// Splitting on spaces alone (the previous behaviour) leaves things like
-// "user\nWrite" as ONE pre-token. No merge rule matches a chunk that
-// long, so BPE falls all the way back to single bytes: 47 tokens where
-// the reference produces 18. Every downstream kernel then receives
-// shredded input regardless of whether it is correct.
-//
-// Implemented directly rather than with std::regex, which does not
-// support Unicode properties and would be far too slow on a prompt.
+// std::regex has no Unicode properties; use a pinned category table instead.
 namespace {
 
-inline bool is_ascii_letter(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-}
-inline bool is_digit(unsigned char c) { return c >= '0' && c <= '9'; }
-inline bool is_space(unsigned char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-inline bool is_nl(unsigned char c) { return c == '\n' || c == '\r'; }
-
-// UTF-8 sequence length from the lead byte.
+inline bool is_nl(uint32_t cp) { return cp == '\n' || cp == '\r'; }
 inline int u8len(unsigned char c) {
     if ((c & 0x80) == 0)    return 1;
     if ((c & 0xE0) == 0xC0) return 2;
@@ -423,9 +408,6 @@ inline int u8len(unsigned char c) {
     if ((c & 0xF8) == 0xF0) return 4;
     return 1;
 }
-
-// Decode a UTF-8 sequence to its codepoint. Returns 0 on a malformed
-// lead byte, which callers treat as "not a letter".
 inline uint32_t u8cp(const std::string& t, size_t i, int len) {
     const unsigned char c0 = t[i];
     if (len == 1) return c0;
@@ -439,50 +421,928 @@ inline uint32_t u8cp(const std::string& t, size_t i, int len) {
     return cp;
 }
 
-// Unicode punctuation/symbol blocks that are NOT \p{L}. Qwen's
-// pre-tokenizer groups these with the punctuation run
-// (' ?[^\s\p{L}\p{N}]+'), not with adjacent words.
-inline bool is_punct_cp(uint32_t cp) {
-    if (cp >= 0x00A0 && cp <= 0x00BF) return true;  // Latin-1 punct/symbols
-    if (cp == 0x00D7 || cp == 0x00F7) return true;  // multiplication/division
-    if (cp >= 0x2000 && cp <= 0x206F) return true;  // General Punctuation
-    if (cp >= 0x2E00 && cp <= 0x2E7F) return true;  // Supplemental Punctuation
-    if (cp >= 0x3000 && cp <= 0x303F) return true;  // CJK Symbols & Punctuation
-    return false;
-}
-
-// \p{L}: ASCII letters plus non-ASCII codepoints that are not punctuation.
-//
-// This USED to return true for EVERY multi-byte codepoint, with a comment
-// claiming that was a safe approximation because "the punctuation that is
-// not gets handled by the byte-level fallback without changing the token
-// count for normal text". That is false, and it was expensive: a curly
-// apostrophe, smart quote or em dash was glued onto the adjacent word, so
-// the chunk handed to BPE ("\u201cHe) never appears in the merge table,
-// nothing merged, and the whole run fell back to raw bytes.
-//
-// MEASURED 2026-09-05 against vLLM serving the same Qwen3.8-27B tokenizer,
-// identical strings through both /v1/completions (prompt_tokens):
-//     ascii only     vLLM 16   GRIMOIRE 16    <- why this was never caught;
-//     smart quotes   vLLM 17   GRIMOIRE 34       the in-tree verifier's
-//     em dash        vLLM 15   GRIMOIRE 27       reference string is pure
-//     apostrophes    vLLM 18   GRIMOIRE 38       ASCII and passes regardless
-// Real prose is ~2x over-tokenised: 24051 chars of Conan Doyle gave vLLM
-// 5983 tokens and GRIMOIRE 7475. That inflates every PP tok/s figure (more
-// tokens counted for the same text), makes TG genuinely worse (each token
-// carries less text), and feeds the model byte-fallback sequences it never
-// saw in training -- which is a plausible contributor to the MTP draft
-// acceptance collapse on real text (12-26%) versus ASCII-ish synthetic
-// prompts (74%).
-inline bool is_letter_at(const std::string& t, size_t i, int& len) {
-    const unsigned char c = t[i];
-    len = u8len(c);
-    if (len > 1) {
-        const uint32_t cp = u8cp(t, i, len);
-        if (cp == 0) return false;
-        return !is_punct_cp(cp);
+// Regex character classes derived from HF tokenizers 0.22.2's Split output
+// over Unicode scalar values, using UnicodeData 13.0 as the baseline.
+// A means \p{L} or \p{M}; N means \p{N}. These are the classes that
+// affect output boundaries. Treating L and M together is equivalent here:
+// consuming an initial mark as the optional prefix still produces the same
+// span as consuming it in the following [\p{L}\p{M}]+ run.
+struct CategoryRange { uint32_t first, last; char category; };
+static constexpr CategoryRange kCategories[] = {
+    {0x30, 0x39, 'N'},
+    {0x41, 0x5A, 'A'},
+    {0x61, 0x7A, 'A'},
+    {0xAA, 0xAA, 'A'},
+    {0xB2, 0xB3, 'N'},
+    {0xB5, 0xB5, 'A'},
+    {0xB9, 0xB9, 'N'},
+    {0xBA, 0xBA, 'A'},
+    {0xBC, 0xBE, 'N'},
+    {0xC0, 0xD6, 'A'},
+    {0xD8, 0xF6, 'A'},
+    {0xF8, 0x2C1, 'A'},
+    {0x2C6, 0x2D1, 'A'},
+    {0x2E0, 0x2E4, 'A'},
+    {0x2EC, 0x2EC, 'A'},
+    {0x2EE, 0x2EE, 'A'},
+    {0x300, 0x374, 'A'},
+    {0x376, 0x377, 'A'},
+    {0x37A, 0x37D, 'A'},
+    {0x37F, 0x37F, 'A'},
+    {0x386, 0x386, 'A'},
+    {0x388, 0x38A, 'A'},
+    {0x38C, 0x38C, 'A'},
+    {0x38E, 0x3A1, 'A'},
+    {0x3A3, 0x3F5, 'A'},
+    {0x3F7, 0x481, 'A'},
+    {0x483, 0x52F, 'A'},
+    {0x531, 0x556, 'A'},
+    {0x559, 0x559, 'A'},
+    {0x560, 0x588, 'A'},
+    {0x591, 0x5BD, 'A'},
+    {0x5BF, 0x5BF, 'A'},
+    {0x5C1, 0x5C2, 'A'},
+    {0x5C4, 0x5C5, 'A'},
+    {0x5C7, 0x5C7, 'A'},
+    {0x5D0, 0x5EA, 'A'},
+    {0x5EF, 0x5F2, 'A'},
+    {0x610, 0x61A, 'A'},
+    {0x620, 0x65F, 'A'},
+    {0x660, 0x669, 'N'},
+    {0x66E, 0x6D3, 'A'},
+    {0x6D5, 0x6DC, 'A'},
+    {0x6DF, 0x6E8, 'A'},
+    {0x6EA, 0x6EF, 'A'},
+    {0x6F0, 0x6F9, 'N'},
+    {0x6FA, 0x6FC, 'A'},
+    {0x6FF, 0x6FF, 'A'},
+    {0x710, 0x74A, 'A'},
+    {0x74D, 0x7B1, 'A'},
+    {0x7C0, 0x7C9, 'N'},
+    {0x7CA, 0x7F5, 'A'},
+    {0x7FA, 0x7FA, 'A'},
+    {0x7FD, 0x7FD, 'A'},
+    {0x800, 0x82D, 'A'},
+    {0x840, 0x85B, 'A'},
+    {0x860, 0x86A, 'A'},
+    {0x870, 0x887, 'A'},
+    {0x889, 0x88E, 'A'},
+    {0x897, 0x8E1, 'A'},
+    {0x8E3, 0x963, 'A'},
+    {0x966, 0x96F, 'N'},
+    {0x971, 0x983, 'A'},
+    {0x985, 0x98C, 'A'},
+    {0x98F, 0x990, 'A'},
+    {0x993, 0x9A8, 'A'},
+    {0x9AA, 0x9B0, 'A'},
+    {0x9B2, 0x9B2, 'A'},
+    {0x9B6, 0x9B9, 'A'},
+    {0x9BC, 0x9C4, 'A'},
+    {0x9C7, 0x9C8, 'A'},
+    {0x9CB, 0x9CE, 'A'},
+    {0x9D7, 0x9D7, 'A'},
+    {0x9DC, 0x9DD, 'A'},
+    {0x9DF, 0x9E3, 'A'},
+    {0x9E6, 0x9EF, 'N'},
+    {0x9F0, 0x9F1, 'A'},
+    {0x9F4, 0x9F9, 'N'},
+    {0x9FC, 0x9FC, 'A'},
+    {0x9FE, 0x9FE, 'A'},
+    {0xA01, 0xA03, 'A'},
+    {0xA05, 0xA0A, 'A'},
+    {0xA0F, 0xA10, 'A'},
+    {0xA13, 0xA28, 'A'},
+    {0xA2A, 0xA30, 'A'},
+    {0xA32, 0xA33, 'A'},
+    {0xA35, 0xA36, 'A'},
+    {0xA38, 0xA39, 'A'},
+    {0xA3C, 0xA3C, 'A'},
+    {0xA3E, 0xA42, 'A'},
+    {0xA47, 0xA48, 'A'},
+    {0xA4B, 0xA4D, 'A'},
+    {0xA51, 0xA51, 'A'},
+    {0xA59, 0xA5C, 'A'},
+    {0xA5E, 0xA5E, 'A'},
+    {0xA66, 0xA6F, 'N'},
+    {0xA70, 0xA75, 'A'},
+    {0xA81, 0xA83, 'A'},
+    {0xA85, 0xA8D, 'A'},
+    {0xA8F, 0xA91, 'A'},
+    {0xA93, 0xAA8, 'A'},
+    {0xAAA, 0xAB0, 'A'},
+    {0xAB2, 0xAB3, 'A'},
+    {0xAB5, 0xAB9, 'A'},
+    {0xABC, 0xAC5, 'A'},
+    {0xAC7, 0xAC9, 'A'},
+    {0xACB, 0xACD, 'A'},
+    {0xAD0, 0xAD0, 'A'},
+    {0xAE0, 0xAE3, 'A'},
+    {0xAE6, 0xAEF, 'N'},
+    {0xAF9, 0xAFF, 'A'},
+    {0xB01, 0xB03, 'A'},
+    {0xB05, 0xB0C, 'A'},
+    {0xB0F, 0xB10, 'A'},
+    {0xB13, 0xB28, 'A'},
+    {0xB2A, 0xB30, 'A'},
+    {0xB32, 0xB33, 'A'},
+    {0xB35, 0xB39, 'A'},
+    {0xB3C, 0xB44, 'A'},
+    {0xB47, 0xB48, 'A'},
+    {0xB4B, 0xB4D, 'A'},
+    {0xB55, 0xB57, 'A'},
+    {0xB5C, 0xB5D, 'A'},
+    {0xB5F, 0xB63, 'A'},
+    {0xB66, 0xB6F, 'N'},
+    {0xB71, 0xB71, 'A'},
+    {0xB72, 0xB77, 'N'},
+    {0xB82, 0xB83, 'A'},
+    {0xB85, 0xB8A, 'A'},
+    {0xB8E, 0xB90, 'A'},
+    {0xB92, 0xB95, 'A'},
+    {0xB99, 0xB9A, 'A'},
+    {0xB9C, 0xB9C, 'A'},
+    {0xB9E, 0xB9F, 'A'},
+    {0xBA3, 0xBA4, 'A'},
+    {0xBA8, 0xBAA, 'A'},
+    {0xBAE, 0xBB9, 'A'},
+    {0xBBE, 0xBC2, 'A'},
+    {0xBC6, 0xBC8, 'A'},
+    {0xBCA, 0xBCD, 'A'},
+    {0xBD0, 0xBD0, 'A'},
+    {0xBD7, 0xBD7, 'A'},
+    {0xBE6, 0xBF2, 'N'},
+    {0xC00, 0xC0C, 'A'},
+    {0xC0E, 0xC10, 'A'},
+    {0xC12, 0xC28, 'A'},
+    {0xC2A, 0xC39, 'A'},
+    {0xC3C, 0xC44, 'A'},
+    {0xC46, 0xC48, 'A'},
+    {0xC4A, 0xC4D, 'A'},
+    {0xC55, 0xC56, 'A'},
+    {0xC58, 0xC5A, 'A'},
+    {0xC5D, 0xC5D, 'A'},
+    {0xC60, 0xC63, 'A'},
+    {0xC66, 0xC6F, 'N'},
+    {0xC78, 0xC7E, 'N'},
+    {0xC80, 0xC83, 'A'},
+    {0xC85, 0xC8C, 'A'},
+    {0xC8E, 0xC90, 'A'},
+    {0xC92, 0xCA8, 'A'},
+    {0xCAA, 0xCB3, 'A'},
+    {0xCB5, 0xCB9, 'A'},
+    {0xCBC, 0xCC4, 'A'},
+    {0xCC6, 0xCC8, 'A'},
+    {0xCCA, 0xCCD, 'A'},
+    {0xCD5, 0xCD6, 'A'},
+    {0xCDD, 0xCDE, 'A'},
+    {0xCE0, 0xCE3, 'A'},
+    {0xCE6, 0xCEF, 'N'},
+    {0xCF1, 0xCF3, 'A'},
+    {0xD00, 0xD0C, 'A'},
+    {0xD0E, 0xD10, 'A'},
+    {0xD12, 0xD44, 'A'},
+    {0xD46, 0xD48, 'A'},
+    {0xD4A, 0xD4E, 'A'},
+    {0xD54, 0xD57, 'A'},
+    {0xD58, 0xD5E, 'N'},
+    {0xD5F, 0xD63, 'A'},
+    {0xD66, 0xD78, 'N'},
+    {0xD7A, 0xD7F, 'A'},
+    {0xD81, 0xD83, 'A'},
+    {0xD85, 0xD96, 'A'},
+    {0xD9A, 0xDB1, 'A'},
+    {0xDB3, 0xDBB, 'A'},
+    {0xDBD, 0xDBD, 'A'},
+    {0xDC0, 0xDC6, 'A'},
+    {0xDCA, 0xDCA, 'A'},
+    {0xDCF, 0xDD4, 'A'},
+    {0xDD6, 0xDD6, 'A'},
+    {0xDD8, 0xDDF, 'A'},
+    {0xDE6, 0xDEF, 'N'},
+    {0xDF2, 0xDF3, 'A'},
+    {0xE01, 0xE3A, 'A'},
+    {0xE40, 0xE4E, 'A'},
+    {0xE50, 0xE59, 'N'},
+    {0xE81, 0xE82, 'A'},
+    {0xE84, 0xE84, 'A'},
+    {0xE86, 0xE8A, 'A'},
+    {0xE8C, 0xEA3, 'A'},
+    {0xEA5, 0xEA5, 'A'},
+    {0xEA7, 0xEBD, 'A'},
+    {0xEC0, 0xEC4, 'A'},
+    {0xEC6, 0xEC6, 'A'},
+    {0xEC8, 0xECE, 'A'},
+    {0xED0, 0xED9, 'N'},
+    {0xEDC, 0xEDF, 'A'},
+    {0xF00, 0xF00, 'A'},
+    {0xF18, 0xF19, 'A'},
+    {0xF20, 0xF33, 'N'},
+    {0xF35, 0xF35, 'A'},
+    {0xF37, 0xF37, 'A'},
+    {0xF39, 0xF39, 'A'},
+    {0xF3E, 0xF47, 'A'},
+    {0xF49, 0xF6C, 'A'},
+    {0xF71, 0xF84, 'A'},
+    {0xF86, 0xF97, 'A'},
+    {0xF99, 0xFBC, 'A'},
+    {0xFC6, 0xFC6, 'A'},
+    {0x1000, 0x103F, 'A'},
+    {0x1040, 0x1049, 'N'},
+    {0x1050, 0x108F, 'A'},
+    {0x1090, 0x1099, 'N'},
+    {0x109A, 0x109D, 'A'},
+    {0x10A0, 0x10C5, 'A'},
+    {0x10C7, 0x10C7, 'A'},
+    {0x10CD, 0x10CD, 'A'},
+    {0x10D0, 0x10FA, 'A'},
+    {0x10FC, 0x1248, 'A'},
+    {0x124A, 0x124D, 'A'},
+    {0x1250, 0x1256, 'A'},
+    {0x1258, 0x1258, 'A'},
+    {0x125A, 0x125D, 'A'},
+    {0x1260, 0x1288, 'A'},
+    {0x128A, 0x128D, 'A'},
+    {0x1290, 0x12B0, 'A'},
+    {0x12B2, 0x12B5, 'A'},
+    {0x12B8, 0x12BE, 'A'},
+    {0x12C0, 0x12C0, 'A'},
+    {0x12C2, 0x12C5, 'A'},
+    {0x12C8, 0x12D6, 'A'},
+    {0x12D8, 0x1310, 'A'},
+    {0x1312, 0x1315, 'A'},
+    {0x1318, 0x135A, 'A'},
+    {0x135D, 0x135F, 'A'},
+    {0x1369, 0x137C, 'N'},
+    {0x1380, 0x138F, 'A'},
+    {0x13A0, 0x13F5, 'A'},
+    {0x13F8, 0x13FD, 'A'},
+    {0x1401, 0x166C, 'A'},
+    {0x166F, 0x167F, 'A'},
+    {0x1681, 0x169A, 'A'},
+    {0x16A0, 0x16EA, 'A'},
+    {0x16EE, 0x16F0, 'N'},
+    {0x16F1, 0x16F8, 'A'},
+    {0x1700, 0x1715, 'A'},
+    {0x171F, 0x1734, 'A'},
+    {0x1740, 0x1753, 'A'},
+    {0x1760, 0x176C, 'A'},
+    {0x176E, 0x1770, 'A'},
+    {0x1772, 0x1773, 'A'},
+    {0x1780, 0x17D3, 'A'},
+    {0x17D7, 0x17D7, 'A'},
+    {0x17DC, 0x17DD, 'A'},
+    {0x17E0, 0x17E9, 'N'},
+    {0x17F0, 0x17F9, 'N'},
+    {0x180B, 0x180D, 'A'},
+    {0x180F, 0x180F, 'A'},
+    {0x1810, 0x1819, 'N'},
+    {0x1820, 0x1878, 'A'},
+    {0x1880, 0x18AA, 'A'},
+    {0x18B0, 0x18F5, 'A'},
+    {0x1900, 0x191E, 'A'},
+    {0x1920, 0x192B, 'A'},
+    {0x1930, 0x193B, 'A'},
+    {0x1946, 0x194F, 'N'},
+    {0x1950, 0x196D, 'A'},
+    {0x1970, 0x1974, 'A'},
+    {0x1980, 0x19AB, 'A'},
+    {0x19B0, 0x19C9, 'A'},
+    {0x19D0, 0x19DA, 'N'},
+    {0x1A00, 0x1A1B, 'A'},
+    {0x1A20, 0x1A5E, 'A'},
+    {0x1A60, 0x1A7C, 'A'},
+    {0x1A7F, 0x1A7F, 'A'},
+    {0x1A80, 0x1A89, 'N'},
+    {0x1A90, 0x1A99, 'N'},
+    {0x1AA7, 0x1AA7, 'A'},
+    {0x1AB0, 0x1ACE, 'A'},
+    {0x1B00, 0x1B4C, 'A'},
+    {0x1B50, 0x1B59, 'N'},
+    {0x1B6B, 0x1B73, 'A'},
+    {0x1B80, 0x1BAF, 'A'},
+    {0x1BB0, 0x1BB9, 'N'},
+    {0x1BBA, 0x1BF3, 'A'},
+    {0x1C00, 0x1C37, 'A'},
+    {0x1C40, 0x1C49, 'N'},
+    {0x1C4D, 0x1C4F, 'A'},
+    {0x1C50, 0x1C59, 'N'},
+    {0x1C5A, 0x1C7D, 'A'},
+    {0x1C80, 0x1C8A, 'A'},
+    {0x1C90, 0x1CBA, 'A'},
+    {0x1CBD, 0x1CBF, 'A'},
+    {0x1CD0, 0x1CD2, 'A'},
+    {0x1CD4, 0x1CFA, 'A'},
+    {0x1D00, 0x1F15, 'A'},
+    {0x1F18, 0x1F1D, 'A'},
+    {0x1F20, 0x1F45, 'A'},
+    {0x1F48, 0x1F4D, 'A'},
+    {0x1F50, 0x1F57, 'A'},
+    {0x1F59, 0x1F59, 'A'},
+    {0x1F5B, 0x1F5B, 'A'},
+    {0x1F5D, 0x1F5D, 'A'},
+    {0x1F5F, 0x1F7D, 'A'},
+    {0x1F80, 0x1FB4, 'A'},
+    {0x1FB6, 0x1FBC, 'A'},
+    {0x1FBE, 0x1FBE, 'A'},
+    {0x1FC2, 0x1FC4, 'A'},
+    {0x1FC6, 0x1FCC, 'A'},
+    {0x1FD0, 0x1FD3, 'A'},
+    {0x1FD6, 0x1FDB, 'A'},
+    {0x1FE0, 0x1FEC, 'A'},
+    {0x1FF2, 0x1FF4, 'A'},
+    {0x1FF6, 0x1FFC, 'A'},
+    {0x2070, 0x2070, 'N'},
+    {0x2071, 0x2071, 'A'},
+    {0x2074, 0x2079, 'N'},
+    {0x207F, 0x207F, 'A'},
+    {0x2080, 0x2089, 'N'},
+    {0x2090, 0x209C, 'A'},
+    {0x20D0, 0x20F0, 'A'},
+    {0x2102, 0x2102, 'A'},
+    {0x2107, 0x2107, 'A'},
+    {0x210A, 0x2113, 'A'},
+    {0x2115, 0x2115, 'A'},
+    {0x2119, 0x211D, 'A'},
+    {0x2124, 0x2124, 'A'},
+    {0x2126, 0x2126, 'A'},
+    {0x2128, 0x2128, 'A'},
+    {0x212A, 0x212D, 'A'},
+    {0x212F, 0x2139, 'A'},
+    {0x213C, 0x213F, 'A'},
+    {0x2145, 0x2149, 'A'},
+    {0x214E, 0x214E, 'A'},
+    {0x2150, 0x2182, 'N'},
+    {0x2183, 0x2184, 'A'},
+    {0x2185, 0x2189, 'N'},
+    {0x2460, 0x249B, 'N'},
+    {0x24EA, 0x24FF, 'N'},
+    {0x2776, 0x2793, 'N'},
+    {0x2C00, 0x2CE4, 'A'},
+    {0x2CEB, 0x2CF3, 'A'},
+    {0x2CFD, 0x2CFD, 'N'},
+    {0x2D00, 0x2D25, 'A'},
+    {0x2D27, 0x2D27, 'A'},
+    {0x2D2D, 0x2D2D, 'A'},
+    {0x2D30, 0x2D67, 'A'},
+    {0x2D6F, 0x2D6F, 'A'},
+    {0x2D7F, 0x2D96, 'A'},
+    {0x2DA0, 0x2DA6, 'A'},
+    {0x2DA8, 0x2DAE, 'A'},
+    {0x2DB0, 0x2DB6, 'A'},
+    {0x2DB8, 0x2DBE, 'A'},
+    {0x2DC0, 0x2DC6, 'A'},
+    {0x2DC8, 0x2DCE, 'A'},
+    {0x2DD0, 0x2DD6, 'A'},
+    {0x2DD8, 0x2DDE, 'A'},
+    {0x2DE0, 0x2DFF, 'A'},
+    {0x2E2F, 0x2E2F, 'A'},
+    {0x3005, 0x3006, 'A'},
+    {0x3007, 0x3007, 'N'},
+    {0x3021, 0x3029, 'N'},
+    {0x302A, 0x302F, 'A'},
+    {0x3031, 0x3035, 'A'},
+    {0x3038, 0x303A, 'N'},
+    {0x303B, 0x303C, 'A'},
+    {0x3041, 0x3096, 'A'},
+    {0x3099, 0x309A, 'A'},
+    {0x309D, 0x309F, 'A'},
+    {0x30A1, 0x30FA, 'A'},
+    {0x30FC, 0x30FF, 'A'},
+    {0x3105, 0x312F, 'A'},
+    {0x3131, 0x318E, 'A'},
+    {0x3192, 0x3195, 'N'},
+    {0x31A0, 0x31BF, 'A'},
+    {0x31F0, 0x31FF, 'A'},
+    {0x3220, 0x3229, 'N'},
+    {0x3248, 0x324F, 'N'},
+    {0x3251, 0x325F, 'N'},
+    {0x3280, 0x3289, 'N'},
+    {0x32B1, 0x32BF, 'N'},
+    {0x3400, 0x4DBF, 'A'},
+    {0x4E00, 0xA48C, 'A'},
+    {0xA4D0, 0xA4FD, 'A'},
+    {0xA500, 0xA60C, 'A'},
+    {0xA610, 0xA61F, 'A'},
+    {0xA620, 0xA629, 'N'},
+    {0xA62A, 0xA62B, 'A'},
+    {0xA640, 0xA672, 'A'},
+    {0xA674, 0xA67D, 'A'},
+    {0xA67F, 0xA6E5, 'A'},
+    {0xA6E6, 0xA6EF, 'N'},
+    {0xA6F0, 0xA6F1, 'A'},
+    {0xA717, 0xA71F, 'A'},
+    {0xA722, 0xA788, 'A'},
+    {0xA78B, 0xA7CD, 'A'},
+    {0xA7D0, 0xA7D1, 'A'},
+    {0xA7D3, 0xA7D3, 'A'},
+    {0xA7D5, 0xA7DC, 'A'},
+    {0xA7F2, 0xA827, 'A'},
+    {0xA82C, 0xA82C, 'A'},
+    {0xA830, 0xA835, 'N'},
+    {0xA840, 0xA873, 'A'},
+    {0xA880, 0xA8C5, 'A'},
+    {0xA8D0, 0xA8D9, 'N'},
+    {0xA8E0, 0xA8F7, 'A'},
+    {0xA8FB, 0xA8FB, 'A'},
+    {0xA8FD, 0xA8FF, 'A'},
+    {0xA900, 0xA909, 'N'},
+    {0xA90A, 0xA92D, 'A'},
+    {0xA930, 0xA953, 'A'},
+    {0xA960, 0xA97C, 'A'},
+    {0xA980, 0xA9C0, 'A'},
+    {0xA9CF, 0xA9CF, 'A'},
+    {0xA9D0, 0xA9D9, 'N'},
+    {0xA9E0, 0xA9EF, 'A'},
+    {0xA9F0, 0xA9F9, 'N'},
+    {0xA9FA, 0xA9FE, 'A'},
+    {0xAA00, 0xAA36, 'A'},
+    {0xAA40, 0xAA4D, 'A'},
+    {0xAA50, 0xAA59, 'N'},
+    {0xAA60, 0xAA76, 'A'},
+    {0xAA7A, 0xAAC2, 'A'},
+    {0xAADB, 0xAADD, 'A'},
+    {0xAAE0, 0xAAEF, 'A'},
+    {0xAAF2, 0xAAF6, 'A'},
+    {0xAB01, 0xAB06, 'A'},
+    {0xAB09, 0xAB0E, 'A'},
+    {0xAB11, 0xAB16, 'A'},
+    {0xAB20, 0xAB26, 'A'},
+    {0xAB28, 0xAB2E, 'A'},
+    {0xAB30, 0xAB5A, 'A'},
+    {0xAB5C, 0xAB69, 'A'},
+    {0xAB70, 0xABEA, 'A'},
+    {0xABEC, 0xABED, 'A'},
+    {0xABF0, 0xABF9, 'N'},
+    {0xAC00, 0xD7A3, 'A'},
+    {0xD7B0, 0xD7C6, 'A'},
+    {0xD7CB, 0xD7FB, 'A'},
+    {0xF900, 0xFA6D, 'A'},
+    {0xFA70, 0xFAD9, 'A'},
+    {0xFB00, 0xFB06, 'A'},
+    {0xFB13, 0xFB17, 'A'},
+    {0xFB1D, 0xFB28, 'A'},
+    {0xFB2A, 0xFB36, 'A'},
+    {0xFB38, 0xFB3C, 'A'},
+    {0xFB3E, 0xFB3E, 'A'},
+    {0xFB40, 0xFB41, 'A'},
+    {0xFB43, 0xFB44, 'A'},
+    {0xFB46, 0xFBB1, 'A'},
+    {0xFBD3, 0xFD3D, 'A'},
+    {0xFD50, 0xFD8F, 'A'},
+    {0xFD92, 0xFDC7, 'A'},
+    {0xFDF0, 0xFDFB, 'A'},
+    {0xFE00, 0xFE0F, 'A'},
+    {0xFE20, 0xFE2F, 'A'},
+    {0xFE70, 0xFE74, 'A'},
+    {0xFE76, 0xFEFC, 'A'},
+    {0xFF10, 0xFF19, 'N'},
+    {0xFF21, 0xFF3A, 'A'},
+    {0xFF41, 0xFF5A, 'A'},
+    {0xFF66, 0xFFBE, 'A'},
+    {0xFFC2, 0xFFC7, 'A'},
+    {0xFFCA, 0xFFCF, 'A'},
+    {0xFFD2, 0xFFD7, 'A'},
+    {0xFFDA, 0xFFDC, 'A'},
+    {0x10000, 0x1000B, 'A'},
+    {0x1000D, 0x10026, 'A'},
+    {0x10028, 0x1003A, 'A'},
+    {0x1003C, 0x1003D, 'A'},
+    {0x1003F, 0x1004D, 'A'},
+    {0x10050, 0x1005D, 'A'},
+    {0x10080, 0x100FA, 'A'},
+    {0x10107, 0x10133, 'N'},
+    {0x10140, 0x10178, 'N'},
+    {0x1018A, 0x1018B, 'N'},
+    {0x101FD, 0x101FD, 'A'},
+    {0x10280, 0x1029C, 'A'},
+    {0x102A0, 0x102D0, 'A'},
+    {0x102E0, 0x102E0, 'A'},
+    {0x102E1, 0x102FB, 'N'},
+    {0x10300, 0x1031F, 'A'},
+    {0x10320, 0x10323, 'N'},
+    {0x1032D, 0x10340, 'A'},
+    {0x10341, 0x10341, 'N'},
+    {0x10342, 0x10349, 'A'},
+    {0x1034A, 0x1034A, 'N'},
+    {0x10350, 0x1037A, 'A'},
+    {0x10380, 0x1039D, 'A'},
+    {0x103A0, 0x103C3, 'A'},
+    {0x103C8, 0x103CF, 'A'},
+    {0x103D1, 0x103D5, 'N'},
+    {0x10400, 0x1049D, 'A'},
+    {0x104A0, 0x104A9, 'N'},
+    {0x104B0, 0x104D3, 'A'},
+    {0x104D8, 0x104FB, 'A'},
+    {0x10500, 0x10527, 'A'},
+    {0x10530, 0x10563, 'A'},
+    {0x10570, 0x1057A, 'A'},
+    {0x1057C, 0x1058A, 'A'},
+    {0x1058C, 0x10592, 'A'},
+    {0x10594, 0x10595, 'A'},
+    {0x10597, 0x105A1, 'A'},
+    {0x105A3, 0x105B1, 'A'},
+    {0x105B3, 0x105B9, 'A'},
+    {0x105BB, 0x105BC, 'A'},
+    {0x105C0, 0x105F3, 'A'},
+    {0x10600, 0x10736, 'A'},
+    {0x10740, 0x10755, 'A'},
+    {0x10760, 0x10767, 'A'},
+    {0x10780, 0x10785, 'A'},
+    {0x10787, 0x107B0, 'A'},
+    {0x107B2, 0x107BA, 'A'},
+    {0x10800, 0x10805, 'A'},
+    {0x10808, 0x10808, 'A'},
+    {0x1080A, 0x10835, 'A'},
+    {0x10837, 0x10838, 'A'},
+    {0x1083C, 0x1083C, 'A'},
+    {0x1083F, 0x10855, 'A'},
+    {0x10858, 0x1085F, 'N'},
+    {0x10860, 0x10876, 'A'},
+    {0x10879, 0x1087F, 'N'},
+    {0x10880, 0x1089E, 'A'},
+    {0x108A7, 0x108AF, 'N'},
+    {0x108E0, 0x108F2, 'A'},
+    {0x108F4, 0x108F5, 'A'},
+    {0x108FB, 0x108FF, 'N'},
+    {0x10900, 0x10915, 'A'},
+    {0x10916, 0x1091B, 'N'},
+    {0x10920, 0x10939, 'A'},
+    {0x10980, 0x109B7, 'A'},
+    {0x109BC, 0x109BD, 'N'},
+    {0x109BE, 0x109BF, 'A'},
+    {0x109C0, 0x109CF, 'N'},
+    {0x109D2, 0x109FF, 'N'},
+    {0x10A00, 0x10A03, 'A'},
+    {0x10A05, 0x10A06, 'A'},
+    {0x10A0C, 0x10A13, 'A'},
+    {0x10A15, 0x10A17, 'A'},
+    {0x10A19, 0x10A35, 'A'},
+    {0x10A38, 0x10A3A, 'A'},
+    {0x10A3F, 0x10A3F, 'A'},
+    {0x10A40, 0x10A48, 'N'},
+    {0x10A60, 0x10A7C, 'A'},
+    {0x10A7D, 0x10A7E, 'N'},
+    {0x10A80, 0x10A9C, 'A'},
+    {0x10A9D, 0x10A9F, 'N'},
+    {0x10AC0, 0x10AC7, 'A'},
+    {0x10AC9, 0x10AE6, 'A'},
+    {0x10AEB, 0x10AEF, 'N'},
+    {0x10B00, 0x10B35, 'A'},
+    {0x10B40, 0x10B55, 'A'},
+    {0x10B58, 0x10B5F, 'N'},
+    {0x10B60, 0x10B72, 'A'},
+    {0x10B78, 0x10B7F, 'N'},
+    {0x10B80, 0x10B91, 'A'},
+    {0x10BA9, 0x10BAF, 'N'},
+    {0x10C00, 0x10C48, 'A'},
+    {0x10C80, 0x10CB2, 'A'},
+    {0x10CC0, 0x10CF2, 'A'},
+    {0x10CFA, 0x10CFF, 'N'},
+    {0x10D00, 0x10D27, 'A'},
+    {0x10D30, 0x10D39, 'N'},
+    {0x10D40, 0x10D49, 'N'},
+    {0x10D4A, 0x10D65, 'A'},
+    {0x10D69, 0x10D6D, 'A'},
+    {0x10D6F, 0x10D85, 'A'},
+    {0x10E60, 0x10E7E, 'N'},
+    {0x10E80, 0x10EA9, 'A'},
+    {0x10EAB, 0x10EAC, 'A'},
+    {0x10EB0, 0x10EB1, 'A'},
+    {0x10EC2, 0x10EC4, 'A'},
+    {0x10EFC, 0x10F1C, 'A'},
+    {0x10F1D, 0x10F26, 'N'},
+    {0x10F27, 0x10F27, 'A'},
+    {0x10F30, 0x10F50, 'A'},
+    {0x10F51, 0x10F54, 'N'},
+    {0x10F70, 0x10F85, 'A'},
+    {0x10FB0, 0x10FC4, 'A'},
+    {0x10FC5, 0x10FCB, 'N'},
+    {0x10FE0, 0x10FF6, 'A'},
+    {0x11000, 0x11046, 'A'},
+    {0x11052, 0x1106F, 'N'},
+    {0x11070, 0x11075, 'A'},
+    {0x1107F, 0x110BA, 'A'},
+    {0x110C2, 0x110C2, 'A'},
+    {0x110D0, 0x110E8, 'A'},
+    {0x110F0, 0x110F9, 'N'},
+    {0x11100, 0x11134, 'A'},
+    {0x11136, 0x1113F, 'N'},
+    {0x11144, 0x11147, 'A'},
+    {0x11150, 0x11173, 'A'},
+    {0x11176, 0x11176, 'A'},
+    {0x11180, 0x111C4, 'A'},
+    {0x111C9, 0x111CC, 'A'},
+    {0x111CE, 0x111CF, 'A'},
+    {0x111D0, 0x111D9, 'N'},
+    {0x111DA, 0x111DA, 'A'},
+    {0x111DC, 0x111DC, 'A'},
+    {0x111E1, 0x111F4, 'N'},
+    {0x11200, 0x11211, 'A'},
+    {0x11213, 0x11237, 'A'},
+    {0x1123E, 0x11241, 'A'},
+    {0x11280, 0x11286, 'A'},
+    {0x11288, 0x11288, 'A'},
+    {0x1128A, 0x1128D, 'A'},
+    {0x1128F, 0x1129D, 'A'},
+    {0x1129F, 0x112A8, 'A'},
+    {0x112B0, 0x112EA, 'A'},
+    {0x112F0, 0x112F9, 'N'},
+    {0x11300, 0x11303, 'A'},
+    {0x11305, 0x1130C, 'A'},
+    {0x1130F, 0x11310, 'A'},
+    {0x11313, 0x11328, 'A'},
+    {0x1132A, 0x11330, 'A'},
+    {0x11332, 0x11333, 'A'},
+    {0x11335, 0x11339, 'A'},
+    {0x1133B, 0x11344, 'A'},
+    {0x11347, 0x11348, 'A'},
+    {0x1134B, 0x1134D, 'A'},
+    {0x11350, 0x11350, 'A'},
+    {0x11357, 0x11357, 'A'},
+    {0x1135D, 0x11363, 'A'},
+    {0x11366, 0x1136C, 'A'},
+    {0x11370, 0x11374, 'A'},
+    {0x11380, 0x11389, 'A'},
+    {0x1138B, 0x1138B, 'A'},
+    {0x1138E, 0x1138E, 'A'},
+    {0x11390, 0x113B5, 'A'},
+    {0x113B7, 0x113C0, 'A'},
+    {0x113C2, 0x113C2, 'A'},
+    {0x113C5, 0x113C5, 'A'},
+    {0x113C7, 0x113CA, 'A'},
+    {0x113CC, 0x113D3, 'A'},
+    {0x113E1, 0x113E2, 'A'},
+    {0x11400, 0x1144A, 'A'},
+    {0x11450, 0x11459, 'N'},
+    {0x1145E, 0x11461, 'A'},
+    {0x11480, 0x114C5, 'A'},
+    {0x114C7, 0x114C7, 'A'},
+    {0x114D0, 0x114D9, 'N'},
+    {0x11580, 0x115B5, 'A'},
+    {0x115B8, 0x115C0, 'A'},
+    {0x115D8, 0x115DD, 'A'},
+    {0x11600, 0x11640, 'A'},
+    {0x11644, 0x11644, 'A'},
+    {0x11650, 0x11659, 'N'},
+    {0x11680, 0x116B8, 'A'},
+    {0x116C0, 0x116C9, 'N'},
+    {0x116D0, 0x116E3, 'N'},
+    {0x11700, 0x1171A, 'A'},
+    {0x1171D, 0x1172B, 'A'},
+    {0x11730, 0x1173B, 'N'},
+    {0x11740, 0x11746, 'A'},
+    {0x11800, 0x1183A, 'A'},
+    {0x118A0, 0x118DF, 'A'},
+    {0x118E0, 0x118F2, 'N'},
+    {0x118FF, 0x11906, 'A'},
+    {0x11909, 0x11909, 'A'},
+    {0x1190C, 0x11913, 'A'},
+    {0x11915, 0x11916, 'A'},
+    {0x11918, 0x11935, 'A'},
+    {0x11937, 0x11938, 'A'},
+    {0x1193B, 0x11943, 'A'},
+    {0x11950, 0x11959, 'N'},
+    {0x119A0, 0x119A7, 'A'},
+    {0x119AA, 0x119D7, 'A'},
+    {0x119DA, 0x119E1, 'A'},
+    {0x119E3, 0x119E4, 'A'},
+    {0x11A00, 0x11A3E, 'A'},
+    {0x11A47, 0x11A47, 'A'},
+    {0x11A50, 0x11A99, 'A'},
+    {0x11A9D, 0x11A9D, 'A'},
+    {0x11AB0, 0x11AF8, 'A'},
+    {0x11BC0, 0x11BE0, 'A'},
+    {0x11BF0, 0x11BF9, 'N'},
+    {0x11C00, 0x11C08, 'A'},
+    {0x11C0A, 0x11C36, 'A'},
+    {0x11C38, 0x11C40, 'A'},
+    {0x11C50, 0x11C6C, 'N'},
+    {0x11C72, 0x11C8F, 'A'},
+    {0x11C92, 0x11CA7, 'A'},
+    {0x11CA9, 0x11CB6, 'A'},
+    {0x11D00, 0x11D06, 'A'},
+    {0x11D08, 0x11D09, 'A'},
+    {0x11D0B, 0x11D36, 'A'},
+    {0x11D3A, 0x11D3A, 'A'},
+    {0x11D3C, 0x11D3D, 'A'},
+    {0x11D3F, 0x11D47, 'A'},
+    {0x11D50, 0x11D59, 'N'},
+    {0x11D60, 0x11D65, 'A'},
+    {0x11D67, 0x11D68, 'A'},
+    {0x11D6A, 0x11D8E, 'A'},
+    {0x11D90, 0x11D91, 'A'},
+    {0x11D93, 0x11D98, 'A'},
+    {0x11DA0, 0x11DA9, 'N'},
+    {0x11EE0, 0x11EF6, 'A'},
+    {0x11F00, 0x11F10, 'A'},
+    {0x11F12, 0x11F3A, 'A'},
+    {0x11F3E, 0x11F42, 'A'},
+    {0x11F50, 0x11F59, 'N'},
+    {0x11F5A, 0x11F5A, 'A'},
+    {0x11FB0, 0x11FB0, 'A'},
+    {0x11FC0, 0x11FD4, 'N'},
+    {0x12000, 0x12399, 'A'},
+    {0x12400, 0x1246E, 'N'},
+    {0x12480, 0x12543, 'A'},
+    {0x12F90, 0x12FF0, 'A'},
+    {0x13000, 0x1342F, 'A'},
+    {0x13440, 0x13455, 'A'},
+    {0x13460, 0x143FA, 'A'},
+    {0x14400, 0x14646, 'A'},
+    {0x16100, 0x1612F, 'A'},
+    {0x16130, 0x16139, 'N'},
+    {0x16800, 0x16A38, 'A'},
+    {0x16A40, 0x16A5E, 'A'},
+    {0x16A60, 0x16A69, 'N'},
+    {0x16A70, 0x16ABE, 'A'},
+    {0x16AC0, 0x16AC9, 'N'},
+    {0x16AD0, 0x16AED, 'A'},
+    {0x16AF0, 0x16AF4, 'A'},
+    {0x16B00, 0x16B36, 'A'},
+    {0x16B40, 0x16B43, 'A'},
+    {0x16B50, 0x16B59, 'N'},
+    {0x16B5B, 0x16B61, 'N'},
+    {0x16B63, 0x16B77, 'A'},
+    {0x16B7D, 0x16B8F, 'A'},
+    {0x16D40, 0x16D6C, 'A'},
+    {0x16D70, 0x16D79, 'N'},
+    {0x16E40, 0x16E7F, 'A'},
+    {0x16E80, 0x16E96, 'N'},
+    {0x16F00, 0x16F4A, 'A'},
+    {0x16F4F, 0x16F87, 'A'},
+    {0x16F8F, 0x16F9F, 'A'},
+    {0x16FE0, 0x16FE1, 'A'},
+    {0x16FE3, 0x16FE4, 'A'},
+    {0x16FF0, 0x16FF1, 'A'},
+    {0x17000, 0x187F7, 'A'},
+    {0x18800, 0x18CD5, 'A'},
+    {0x18CFF, 0x18D08, 'A'},
+    {0x1AFF0, 0x1AFF3, 'A'},
+    {0x1AFF5, 0x1AFFB, 'A'},
+    {0x1AFFD, 0x1AFFE, 'A'},
+    {0x1B000, 0x1B122, 'A'},
+    {0x1B132, 0x1B132, 'A'},
+    {0x1B150, 0x1B152, 'A'},
+    {0x1B155, 0x1B155, 'A'},
+    {0x1B164, 0x1B167, 'A'},
+    {0x1B170, 0x1B2FB, 'A'},
+    {0x1BC00, 0x1BC6A, 'A'},
+    {0x1BC70, 0x1BC7C, 'A'},
+    {0x1BC80, 0x1BC88, 'A'},
+    {0x1BC90, 0x1BC99, 'A'},
+    {0x1BC9D, 0x1BC9E, 'A'},
+    {0x1CCF0, 0x1CCF9, 'N'},
+    {0x1CF00, 0x1CF2D, 'A'},
+    {0x1CF30, 0x1CF46, 'A'},
+    {0x1D165, 0x1D169, 'A'},
+    {0x1D16D, 0x1D172, 'A'},
+    {0x1D17B, 0x1D182, 'A'},
+    {0x1D185, 0x1D18B, 'A'},
+    {0x1D1AA, 0x1D1AD, 'A'},
+    {0x1D242, 0x1D244, 'A'},
+    {0x1D2C0, 0x1D2D3, 'N'},
+    {0x1D2E0, 0x1D2F3, 'N'},
+    {0x1D360, 0x1D378, 'N'},
+    {0x1D400, 0x1D454, 'A'},
+    {0x1D456, 0x1D49C, 'A'},
+    {0x1D49E, 0x1D49F, 'A'},
+    {0x1D4A2, 0x1D4A2, 'A'},
+    {0x1D4A5, 0x1D4A6, 'A'},
+    {0x1D4A9, 0x1D4AC, 'A'},
+    {0x1D4AE, 0x1D4B9, 'A'},
+    {0x1D4BB, 0x1D4BB, 'A'},
+    {0x1D4BD, 0x1D4C3, 'A'},
+    {0x1D4C5, 0x1D505, 'A'},
+    {0x1D507, 0x1D50A, 'A'},
+    {0x1D50D, 0x1D514, 'A'},
+    {0x1D516, 0x1D51C, 'A'},
+    {0x1D51E, 0x1D539, 'A'},
+    {0x1D53B, 0x1D53E, 'A'},
+    {0x1D540, 0x1D544, 'A'},
+    {0x1D546, 0x1D546, 'A'},
+    {0x1D54A, 0x1D550, 'A'},
+    {0x1D552, 0x1D6A5, 'A'},
+    {0x1D6A8, 0x1D6C0, 'A'},
+    {0x1D6C2, 0x1D6DA, 'A'},
+    {0x1D6DC, 0x1D6FA, 'A'},
+    {0x1D6FC, 0x1D714, 'A'},
+    {0x1D716, 0x1D734, 'A'},
+    {0x1D736, 0x1D74E, 'A'},
+    {0x1D750, 0x1D76E, 'A'},
+    {0x1D770, 0x1D788, 'A'},
+    {0x1D78A, 0x1D7A8, 'A'},
+    {0x1D7AA, 0x1D7C2, 'A'},
+    {0x1D7C4, 0x1D7CB, 'A'},
+    {0x1D7CE, 0x1D7FF, 'N'},
+    {0x1DA00, 0x1DA36, 'A'},
+    {0x1DA3B, 0x1DA6C, 'A'},
+    {0x1DA75, 0x1DA75, 'A'},
+    {0x1DA84, 0x1DA84, 'A'},
+    {0x1DA9B, 0x1DA9F, 'A'},
+    {0x1DAA1, 0x1DAAF, 'A'},
+    {0x1DF00, 0x1DF1E, 'A'},
+    {0x1DF25, 0x1DF2A, 'A'},
+    {0x1E000, 0x1E006, 'A'},
+    {0x1E008, 0x1E018, 'A'},
+    {0x1E01B, 0x1E021, 'A'},
+    {0x1E023, 0x1E024, 'A'},
+    {0x1E026, 0x1E02A, 'A'},
+    {0x1E030, 0x1E06D, 'A'},
+    {0x1E08F, 0x1E08F, 'A'},
+    {0x1E100, 0x1E12C, 'A'},
+    {0x1E130, 0x1E13D, 'A'},
+    {0x1E140, 0x1E149, 'N'},
+    {0x1E14E, 0x1E14E, 'A'},
+    {0x1E290, 0x1E2AE, 'A'},
+    {0x1E2C0, 0x1E2EF, 'A'},
+    {0x1E2F0, 0x1E2F9, 'N'},
+    {0x1E4D0, 0x1E4EF, 'A'},
+    {0x1E4F0, 0x1E4F9, 'N'},
+    {0x1E5D0, 0x1E5F0, 'A'},
+    {0x1E5F1, 0x1E5FA, 'N'},
+    {0x1E7E0, 0x1E7E6, 'A'},
+    {0x1E7E8, 0x1E7EB, 'A'},
+    {0x1E7ED, 0x1E7EE, 'A'},
+    {0x1E7F0, 0x1E7FE, 'A'},
+    {0x1E800, 0x1E8C4, 'A'},
+    {0x1E8C7, 0x1E8CF, 'N'},
+    {0x1E8D0, 0x1E8D6, 'A'},
+    {0x1E900, 0x1E94B, 'A'},
+    {0x1E950, 0x1E959, 'N'},
+    {0x1EC71, 0x1ECAB, 'N'},
+    {0x1ECAD, 0x1ECAF, 'N'},
+    {0x1ECB1, 0x1ECB4, 'N'},
+    {0x1ED01, 0x1ED2D, 'N'},
+    {0x1ED2F, 0x1ED3D, 'N'},
+    {0x1EE00, 0x1EE03, 'A'},
+    {0x1EE05, 0x1EE1F, 'A'},
+    {0x1EE21, 0x1EE22, 'A'},
+    {0x1EE24, 0x1EE24, 'A'},
+    {0x1EE27, 0x1EE27, 'A'},
+    {0x1EE29, 0x1EE32, 'A'},
+    {0x1EE34, 0x1EE37, 'A'},
+    {0x1EE39, 0x1EE39, 'A'},
+    {0x1EE3B, 0x1EE3B, 'A'},
+    {0x1EE42, 0x1EE42, 'A'},
+    {0x1EE47, 0x1EE47, 'A'},
+    {0x1EE49, 0x1EE49, 'A'},
+    {0x1EE4B, 0x1EE4B, 'A'},
+    {0x1EE4D, 0x1EE4F, 'A'},
+    {0x1EE51, 0x1EE52, 'A'},
+    {0x1EE54, 0x1EE54, 'A'},
+    {0x1EE57, 0x1EE57, 'A'},
+    {0x1EE59, 0x1EE59, 'A'},
+    {0x1EE5B, 0x1EE5B, 'A'},
+    {0x1EE5D, 0x1EE5D, 'A'},
+    {0x1EE5F, 0x1EE5F, 'A'},
+    {0x1EE61, 0x1EE62, 'A'},
+    {0x1EE64, 0x1EE64, 'A'},
+    {0x1EE67, 0x1EE6A, 'A'},
+    {0x1EE6C, 0x1EE72, 'A'},
+    {0x1EE74, 0x1EE77, 'A'},
+    {0x1EE79, 0x1EE7C, 'A'},
+    {0x1EE7E, 0x1EE7E, 'A'},
+    {0x1EE80, 0x1EE89, 'A'},
+    {0x1EE8B, 0x1EE9B, 'A'},
+    {0x1EEA1, 0x1EEA3, 'A'},
+    {0x1EEA5, 0x1EEA9, 'A'},
+    {0x1EEAB, 0x1EEBB, 'A'},
+    {0x1F100, 0x1F10C, 'N'},
+    {0x1FBF0, 0x1FBF9, 'N'},
+    {0x20000, 0x2A6DF, 'A'},
+    {0x2A700, 0x2B739, 'A'},
+    {0x2B740, 0x2B81D, 'A'},
+    {0x2B820, 0x2CEA1, 'A'},
+    {0x2CEB0, 0x2EBE0, 'A'},
+    {0x2EBF0, 0x2EE5D, 'A'},
+    {0x2F800, 0x2FA1D, 'A'},
+    {0x30000, 0x3134A, 'A'},
+    {0x31350, 0x323AF, 'A'},
+    {0xE0100, 0xE01EF, 'A'},
+};
+inline char category(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(kCategories) / sizeof(kCategories[0]);
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (kCategories[mid].last < cp) lo = mid + 1;
+        else hi = mid;
     }
-    return is_ascii_letter(c);
+    return lo < sizeof(kCategories) / sizeof(kCategories[0]) &&
+           kCategories[lo].first <= cp ? kCategories[lo].category : 0;
+}
+// Unicode White_Space (the meaning of regex \s), including NBSP and
+// paragraph separators. A codepoint's UTF-8 byte length is kept intact.
+inline bool is_space(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+struct Char { uint32_t cp; size_t len; char cat; };
+inline Char char_at(const std::string& text, size_t i) {
+    const size_t len = size_t(u8len((unsigned char)text[i]));
+    const uint32_t cp = u8cp(text, i, int(len));
+    return {cp, std::min(len, text.size() - i), category(cp)};
 }
 
 } // namespace
@@ -491,105 +1351,104 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
     std::vector<std::string> out;
     size_t i = 0;
     const size_t n = text.size();
-
     while (i < n) {
         const size_t start = i;
-        const unsigned char c = text[i];
+        const Char c = char_at(text, i);
 
         // (?i:'s|'t|'re|'ve|'m|'ll|'d)
-        if (c == '\'' && i + 1 < n) {
-            static const char* conts[] = {"s","t","m","d","re","ve","ll"};
-            bool hit = false;
-            for (const char* k : conts) {
-                const size_t kl = std::strlen(k);
-                if (i + kl < n) {
-                    bool eq = true;
-                    for (size_t z = 0; z < kl; ++z) {
-                        const char a = char(std::tolower((unsigned char)text[i + 1 + z]));
-                        if (a != k[z]) { eq = false; break; }
-                    }
-                    if (eq) { i += 1 + kl; hit = true; break; }
-                }
+        if (c.cp == '\'') {
+            // Unicode case folding also equates long s (U+017F) with s.
+            if (text.compare(i, 3, "'\xC5\xBF") == 0) {
+                i += 3;
+                out.push_back(text.substr(start, i - start));
+                continue;
             }
-            if (hit) { out.push_back(text.substr(start, i - start)); continue; }
+            static const char* conts[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+            for (const char* suffix : conts) {
+                const size_t len = std::strlen(suffix);
+                if (i + 1 + len > n) continue;
+                bool same = true;
+                for (size_t k = 0; k < len; ++k)
+                    same &= std::tolower((unsigned char)text[i + 1 + k]) == suffix[k];
+                if (same) { i += 1 + len; break; }
+            }
+            if (i != start) { out.push_back(text.substr(start, i - start)); continue; }
         }
 
-        // [^\r\n\p{L}\p{N}]?\p{L}+   -- optional single non-letter, then letters
+        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
         {
             size_t j = i;
-            int len = 0;
-            if (!is_nl(text[j]) && !is_letter_at(text, j, len) && !is_digit(text[j])) {
-                const size_t save = j;
-                j += u8len(text[j]);
-                if (j < n && is_letter_at(text, j, len)) {
-                    while (j < n && is_letter_at(text, j, len)) j += len;
+            if (!is_nl(c.cp) && c.cat != 'A' && c.cat != 'N') j += c.len;
+            if (j < n) {
+                const Char next = char_at(text, j);
+                if (next.cat == 'A') {
+                    do { j += char_at(text, j).len; }
+                    while (j < n && char_at(text, j).cat == 'A');
                     out.push_back(text.substr(start, j - start));
                     i = j;
                     continue;
                 }
-                j = save;
-            }
-            if (j < n && is_letter_at(text, j, len)) {
-                while (j < n && is_letter_at(text, j, len)) j += len;
-                out.push_back(text.substr(start, j - start));
-                i = j;
-                continue;
             }
         }
 
-        // \p{N}{1,3} -- the Muse tokenizer groups decimal runs in chunks of
-        // at most three digits.  Splitting every digit changes prompt IDs.
-        if (is_digit(c)) {
-            size_t j = i;
-            while (j < n && is_digit((unsigned char)text[j]) && j - i < 3) ++j;
-            out.push_back(text.substr(i, j - i));
-            i = j;
+        // \p{N}: exactly one numeric codepoint, including non-ASCII digits.
+        if (c.cat == 'N') {
+            i += c.len;
+            out.push_back(text.substr(start, i - start));
             continue;
         }
 
-        // ' ?[^\s\p{L}\p{N}]+[\r\n]*'  -- optional space, punctuation run
+        //  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
         {
-            size_t j = i;
-            if (text[j] == ' ') ++j;
-            int len = 0;
-            size_t k = j;
-            while (k < n && !is_space(text[k]) && !is_letter_at(text, k, len) && !is_digit(text[k]))
-                k += u8len(text[k]);
-            if (k > j) {
-                while (k < n && is_nl(text[k])) ++k;
-                out.push_back(text.substr(start, k - start));
-                i = k;
-                continue;
+            size_t j = i + (c.cp == ' ' ? 1 : 0);
+            const size_t punct_start = j;
+            while (j < n) {
+                const Char x = char_at(text, j);
+                if (is_space(x.cp) || x.cat == 'A' || x.cat == 'N') break;
+                j += x.len;
             }
-        }
-
-        // \s*[\r\n]+
-        {
-            size_t j = i;
-            while (j < n && is_space(text[j]) && !is_nl(text[j])) ++j;
-            if (j < n && is_nl(text[j])) {
-                while (j < n && is_nl(text[j])) ++j;
+            if (j > punct_start) {
+                while (j < n && is_nl(char_at(text, j).cp)) j += char_at(text, j).len;
                 out.push_back(text.substr(start, j - start));
                 i = j;
                 continue;
             }
         }
 
-        // \s+(?!\S) and \s+
-        if (is_space(c)) {
-            size_t j = i;
-            while (j < n && is_space(text[j])) ++j;
-            // (?!\S): if more text follows, the last space starts the
-            // next token instead of ending this one.
-            if (j < n && j - i > 1) --j;
+        // \s*[\r\n]+: greedily consumes the whole whitespace run, then
+        // backtracks to the last CR/LF. Whitespace after it remains for the
+        // next alternative at the next position.
+        {
+            size_t j = i, last_nl_end = i;
+            while (j < n && is_space(char_at(text, j).cp)) {
+                const Char x = char_at(text, j);
+                j += x.len;
+                if (is_nl(x.cp)) last_nl_end = j;
+            }
+            if (last_nl_end > i) {
+                out.push_back(text.substr(start, last_nl_end - start));
+                i = last_nl_end;
+                continue;
+            }
+        }
+
+        // \s+(?!\S) first, then \s+. Before non-space text the first
+        // branch backtracks one whole whitespace codepoint for the next token.
+        if (is_space(c.cp)) {
+            size_t j = i, last_start = i;
+            while (j < n && is_space(char_at(text, j).cp)) {
+                last_start = j;
+                j += char_at(text, j).len;
+            }
+            if (j < n && last_start > i) j = last_start;
             out.push_back(text.substr(start, j - start));
             i = j;
             continue;
         }
 
-        // anything left: emit one character
-        out.push_back(text.substr(i, u8len(c)));
-        i += u8len(c);
+        // An unmatched codepoint is isolated by Split.
+        i += c.len;
+        out.push_back(text.substr(start, c.len));
     }
     return out;
 }

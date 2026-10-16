@@ -101,6 +101,13 @@ int main(int argc, char** argv) {
         const std::string p = tk.apply_chat_template("Hi");
         auto ids = tk.encode(p);
         CHECK(!ids.empty(), "chat template encoded to nothing");
+        const int32_t im_start = tk.special_id("<|im_start|>");
+        if (im_start >= 0) {
+            CHECK(!ids.empty() && ids.front() == im_start,
+                  "chat template did not start with <|im_start|>");
+            CHECK(tk.encode("<|im_start|>") == std::vector<int32_t>{im_start},
+                  "special token was split by the pre-tokenizer");
+        }
         std::printf("  chat template: %zu tokens, first id %d\n",
                     ids.size(), ids.empty() ? -1 : ids[0]);
     }

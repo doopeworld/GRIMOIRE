@@ -24,7 +24,7 @@ test-correctness: bin/test_generation bin/test_http
 	./bin/test_http
 
 HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp
-tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect
+tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect bin/tok_dump
 
 GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
 
@@ -133,7 +133,18 @@ bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+bin/test_tokenizer_golden: tests/test_tokenizer_golden.cpp src/tokenizer.cpp include/b70/tokenizer.hpp include/b70/json.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+bin/tok_dump: tools/tok_dump.cpp src/tokenizer.cpp include/b70/tokenizer.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+.PHONY: tok_dump
+tok_dump: bin/tok_dump
+
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
@@ -143,6 +154,7 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin
 	@echo ""; echo "=========== deltanet ==========="; ./bin/test_deltanet
 	@echo ""; echo "=========== ops ==========="; ./bin/test_ops
 	@echo ""; echo "=========== tokenizer ==========="; ./bin/test_tokenizer
+	@echo ""; echo "=========== tokenizer HF goldens ==========="; ./bin/test_tokenizer_golden
 	@echo ""; echo "=========== gptq ==========="; ./bin/test_gptq
 	@echo ""; echo "=========== k2-horizon ==========="; ./bin/test_k2_horizon
 	@echo ""; echo "=========== k2-config ==========="; ./bin/test_k2_config
