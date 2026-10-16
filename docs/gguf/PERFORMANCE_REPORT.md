@@ -58,3 +58,36 @@ answer that directly.
 Native Q4_K/Q6_K execution is not only "format support": it is the way to give GGUF models
 llama.cpp-level accuracy (KLD ~0.06) at GRIMOIRE speed. Next: design + kernels, gated first on
 KLD (target ≈ llama.cpp's 0.061) and token sanity, then on speed (≥ 9.6k pp4096 now, vLLM 10.6k).
+
+## 5. Native Q4_K/Q6_K execution (`--proj native`, 2026-10-16)
+
+GGUF Q4_K/Q6_K blocks are kept on the device and decoded inside the kernels (commits c46f0cf,
+fa721d3). Ornith Q4_K_M: 371 tensors native (Q4_K 310 = 14.66 GiB, Q6_K 61 = 4.69 GiB incl. the
+output head); remaining small projections MXFP4; critical tensors BF16.
+
+**Accuracy** (WikiText-2, first 16 chunks of 512, vs the BF16 distribution, llama.cpp formulas):
+
+| Configuration | Mean KLD | Same top-1 | PPL / BF16 |
+|---|---:|---:|---:|
+| **GRIMOIRE native Q4_K/Q6_K** | **0.064** | **88.8%** | **1.008** |
+| llama.cpp native Q4_K_M (64 chunks) | 0.061 | 89.3% | 1.010 |
+| GRIMOIRE Q4_K_M -> MXFP4 (Strategy A) | 0.239 | 77.9% | 1.067 |
+
+Native execution brings GRIMOIRE to llama.cpp's accuracy on the same file (3.7x lower KLD than
+the MXFP4 requant). Generation coherent on test prompts.
+
+**Prefill speed** (CLI `--prefill-only 4096`, synthetic ids, `GRIMOIRE_TIME_LAYER=all` overhead included):
+
+| Path | routed MoE | total | tok/s |
+|---|---:|---:|---:|
+| MXFP4 (Strategy A) | 164 ms | 470 ms | 8,716 |
+| native, per-expert fallback (`GRIMOIRE_MOE_NATIVE_GROUPED=0`) | 1,702 ms | 2,066 ms | 1,983 |
+| **native, grouped Q4_K/Q6_K MoE kernel** | **369 ms** | 734 ms | **5,581** |
+
+Prefill-path correctness: decode-vs-prefill max |Δlogit| at position 510 = 0.42 (grouped) vs
+0.44 (per-expert reference) vs 0.99 (MXFP4 path). Dense projections in native mode are already
+close to MXFP4 (DN qkv 43 vs 37 ms, DN out 52 vs 33 ms). Decode with the generic native GEMV is
+~11 tok/s (vs ~170 MXFP4) — the fast native GEMV is the next item.
+
+Open speed items: grouped native MoE 369 -> ~164 ms (MXFP4 kernel parity), native DN out/qkv
+projections, fast native decode GEMV + MoE decode.
