@@ -1,4 +1,4 @@
-// GRIMOIRE -- qwen35moe GGUF source adapter. SPDX-License-Identifier: GPL-3.0-or-later
+// GRIMOIRE -- qwen35/qwen35moe GGUF source adapter. SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "qwen35.hpp"
 #include <string>

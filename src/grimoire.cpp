@@ -4073,7 +4073,8 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
     if(ck.gguf_file && mtp_enabled())
-        return "GGUF qwen35moe MTP (GRIMOIRE_MTP) is not mapped: blk.40.* and nextn.*";
+        return "GGUF MTP (GRIMOIRE_MTP) is not mapped: blk."+
+               std::to_string(cfg.n_layers)+".* and nextn.*";
     // Qwen4-Exp / Qwen3.8-Flash-Next.  The loader resolves this config
     // (rule 10: the loader says what the file IS), and the engine says
     // here what it cannot RUN.  Its Qwen3-Next base -- Gated DeltaNet
