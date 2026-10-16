@@ -53,6 +53,30 @@ uint64_t gguf_v_tiled_index(uint64_t grouped,uint64_t nk,uint64_t nv) {
     return (grouped%r)*nk+grouped/r;
 }
 
+bool gguf_a_log_recovery_ok(float a, float recovered) {
+    if (!(a < 0.0f) || !std::isfinite(a) || !std::isfinite(recovered)) return false;
+    const bf16_t rounded = f32_to_bf16(recovered);
+    if (bf16_to_f32(rounded) != recovered) return false;
+    const uint16_t bits = rounded.bits;
+    const auto adjacent = [&](bool up) {
+        // BF16's encoding is monotone within each sign, with the direction
+        // reversed for negative values. Handle both signed zero encodings.
+        if ((bits & 0x7fff) == 0)
+            return bf16_to_f32(bf16_t{uint16_t(up ? 0x0001 : 0x8001)});
+        return bf16_to_f32(bf16_t{uint16_t(bits + ((bool(bits & 0x8000) == up) ? -1 : 1))});
+    };
+    const double target = double(a);
+    // -exp(x) - A == -(expm1(x) + (A + 1)). The latter retains the
+    // separation of BF16 neighbours around x=0, where -exp(x) rounds to
+    // exactly -1 in double even for a nonzero BF16 subnormal.
+    const auto distance = [&](double x) { return std::abs(std::expm1(x) + (target + 1.0)); };
+    const double delta = distance(double(recovered));
+    const double ulp = double(std::nextafter(a, -INFINITY)) - target;
+    return delta <= 4.0 * std::abs(ulp) &&
+           delta < distance(double(adjacent(false))) &&
+           delta < distance(double(adjacent(true)));
+}
+
 bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
                          std::string& out,std::string& err) {
     std::string arch;
@@ -309,8 +333,8 @@ bool Qwen35Model::read_gguf_f32(const TensorRef& r,float* dst,std::string& err,
                 } else {
                     if(!(g<0.0f)){err="GGUF ssm_a must be negative";return false;}
                     const float w=bf16_to_f32(f32_to_bf16(float(std::log(-double(g)))));
-                    out[k]=w;float back=float(-std::exp(double(w)));
-                    if(f32_to_bits(back)!=f32_to_bits(g))++bad;
+                    out[k]=w;
+                    if(!gguf_a_log_recovery_ok(g,w))++bad;
                 }
             }
             if(inv==TensorRef::GGUFInverse::NORM){gguf_norm_checks+=K;gguf_norm_mismatches+=bad;}

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <string>
 #include <cstdlib>
+#include <climits>
 
 namespace b70 {
 int grimoire_load_report(const std::string& dir, Fmt proj_fmt, int max_seq);
@@ -33,6 +34,9 @@ int grimoire_prefill_only(const std::string& dir, Fmt proj_fmt, int max_seq,
                           int n_tokens);
 int grimoire_prefix_cache_test(const std::string& dir, Fmt proj_fmt, int max_seq,
                                int n_tokens);
+int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
+                       const std::string& path, int ctx, int chunks,
+                       const std::string& dump, bool selfcheck);
 }
 
 int main(int argc, char** argv) {
@@ -42,6 +46,17 @@ int main(int argc, char** argv) {
     int n_predict = 128;
     int prefill_only = 0;
     int prefix_cache_test = 0;
+    std::string ppl_file, ppl_dump;
+    int ppl_ctx = 512, ppl_chunks = 0;
+    bool ppl_selfcheck = false;
+    bool ppl_option = false, ctx_given = false;
+    auto positive = [](const char* value, int& out) {
+        char* end = nullptr;
+        const long n = std::strtol(value, &end, 10);
+        if (!*value || *end || n <= 0 || n > INT_MAX) return false;
+        out = int(n);
+        return true;
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -60,11 +75,22 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        else if (a == "--ctx" && i + 1 < argc) max_seq = std::atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc) { max_seq = std::atoi(argv[++i]); ctx_given = true; }
         else if ((a == "-p" || a == "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if ((a == "-n" || a == "--n-predict") && i + 1 < argc) n_predict = std::atoi(argv[++i]);
         else if (a == "--prefill-only" && i + 1 < argc) prefill_only = std::atoi(argv[++i]);
         else if (a == "--prefix-cache-test" && i + 1 < argc) prefix_cache_test = std::atoi(argv[++i]);
+        else if (a == "--ppl" && i + 1 < argc) ppl_file = argv[++i];
+        else if (a == "--ppl-ctx" && i + 1 < argc) {
+            ppl_option = true;
+            if (!positive(argv[++i], ppl_ctx)) { std::fprintf(stderr, "--ppl-ctx must be positive\n"); return 1; }
+        }
+        else if (a == "--ppl-chunks" && i + 1 < argc) {
+            ppl_option = true;
+            if (!positive(argv[++i], ppl_chunks)) { std::fprintf(stderr, "--ppl-chunks must be positive\n"); return 1; }
+        }
+        else if (a == "--ppl-dump" && i + 1 < argc) { ppl_dump = argv[++i]; ppl_option = true; }
+        else if (a == "--ppl-selfcheck") { ppl_selfcheck = true; ppl_option = true; }
         else if (a == "-h" || a == "--help") {
             std::printf(
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
@@ -77,6 +103,11 @@ int main(int argc, char** argv) {
               "           The linear layers do not grow with context.\n"
               "  -p       prompt to generate from. Without it, runs benchmarks.\n"
               "  -n       tokens to generate (default 128).\n");
+            std::printf("  --ppl FILE          raw-text perplexity (no chat template).\n"
+                        "  --ppl-ctx N         tokens per chunk (default 512).\n"
+                        "  --ppl-chunks C      score at most C complete chunks.\n"
+                        "  --ppl-dump FILE     per-token TSV logits summary.\n"
+                        "  --ppl-selfcheck     compare last scored logits with prefill.\n");
 #ifdef GRIMOIRE_NATIVE_ONLY
             std::printf("\n  Standalone native build: external framework bridges disabled.\n");
 #endif
@@ -84,6 +115,18 @@ int main(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::printf("need -m <model_dir>; see --help\n"); return 1; }
+    if (!ppl_file.empty()) {
+        if (ppl_ctx < 4 || ctx_given || !prompt.empty() || prefill_only || prefix_cache_test ||
+            n_predict != 128) {
+            std::fprintf(stderr, "--ppl needs --ppl-ctx >= 4 and cannot combine with --ctx, generation, or benchmark modes\n");
+            return 1;
+        }
+        return b70::grimoire_perplexity(model, pf, ppl_file, ppl_ctx,
+                                        ppl_chunks, ppl_dump, ppl_selfcheck);
+    }
+    if (ppl_option) {
+        std::fprintf(stderr, "--ppl-* requires --ppl FILE\n"); return 1;
+    }
     if (prefix_cache_test > 0)
         return b70::grimoire_prefix_cache_test(model, pf, max_seq, prefix_cache_test);
     if (prefill_only > 0)

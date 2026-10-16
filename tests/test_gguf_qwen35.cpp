@@ -45,6 +45,25 @@ static void add(std::vector<TS>& ts,std::string name,std::vector<uint64_t> dims,
 }
 static std::vector<float> seq(size_t n,float base=0){std::vector<float> v(n);for(size_t i=0;i<n;++i)v[i]=base+float(i)/8;return v;}
 static bool same(const std::vector<float>& a,const std::vector<float>& b){return a.size()==b.size()&&!std::memcmp(a.data(),b.data(),a.size()*4);}
+static void a_log_recovery(){
+    // Converter uses torch float32 exp. It can differ in the low f32 bits
+    // from converting exp(double(r)) back to float, without losing BF16 r.
+    for(uint16_t bits : {uint16_t(0x3e80),uint16_t(0x3f00),uint16_t(0xbf00),uint16_t(0x4000)}){
+        const float r=bf16_to_f32(bf16_t{bits});
+        const float a=-std::exp(r);
+        CHECK(gguf_a_log_recovery_ok(a,r));
+    }
+    // Midpoint between neighbouring BF16 reconstructions is ambiguous.
+    // Pick a representable f32 midpoint on the neighbour's side of the
+    // exact boundary, so float rounding cannot accidentally favour r.
+    const float r=bf16_to_f32(bf16_t{0x3f00});
+    const float up=bf16_to_f32(bf16_t{0x3f01});
+    const double er=-std::exp(double(r)),eu=-std::exp(double(up));
+    float halfway=float((er+eu)/2.0);
+    if(std::abs(double(halfway)-eu)>=std::abs(double(halfway)-er))
+        halfway=std::nextafter(halfway,float(eu));
+    CHECK(!gguf_a_log_recovery_ok(halfway,r));
+}
 // Forward: gguf[tiled j*NK+g] = hf[grouped g*r+j].
 static std::vector<float> fwd_rows(const std::vector<float>& hf,int K,int nk,int nv,int width,int prefix){
     std::vector<float> out(hf.size());
@@ -190,5 +209,5 @@ static void real_headers(){
       CHECK(model.index.count("model.language_model.layers.39.mlp.experts.255.down_proj.weight")==1);
     }
 }
-int main(){transforms(4,8);transforms(16,32);small_loader();real_headers();
+int main(){a_log_recovery();transforms(4,8);transforms(16,32);small_loader();real_headers();
   std::printf("GGUF qwen35: %d assertions, %d failures\n",checks,failures);return failures?1:0;}

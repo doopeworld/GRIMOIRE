@@ -79,6 +79,9 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <thread>
 #include <atomic>
 #include <tuple>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -16151,6 +16154,128 @@ const float* Grimoire::step() {
 #include "b70/tokenizer.hpp"
 
 namespace b70 {
+
+int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
+                       const std::string& path, int ctx, int chunks,
+                       const std::string& dump, bool selfcheck) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) { std::fprintf(stderr, "--ppl: cannot open %s\n", path.c_str()); return 1; }
+    const std::string text((std::istreambuf_iterator<char>(input)), {});
+    if (input.bad()) { std::fprintf(stderr, "--ppl: failed reading %s\n", path.c_str()); return 1; }
+    Tokenizer tk; std::string err;
+    if (!tk.load(dir, err)) { std::fprintf(stderr, "tokenizer: %s\n", err.c_str()); return 1; }
+    auto ids = tk.encode(text);
+    if (tk.add_bos_token()) {
+        if (tk.bos() < 0) { std::fprintf(stderr, "--ppl: tokenizer requests BOS but has no BOS id\n"); return 1; }
+        ids.insert(ids.begin(), tk.bos());
+    }
+    const size_t available = ids.size() / size_t(ctx);
+    const size_t count = chunks ? std::min(available, size_t(chunks)) : available;
+    if (!count) {
+        std::fprintf(stderr, "--ppl: %zu tokens, no complete %d-token chunk\n", ids.size(), ctx);
+        return 1;
+    }
+    Grimoire e;
+    if (e.pp_enabled() || e.tp_enabled()) {
+        std::fprintf(stderr, "--ppl cannot score PP/TP: full host logits are unavailable on every rank\n");
+        return 1;
+    }
+    if (!grimoire_load(e, dir, proj_fmt, ctx, err)) {
+        std::fprintf(stderr, "load: %s\n", err.c_str()); e.release(); return 1;
+    }
+    try {
+        if (!dump.empty() && e.cfg.vocab < 8)
+            throw std::runtime_error("--ppl-dump cannot score " + dir + ": fewer than eight vocabulary entries");
+        for (size_t i = 0; i < count * size_t(ctx); ++i)
+            if (ids[i] < 0 || ids[i] >= e.cfg.vocab)
+                throw std::runtime_error("--ppl cannot score " + dir + ": tokenizer id outside model vocabulary");
+        std::ofstream out;
+        if (!dump.empty()) {
+            out.open(dump, std::ios::binary | std::ios::trunc);
+            if (!out) throw std::runtime_error("--ppl-dump cannot open " + dump);
+            out << std::setprecision(12);
+        }
+        std::printf("--ppl: %zu raw tokens, %zu complete chunks of %d, %zu dropped; teacher-forced per-token decode\n",
+                    ids.size(), count, ctx, ids.size() - available * size_t(ctx));
+        std::vector<float> logits(static_cast<size_t>(e.cfg.vocab));
+        std::vector<float> check_logits;
+        if (selfcheck) check_logits.resize(logits.size());
+        size_t scored = 0;
+        double mean = 0.0, m2 = 0.0;
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t chunk = 0; chunk < count; ++chunk) {
+            e.reset(); // resets the KV cursor and clears DeltaNet/conv state.
+            const size_t offset = chunk * size_t(ctx);
+            for (int pos = 0; pos < ctx; ++pos) {
+                if (!e.forward(ids[offset + size_t(pos)]))
+                    throw std::runtime_error("--ppl decode cannot score " + dir + " at position " + std::to_string(pos));
+                if (pos < ctx / 2 || pos == ctx - 1) continue;
+                e.q.memcpy(logits.data(), e.s.logits, logits.size() * sizeof(float)).wait();
+                double largest = -std::numeric_limits<double>::infinity();
+                int best = -1;
+                std::array<int, 8> top{};
+                top.fill(-1);
+                for (size_t id = 0; id < logits.size(); ++id) {
+                    const double value = logits[id];
+                    if (!std::isfinite(value))
+                        throw std::runtime_error("--ppl non-finite logits at position " + std::to_string(pos));
+                    if (value > largest) { largest = value; best = int(id); }
+                    if (out.is_open() && (top[7] < 0 || value > logits[size_t(top[7])])) {
+                        int k = 7;
+                        while (k > 0 && (top[k-1] < 0 || value > logits[size_t(top[k-1])])) {
+                            top[k] = top[k-1]; --k;
+                        }
+                        top[k] = int(id);
+                    }
+                }
+                double sum = 0.0;
+                for (float value : logits) sum += std::exp(double(value) - largest);
+                const double logz = largest + std::log(sum);
+                const int target = ids[offset + size_t(pos + 1)];
+                const double logprob = double(logits[size_t(target)]) - logz;
+                const double nll = -logprob;
+                ++scored;
+                const double delta = nll - mean;
+                mean += delta / double(scored);
+                m2 += delta * (nll - mean);
+                if (out.is_open()) {
+                    out << chunk + 1 << '\t' << pos << '\t' << target << '\t'
+                        << logprob << '\t' << best << '\t'
+                        << double(logits[size_t(best)]) - logz;
+                    for (int id : top) out << '\t' << id << ':' << double(logits[size_t(id)]) - logz;
+                    out << '\n';
+                    if (!out) throw std::runtime_error("--ppl-dump write failed");
+                }
+                if (selfcheck && chunk == 0 && pos == ctx - 2) check_logits = logits;
+            }
+            std::printf("[%zu]%.4f%s", chunk + 1, std::exp(mean),
+                        chunk + 1 == count ? "\n" : ",");
+            if (selfcheck && chunk == 0) {
+                e.reset();
+                const std::vector<int32_t> prefix(ids.begin(), ids.begin() + long(ctx - 1));
+                if (!e.prefill(prefix, nullptr, nullptr, false))
+                    throw std::runtime_error("--ppl-selfcheck batched prefill cannot score " + dir);
+                e.q.memcpy(logits.data(), e.s.logits, logits.size() * sizeof(float)).wait();
+                double max_diff = 0.0;
+                for (size_t i = 0; i < logits.size(); ++i) {
+                    if (!std::isfinite(logits[i])) throw std::runtime_error("--ppl-selfcheck non-finite prefill logits");
+                    max_diff = std::max(max_diff, std::abs(double(logits[i]) - double(check_logits[i])));
+                }
+                std::fprintf(stderr, "PPL selfcheck: max abs logits diff (decode vs prefill) = %.9g\n", max_diff);
+            }
+        }
+        const double ppl = std::exp(mean);
+        const double stderr_nll = scored > 1 ? std::sqrt(m2 / double(scored - 1) / double(scored)) : 0.0;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::printf("PPL: %.6f +/- %.6f; scored tokens: %zu; wall time: %.3fs\n",
+                    ppl, ppl * stderr_nll, scored, seconds);
+        e.release(); return 0;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "perplexity failed: %s\n", ex.what());
+        e.release(); return 1;
+    }
+}
 
 int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
                       const std::string& prompt, int n_predict) {

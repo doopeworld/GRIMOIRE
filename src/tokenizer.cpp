@@ -142,6 +142,20 @@ void Tokenizer::build_byte_tables() {
 
 bool Tokenizer::load(const std::string& dir, std::string& err) {
     build_byte_tables();
+    add_bos_token_ = false;
+    // Raw-text scoring follows the checkpoint's tokenizer setting, not the
+    // presence of a BOS id. Qwen-family tokenizers normally set this false.
+    const std::string tokenizer_cfg = read_file(dir + "/tokenizer_config.json");
+    const size_t bos_key = tokenizer_cfg.find("\"add_bos_token\"");
+    if (bos_key != std::string::npos) {
+        size_t value = tokenizer_cfg.find(':', bos_key);
+        if (value == std::string::npos) { err = "malformed add_bos_token"; return false; }
+        ++value;
+        skip_ws(tokenizer_cfg, value);
+        if (tokenizer_cfg.compare(value, 4, "true") == 0) add_bos_token_ = true;
+        else if (tokenizer_cfg.compare(value, 5, "false") == 0) add_bos_token_ = false;
+        else { err = "invalid add_bos_token"; return false; }
+    }
 
     const std::string js = read_file(dir + "/tokenizer.json");
     if (js.empty()) { err = "cannot read " + dir + "/tokenizer.json"; return false; }
@@ -306,6 +320,31 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
         if (id >= 0 && id != eos_) { eos2_ = id; break; }
     }
     bos_ = find_special("<|im_start|>");
+    if (add_bos_token_) {
+        // A tokenizer that requests BOS may use a different literal from
+        // ChatML's <|im_start|>. Resolve its configured token explicitly.
+        bos_ = -1;
+        const size_t key = tokenizer_cfg.find("\"bos_token\"");
+        if (key != std::string::npos) {
+            size_t value = tokenizer_cfg.find(':', key);
+            if (value != std::string::npos) {
+                ++value; skip_ws(tokenizer_cfg, value);
+                if (value < tokenizer_cfg.size() && tokenizer_cfg[value] == '{') {
+                    const size_t content = tokenizer_cfg.find("\"content\"", value);
+                    const size_t close = tokenizer_cfg.find('}', value);
+                    if (content != std::string::npos && content < close) {
+                        value = tokenizer_cfg.find(':', content) + 1;
+                        skip_ws(tokenizer_cfg, value);
+                    }
+                }
+                if (value < tokenizer_cfg.size() && tokenizer_cfg[value] == '"') {
+                    const std::string literal = json_string(tokenizer_cfg, value);
+                    const auto it = tok_to_id_.find(literal);
+                    if (it != tok_to_id_.end()) bos_ = it->second;
+                }
+            }
+        }
+    }
 
     return true;
 }

@@ -76,6 +76,7 @@ public:
     std::string decode_one(int32_t id) const;
 
     int32_t bos() const { return bos_; }
+    bool add_bos_token() const { return add_bos_token_; }
     int32_t eos() const { return eos_; }
     size_t  vocab_size() const { return id_to_tok_.size(); }
     const std::string& raw_token(size_t id) const { return id_to_tok_.at(id); }
@@ -123,6 +124,7 @@ private:
     std::unordered_map<std::string, int32_t>     special_by_text_;
 
     int32_t bos_ = -1, eos_ = -1, eos2_ = -1;
+    bool add_bos_token_ = false;
     size_t  bad_merges_ = 0;
     // read from the checkpoint's chat template (chat_template.jinja or
     // tokenizer_config.json), see apply_chat_template
