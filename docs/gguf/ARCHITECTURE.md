@@ -1,9 +1,10 @@
-# GRIMOIRE weight-loading architecture for a proposed GGUF source
+# GRIMOIRE weight-loading architecture and GGUF source
 
-This is a source audit of the checked-out tree. Paths and line numbers below refer to this tree, not to
-an installed image. The GGUF design in §7 is a **proposal**; there is no GGUF reader, `Fmt::GGUF`, or
-Q4_K/Q8_0/IQ dispatch in the inspected loader and format paths (`src/qwen35_loader.cpp:747-782`,
-`include/b70/formats.hpp:231-233`, `src/gemv_decode.cpp:1697-1707`).
+The numbered inventory below records the original pre-GGUF source audit; its
+line numbers describe that baseline. The GGUF adapter and native Q4_K/Q6_K
+execution are now implemented. See [NATIVE_QK.md](NATIVE_QK.md) for the
+current upload, dispatch, guard and verification status. Q8_0/IQ have no
+native kernel dispatch.
 
 ## 1. Build and run
 
@@ -240,11 +241,15 @@ an unclamped tile read (`src/grimoire.cpp:5150-5159`).
 
 ## 5. Kernel inventory relevant to GGUF
 
+Phase 3 step 1 implements the native Q4_K/Q6_K path described in
+[NATIVE_QK.md](NATIVE_QK.md). The inventory below records the original
+Strategy A baseline and its kernel insertion points.
+
 The existing kernels take runtime `QuantWeight`/`MoeLayer` views, not safetensors records
 (`include/b70/weights.hpp:46-55`, `include/b70/moe.hpp:85-102`). Thus a GGUF reader that produces a
 supported runtime view can reuse the paths below **after its tensor has been decoded/repacked or
-otherwise made layout-compatible**. No existing dispatch switch lists Q4_K, Q5_K, Q6_K, Q8_0 or IQ as a
-runtime format (`include/b70/formats.hpp:231-233`, `src/gemv_decode.cpp:1697-1707`).
+otherwise made layout-compatible**. At the baseline of this audit, no dispatch switch listed
+Q4_K, Q5_K, Q6_K, Q8_0 or IQ. The current tree adds native Q4_K/Q6_K dispatch.
 
 | Path | Accepted runtime view / condition | Selection and reuse point |
 |---|---|---|

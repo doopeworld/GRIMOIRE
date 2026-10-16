@@ -477,6 +477,8 @@ sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
         case Fmt::FP8_E5M2: return gemm_flt_dispatch<Fmt::FP8_E5M2>(q, w, x, y, M, deps);
         case Fmt::MXFP8:    return gemm_flt_dispatch<Fmt::MXFP8>(q, w, x, y, M, deps);
         case Fmt::MXFP4:    return gemm_flt_dispatch<Fmt::MXFP4>(q, w, x, y, M, deps);
+        case Fmt::Q4_K:     return gemm_flt_dispatch<Fmt::Q4_K>(q, w, x, y, M, deps);
+        case Fmt::Q6_K:     return gemm_flt_dispatch<Fmt::Q6_K>(q, w, x, y, M, deps);
         // INT8/INT4 dequantise to bf16 in the staging loop and use the
         // same DPAS path. gemm_int() exists for the pure-integer pipeline
         // but needs pre-quantised activations; prefill does not have them.

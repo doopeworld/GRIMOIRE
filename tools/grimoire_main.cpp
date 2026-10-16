@@ -43,6 +43,7 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
 int main(int argc, char** argv) {
     std::string model, prompt;
     b70::Fmt pf = b70::Fmt::INT4;
+    bool proj_explicit = false;
     int max_seq = 8192;
     int n_predict = 128;
     int prefill_only = 0;
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
         if (a == "-m" && i + 1 < argc) model = argv[++i];
         else if (a == "--proj" && i + 1 < argc) {
             const std::string v = argv[++i];
+            proj_explicit = true;
             if      (v == "int4")  pf = b70::Fmt::INT4;
             else if (v == "int8")  pf = b70::Fmt::INT8;
             else if (v == "mxfp4") pf = b70::Fmt::MXFP4;
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
             else if (v == "fp8" || v == "fp8_e4m3") pf = b70::Fmt::FP8_E4M3;
             else if (v == "fp8_e5m2") pf = b70::Fmt::FP8_E5M2;
             else if (v == "bf16")  pf = b70::Fmt::BF16;
+            else if (v == "native") { pf = b70::Fmt::MXFP4; setenv("GRIMOIRE_GGUF_NATIVE","1",1); }
             else {
                 std::fprintf(stderr, "unknown --proj format: %s\n", v.c_str());
                 return 1;
@@ -97,8 +100,9 @@ int main(int argc, char** argv) {
             std::printf(
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
               "  grimoire -m <model_dir> [--proj FORMAT] [--ctx N]\n\n"
-              "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16\n"
+              "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16, native (GGUF)\n"
               "  --proj   format for projections converted from safetensors at load.\n"
+              "           native keeps GGUF Q4_K/Q6_K; other projections use MXFP4.\n"
               "           Native v3 artifacts preserve their saved formats.\n"
               "           Use grimoire-quantize to choose formats offline.\n"
               "  --ctx    KV cache capacity for the full-attention layers.\n"
@@ -116,6 +120,14 @@ int main(int argc, char** argv) {
 #endif
             return 0;
         }
+    }
+    const char* gguf_native = std::getenv("GRIMOIRE_GGUF_NATIVE");
+    if (gguf_native && std::strcmp(gguf_native, "1") == 0) {
+        if (proj_explicit && pf != b70::Fmt::MXFP4) {
+            std::fprintf(stderr, "native GGUF requires --proj native or mxfp4 for other tensors\n");
+            return 1;
+        }
+        pf = b70::Fmt::MXFP4;
     }
     if (model.empty()) { std::printf("need -m <model_dir>; see --help\n"); return 1; }
     if (!ppl_file.empty() || !ppl_kld_base.empty()) {

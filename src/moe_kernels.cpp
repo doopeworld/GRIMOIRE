@@ -967,6 +967,8 @@ sycl::event launch_moe_gate_up(sycl::queue& q, const MoeLayer& L,
         case Fmt::FP8_E4M3: return moe_gate_up_impl<Fmt::FP8_E4M3>(q, L, d_expert, x, h, 1, deps);
         case Fmt::FP8_E5M2: return moe_gate_up_impl<Fmt::FP8_E5M2>(q, L, d_expert, x, h, 1, deps);
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::Q4_K: return moe_gate_up_impl<Fmt::Q4_K>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::Q6_K: return moe_gate_up_impl<Fmt::Q6_K>(q, L, d_expert, x, h, 1, deps);
     }
     return {};
 }
@@ -986,6 +988,8 @@ sycl::event launch_moe_gate_up_shared(sycl::queue& q, const MoeLayer& L, const Q
         case Fmt::FP8_E4M3: return moe_gate_up_sh<Fmt::FP8_E4M3>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
         case Fmt::FP8_E5M2: return moe_gate_up_sh<Fmt::FP8_E5M2>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
         case Fmt::BF16:     return moe_gate_up_sh<Fmt::BF16>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::Q4_K: return moe_gate_up_sh<Fmt::Q4_K>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::Q6_K: return moe_gate_up_sh<Fmt::Q6_K>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
     }
     return {};
 }
@@ -1005,6 +1009,8 @@ sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const Quan
         case Fmt::FP8_E4M3: return moe_down_sh<Fmt::FP8_E4M3>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
         case Fmt::FP8_E5M2: return moe_down_sh<Fmt::FP8_E5M2>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
         case Fmt::BF16:     return moe_down_sh<Fmt::BF16>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::Q4_K: return moe_down_sh<Fmt::Q4_K>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::Q6_K: return moe_down_sh<Fmt::Q6_K>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
     }
     return {};
 }
@@ -1039,6 +1045,8 @@ sycl::event launch_mova_value_decode(sycl::queue& q, const QuantWeight& w,
         case Fmt::FP8_E4M3: return mova_decode_impl<Fmt::FP8_E4M3>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
         case Fmt::FP8_E5M2: return mova_decode_impl<Fmt::FP8_E5M2>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
         case Fmt::BF16:     return mova_decode_impl<Fmt::BF16>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::Q4_K: return mova_decode_impl<Fmt::Q4_K>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::Q6_K: return mova_decode_impl<Fmt::Q6_K>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
     }
     return {};
 }
@@ -1055,6 +1063,8 @@ sycl::event launch_moe_down(sycl::queue& q, const MoeLayer& L,
         case Fmt::FP8_E4M3: return moe_down_impl<Fmt::FP8_E4M3>(q, L, d_expert, d_weight, h, y, 1, deps);
         case Fmt::FP8_E5M2: return moe_down_impl<Fmt::FP8_E5M2>(q, L, d_expert, d_weight, h, y, 1, deps);
         case Fmt::BF16:     return moe_down_impl<Fmt::BF16>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::Q4_K: return moe_down_impl<Fmt::Q4_K>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::Q6_K: return moe_down_impl<Fmt::Q6_K>(q, L, d_expert, d_weight, h, y, 1, deps);
     }
     return {};
 }
@@ -1071,6 +1081,8 @@ sycl::event launch_moe_gate_up_batched(
         case Fmt::FP8_E4M3: return moe_gate_up_impl<Fmt::FP8_E4M3>(q, L, d_expert, x, h, tokens, deps);
         case Fmt::FP8_E5M2: return moe_gate_up_impl<Fmt::FP8_E5M2>(q, L, d_expert, x, h, tokens, deps);
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::Q4_K: return moe_gate_up_impl<Fmt::Q4_K>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::Q6_K: return moe_gate_up_impl<Fmt::Q6_K>(q, L, d_expert, x, h, tokens, deps);
     }
     return {};
 }
@@ -1087,6 +1099,8 @@ sycl::event launch_moe_down_batched(
         case Fmt::FP8_E4M3: return moe_down_impl<Fmt::FP8_E4M3>(q, L, d_expert, d_weight, h, y, tokens, deps);
         case Fmt::FP8_E5M2: return moe_down_impl<Fmt::FP8_E5M2>(q, L, d_expert, d_weight, h, y, tokens, deps);
         case Fmt::BF16:     return moe_down_impl<Fmt::BF16>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::Q4_K: return moe_down_impl<Fmt::Q4_K>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::Q6_K: return moe_down_impl<Fmt::Q6_K>(q, L, d_expert, d_weight, h, y, tokens, deps);
     }
     return {};
 }

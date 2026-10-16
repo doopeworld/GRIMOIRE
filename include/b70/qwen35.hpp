@@ -449,6 +449,8 @@ struct Qwen35Model {
     bool read_native_f32(const TensorRef& r, float* dst, std::string& err) const;
     bool read_gguf_f32(const TensorRef& r, float* dst, std::string& err,
                        uint64_t first_row = 0, uint64_t row_count = 0) const;
+    bool read_gguf_raw_rows(const TensorRef& r, uint8_t* dst, std::string& err,
+                            uint64_t first_row = 0, uint64_t row_count = 0) const;
 
     const void* data(const TensorRef& r) const {
         if(r.gguf)return nullptr;

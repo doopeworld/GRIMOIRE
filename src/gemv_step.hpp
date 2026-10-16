@@ -50,6 +50,19 @@ namespace b70 {
 template <Fmt F, int EPL>
 struct GemvStep;
 
+template <Fmt F, int EPL> struct GemvStepGGUF {
+    static inline float run(const QuantWeight&, const uint8_t* row,
+                            const float* x, const float*, const float*, const float*, int, int k0) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < EPL; ++i)
+            acc = sycl::fma(decode_elem<F>(row, k0 + i, 1.0f), x[k0 + i], acc);
+        return acc;
+    }
+};
+template <int EPL> struct GemvStep<Fmt::Q4_K, EPL> : GemvStepGGUF<Fmt::Q4_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q6_K, EPL> : GemvStepGGUF<Fmt::Q6_K, EPL> {};
+
 template <int EPL> struct GemvStep<Fmt::BF16, EPL> {
     static inline float run(const QuantWeight& w, const uint8_t* row,
                             const float* x, const float* lut,

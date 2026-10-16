@@ -44,6 +44,7 @@
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
 #include "b70/qwen35.hpp"
+#include "b70/gguf_qwen35.hpp"
 #include "b70/dflash_config.hpp"
 #include "b70/qwen4_exp.hpp"
 #include "b70/nvfp4.hpp"
@@ -1345,6 +1346,34 @@ bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
 
 static DevQuant upload_packed(sycl::queue& q, const PackedWeight& p);
 
+static bool gguf_native_enabled(const Qwen35Model& ck) {
+    const char* e=std::getenv("GRIMOIRE_GGUF_NATIVE");
+    return ck.gguf_file && e && std::strcmp(e,"1")==0;
+}
+static bool gguf_native_ref(const Qwen35Model& ck,const TensorRef& r) {
+    return gguf_native_enabled(ck) && r.gguf && (r.gguf->type==12 || r.gguf->type==14) &&
+        (r.t.name=="lm_head.weight" || !keep_qwen_bf16(r.t.name));
+}
+static Fmt gguf_ref_fmt(const TensorRef& r) {
+    return r.gguf->type==12 ? Fmt::Q4_K : Fmt::Q6_K;
+}
+template <class T>
+static sycl::event launch_gguf_ssm_out_gather(sycl::queue& q,const T* grouped,T* tiled,
+                                                int rows,int nk,int nv,int width,
+                                                const std::vector<sycl::event>& deps={}) {
+    // GGUF stores ssm_out columns in tiled V-head order. Keeping its raw
+    // quantized blocks requires the matching input order at this projection.
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(rows)*nv*width),[=](sycl::id<1> id){
+            const size_t pos=id[0], k=pos%(size_t(nv)*width);
+            const size_t src=(pos/(size_t(nv)*width))*(size_t(nv)*width)+
+                gguf_v_grouped_index(k/width,nk,nv)*width+k%width;
+            tiled[pos]=grouped[src];
+        });
+    });
+}
+
 DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
                            const TensorRef& r, Fmt fmt, const char* what,
                            bool* ok) {
@@ -1357,6 +1386,21 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const int N = int(r.t.shape[0]);
     const int K = int(r.t.shape[1]);
     if(r.gguf){
+        if(gguf_native_ref(ck,r)){
+            if(K%256){std::printf("\n  native GGUF refused for %s: K=%d is not divisible by 256\n",what,K);
+                *ok=false;return d;}
+            std::vector<uint8_t> raw(size_t(N)*r.gguf->row_bytes);
+            std::string rr;
+            if(!ck.read_gguf_raw_rows(r,raw.data(),rr)){
+                std::printf("\n  native GGUF read failed for %s: %s\n",what,rr.c_str());
+                *ok=false;return d;
+            }
+            d.payload=dev_copy<uint8_t>(q,raw.data(),raw.size());
+            d.w=QuantWeight{gguf_ref_fmt(r),N,K,d.payload,nullptr,nullptr,
+                            int64_t(r.gguf->row_bytes),0};
+            if(!d.payload)*ok=false;
+            return d;
+        }
         Fmt use=fmt;
         const int blk=(fmt==Fmt::INT4)?kInt4Group:
                       (fmt==Fmt::MXFP4||fmt==Fmt::MXFP8)?kMXBlock:1;
@@ -1699,6 +1743,25 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const int Nb = int(rb.t.shape[0]);
     const int K  = int(ra.t.shape[1]);
     const int N  = Na + Nb;
+
+    if(ra.gguf && rb.gguf && gguf_native_ref(ck,ra) && gguf_native_ref(ck,rb)){
+        if(ra.gguf->type!=rb.gguf->type || K%256){
+            std::printf("\n  native GGUF concat refused for %s: mismatched types or K=%d\n",what,K);
+            *ok=false;return d;
+        }
+        const size_t raw_row_bytes=ra.gguf->row_bytes;
+        std::vector<uint8_t> raw(size_t(N)*raw_row_bytes);
+        std::string rr;
+        if(!ck.read_gguf_raw_rows(ra,raw.data(),rr) ||
+           !ck.read_gguf_raw_rows(rb,raw.data()+size_t(Na)*raw_row_bytes,rr)){
+            std::printf("\n  native GGUF concat read failed for %s: %s\n",what,rr.c_str());
+            *ok=false;return d;
+        }
+        d.payload=dev_copy<uint8_t>(q,raw.data(),raw.size());
+        d.w=QuantWeight{gguf_ref_fmt(ra),N,K,d.payload,nullptr,nullptr,int64_t(raw_row_bytes),0};
+        if(!d.payload)*ok=false;
+        return d;
+    }
 
     if(fmt==Fmt::BF16&&!ra.gguf&&!rb.gguf&&!ra.row_scaled&&!rb.row_scaled&&!ra.native&&!rb.native&&
        ra.t.dtype==STDtype::BF16&&rb.t.dtype==STDtype::BF16){
@@ -4152,7 +4215,8 @@ std::string Grimoire::unsupported_reason() const {
     return {};
 }
 
-bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::string& err) {
+bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt, std::string& err) {
+    UploadOptions opt = requested_opt;
     const auto t0 = std::chrono::high_resolution_clock::now();
     // ---- pipeline setup FIRST: both queues on ONE shared context -----
     // A single process using two B70s must keep BOTH queues in the SAME sycl
@@ -4214,6 +4278,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     double(dev.get_info<sycl::info::device::global_mem_size>()) / (1 << 30));
     }
     if (!ck.load(dir, err)) return false;
+    // Environment opt-in also reaches callers of the C/API build path, whose
+    // UploadOptions normally default to INT4. Other GGUF tensors use MXFP4.
+    if (gguf_native_enabled(ck)) {
+        opt.lm_head_fmt = Fmt::MXFP4;
+        opt.quantize_lm_head = true;
+    }
     cfg = ck.cfg;
     if(ck.gguf_file){
         std::map<std::string,size_t> counts;bool quantized=false;
@@ -4227,8 +4297,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         bool first=true;
         for(const auto& item:counts){if(!first)std::printf(", ");first=false;
             std::printf("%s %zu",item.first.c_str(),item.second);}
-        std::printf(" | decode at load (Strategy A) -> --proj %s\n",fmt_name(opt.lm_head_fmt));
-        if(quantized&&opt.lm_head_fmt!=Fmt::BF16)
+        if(gguf_native_enabled(ck)){
+            std::map<uint32_t,std::pair<size_t,uint64_t>> native;
+            std::map<std::string,std::pair<size_t,size_t>> native_roles;
+            std::map<std::string,size_t> bf16_roles;
+            std::set<const GGUFTensor*> seen;
+            for(const auto& kv:ck.index){
+                const auto& r=kv.second;
+                if(!r.gguf || !seen.insert(r.gguf).second)continue;
+                std::string role=r.gguf->name;
+                if(role.rfind("blk.",0)==0){
+                    const size_t dot=role.find('.',4);
+                    if(dot!=std::string::npos)role=role.substr(dot+1);
+                }
+                if(gguf_native_ref(ck,r)){
+                    ++native[r.gguf->type].first;
+                    native[r.gguf->type].second+=r.gguf->nbytes;
+                    auto& nr=native_roles[role];
+                    ++(r.gguf->type==12?nr.first:nr.second);
+                }else if(r.gguf->type==12 || r.gguf->type==14){
+                    ++bf16_roles[role];
+                }
+            }
+            std::printf(" | native Q4_K %zu (%.2f GiB), Q6_K %zu (%.2f GiB) raw on device; other projections MXFP4; critical tensors BF16\n",
+                native[12].first,double(native[12].second)/(1ull<<30),
+                native[14].first,double(native[14].second)/(1ull<<30));
+            for(const auto& nr:native_roles)
+                std::printf("    native %-28s Q4_K %zu Q6_K %zu\n",nr.first.c_str(),nr.second.first,nr.second.second);
+            for(const auto& br:bf16_roles)
+                std::printf("    BF16 policy %-23s %zu GGUF quantized tensor(s) decoded\n",br.first.c_str(),br.second);
+        } else std::printf(" | decode at load (Strategy A) -> --proj %s\n",fmt_name(opt.lm_head_fmt));
+        if(!gguf_native_enabled(ck)&&quantized&&opt.lm_head_fmt!=Fmt::BF16)
             std::printf("  WARNING: LOSSY REQUANT from quantized GGUF to --proj %s\n",
                         fmt_name(opt.lm_head_fmt));
     }
@@ -4389,7 +4488,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // Linear layers are W4A16.  Do not let --proj int4 requantize this head.
     const bool preserve_muse_lm_head = cfg.is_muse;
     std::printf("  lm_head       %s ... ", preserve_muse_lm_head
-        ? "preserving checkpoint bf16" : fmt_name(opt.lm_head_fmt));
+        ? "preserving checkpoint bf16" : gguf_native_ref(ck,ck.lm_head)
+        ? fmt_name(gguf_ref_fmt(ck.lm_head)) : fmt_name(opt.lm_head_fmt));
     std::fflush(stdout);
     if((!pp_enabled()||pp_rank==pp_world-1)&&ck.lm_head.ok()&&ck.lm_head.t.shape.size()==2) {
         const int V = int(ck.lm_head.t.shape[0]);
@@ -4397,7 +4497,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         // the target is bf16 -- the raw copy below is for a bf16 tensor.
         const bool head_quantized = ck.lm_head.gguf || ck.lm_head.nvfp4 || ck.lm_head.row_scaled ||
                                     ck.lm_head.block_scaled;
-        if (!preserve_muse_lm_head && opt.quantize_lm_head &&
+        if(gguf_native_ref(ck,ck.lm_head)) {
+            lm_head=quantize_upload_t(q,ck,ck.lm_head,Fmt::BF16,"lm_head",&ok);
+        } else if (!preserve_muse_lm_head && opt.quantize_lm_head &&
             opt.lm_head_fmt != Fmt::BF16) {
             lm_head = quantize_upload_t(q, ck, ck.lm_head, opt.lm_head_fmt, "lm_head", &ok);
         } else if (head_quantized) {
@@ -5027,13 +5129,37 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // Experts: concatenate gate and up into one [E][2I][H] block
             // and copy the packed bytes verbatim. No dequantize, no
             // requantize -- the on-disk layout IS the kernel layout.
-            // A GGUF source gets exactly what its safetensors twin gets: MXFP4
-            // experts whatever --proj says (the grouped MoE prefill and the
-            // small-M grouped path are MXFP4-only -- docs/gguf/ARCHITECTURE.md
-            // section 5).  Following PF here sent `--proj int4` experts down the
-            // per-expert fallback and broke GGUF-vs-safetensors parity.
+            // Strategy A GGUF keeps MXFP4 experts regardless of --proj for
+            // safetensors parity. Native GGUF retains each expert tensor's
+            // Q4_K/Q6_K rows and uses the per-expert GEMM fallback in prefill.
             Fmt EF = (!ck.gguf_file && !src.e_gate_p.empty() && src.e_gate_p[0].gptq)
                          ? Fmt::INT4 : Fmt::MXFP4;
+            Fmt DF = EF;
+            if(gguf_native_enabled(ck)){
+                const auto& gate=src.e_gate_p[0];
+                const auto& up=src.e_up_p[0];
+                const auto& down=src.e_down_p[0];
+                if(!gate.gguf||!up.gguf||!down.gguf){
+                    err="native GGUF expert source missing: "+
+                        gate.t.name+" / "+up.t.name+" / "+down.t.name;
+                    return false;
+                }
+                const bool gate_native=gguf_native_ref(ck,gate);
+                const bool up_native=gguf_native_ref(ck,up);
+                if(gate_native!=up_native ||
+                   (gate_native && gate.gguf->type!=up.gguf->type)){
+                    err="native GGUF gate/up expert formats cannot share one packed matrix: "+
+                        gate.t.name+" / "+up.t.name;
+                    return false;
+                }
+                if(gate_native)EF=gguf_ref_fmt(gate);
+                if(gguf_native_ref(ck,down))DF=gguf_ref_fmt(down);
+                if((gate_native && H%256) || (DF!=Fmt::MXFP4 && I%256)){
+                    err="native GGUF expert K is not divisible by 256: "+
+                        (H%256?gate.t.name:down.t.name);
+                    return false;
+                }
+            }
             if (!ck.gguf_file && !src.e_gate_p.empty() && src.e_gate_p[0].native) {
                 QuantWeight view;
                 if (!ck.native_view(src.e_gate_p[0],view,err)) return false;
@@ -5041,10 +5167,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             }
             const size_t gu_row  = bytes_per_row(EF, H);
             const size_t gu_srow = scales_per_row(EF, H) * scale_element_bytes(EF);
-            const size_t dn_row  = bytes_per_row(EF, I);
-            const size_t dn_srow = scales_per_row(EF, I) * scale_element_bytes(EF);
+            const size_t dn_row  = bytes_per_row(DF, I);
+            const size_t dn_srow = scales_per_row(DF, I) * scale_element_bytes(DF);
             const size_t gu_zrow = EF == Fmt::INT4 ? scales_per_row(EF, H) : 0;
-            const size_t dn_zrow = EF == Fmt::INT4 ? scales_per_row(EF, I) : 0;
+            const size_t dn_zrow = DF == Fmt::INT4 ? scales_per_row(DF, I) : 0;
 
             d.gu_pack  = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_row, lq);
             if (gu_srow) d.gu_scale = sycl::malloc_device<uint8_t>(size_t(E) * 2 * I * gu_srow, lq);
@@ -5071,32 +5197,39 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 std::vector<uint8_t> h_ds(size_t(E) * H * dn_srow);
                 std::vector<uint8_t> h_gz(size_t(E) * 2 * I * gu_zrow);
                 std::vector<uint8_t> h_dz(size_t(E) * H * dn_zrow);
-                auto stage_expert = [&](const TensorRef& r, uint8_t* payload,
+                auto stage_expert = [&](const TensorRef& r, Fmt target, uint8_t* payload,
                                         uint8_t* scales, uint8_t* zeros, int N, int K,
                                         size_t row_bytes, size_t scale_bytes, size_t zero_bytes,
                                         std::string& rr) {
+                    if(gguf_native_ref(ck,r)){
+                        if(gguf_ref_fmt(r)!=target || K%256 ||
+                           r.gguf->row_bytes!=row_bytes){
+                            rr="native GGUF expert format or K mismatch: "+r.gguf->name;return false;
+                        }
+                        return ck.read_gguf_raw_rows(r,payload,rr);
+                    }
                     if(!r.gguf&&row_scales_ok(r,N)&&
-                       ((EF==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
-                        (EF==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2))){
+                       ((target==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
+                        (target==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2))){
                         std::vector<float> hs(size_t(N),0.0f);
                         if(!ck.read_raw(r,payload,rr)||
                            !read_row_scales(ck,r,N,hs.data(),rr))return false;
                         std::memcpy(scales,hs.data(),size_t(N)*sizeof(float));return true;
                     }
-                    if(EF==Fmt::BF16&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
+                    if(target==Fmt::BF16&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16)
                         return ck.read_raw(r,payload,rr);
                     // !r.nvfp4: an NVFP4 expert is also called
                     // weight_packed and also holds E2M1 nibbles; reading
                     // it straight would hand E4M3 per-16 scales to a
                     // kernel expecting E8M0 per-32.  b70/nvfp4.hpp.
-                    const bool packed = EF==Fmt::MXFP4&&!r.gguf&&!r.gptq&&!r.row_scaled&&!r.nvfp4&&
+                    const bool packed = target==Fmt::MXFP4&&!r.gguf&&!r.gptq&&!r.row_scaled&&!r.nvfp4&&
                                         r.t.name.find("weight_packed") != std::string::npos;
                     if (packed) return ck.read_raw(r, payload, rr);
                     PackedWeight pw;
                     if (!r.gguf && r.native) {
                         QuantWeight view;
                         if (!ck.native_view(r,view,rr)) return false;
-                        if (view.fmt!=EF || view.N!=N || view.K!=K) {
+                        if (view.fmt!=target || view.N!=N || view.K!=K) {
                             rr="native expert format or shape differs within layer"; return false;
                         }
                         pw=copy_packed(view);
@@ -5105,7 +5238,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                     } else {
                         std::vector<float> f32(size_t(N) * K);
                         if (!read_matrix_f32(ck, r, f32.data(), rr)) return false;
-                        pw = quantize(f32.data(), N, K, EF);
+                        pw = quantize(f32.data(), N, K, target);
                     }
                     if (pw.payload.size() != size_t(N) * row_bytes ||
                         pw.scales_raw.size() != size_t(N) * scale_bytes) {
@@ -5143,13 +5276,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                            && ck.read_raw(src.e_down_p[e],h_dn.data()+size_t(le)*H*dn_row,rr)
                            && ck.read_raw(src.e_down_s[e],h_ds.data()+size_t(le)*H*dn_srow,rr);
                     } else {
-                        rok = stage_expert(src.e_gate_p[e], h_gu.data() + goff * gu_row,
+                        rok = stage_expert(src.e_gate_p[e], EF, h_gu.data() + goff * gu_row,
                                            gu_srow ? h_gs.data() + goff * gu_srow : nullptr, gu_zrow ? h_gz.data() + goff * gu_zrow : nullptr,
                                            I, H, gu_row, gu_srow, gu_zrow, rr)
-                           && stage_expert(src.e_up_p[e], h_gu.data() + (goff + I) * gu_row,
+                           && stage_expert(src.e_up_p[e], EF, h_gu.data() + (goff + I) * gu_row,
                                            gu_srow ? h_gs.data() + (goff + I) * gu_srow : nullptr, gu_zrow ? h_gz.data() + (goff + I) * gu_zrow : nullptr,
                                            I, H, gu_row, gu_srow, gu_zrow, rr)
-                           && stage_expert(src.e_down_p[e], h_dn.data() + size_t(le) * H * dn_row,
+                           && stage_expert(src.e_down_p[e], DF, h_dn.data() + size_t(le) * H * dn_row,
                                            dn_srow ? h_ds.data() + size_t(le) * H * dn_srow : nullptr, dn_zrow ? h_dz.data() + size_t(le) * H * dn_zrow : nullptr,
                                            H, I, dn_row, dn_srow, dn_zrow, rr);
                     }
@@ -5189,8 +5322,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             d.moe.cfg.shared_inter = cfg.shared_inter;
             d.moe.gate_up = QuantWeight{EF, E * 2 * I, H, d.gu_pack, d.gu_scale,
                                         d.gu_zero, int64_t(gu_row), scales_per_row(EF, H)};
-            d.moe.down    = QuantWeight{EF, E * H, I, d.dn_pack, d.dn_scale,
-                                        d.dn_zero, int64_t(dn_row), scales_per_row(EF, I)};
+            d.moe.down    = QuantWeight{DF, E * H, I, d.dn_pack, d.dn_scale,
+                                        d.dn_zero, int64_t(dn_row), scales_per_row(DF, I)};
             }   // !tiered
 
             // gate and up share an input and are consumed together by
@@ -6568,6 +6701,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         if (dl.q_proj.output_rows() > qkv_max) qkv_max = dl.q_proj.output_rows();
     }
     s.qkv     = sycl::malloc_device<float>(qkv_max, q);
+    // s.bbuf is also the native GGUF ssm_out gather destination. Its minimum
+    // capacity is the full DeltaNet V vector, even in a layer with no v_proj.
     int aux_max = Hv * Dv;
     for (const auto& dl : L) {
         if (dl.la_z.output_rows()   > aux_max) aux_max = dl.la_z.output_rows();
@@ -8271,6 +8406,8 @@ static double meas_rate(Fmt f) {
         case Fmt::INT4:  return 478.0;
         case Fmt::MXFP4: return 352.0;
         case Fmt::MXFP8: return 386.0;
+        case Fmt::Q4_K:  return 380.0; // Placeholder until B70 native measurements.
+        case Fmt::Q6_K:  return 380.0;
         default:         return 380.0;
     }
 }
@@ -9023,7 +9160,13 @@ const float* Grimoire::forward_dag(int token) {
                 q, s.attn_out, d.la_norm, Hv, Dv, cfg.rms_eps, false, deps({e_dn}));
             sycl::event e_gate = launch_gate_silu(
                 q, s.attn_out, s.zbuf, s.attn_out, Hv * Dv, deps({e_norm, e_z}));
-            e_attn = gemv_any(d.la_out, s.attn_out, s.moe_y, deps({e_gate}));
+            if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                // e_attn waits on the gather. The next layer's e_in waits on
+                // e_attn through e_h/e_moe, so a full-attention v_proj cannot
+                // overwrite s.bbuf while this projection still reads it.
+                auto eg=launch_gguf_ssm_out_gather(q,s.attn_out,s.bbuf,1,Hk,Hv,Dv,deps({e_gate}));
+                e_attn=gemv_any(d.la_out,s.bbuf,s.moe_y,deps({eg}));
+            }else e_attn=gemv_any(d.la_out,s.attn_out,s.moe_y,deps({e_gate}));
         } else {
             const int QD = d.q_proj.w.N;
             const bool gated = QD == 2 * cfg.n_heads * d.head_dim;
@@ -9744,7 +9887,10 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             else
             launch_rmsnorm_gate_silu(q, s.attn_out, s.zbuf, d.la_norm,
                                      Hv, Dv, cfg.rms_eps, none);
-            gemv_any(d.la_out, s.attn_out, s.moe_y, none);
+            if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                launch_gguf_ssm_out_gather(q,s.attn_out,s.bbuf,1,Hk,Hv,Dv,none);
+                gemv_any(d.la_out,s.bbuf,s.moe_y,none);
+            }else gemv_any(d.la_out,s.attn_out,s.moe_y,none);
         } else {
             const int QD = d.q_proj.output_rows();
             const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
@@ -10191,7 +10337,10 @@ const float* Grimoire::forward(int token) {
             }
             if (i == probe_layer) probe("L0 after gate", s.attn_out, Hv * Dv);
             MK("  rmsnorm + gate");
-            gemv_any(d.la_out, s.attn_out, s.moe_y, none);
+            if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                launch_gguf_ssm_out_gather(q,s.attn_out,s.bbuf,1,Hk,Hv,Dv,none);
+                gemv_any(d.la_out,s.bbuf,s.moe_y,none);
+            }else gemv_any(d.la_out,s.attn_out,s.moe_y,none);
             if (i == probe_layer) probe("L0 attn out", s.moe_y, H);
             MK("  out gemv");
         } else {
@@ -12882,6 +13031,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     float* mh     = df(size_t(M) * TK * MI);
     float* rlog   = df(size_t(M) * E);
     float* shout  = df(size_t(M) * H);
+    float* gguf_v_input = gguf_native_enabled(ck) ? df(size_t(M) * Hv * Dv) : nullptr;
     sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
     int8_t* a8    = sycl::malloc_device<int8_t>(size_t(M) * WX, q);
     float*  a8s   = df(size_t(M));
@@ -12914,6 +13064,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         (void*)lgt,
         (void*)bsel,(void*)idx,(void*)vis,(void*)sql,(void*)qps,(void*)pids,
         (void*)pemb,(void*)pkey,(void*)pval,(void*)pgat,(void*)pcnv};
+    if (gguf_native_enabled(ck)) mem.push_back(gguf_v_input);
     auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
     for (void* p : mem) if (!p) { cleanup(); return false; }
 
@@ -13104,7 +13255,11 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             else
             launch_rmsnorm_gate_silu(q, attn, t3, d.la_norm, M * Hv, Dv,
                                      eps, none);
-            mm(d.la_out, attn, pend);
+            if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                // The raw GGUF out projection expects tiled V-head columns.
+                launch_gguf_ssm_out_gather(q,attn,gguf_v_input,M,Hk,Hv,Dv);
+                mm(d.la_out,gguf_v_input,pend);
+            }else mm(d.la_out,attn,pend);
         } else {
             const int HD = d.head_dim, KVH = d.kv_heads;
             const bool gated = (d.q_proj.output_rows() == 2 * QH * HD);
@@ -13712,10 +13867,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     Xe2ChunkGdn xe2_gdn=load_xe2_chunk_gdn();
     Xe2ChunkGdnRaw xe2_gdn_raw=load_xe2_chunk_gdn_raw();
     OneDnnW4Api od=load_onednn_w4();
-    const bool parallel_prefill=!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_PREFILL") && xe2_dense_mxfp4;
-    const bool parallel_shared=!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_SHARED") && xe2_dense_mxfp4;
+    const bool parallel_prefill=!gguf_native_enabled(ck)&&!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_PREFILL") && xe2_dense_mxfp4;
+    const bool parallel_shared=!gguf_native_enabled(ck)&&!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_SHARED") && xe2_dense_mxfp4;
     const bool need_aux=parallel_prefill||parallel_shared;
-    const bool norm_bf_only=!tp_enabled() && M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
+    const bool norm_bf_only=!gguf_native_enabled(ck)&&!tp_enabled() && M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
         (!cfg.is_moe()||xe2_grouped_mxfp4)&&!need_aux;
     // Deferred gathering leaves the routed result permuted in moe_res and
     // makes the NEXT layer's input norm un-permute it
@@ -13733,13 +13888,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // sets GRIMOIRE_DEFER_MOE_GATHER=1, so this is a reachable launcher
     // configuration, not a dormant helper.
     bool all_layers_routed=cfg.is_moe();
+    bool all_moe_mxfp4=cfg.is_moe();
     {
         const int lb=pp_enabled()?pp_begin:0, le=pp_enabled()?pp_end:cfg.n_layers;
-        for(int li=lb;li<le&&all_layers_routed;++li)
-            if(!L[size_t(li)].moe_layer)all_layers_routed=false;
+        for(int li=lb;li<le;++li){
+            const auto& layer=L[size_t(li)];
+            if(!layer.moe_layer)all_layers_routed=false;
+            else if(layer.moe.gate_up.fmt!=Fmt::MXFP4 || layer.moe.down.fmt!=Fmt::MXFP4 ||
+                    !layer.moe.gate_up.payload || !layer.moe.down.payload)
+                all_moe_mxfp4=false;
+        }
     }
     const bool defer_moe_gather=std::getenv("GRIMOIRE_DEFER_MOE_GATHER")&&
-        cfg.is_moe()&&!cfg.is_k2&&all_layers_routed&&
+        cfg.is_moe()&&!cfg.is_k2&&all_layers_routed&&all_moe_mxfp4&&
         M>=32&&xe2_grouped_mxfp4&&norm_bf_only;
     // Dense Qwen has no routed experts (R=M, I=1) but its fused MLP projection
     // is much wider than H.  Size bridge scratch from every real projection,
@@ -13776,6 +13937,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                                                 size_t(M)*W),gdn_qkv_elems),
                                        attn_stage_elems);
     sycl_bf16* xperm=static_cast<sycl_bf16*>(pf_alloc(size_t(bridge_elems)*sizeof(sycl_bf16),false));
+    // The raw GGUF ssm_out blocks retain tiled V-head columns. Reorder only
+    // this projection's activation, after DeltaNet and its gate have finished.
+    const bool gguf_v_needed=gguf_native_enabled(ck);
+    float* gguf_v_f=gguf_v_needed?df(size_t(M)*Hv*Dv):nullptr;
+    sycl_bf16* gguf_v_bf=gguf_v_needed?static_cast<sycl_bf16*>(
+        pf_alloc(size_t(M)*Hv*Dv*sizeof(sycl_bf16),false)):nullptr;
     sycl_bf16* grouped_out=(xe2_grouped||xe2_grouped_mxfp4||xe2_dense_mxfp4||xe2_attention||xe2_gdn||od)
         ? static_cast<sycl_bf16*>(pf_alloc(size_t(std::max(std::max(Rpad*std::max(H,2*I),
               size_t(M)*W),gdn_tokens*size_t(Hv)*Dv))*sizeof(sycl_bf16),false)) : nullptr;
@@ -13806,6 +13973,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     sycl_bf16* aux_out=need_aux?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(M)*W)*sizeof(sycl_bf16),false)):nullptr;
     std::vector<void*> mem={bh,bn,r0,r1,t0,t1,t2,t3,t4,la_fused,xb,bn_bf,dtok,rex,rwt,rlog,mh,alpha,beta,moe_tab,
         xperm,yperm,ptoken,pinv};
+    if(gguf_v_needed){mem.push_back(gguf_v_f);mem.push_back(gguf_v_bf);}
     if (next_tokens) mem.push_back(batch_logits);
     if(a8){mem.push_back(a8);mem.push_back(a8s);}
     if(grouped_out)mem.push_back(grouped_out);
@@ -14319,13 +14487,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         const sycl_bf16* x_bf=bn_bf;
         if(x!=bn){launch_f32_to_bf16(q,x,xb,size_t(M)*w.w.K);x_bf=xb;}
-        if(!no_f32_dense && xe2_dense_mxfp4_f32 && w.w.fmt==Fmt::MXFP4){
+        if(!no_f32_dense && xe2_dense_mxfp4_f32 && w.w.fmt==Fmt::MXFP4
+           && w.w.payload && w.w.scales){
             xe2_dense_mxfp4_f32(&q,x_bf,w.w.payload,
                              static_cast<const unsigned char*>(w.w.scales),y,
                              M,w.w.N,w.w.K);
             return;
         }
-        if(xe2_dense_mxfp4 && grouped_out && w.w.fmt==Fmt::MXFP4){
+        if(xe2_dense_mxfp4 && grouped_out && w.w.fmt==Fmt::MXFP4
+           && w.w.payload && w.w.scales){
             xe2_dense_mxfp4(&q,x_bf,w.w.payload,
                              static_cast<const unsigned char*>(w.w.scales),grouped_out,
                              M,w.w.N,w.w.K);
@@ -14377,6 +14547,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             xe2_w4a8_f32(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
             return;
         }
+        if(!w.w.payload)
+            throw std::runtime_error("bf16 projection requires weight payload or W4A8 bridge");
+        if(w.w.fmt!=Fmt::MXFP4 || !w.w.scales || !xe2_dense_mxfp4_f32){
+            launch_gemm_xmx(q,w.w,x_bf,y,M);return;
+        }
         xe2_dense_mxfp4_f32(&q,x_bf,w.w.payload,
             static_cast<const unsigned char*>(w.w.scales),y,M,w.w.N,w.w.K);
     };
@@ -14390,6 +14565,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             xe2_w4a8_bf16(&q,a8,w.i4,w.i4s,a8s,y,M,w.w.N,w.w.K);
             return;
         }
+        if(w.w.fmt!=Fmt::MXFP4 || !w.w.payload || !w.w.scales || !xe2_dense_mxfp4)
+            throw std::runtime_error("bf16 bridge requires intact MXFP4 payload");
         xe2_dense_mxfp4(&q,x_bf,w.w.payload,
             static_cast<const unsigned char*>(w.w.scales),y,M,w.w.N,w.w.K);
     };
@@ -14401,6 +14578,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     };
     auto mm_aux=[&](const DevQuant& w,const float* x,float* y){
         launch_f32_to_bf16(q_aux,x,aux_xb,size_t(M)*w.w.K);
+        if(!w.w.payload)
+            throw std::runtime_error("aux projection requires weight payload");
+        if(w.w.fmt!=Fmt::MXFP4 || !w.w.scales)
+            return launch_gemm_xmx(q_aux,w.w,aux_xb,y,M);
         xe2_dense_mxfp4(&q_aux,aux_xb,w.w.payload,
             static_cast<const unsigned char*>(w.w.scales),aux_out,
             M,w.w.N,w.w.K);
@@ -14417,7 +14598,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(exact_verify) return false;
         // BesTLA prefill path: gate and up as two separate GEMMs (it has no fused
         // 2*inter weight), SwiGLU over the two halves of grouped_out, then down.
-        if(g_bestla_ready && layer>=0 && M>=g_bestla_min_m && grouped_out && xb){
+        if(!gguf_native_enabled(ck) && g_bestla_ready && layer>=0 && M>=g_bestla_min_m && grouped_out && xb){
             const int inter=gu.w.N/2;
             // BesTLA returns its own tensors; use them in place rather than copying.
             void *pg=nullptr,*pu=nullptr,*pd=nullptr;
@@ -14796,15 +14977,28 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(recurrence_bf){
                 launch_rmsnorm_gate_silu_bf16_io(
                     q,recurrence_bf,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
-                mmb(d.la_out,xb,r0);
+                if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                    launch_gguf_ssm_out_gather(q,xb,gguf_v_bf,M,Hk,Hv,Dv);
+                    mmb(d.la_out,gguf_v_bf,r0);
+                }else mmb(d.la_out,xb,r0);
             }else if(dense_pure && !d.la_out.has_i4()){
                 launch_rmsnorm_gate_silu_bf16_out(q,t0,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
+                const sycl_bf16* out_x=xb;
+                if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                    launch_gguf_ssm_out_gather(q,xb,gguf_v_bf,M,Hk,Hv,Dv);
+                    out_x=gguf_v_bf;
+                }
                 if(gemm_fast_supported(d.la_out.w,M)){
-                    launch_gemm_fast_residual(q,d.la_out.w,xb,bh,M);r0_in_h=true;
-                }else launch_gemm_xmx(q,d.la_out.w,xb,r0,M);
+                    launch_gemm_fast_residual(q,d.la_out.w,out_x,bh,M);r0_in_h=true;
+                }else launch_gemm_xmx(q,d.la_out.w,out_x,r0,M);
             }else{
                 launch_rmsnorm_gate_silu(q,t0,z_in,d.la_norm,M*Hv,Dv,cfg.rms_eps,{});
-                mm(d.la_out,t0,r0);
+                const float* out_x=t0;
+                if(d.la_out.w.fmt==Fmt::Q4_K || d.la_out.w.fmt==Fmt::Q6_K){
+                    launch_gguf_ssm_out_gather(q,t0,gguf_v_f,M,Hk,Hv,Dv);
+                    out_x=gguf_v_f;
+                }
+                mm(d.la_out,out_x,r0);
             }
             pp_mark("DN norm + output projection");
         }else{
@@ -15504,7 +15698,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
                 launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
-                if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
+                if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4 &&
+                   d.moe.down.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);
                     pp_mark("MoE device remap");

@@ -32,6 +32,8 @@
 //   INT4       asymmetric, per-group(128) bf16 scale+zero    4 bit/elem
 //   MXFP8      OCP Microscaling: E4M3 + E8M0 per 32          8.25 bit/elem
 //   MXFP4      OCP Microscaling: E2M1 + E8M0 per 32          4.25 bit/elem
+//   Q4_K       GGUF/ggml 256-element super-block             4.50 bit/elem
+//   Q6_K       GGUF/ggml 256-element super-block             6.5625 bit/elem
 //
 //  Every format decodes through one of two compute pipelines:
 //    PIPE_INT : INT8 / INT4  -> XMX int8 DPAS, int32 accumulator (2x rate)
@@ -229,7 +231,7 @@ inline uint8_t f32_to_e5m2(float v) {
 // Format enumeration and static traits
 // ---------------------------------------------------------------------
 enum class Fmt : uint8_t {
-    BF16 = 0, FP8_E4M3, FP8_E5M2, INT8, INT4, MXFP8, MXFP4
+    BF16 = 0, FP8_E4M3, FP8_E5M2, INT8, INT4, MXFP8, MXFP4, Q4_K, Q6_K
 };
 
 enum class Pipe : uint8_t { FLT, INT };   // which XMX datapath consumes it
@@ -283,6 +285,50 @@ template <> struct Traits<Fmt::MXFP4> {
     static constexpr int  bits_per_elem = 4;
     static constexpr const char* name = "mxfp4";
 };
+template <> struct Traits<Fmt::Q4_K> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 4;
+    static constexpr const char* name = "q4_k";
+};
+template <> struct Traits<Fmt::Q6_K> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 6;
+    static constexpr const char* name = "q6_k";
+};
+
+// GGML super-blocks carry their own scales. These functions are shared by
+// host tests and device kernels; no side scale array is involved.
+inline float decode_q4_k(const uint8_t* row, int k) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const uint8_t* p = row + (k / 256) * 144;
+    const int group = (k % 256) / 32, i = k % 32;
+    const uint8_t* s = p + 4;
+    int sc, m;
+    if (group < 4) { sc = s[group] & 63; m = s[group + 4] & 63; }
+    else {
+        sc = (s[group + 4] & 15) | ((s[group - 4] >> 2) & 48);
+        m = (s[group + 4] >> 4) | ((s[group] >> 2) & 48);
+    }
+    const float d = f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+    const float dm = f16_to_f32(uint16_t(p[2]) | (uint16_t(p[3]) << 8));
+    const int q = (p[16 + (group / 2) * 32 + i] >> ((group % 2) * 4)) & 15;
+    const float ds = d * float(sc), mins = dm * float(m);
+    return ds * float(q) - mins;
+}
+inline float decode_q6_k(const uint8_t* row, int k) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const uint8_t* p = row + (k / 256) * 210;
+    const int idx = k % 256, half = idx / 128, lane = (idx % 128) / 32, i = idx % 32;
+    const int low = (p[half * 64 + (lane % 2) * 32 + i] >> ((lane / 2) * 4)) & 15;
+    const int high = (p[128 + half * 32 + i] >> (lane * 2)) & 3;
+    const int q = (low | (high << 4)) - 32;
+    const float d = f16_to_f32(uint16_t(p[208]) | (uint16_t(p[209]) << 8));
+    return (d * float(int8_t(p[192 + idx / 16]))) * float(q);
+}
 
 // ---------------------------------------------------------------------
 // Element decode. `payload` points at the start of the row's packed
@@ -315,6 +361,8 @@ template <> inline float decode_elem<Fmt::MXFP4>(const uint8_t* p, int i, float 
     const uint8_t nib  = (i & 1) ? (byte >> 4) : (byte & 0x0F);
     return e2m1_to_f32(nib) * s;
 }
+template <> inline float decode_elem<Fmt::Q4_K>(const uint8_t* p, int i, float) { return decode_q4_k(p, i); }
+template <> inline float decode_elem<Fmt::Q6_K>(const uint8_t* p, int i, float) { return decode_q6_k(p, i); }
 // INT4 is asymmetric so it needs the zero point too; handled separately.
 inline float decode_int4(const uint8_t* p, int i, float scale, uint8_t zero) {
     const uint8_t byte = p[i >> 1];
@@ -345,6 +393,8 @@ inline int bytes_per_row(Fmt f, int K) {
         case Fmt::INT4:     return K / 2;
         case Fmt::MXFP8:    return K;            // scales in a side array
         case Fmt::MXFP4:    return K / 2;        // scales in a side array
+        case Fmt::Q4_K:     return K % 256 ? 0 : K / 256 * 144;
+        case Fmt::Q6_K:     return K % 256 ? 0 : K / 256 * 210;
     }
     return 0;
 }
@@ -352,6 +402,8 @@ inline int bytes_per_row(Fmt f, int K) {
 inline int scales_per_row(Fmt f, int K) {
     switch (f) {
         case Fmt::BF16:     return 0;
+        case Fmt::Q4_K:
+        case Fmt::Q6_K:     return 0;
         case Fmt::FP8_E4M3:
         case Fmt::FP8_E5M2:
         case Fmt::INT8:     return 1;            // one fp32 per output channel
@@ -371,6 +423,8 @@ inline double bits_per_elem(Fmt f) {
         case Fmt::INT4:     return 4.0 + 24.0 / kInt4Group;   // bf16 scale + u8 zero
         case Fmt::MXFP8:    return 8.0 + 8.0 / kMXBlock;
         case Fmt::MXFP4:    return 4.0 + 8.0 / kMXBlock;
+        case Fmt::Q4_K:     return 4.5;
+        case Fmt::Q6_K:     return 6.5625;
     }
     return 0.0;
 }
@@ -384,6 +438,8 @@ inline const char* fmt_name(Fmt f) {
         case Fmt::INT4:     return "int4";
         case Fmt::MXFP8:    return "mxfp8";
         case Fmt::MXFP4:    return "mxfp4";
+        case Fmt::Q4_K:     return "q4_k";
+        case Fmt::Q6_K:     return "q6_k";
     }
     return "?";
 }

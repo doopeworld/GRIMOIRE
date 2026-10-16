@@ -280,6 +280,35 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
     return true;
 }
 
+bool Qwen35Model::read_gguf_raw_rows(const TensorRef& r,uint8_t* dst,std::string& err,
+                                     uint64_t first,uint64_t count) const {
+    if(!gguf_file||!r.gguf||!dst){err="GGUF tensor source missing";return false;}
+    const auto& t=*r.gguf;
+    const uint64_t K=uint64_t(r.t.shape.back()),N=uint64_t(r.t.numel())/K;
+    if(!count)count=N-first;
+    if(first>N||count>N-first||t.ne[0]!=K){err="GGUF raw row shape mismatch: "+t.name;return false;}
+    if(K%256 || (t.type!=12 && t.type!=14)){
+        err="native GGUF requires Q4_K/Q6_K and K divisible by 256: "+t.name;return false;
+    }
+    const int nk=cfg.lin_k_heads,nv=cfg.lin_v_heads,dv=cfg.lin_v_dim,dk=cfg.lin_k_dim;
+    if(nk<=0||nv<=0||nv%nk){err="GGUF V-head geometry invalid";return false;}
+    const auto inv=r.gguf_inverse;
+    for(uint64_t i=0;i<count;++i){
+        uint64_t row=first+i;
+        if(inv==TensorRef::GGUFInverse::V_ROWS || inv==TensorRef::GGUFInverse::QKV_ROWS){
+            const uint64_t start=inv==TensorRef::GGUFInverse::V_ROWS?0:uint64_t(2)*nk*dk;
+            const uint64_t width=(t.name.find("ssm_alpha")!=std::string::npos||
+                                  t.name.find("ssm_beta")!=std::string::npos)?1:dv;
+            if(row>=start)row=start+gguf_v_tiled_index((row-start)/width,nk,nv)*width+
+                                  (row-start)%width;
+        }
+        if(r.gguf_expert>=0)row+=uint64_t(r.gguf_expert)*N;
+        if(row>=t.n_rows){err="GGUF raw row permutation out of bounds: "+t.name;return false;}
+        if(!gguf_file->read_raw_row(t,row,dst+i*t.row_bytes,err))return false;
+    }
+    return true;
+}
+
 bool Qwen35Model::read_gguf_f32(const TensorRef& r,float* dst,std::string& err,
                                 uint64_t first,uint64_t count) const {
     if(!gguf_file||!r.gguf||!dst){err="GGUF tensor source missing";return false;}

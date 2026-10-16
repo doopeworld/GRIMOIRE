@@ -1687,6 +1687,8 @@ sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
             case Fmt::INT4:     e = dispatch<Fmt::INT4, 4>(q, w, xm, ym, d, mc); break;
             case Fmt::MXFP8:    e = dispatch<Fmt::MXFP8, 4>(q, w, xm, ym, d, mc); break;
             case Fmt::MXFP4:    e = dispatch<Fmt::MXFP4, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::Q4_K:     e = dispatch<Fmt::Q4_K, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::Q6_K:     e = dispatch<Fmt::Q6_K, 4>(q, w, xm, ym, d, mc); break;
         }
     }
     return e;
@@ -1703,6 +1705,8 @@ sycl::event launch_gemv(sycl::queue& q, const QuantWeight& w,
         case Fmt::INT4:     return dispatch<Fmt::INT4>(q, w, x, y, deps);
         case Fmt::MXFP8:    return dispatch<Fmt::MXFP8>(q, w, x, y, deps);
         case Fmt::MXFP4:    return dispatch<Fmt::MXFP4>(q, w, x, y, deps);
+        case Fmt::Q4_K:     return dispatch<Fmt::Q4_K>(q, w, x, y, deps);
+        case Fmt::Q6_K:     return dispatch<Fmt::Q6_K>(q, w, x, y, deps);
     }
     return {};
 }

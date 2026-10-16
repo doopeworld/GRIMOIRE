@@ -58,6 +58,8 @@ struct QuantWeight {
     inline float scale_for(int n, int k) const {
         switch (fmt) {
             case Fmt::BF16:
+            case Fmt::Q4_K:
+            case Fmt::Q6_K:
                 return 1.0f;
             case Fmt::FP8_E4M3:
             case Fmt::FP8_E5M2:
@@ -103,6 +105,8 @@ struct QuantWeight {
             case Fmt::INT8:     return decode_elem<Fmt::INT8>(row, k, s);
             case Fmt::MXFP8:    return decode_elem<Fmt::MXFP8>(row, k, s);
             case Fmt::MXFP4:    return decode_elem<Fmt::MXFP4>(row, k, s);
+            case Fmt::Q4_K:     return decode_q4_k(row, k);
+            case Fmt::Q6_K:     return decode_q6_k(row, k);
             case Fmt::INT4:     return decode_int4(row, k, s, zero_for(n, k));
         }
         return 0.0f;

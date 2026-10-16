@@ -404,6 +404,8 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::MXFP4:    return dequant_vnni<Fmt::MXFP4>(q, w, dst, deps, ldn);
             case Fmt::INT8:     return dequant_vnni<Fmt::INT8>(q, w, dst, deps, ldn);
             case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps, ldn);
+            case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps, ldn);
+            case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps, ldn);
         }
         return {};
     }
@@ -421,6 +423,8 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::MXFP4:    return dequant_vnni_tiled<Fmt::MXFP4>(q, w, dst, deps);
             case Fmt::INT8:     return dequant_vnni_tiled<Fmt::INT8>(q, w, dst, deps);
             case Fmt::INT4:     return dequant_vnni_tiled<Fmt::INT4>(q, w, dst, deps);
+            case Fmt::Q4_K:     return dequant_vnni_tiled<Fmt::Q4_K>(q, w, dst, deps);
+            case Fmt::Q6_K:     return dequant_vnni_tiled<Fmt::Q6_K>(q, w, dst, deps);
         }
     }
     switch (w.fmt) {
@@ -431,6 +435,8 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
         case Fmt::MXFP4:    return dequant_vnni<Fmt::MXFP4>(q, w, dst, deps);
         case Fmt::INT8:     return dequant_vnni<Fmt::INT8>(q, w, dst, deps);
         case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps);
+        case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps);
+        case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps);
     }
     return {};
 }

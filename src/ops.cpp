@@ -2116,7 +2116,7 @@ static sycl::event mova_value_packed_impl(
                     float a = 0.0f;
                     for (int k = 0; k < K; ++k) {
                         float sc;
-                        if constexpr (F == Fmt::BF16) {
+                        if constexpr (F == Fmt::BF16 || F == Fmt::Q4_K || F == Fmt::Q6_K) {
                             sc = 1.0f;
                         } else if constexpr (F == Fmt::FP8_E4M3 ||
                                              F == Fmt::FP8_E5M2 ||
@@ -2164,6 +2164,8 @@ sycl::event launch_mova_value_packed(
         case Fmt::INT4:     return mova_value_packed_impl<Fmt::INT4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::MXFP8:    return mova_value_packed_impl<Fmt::MXFP8>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::MXFP4:    return mova_value_packed_impl<Fmt::MXFP4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q4_K:     return mova_value_packed_impl<Fmt::Q4_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q6_K:     return mova_value_packed_impl<Fmt::Q6_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
     }
     return {};
 }

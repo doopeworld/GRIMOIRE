@@ -1,6 +1,6 @@
 # GGUF format support — Ornith-1.5-35B-A3B (`qwen35moe`)
 
-Status: **specification; transforms VERIFIED against real tensor values (2026-10-15, §7).** Everything marked *(header)* was read from
+Status: **GGUF adapter and native Q4_K/Q6_K path implemented; B70 execution pending.** Transforms were verified against real tensor values (2026-10-15, §7). Everything marked *(header)* was read from
 the real GGUF headers (first 16 MiB of each file, fetched by HTTP range request on
 2026-10-15). Everything marked *(converter)* was read from llama.cpp's converter source at
 `ggml-org/llama.cpp@711780ffc75b` (`conversion/qwen.py`). Items marked **UNVERIFIED** must be
@@ -111,7 +111,7 @@ and `Qwen2MoeModel.modify_tensors`.
 | T1 | `A = -exp(A_log)` (l.396-397), stored F32; **verified exact** vs f32(-exp(bf16 A_log)) | `ssm_a` | Feed `A` directly where the engine computes `-exp(A_log)`; `A_log = log(-A)` is not bit-exact. Which form GRIMOIRE's DeltaNet consumes is checked in the adapter task. |
 | T2 | `w + 1` for every `*norm.weight` **except** `linear_attn.norm.weight` (l.402-403). **Verified: stored as exact f32(1 + w)** — NOT bf16-rounded (that hypothesis differs by up to 7.8e-3 and is the control) | `attn_norm`, `post_attention_norm`, `output_norm`, `attn_q_norm`, `attn_k_norm`, `nextn.{enorm,hnorm,shared_head_norm}` | GRIMOIRE applies `(1 + w)` in f32 (CLAUDE.md rule 11): use the GGUF value under the plain-`w` convention for these norms. Since f32(1+w) is exactly what the engine forms from the bf16 `w`, **exact token equality with the safetensors path is possible.** `ssm_norm` is NOT shifted (verified). |
 | T3 | `conv1d` squeezed `[C,1,4] → [C,4]` (l.400-401) | `ssm_conv1d` | ne = [4, 8192]: row per channel, 4 taps contiguous. |
-| T4 | **V-head reorder grouped → tiled** (`_reorder_v_heads`, l.454-646); applies because `num_k_heads (16) ≠ num_v_heads (32)`, `num_v_per_k = 2` | V rows of `attn_qkv` (rows 4096..8191); rows of `attn_gate` (z); rows of `ssm_alpha`, `ssm_beta`; `ssm_a`; `ssm_dt.bias`; V channels of `ssm_conv1d` (4096..8191); **columns** of `ssm_out` | Row-side (all but `ssm_out`): exact inverse = row permutation; for quantized tensors whole rows (blocks along K) move, lossless. **Column-side (`ssm_out`) cannot be undone on quantized blocks** (a 256-element block spans two 128-wide V heads). Options: (a) decode to f32 then permute (Strategy A only), or (b) run DeltaNet in tiled order — v-head `h` uses k-head `h % 16` instead of `h / 2` — and keep every tensor as stored. (b) needs a DeltaNet kernel flag. |
+| T4 | **V-head reorder grouped → tiled** (`_reorder_v_heads`, l.454-646); applies because `num_k_heads (16) ≠ num_v_heads (32)`, `num_v_per_k = 2` | V rows of `attn_qkv` (rows 4096..8191); rows of `attn_gate` (z); rows of `ssm_alpha`, `ssm_beta`; `ssm_a`; `ssm_dt.bias`; V channels of `ssm_conv1d` (4096..8191); **columns** of `ssm_out` | Row-side (all but `ssm_out`): exact inverse = row permutation; for quantized tensors whole rows (blocks along K) move, lossless. **Column-side (`ssm_out`) cannot be undone on quantized blocks** (a 256-element block spans two 128-wide V heads). Strategy A decodes and permutes columns at load. Native Q4_K/Q6_K keeps the blocks intact and gathers the grouped-order activation into tiled V-head order immediately before the `ssm_out` projection. |
 | T5 | `dt_bias` renamed to `dt_proj.bias` → GGUF `ssm_dt.bias` (l.398-399) | | name only (plus T4 permutation) |
 | T6 | Fused experts `gate_up_proj [E, 2I, H]` split: gate = rows `[0, I)`, up = rows `[I, 2I)` (`Qwen2MoeModel`, l.105-118) | `ffn_gate_exps`, `ffn_up_exps` | Concatenate gate then up per expert = GRIMOIRE's existing `[E*2I, H]` gate-then-up layout. `down_proj [E, H, I]` unchanged → `ffn_down_exps` ne [512, 2048, 256]. |
 
@@ -153,14 +153,19 @@ and must be checked against values (§7), not assumed.
 | `blk.L.ffn_down_exps.weight` | `… mlp.experts.down_proj` | |
 | `blk.40.*` (+ `nextn.*`) | `mtp.*` (one-layer MTP head) | MTP is optional (`GRIMOIRE_MTP`); map after the main path works |
 
-## 5. Quantization strategy (decision deferred to measurement)
+## 5. Quantization strategies
+
+**Phase 3 step 1 implementation:** `--proj native` preserves Q4_K/Q6_K
+blocks in device memory and decodes them in projection kernels. See
+[NATIVE_QK.md](NATIVE_QK.md) for storage, T4 handling and validation.
 
 - **Strategy A (load-time decode → `--proj`)**: reuses every existing kernel; the path to the
   correctness milestone. Requantizing Q4_K/Q6_K → MXFP4/INT4 is **lossy** and must pass an
   accuracy gate against the GGUF's own dequantized values, not just "generates text".
-- **Strategy B (native Q4_K/Q6_K kernels)**: needs a new runtime format in `Fmt`, decode GEMV,
-  small-M and large-M prefill GEMM, and grouped-expert variants, plus T4(b) in DeltaNet.
-  Chosen only if Phase 1 data says A cannot meet the gate.
+- **Strategy B (native Q4_K/Q6_K kernels)**: implemented as an opt-in path
+  with raw super-blocks, decode GEMV, prefill GEMM, MoE dispatch and an
+  `ssm_out` activation gather for T4(b). B70 compilation, generation, KLD
+  and throughput remain to be checked.
 
 ## 6. Tokenizer
 

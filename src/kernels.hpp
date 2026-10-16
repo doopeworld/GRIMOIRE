@@ -187,6 +187,8 @@ template <> struct GemvGeom<Fmt::FP8_E5M2> { static constexpr int EPL_DEFAULT = 
 template <> struct GemvGeom<Fmt::MXFP8>    { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 8; static constexpr int EPL_MAX = 32; };
 template <> struct GemvGeom<Fmt::MXFP4>    { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 32; };
 template <> struct GemvGeom<Fmt::INT4>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 4; static constexpr int EPL_MAX = 64; };
+template <> struct GemvGeom<Fmt::Q4_K>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+template <> struct GemvGeom<Fmt::Q6_K>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
 
 // Runtime knobs, read once from the environment.
 int gemv_epl_override();      // 0 = use per-format default

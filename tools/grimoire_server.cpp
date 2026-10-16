@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
     std::string model_dir, host = "0.0.0.0", dflash_model;
     b70::Fmt proj_fmt = b70::Fmt::INT4;
+    bool proj_explicit = false;
     int max_seq = 8192, port = 8000;
     bool defer_moe_gather = false, bf16_qkv = false, bf16_dn_qkv = false;
 
@@ -88,6 +89,7 @@ int main(int argc, char** argv) {
         if (a == "--model" && i + 1 < argc) model_dir = argv[++i];
         else if (a == "--proj" && i + 1 < argc) {
             const std::string v = argv[++i];
+            proj_explicit = true;
             if      (v == "int4")  proj_fmt = b70::Fmt::INT4;
             else if (v == "int8")  proj_fmt = b70::Fmt::INT8;
             else if (v == "mxfp4") proj_fmt = b70::Fmt::MXFP4;
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
             else if (v == "fp8" || v == "fp8_e4m3") proj_fmt = b70::Fmt::FP8_E4M3;
             else if (v == "fp8_e5m2") proj_fmt = b70::Fmt::FP8_E5M2;
             else if (v == "bf16")  proj_fmt = b70::Fmt::BF16;
+            else if (v == "native") { proj_fmt = b70::Fmt::MXFP4; setenv("GRIMOIRE_GGUF_NATIVE","1",1); }
             else { std::fprintf(stderr, "unknown --proj: %s\n", v.c_str()); return 1; }
         }
         else if (a == "--ctx" && i + 1 < argc) max_seq = std::atoi(argv[++i]);
@@ -108,6 +111,7 @@ int main(int argc, char** argv) {
             std::printf(
                 "grimoire-server -- OpenAI-compatible front end\n\n"
                 "  grimoire-server --model <dir> [--proj FORMAT] [--ctx N]\n"
+                "                  FORMAT includes native (GGUF Q4_K/Q6_K, MXFP4 base)\n"
                 "                  [--port N] [--host ADDR]\n"
                 "                  [--dflash-model <dir>]         speculative decode drafter\n"
                 "                  [--defer-moe-gather]           (Ornith only)\n"
@@ -116,6 +120,14 @@ int main(int argc, char** argv) {
                 "  they are MoE-specific and produce degenerate output on a dense model.\n");
             return 0;
         }
+    }
+    const char* gguf_native = std::getenv("GRIMOIRE_GGUF_NATIVE");
+    if (gguf_native && std::strcmp(gguf_native, "1") == 0) {
+        if (proj_explicit && proj_fmt != b70::Fmt::MXFP4) {
+            std::fprintf(stderr, "native GGUF requires --proj native or mxfp4 for other tensors\n");
+            return 1;
+        }
+        proj_fmt = b70::Fmt::MXFP4;
     }
     if (max_seq < 2 || port < 1 || port > 65535) {
         std::fprintf(stderr, "invalid --ctx or --port\n"); return 1;
