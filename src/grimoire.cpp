@@ -15698,7 +15698,32 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
                 launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
-                if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4 &&
+                const char* native_grouped_env=std::getenv("GRIMOIRE_MOE_NATIVE_GROUPED");
+                const bool native_grouped_on=!native_grouped_env || native_grouped_env[0]!='0';
+                if(native_grouped_on && !std::getenv("GRIMOIRE_MOE_GROUPED_OFF") &&
+                   !std::getenv("GRIMOIRE_MOE_HOST_ROUTE") &&
+                   cfg.top_k==8 && cfg.n_experts<=1024 && (H%8)==0 &&
+                   d.moe.gate_up.N==cfg.n_experts*2*I && d.moe.gate_up.K==H &&
+                   d.moe.down.N==cfg.n_experts*H && d.moe.down.K==I &&
+                   moe_native_qk_grouped_supported(d.moe.gate_up,2*I) &&
+                   moe_native_qk_grouped_supported(d.moe.down,H)){
+                    // The route kernel packs rows by expert and builds the same
+                    // padded (expert, 256-row tile) table as the MXFP4 path.
+                    // The native GEMM decodes one 16-K chunk per B tile writer,
+                    // then uses the grouped DPAS and fused SwiGLU epilogue.
+                    const int E=cfg.n_experts;
+                    int32_t* d_te=moe_tab; int32_t* d_tm=moe_tab+moe_tab_tiles;
+                    int32_t* d_off=moe_tab+2*moe_tab_tiles; int32_t* d_cnt=d_off+E;
+                    launch_moe_route_grouped(q,bn,rex,xperm,bn_bf,d_cnt,d_off,pinv,d_te,d_tm,
+                                             moe_tab_tiles,M,H,E,moe_grouped_rows());
+                    bn_bf_from_route=true;
+                    sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                    launch_moe_native_qk_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
+                                                 d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                    launch_moe_native_qk_grouped(q,d.moe.down,H,false,hb,yperm,
+                                                 d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                    launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
+                }else if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4 &&
                    d.moe.down.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
                                                 ptoken,pinv,M,H,cfg.n_experts);

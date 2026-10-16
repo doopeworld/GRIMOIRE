@@ -42,6 +42,7 @@
 #include "kernels.hpp"
 #include "int4_smallm.hpp"
 #include "b70/tiered_moe.hpp"
+#include "b70/native_qk_tile.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -1311,7 +1312,7 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
 // e*Ne + ..., and writes the same rows of the output.  The per-tile math
 // is gemm_mxfp4_fused's, unchanged.
 // ---------------------------------------------------------------------
-template <int EPI>
+template <int EPI, Fmt F = Fmt::MXFP4>
 sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
                                      const sycl_bf16* A, void* out,
                                      const int32_t* tile_e, const int32_t* tile_mb,
@@ -1344,6 +1345,8 @@ sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int N
             const int L = int(it.get_group(0));
             const int t = L / nNB, nb = L % nNB;
             const int e = tile_e[t], mb = tile_mb[t];
+            // Device-built tile tables pad unused entries with expert -1.
+            if constexpr (F != Fmt::MXFP4) { if (e < 0) return; }
             const int M = cnt[e];
             const int64_t rbase = off[e];
             const int s = lid / SG_SIZE, sm = s / SGN, sn = s % SGN;
@@ -1357,20 +1360,42 @@ sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int N
                 : nb * NC2 + dn;
             const int64_t grow = int64_t(e) * Ne + wrow;
             const uint8_t* prow = wc.payload + grow * wc.row_bytes;
-            const uint8_t* srow = static_cast<const uint8_t*>(wc.scales) + grow * wc.row_scales;
             uint32_t* bs = Bs.template get_multi_ptr<sycl::access::decorated::no>().get();
-            uint64_t pk = 0; uint8_t sb = 0;
+            uint64_t pk = 0; uint8_t sb = 0; int qk = 0;
+            float qk_scales[16], qk_mins[8];
+            int qk_block = -1;
             auto fetch = [&](int k) {
                 const int kb = k + dh * 16;
-                pk = *reinterpret_cast<const uint64_t*>(prow + (kb >> 1));
-                sb = srow[kb / kMXBlock];
+                if constexpr (F == Fmt::MXFP4) {
+                    const uint8_t* srow = static_cast<const uint8_t*>(wc.scales) + grow * wc.row_scales;
+                    pk = *reinterpret_cast<const uint64_t*>(prow + (kb >> 1));
+                    sb = srow[kb / kMXBlock];
+                } else {
+                    qk = kb;
+                    const int block = kb / 256;
+                    if (block != qk_block) {
+                        native_qk_block_scales<F>(
+                            prow + block * (F == Fmt::Q4_K ? 144 : 210),
+                            qk_scales, qk_mins);
+                        qk_block = block;
+                    }
+                }
             };
             auto decode = [&](int buf) {
-                const float sc = e8m0_to_f32(sb);
                 uint32_t* d = bs + buf * BT + dh * (KP / 2) * NC2 + dn;
-                #pragma unroll
-                for (int p = 0; p < 8; ++p)
-                    d[p * NC2] = mxfp4_pair_bf16(uint32_t(pk >> (8 * p)) & 0xFFu, sc);
+                if constexpr (F == Fmt::MXFP4) {
+                    const float sc = e8m0_to_f32(sb);
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                        d[p * NC2] = mxfp4_pair_bf16(uint32_t(pk >> (8 * p)) & 0xFFu, sc);
+                } else {
+                    float v[16];
+                    native_qk_tile_16_scaled<F>(prow, qk, qk_scales, qk_mins, v);
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                        d[p * NC2] = uint32_t(sycl::bit_cast<uint16_t>(bf16_rne(v[2 * p]))) |
+                            (uint32_t(sycl::bit_cast<uint16_t>(bf16_rne(v[2 * p + 1]))) << 16);
+                }
             };
             auto bcol = [&](int n) {
                 return EPI == 1 ? (n < 2 ? sn * (NC1 / 2) + n * TN
@@ -1891,6 +1916,25 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 // Grouped MoE entry points (see gemm_mxfp4_fused_grouped).  The host builds
 // the m-tile table in units of moe_grouped_rows() rows per tile.
 int moe_grouped_rows() { return MC2; }
+bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne) {
+    return (w.fmt == Fmt::Q4_K || w.fmt == Fmt::Q6_K) && w.payload &&
+           !w.scales && !w.zeros && Ne > 0 && Ne % NC2 == 0 &&
+           w.K > 0 && w.K % 256 == 0 && w.N % Ne == 0 &&
+           w.row_bytes == bytes_per_row(w.fmt, w.K);
+}
+sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+                                         bool swiglu, const sycl_bf16* A, void* out,
+                                         const int32_t* tile_e, const int32_t* tile_mb,
+                                         const int32_t* off, const int32_t* cnt, int T,
+                                         const std::vector<sycl::event>& deps) {
+    if (!moe_native_qk_grouped_supported(w, Ne))
+        throw std::runtime_error("launch_moe_native_qk_grouped: unsupported native QK weight or shape");
+    if (w.fmt == Fmt::Q4_K)
+        return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::Q4_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
+                      : gemm_mxfp4_fused_grouped<0, Fmt::Q4_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps);
+    return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::Q6_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
+                  : gemm_mxfp4_fused_grouped<0, Fmt::Q6_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps);
+}
 // Upload the ESIMD MoE kernels' byte -> bf16 table now: its first use waits
 // on the queue, which a queue recording a command graph refuses.
 void moe_esimd_warmup(sycl::queue& q) { (void)mxfp4_pair_lut(q); }

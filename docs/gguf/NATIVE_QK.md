@@ -63,7 +63,7 @@ Attention/router ESIMD and benchmarks in that grep do not read a `QuantWeight`.
 | `src/grimoire.cpp:11220-11264,12263-12293,13093-13113,14241-14293` | Draft, sandwich, Qwen4-Exp and main prefill small-M/bridge selections either check exact formats or call format-aware generic GEMV/XMX. |
 | `src/grimoire.cpp:13870-13904,14490-14586,14657-14670` | Native mode disables MXFP4-only parallel modes and norm shortcut. Dense/aux/BF16 bridges check format and payload; grouped FFN bridge checks both gate/up and down. |
 | `src/grimoire.cpp:14980-15000,15339,15471-15479` | Native `ssm_out` gathers before float or BF16 GEMM. Attention/router bridge uses MXFP4 predicate; native input takes generic GEMM. |
-| `src/grimoire.cpp:15628-15958` | Small-M and grouped MoE predicates require MXFP4 for both weights. Native weights take per-expert `slice_quant_rows` and XMX fallback; gate/up and down use their own `row_bytes`. Shared expert uses generic GEMM. |
+| `src/grimoire.cpp:15628-15958` | Small-M grouped predicates require MXFP4. At M >= 32 native Q4_K/Q6_K experts use the grouped QK path when both matrices and dimensions pass its guards; `GRIMOIRE_MOE_NATIVE_GROUPED=0` restores the per-expert reference. Shared expert uses generic GEMM. |
 | `src/grimoire.cpp:16033-16055` | Native lm_head misses the MXFP4/INT4/FP8-only batch shortcuts and reaches native GEMV for each row. |
 | `src/native_model.cpp:124-132` | `slice_quant_rows` advances payload by native `row_bytes` and touches side scales only when non-null. |
 | `src/quantize.cpp:83-110` | Generic quantizer explicitly refuses Q4_K/Q6_K; raw GGUF blocks enter through the native upload path. |
@@ -73,6 +73,33 @@ converted INT4 companion (`has_i4`) or exact MXFP4 plus payload and scales.
 The remaining oneDNN FP16 paths are Muse-only. `GRIMOIRE_FUSE_DN_PROJECTIONS`
 is excluded for GGUF at `src/grimoire.cpp:4861`. The `ssm_out` gather sites
 are `src/grimoire.cpp:9167,9891,10341,13260,14981-14998`.
+
+## Grouped native expert prefill
+
+At M >= 32, `launch_moe_route_grouped` sorts the top-8 routes on the device
+and builds the same padded 256-row tile table used by the MXFP4 grouped path.
+`launch_moe_native_qk_grouped` runs once for gate/up and once for down. It
+reuses the grouped joint-matrix DPAS tile and its fused SwiGLU epilogue; each
+matrix dispatches its own Q4_K or Q6_K format. The down result is fp32 and
+uses the existing weighted unpermute. Empty table entries have expert -1 and
+return before reading the weight or entering a work-group barrier.
+
+Each B-tile writer covers 16 K values of one output row. It resolves all
+Q4_K scales/mins or Q6_K signed scales once when it enters a 256-value
+super-block, then uses the cached values for every 16-value slice of that
+block. It rounds decoded values to bf16 RNE in the same VNNI pair layout as
+the MXFP4 tile. Two B-tile writers cover the two halves of each 32-K step.
+The grouped path requires exact native formats, payloads without side scales,
+K divisible by 256, output width divisible by 256, the expected expert matrix
+shapes, top_k 8, and at most 1024 experts. A failed guard takes the existing
+per-expert path. `GRIMOIRE_MOE_NATIVE_GROUPED=0` selects that reference for
+B70 A/B; `GRIMOIRE_MOE_GROUPED_OFF=1` also disables grouped dispatch.
+
+The host test checks the VNNI pair layout against `gguf_dequantize` rounded
+to bf16, checks cached decoding across two super-blocks, and compares a small
+grouped top-k/SwiGLU/down reference with independent per-expert dequant and
+matmul for Q4_K gate/up with both Q4_K and Q6_K down. No SYCL compiler is
+available on the Mac; compile and measure this kernel on the B70.
 
 ## Validation
 

@@ -441,6 +441,13 @@ sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int row
 // the host lists the (expert, m-tile) pairs, moe_grouped_rows() rows each.
 // swiglu: w holds [gate; up] per expert and out is bf16 h [rows][Ne/2].
 int moe_grouped_rows();
+// Native GGUF Q4_K/Q6_K grouped DPAS path. Each matrix has its own format.
+// Gate/up writes bf16 SwiGLU rows; down writes fp32 rows.
+bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne);
+sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+    bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
+    const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
+    const std::vector<sycl::event>& deps = {});
 void moe_esimd_warmup(sycl::queue& q);
 bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne);
 // True when launch_moe_mxfp4_grouped takes the ESIMD kernel, which also skips

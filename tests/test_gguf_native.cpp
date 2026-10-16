@@ -4,12 +4,14 @@
 #include "b70/gguf_decode.hpp"
 #include "b70/gguf_qwen35.hpp"
 #include "b70/native_model.hpp"
+#include "b70/native_qk_tile.hpp"
 #include "gguf/test_writer.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
 #include <vector>
 #include <unistd.h>
 
@@ -58,6 +60,24 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
         uint32_t golden=u32(file.data()+16+raw_size+(size_t(n)*K+k)*4);
         CHECK(f32_to_bits(got)==golden);
     }
+    // The grouped GEMM's B tile is [K/2][256][2] bf16 VNNI. Exercise all
+    // scale/min groups and a nonzero N column against the independent decoder.
+    for(int n=0;n<N;++n){
+        std::vector<uint32_t> tile(size_t(K/2)*256,0xdeadbeefu);
+        for(int k=0;k<K;k+=16){
+            if(fmt==Fmt::Q4_K)
+                native_qk_tile_16_vnni<Fmt::Q4_K>(w.payload+size_t(n)*block_bytes,k,
+                                                    tile.data()+size_t(k/2)*256,256,7);
+            else
+                native_qk_tile_16_vnni<Fmt::Q6_K>(w.payload+size_t(n)*block_bytes,k,
+                                                    tile.data()+size_t(k/2)*256,256,7);
+        }
+        for(int p=0;p<K/2;++p){
+            const uint32_t expected=uint32_t(f32_to_bf16(decoded[size_t(n)*K+2*p]).bits) |
+                (uint32_t(f32_to_bf16(decoded[size_t(n)*K+2*p+1]).bits)<<16);
+            CHECK(tile[size_t(p)*256+7]==expected);
+        }
+    }
     // GEMV and GEMM references read the checked-in independent f32 golden,
     // while the runtime operand reads the original compressed device layout.
     constexpr int M=3;
@@ -79,6 +99,22 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
     for(int k=0;k<512;++k)
         CHECK(f32_to_bits(wide.at(0,k))==u32(file.data()+16+raw_size+
               size_t(k/256)*256*4+size_t(k%256)*4));
+    for(int block=0;block<2;++block){
+        float scales[16],mins[8];
+        if(fmt==Fmt::Q4_K)
+            native_qk_block_scales<Fmt::Q4_K>(two.data()+size_t(block)*block_bytes,scales,mins);
+        else
+            native_qk_block_scales<Fmt::Q6_K>(two.data()+size_t(block)*block_bytes,scales,mins);
+        for(int k=block*256;k<(block+1)*256;k+=16){
+            float values[16];
+            if(fmt==Fmt::Q4_K)
+                native_qk_tile_16_scaled<Fmt::Q4_K>(two.data(),k,scales,mins,values);
+            else
+                native_qk_tile_16_scaled<Fmt::Q6_K>(two.data(),k,scales,mins,values);
+            for(int i=0;i<16;++i)
+                CHECK(f32_to_bf16(values[i]).bits==f32_to_bf16(wide.at(0,k+i)).bits);
+        }
+    }
 }
 
 static void gather_test(){
@@ -132,12 +168,104 @@ static void raw_row_test(Fmt fmt,uint32_t type,int row_bytes){
     CHECK(bytes_per_row(fmt,K)==row_bytes);
     ::unlink(path.c_str());
 }
+
+struct HostQK {
+    Fmt fmt;
+    int N,K,rb;
+    std::vector<uint8_t> raw;
+    std::vector<float> independent;
+    std::vector<bf16_t> tile;
+};
+static HostQK host_qk(Fmt fmt,int N,int K){
+    const bool q4=fmt==Fmt::Q4_K;
+    const char* name=q4?"Q4_K":"Q6_K";
+    std::ifstream in(std::string("tests/gguf/data/")+name+".bin",std::ios::binary);
+    CHECK(bool(in));
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),{});
+    const int rb=q4?144:210, src_rows=int(u32(file.data()+8))/256;
+    HostQK w{fmt,N,K,rb,{},{},{}};
+    w.raw.resize(size_t(N)*rb*(K/256));
+    for(int n=0;n<N;++n)for(int b=0;b<K/256;++b)
+        std::memcpy(w.raw.data()+(size_t(n)*(K/256)+b)*rb,
+                    file.data()+16+size_t((n+b)%src_rows)*rb,rb);
+    w.independent.resize(size_t(N)*K);
+    std::string err;
+    CHECK(gguf_dequantize(q4?12:14,w.raw.data(),size_t(N)*K,w.independent.data(),err));
+    w.tile.resize(size_t(N)*K);
+    for(int n=0;n<N;++n)for(int b=0;b<K;b+=16){
+        uint32_t packed[8];
+        if(q4) native_qk_tile_16_vnni<Fmt::Q4_K>(w.raw.data()+size_t(n)*rb*(K/256),
+                                                  b,packed,1,0);
+        else native_qk_tile_16_vnni<Fmt::Q6_K>(w.raw.data()+size_t(n)*rb*(K/256),
+                                                b,packed,1,0);
+        for(int p=0;p<8;++p){
+            w.tile[size_t(n)*K+b+2*p]={uint16_t(packed[p])};
+            w.tile[size_t(n)*K+b+2*p+1]={uint16_t(packed[p]>>16)};
+        }
+    }
+    return w;
+}
+static float host_w(const HostQK& w,int n,int k,bool grouped){
+    const size_t i=size_t(n)*w.K+k;
+    return bf16_to_f32(grouped?w.tile[i]:f32_to_bf16(w.independent[i]));
+}
+static std::vector<float> host_moe(const HostQK& gu,const HostQK& dn,bool grouped){
+    constexpr int E=3,TOP=2,H=256,I=256,M=4,R=M*TOP;
+    const int routes[R]={2,0,1,2,0,1,2,1};
+    const float weights[R]={0.7f,0.3f,0.4f,0.6f,0.2f,0.8f,0.5f,0.5f};
+    std::vector<bf16_t> x(size_t(M)*H);
+    for(int m=0;m<M;++m)for(int k=0;k<H;++k)
+        x[size_t(m)*H+k]=f32_to_bf16(float((m*17+k*3)%37-18)/1024.0f);
+    int order[R],inverse[R];
+    if(grouped){
+        int count[E]={},off[E+1]={},next[E];
+        for(int r=0;r<R;++r)++count[routes[r]];
+        for(int e=0;e<E;++e)off[e+1]=off[e]+count[e];
+        std::copy(off,off+E,next);
+        for(int r=0;r<R;++r){const int p=next[routes[r]]++;order[p]=r;inverse[r]=p;}
+    }else for(int r=0;r<R;++r){order[r]=r;inverse[r]=r;}
+    std::vector<float> rows(size_t(R)*H),out(size_t(M)*H,0.0f);
+    for(int p=0;p<R;++p){
+        const int r=order[p],e=routes[r],m=r/TOP;
+        std::vector<bf16_t> hidden(I);
+        for(int j=0;j<I;++j){
+            float gate=0,up=0;
+            for(int k=0;k<H;++k){
+                const float a=bf16_to_f32(x[size_t(m)*H+k]);
+                gate+=a*host_w(gu,e*2*I+j,k,grouped);
+                up+=a*host_w(gu,e*2*I+I+j,k,grouped);
+            }
+            hidden[j]=f32_to_bf16((gate/(1.0f+std::exp(-gate)))*up);
+        }
+        for(int j=0;j<H;++j){
+            float v=0;
+            for(int k=0;k<I;++k)
+                v+=bf16_to_f32(hidden[k])*host_w(dn,e*H+j,k,grouped);
+            rows[size_t(p)*H+j]=v;
+        }
+    }
+    for(int r=0;r<R;++r)for(int j=0;j<H;++j)
+        out[size_t(r/TOP)*H+j]+=weights[r]*rows[size_t(inverse[r])*H+j];
+    return out;
+}
+static void grouped_moe_test(){
+    constexpr int E=3,H=256,I=256;
+    const HostQK gu=host_qk(Fmt::Q4_K,E*2*I,H);
+    for(const Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
+        const HostQK dn=host_qk(fmt,E*H,I);
+        const auto grouped=host_moe(gu,dn,true),per_expert=host_moe(gu,dn,false);
+        for(size_t i=0;i<grouped.size();++i)
+            CHECK(std::fabs(grouped[i]-per_expert[i])<=
+                  1e-5f*std::max(1.0f,std::fabs(per_expert[i])));
+    }
+}
 int main(){
     format_test(Fmt::Q4_K,12,"Q4_K",144);
     format_test(Fmt::Q6_K,14,"Q6_K",210);
     gather_test();
     raw_row_test(Fmt::Q4_K,12,144);
     raw_row_test(Fmt::Q6_K,14,210);
+    grouped_moe_test();
     std::printf("GGUF native: %d assertions, %d failures\n",checked,bad);
     return bad?1:0;
 }
