@@ -385,7 +385,15 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
     // single-codepoint numbers). Other pre names select different regexes.
     if ((!sentencepiece_ && pre!="qwen35") ||
         (sentencepiece_ && !pre.empty() && pre!="default")) {
-        err="unsupported tokenizer.ggml.pre: "+(pre.empty()?"<missing>":pre); return false;
+        std::string why;
+        if (!sentencepiece_ && (pre=="qwen2"||pre=="deepseek-r1-qwen"||pre=="kormo"||pre=="f2llmv2"||
+                                pre=="llama3"||pre=="llama-v3"||pre=="llama-bpe"||pre=="smaug-bpe"||
+                                pre=="dbrx"||pre=="falcon3"||pre=="falcon-h1"||pre=="pixtral"||
+                                pre=="midm-2.0"||pre=="lfm2"||pre=="chatglm-bpe"))
+            why=" (llama.cpp's regex for it uses \\p{L} without \\p{M}; this splitter's letter "
+                "class includes marks and has no Unicode mark table, so it would differ on "
+                "combining characters)";
+        err="unsupported tokenizer.ggml.pre: "+(pre.empty()?"<missing>":pre)+why; return false;
     }
     const GGUFValue *v=nullptr,*types=nullptr;
     if (!file.get_array("tokenizer.ggml.tokens",v,err)) return false;

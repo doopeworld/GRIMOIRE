@@ -14,8 +14,13 @@
 #include <vector>
 
 int main() {
+    // Defaults point at the reference material under .ref/ (tokenizer.json is
+    // the HF reference for this vocabulary); each is overridable by env var.
     const char* env = std::getenv("GRIMOIRE_TOKENIZER_DIR");
-    const std::string dir = env && *env ? env : "/tmp/toktest";
+    std::string dir = env && *env ? env : ".ref";
+    if (!(env && *env) && !std::ifstream(dir + "/tokenizer.json", std::ios::binary).good() &&
+        std::ifstream("/tmp/toktest/tokenizer.json", std::ios::binary).good())
+        dir = "/tmp/toktest";
     std::ifstream model(dir + "/tokenizer.json", std::ios::binary);
     if (!model) {
         std::printf("SKIP tokenizer HF goldens: %s/tokenizer.json absent\n", dir.c_str());
@@ -31,11 +36,10 @@ int main() {
     b70::Tokenizer gguf_tokenizer;
     b70::GGUFFile gguf;
     const char* header_env=std::getenv("GRIMOIRE_GGUF_HEADER");
-    const char* home=std::getenv("HOME");
-    const std::string header=header_env&&*header_env ? header_env :
-        (home ? std::string(home) : std::string("/tmp"))+
-        "/Desktop/gguf-ref/hdr/q38-UD-Q4_K_XL.bin";
+    const std::string header=header_env&&*header_env ? header_env : ".ref/q38-UD-Q4_K_XL.bin";
     const bool have_gguf=std::ifstream(header,std::ios::binary).good();
+    if (!have_gguf)
+        std::printf("SKIP GGUF-built tokenizer checks: %s absent (GRIMOIRE_GGUF_HEADER)\n",header.c_str());
     if (have_gguf) {
         if (!gguf.open(header,error,true) || !gguf_tokenizer.load_gguf(gguf,error)) {
             std::fprintf(stderr,"GGUF tokenizer load failed: %s\n",error.c_str());return 1;
@@ -109,7 +113,34 @@ int main() {
                 byte, b70::json_dump_string(context).c_str());
             return 1;
         }
-        std::printf("PASS %s: %zu HF ids identical\n", name.c_str(), actual.size());
+        std::printf("PASS %s: %zu HF ids identical%s\n", name.c_str(), actual.size(),
+                    have_gguf ? " (GGUF-built tokenizer too)" : "");
+    }
+    // The tokenizer.json path is verified equal to HF on wiki.test.raw
+    // (297,193 tokens); the GGUF-built tokenizer must give exactly the same ids.
+    if (have_gguf) {
+        const char* wiki_env=std::getenv("GRIMOIRE_WIKI_RAW");
+        const std::string wiki_path=wiki_env&&*wiki_env ? wiki_env : ".ref/wiki.test.raw";
+        std::ifstream wf(wiki_path, std::ios::binary);
+        if (!wf) {
+            std::printf("SKIP GGUF vs tokenizer.json on wiki: %s absent (GRIMOIRE_WIKI_RAW)\n",wiki_path.c_str());
+        } else {
+            const std::string wiki((std::istreambuf_iterator<char>(wf)), {});
+            const std::vector<int32_t> a = tokenizer.encode(wiki), g = gguf_tokenizer.encode(wiki);
+            size_t i = 0;
+            while (i < a.size() && i < g.size() && a[i] == g[i]) ++i;
+            if (i != a.size() || i != g.size()) {
+                std::fprintf(stderr,"FAIL GGUF vs tokenizer.json on %s: first divergence at %zu "
+                             "(json %zu ids, GGUF %zu ids)\n",wiki_path.c_str(),i,a.size(),g.size());
+                return 1;
+            }
+            std::printf("PASS GGUF-built tokenizer == tokenizer.json on %s: %zu ids\n",
+                        wiki_path.c_str(), a.size());
+            if (!(wiki_env&&*wiki_env) && a.size()!=297193) {
+                std::fprintf(stderr,"FAIL expected 297193 ids on default wiki.test.raw, got %zu\n",a.size());
+                return 1;
+            }
+        }
     }
     return 0;
 }
