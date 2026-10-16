@@ -106,7 +106,11 @@ static void golden_tests() {
         float out[2]{};std::string err;
         CHECK(gguf_dequantize(0,raw.data(),2,out,err) && out[0]==1.0f && out[1]==-0.5f);
     }
-    for(const char* name:{"Q8_0","Q4_K","Q5_K","Q6_K","F16","BF16"}) {
+    for(const char* name:{"F32","F16","BF16","F64","I8","I16","I32","I64",
+            "Q4_0","Q4_1","Q5_0","Q5_1","Q8_0","Q8_1","Q2_K","Q3_K","Q4_K",
+            "Q5_K","Q6_K","Q8_K","IQ1_S","IQ1_M","IQ2_XXS","IQ2_XS","IQ2_S",
+            "IQ3_XXS","IQ3_S","IQ4_NL","IQ4_XS","TQ1_0","TQ2_0","MXFP4",
+            "NVFP4","Q1_0","Q2_0"}) {
         std::string path=std::string("tests/gguf/data/")+name+".bin";
         std::ifstream in(path,std::ios::binary);
         if(!in) {std::fprintf(stderr,"MISSING GGUF golden file: %s; run /tmp/gguf-golden-venv/bin/python tests/gguf/gen_golden.py\n",path.c_str());++failures;continue;}
@@ -115,7 +119,7 @@ static void golden_tests() {
         uint32_t type=get32(b,4),n=get32(b,8),raw_size=get32(b,12);
         CHECK(b.size()==16ull+raw_size+4ull*n);if(b.size()!=16ull+raw_size+4ull*n)continue;
         std::vector<float> out(n);
-        std::string err;CHECK(gguf_dequantize(type,b.data()+16,n,out.data(),err));
+        std::string err;CHECK(gguf_dequantize(type,b.data()+16,n,out.data(),err,"test.weight"));
         for(uint32_t i=0;i<n;++i) if(std::memcmp(&out[i],b.data()+16+raw_size+4ull*i,4)!=0) {
             float expected;std::memcpy(&expected,b.data()+16+raw_size+4ull*i,4);
             std::fprintf(stderr,"golden mismatch %s[%u]: got %.9g expected %.9g\n",name,i,out[i],expected);
@@ -123,6 +127,7 @@ static void golden_tests() {
         }
     }
     float out[32]{};uint8_t bytes[34]{};std::string err;
-    CHECK(!gguf_dequantize(2,bytes,32,out,err) && err.find("unsupported")!=std::string::npos);
+    CHECK(!gguf_dequantize(99,bytes,32,out,err) && err.find("unknown")!=std::string::npos);
+    CHECK(!gguf_dequantize(24,bytes,1,out,err,"tokenizer.ids") && err.find("tokenizer.ids")!=std::string::npos);
 }
 int main() {parse_tests();golden_tests();std::printf("GGUF: %d assertions, %d failures\n",cases,failures);return failures?1:0;}
