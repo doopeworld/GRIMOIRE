@@ -5,6 +5,7 @@
 #include "b70/gguf_qwen35.hpp"
 #include "b70/native_model.hpp"
 #include "b70/native_qk_tile.hpp"
+#include "b70/native_qk_gemv.hpp"
 #include "gguf/test_writer.hpp"
 #include <cmath>
 #include <cstdio>
@@ -206,6 +207,67 @@ static HostQK host_qk(Fmt fmt,int N,int K){
     }
     return w;
 }
+template <Fmt F, int MB>
+static void fast_gemv_case(int K,int mc){
+    constexpr int N=3;
+    const HostQK w=host_qk(F,N,K);
+    std::vector<float> x(size_t(MB)*K);
+    for(int m=0;m<mc;++m)for(int k=0;k<K;++k)
+        x[size_t(m)*K+k]=float(((k*37+m*53+k/256*11)%211)-105)/173.0f;
+    const float* xp[MB];
+    for(int m=0;m<MB;++m)xp[m]=x.data()+size_t(m)*K;
+    for(int n=0;n<N;++n){
+        const uint8_t* row=w.raw.data()+size_t(n)*w.rb*(K/256);
+        float got[MB]={};
+        for(int lane=0;lane<16;++lane){
+            float part[MB]={};
+            native_qk_row_lane<F,MB>(row,xp,K,lane,mc,part);
+            for(int m=0;m<mc;++m)got[m]+=part[m];
+        }
+        for(int m=0;m<mc;++m){
+            float ref=0.0f;
+            for(int k=0;k<K;++k)
+                ref=std::fma(w.independent[size_t(n)*K+k],x[size_t(m)*K+k],ref);
+            CHECK(std::fabs(got[m]-ref)<=2e-3f*std::max(1.0f,std::fabs(ref)));
+        }
+    }
+}
+static void fast_gemv_test(){
+    for(int K:{512,2048,17408}){
+        fast_gemv_case<Fmt::Q4_K,1>(K,1);
+        fast_gemv_case<Fmt::Q6_K,1>(K,1);
+    }
+    fast_gemv_case<Fmt::Q4_K,4>(2048,4);
+    fast_gemv_case<Fmt::Q6_K,4>(2048,4);
+    // Isolate the terms a decoder can accidentally omit: Q4_K's dmin
+    // subtraction and Q6_K's signed -32 offset.
+    for(Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
+        std::vector<uint8_t> block(fmt==Fmt::Q4_K?144:210,0);
+        const float expected=fmt==Fmt::Q4_K?-16.0f:-512.0f;
+        if(fmt==Fmt::Q4_K){
+            block[0]=0x00;block[1]=0x3c; // d=1
+            block[2]=0x00;block[3]=0x38; // dmin=0.5
+            block[4]=1;block[8]=1;       // first group scale=1, min=1
+        }else{
+            block[192]=1;block[208]=0x00;block[209]=0x3c; // sc0=1, d=1
+        }
+        float x[256],out[256];std::fill(x,x+256,1.0f);
+        std::string err;
+        CHECK(gguf_dequantize(fmt==Fmt::Q4_K?12:14,block.data(),256,out,err));
+        float ref=0.0f;for(int k=0;k<256;++k)ref+=out[k]*x[k];
+        float fast=0.0f;const float* xp[1]={x};
+        for(int lane=0;lane<16;++lane){
+            float part=0.0f;
+            if(fmt==Fmt::Q4_K)
+                native_qk_row_lane<Fmt::Q4_K,1>(block.data(),xp,256,lane,1,&part);
+            else
+                native_qk_row_lane<Fmt::Q6_K,1>(block.data(),xp,256,lane,1,&part);
+            fast+=part;
+        }
+        CHECK(ref==expected);
+        CHECK(fast==expected);
+    }
+}
 static float host_w(const HostQK& w,int n,int k,bool grouped){
     const size_t i=size_t(n)*w.K+k;
     return bf16_to_f32(grouped?w.tile[i]:f32_to_bf16(w.independent[i]));
@@ -311,6 +373,7 @@ int main(){
     raw_row_test(Fmt::Q4_K,12,144);
     raw_row_test(Fmt::Q6_K,14,210);
     grouped_moe_test();
+    fast_gemv_test();
     dense_ffn_raw_test(Fmt::Q4_K,12);
     dense_ffn_raw_test(Fmt::Q6_K,14);
     std::printf("GGUF native: %d assertions, %d failures\n",checked,bad);

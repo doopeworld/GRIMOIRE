@@ -30,6 +30,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <limits>
 #include "kernels.hpp"
+#include "gemv_step.hpp"
 #include <climits>
 #include <cmath>
 #include <limits>
@@ -2093,6 +2094,11 @@ static sycl::event mova_value_packed_impl(
         int M, int N, int E, int top_k,
         const std::vector<sycl::event>& deps) {
     const int K = w.K;
+    const bool fast = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return native_qk_fast_weight<F>(w);
+        return false;
+    }();
     constexpr int WG = 128;
     const size_t total  = size_t(M) * size_t(N);
     const size_t groups = (total + WG - 1) / WG;
@@ -2114,6 +2120,19 @@ static sycl::event mova_value_packed_impl(
                     const int64_t row = int64_t(e) * N + n;
                     const uint8_t* rp = wc.payload + row * wc.row_bytes;
                     float a = 0.0f;
+                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                        if (fast) {
+                            const float* xp[1] = {xr};
+                            for (int lane = 0; lane < (F == Fmt::Q4_K ? 8 : 16); ++lane) {
+                                float partial = 0.0f;
+                                native_qk_row_lane<F, 1>(rp, xp, K, lane, 1, &partial);
+                                a += partial;
+                            }
+                        } else {
+                            for (int k = 0; k < K; ++k)
+                                a = sycl::fma(decode_elem<F>(rp, k, 1.0f), xr[k], a);
+                        }
+                    } else {
                     for (int k = 0; k < K; ++k) {
                         float sc;
                         if constexpr (F == Fmt::BF16 || F == Fmt::Q4_K || F == Fmt::Q6_K) {
@@ -2139,6 +2158,7 @@ static sycl::event mova_value_packed_impl(
                             wv = decode_elem<F>(rp, k, sc);
                         }
                         a = sycl::fma(wv, xr[k], a);
+                    }
                     }
                     // silu THEN weight, matching launch_silu_scale_accum:
                     // the router weight scales the activated expert output,

@@ -42,7 +42,7 @@ bin/test_gguf_qwen35: tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) include/b70/g
 test_gguf_qwen35: bin/test_gguf_qwen35
 	./bin/test_gguf_qwen35
 
-bin/test_gguf_native: tests/test_gguf_native.cpp $(HOST_MODEL_SRC) include/b70/weights.hpp include/b70/native_model.hpp include/b70/gguf_qwen35.hpp
+bin/test_gguf_native: tests/test_gguf_native.cpp $(HOST_MODEL_SRC) include/b70/weights.hpp include/b70/native_model.hpp include/b70/gguf_qwen35.hpp include/b70/native_qk_gemv.hpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tests/test_gguf_native.cpp $(HOST_MODEL_SRC) -o $@
 

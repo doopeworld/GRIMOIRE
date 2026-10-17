@@ -1181,9 +1181,70 @@ bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
 }
 } // namespace
 
+// Native GGUF decode: one 16-lane sub-group owns R rows. Eight Q4_K lanes
+// or all sixteen Q6_K lanes stream 16-byte quant chunks per block and use
+// the normal sub-group reduction. The four-row
+// variant exposes 32 independent weight rows per work-group; the M=4
+// variant keeps one row and applies each loaded block to four x rows.
+template <Fmt F, int MB>
+sycl::event gemv_native_qk(sycl::queue& q, const QuantWeight& w,
+                          const float* x, float* y,
+                          const std::vector<sycl::event>& deps, int mc = 1) {
+    static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
+    constexpr int R = MB == 1 ? ROWS_PER_SG : 1;
+    constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+    constexpr int ROWS = WG_SUBGROUPS * R;
+    const int blocks = (w.N + ROWS - 1) / ROWS;
+    const int cap = gemv_cap();
+    const int groups = cap > 0 ? std::min(blocks, cap) : blocks;
+    return q.submit([&](sycl::handler& hc) {
+        hc.depends_on(deps);
+        const QuantWeight wc = w;
+        hc.parallel_for(
+            sycl::nd_range<1>(size_t(groups) * WG_SUBGROUPS * SG_SIZE,
+                              WG_SUBGROUPS * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int sgid = int(sg.get_group_id()[0]);
+                const float* xp[MB];
+                #pragma unroll
+                for (int m = 0; m < MB; ++m) xp[m] = x + int64_t(m) * wc.K;
+                for (int blk = int(it.get_group(0)); blk < blocks;
+                     blk += int(it.get_group_range(0))) {
+                    const int first = blk * ROWS + sgid * R;
+                    float acc[R][MB] = {};
+                    for (int base = 0; base < wc.K; base += 256) {
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            const int n = first + r;
+                            if (n >= wc.N) continue;
+                            const uint8_t* p = wc.payload + int64_t(n) * wc.row_bytes
+                                             + int64_t(base / 256) * BYTES;
+                            native_qk_block_lane<F, MB>(p, xp, base, lane, mc, acc[r]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const int n = first + r;
+                        #pragma unroll
+                        for (int m = 0; m < MB; ++m) {
+                            if (m >= mc) break;
+                            const float v = sycl::reduce_over_group(sg, acc[r][m], sycl::plus<float>());
+                            if (lane == 0 && n < wc.N) y[int64_t(m) * wc.N + n] = v;
+                        }
+                    }
+                }
+            });
+    });
+}
+
 template <Fmt F, int MB = 1>
 sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
                      float* y, const std::vector<sycl::event>& deps, int mc = 1) {
+    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if (native_qk_fast_weight<F>(w))
+            return gemv_native_qk<F, MB>(q, w, x, y, deps, mc);
     if constexpr (F == Fmt::MXFP4 && MB == 1) {
         sycl::event ev;
         if (esgemv_try(q, w, x, y, deps, ev)) return ev;

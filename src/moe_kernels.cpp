@@ -97,6 +97,16 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
     const int row_groups = (KS * I + rows_per_wg - 1) / rows_per_wg;
     const int groups_per_token = row_groups + (gate_w ? 1 : 0);
     const int n_groups = M * groups_per_token;
+    const bool fast_w = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return L.gate_up.K == H && native_qk_fast_weight<F>(L.gate_up);
+        return false;
+    }();
+    const bool fast_ws = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return has_sh && wsh->K == H && native_qk_fast_weight<F>(*wsh);
+        return false;
+    }();
 
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
@@ -190,7 +200,24 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                 // inlined once per weight: a runtime pick between two
                 // captured QuantWeights put the descriptor in private memory
                 // and slowed every load (1.57 -> 1.81 s per 160 tokens).
-                auto dots = [&](const QuantWeight& wr) {
+                auto dots = [&](const QuantWeight& wr, bool fast) {
+                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                        if (fast) {
+                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            const float* xp[1] = {xs};
+                            for (int base = 0; base < H; base += 256) {
+                                #pragma unroll
+                                for (int r = 0; r < R; ++r) {
+                                    if (grow[r] < 0) continue;
+                                    const uint8_t* gp = wr.payload + grow[r] * wr.row_bytes + int64_t(base / 256) * BYTES;
+                                    const uint8_t* up = wr.payload + urow[r] * wr.row_bytes + int64_t(base / 256) * BYTES;
+                                    native_qk_block_lane<F, 1>(gp, xp, base, lane, 1, &ga[r]);
+                                    native_qk_block_lane<F, 1>(up, xp, base, lane, 1, &ua[r]);
+                                }
+                            }
+                            return;
+                        }
+                    }
                     for (int base = 0; base + GEMV_STEP <= H; base += GEMV_STEP) {
                         const int k0 = base + lane * GEMV_EPL;
                         #pragma unroll
@@ -213,8 +240,8 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                         }
                     }
                 };
-                if constexpr (SH) { if (shr) dots(ws); else dots(w); }
-                else dots(w);
+                if constexpr (SH) { if (shr) dots(ws, fast_ws); else dots(w, fast_w); }
+                else dots(w, fast_w);
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const int sr = slot_row_base + r;
@@ -257,6 +284,16 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
     const int rows_per_wg = WG_SUBGROUPS * R;
     const int groups_per_token = (H + rows_per_wg - 1) / rows_per_wg;
     const int n_groups = M * groups_per_token;
+    const bool fast_w = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return L.down.K == I && native_qk_fast_weight<F>(L.down);
+        return false;
+    }();
+    const bool fast_wd = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return has_sh && wdsh->K == I && native_qk_fast_weight<F>(*wdsh);
+        return false;
+    }();
 
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
@@ -318,10 +355,39 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
 
                 // One inlined copy per weight (see moe_gate_up_impl_r: a
                 // runtime pick between two QuantWeights slows every load).
-                auto slot_dot = [&](const QuantWeight& wr, int64_t ebase, int slot, float rw) {
+                auto slot_dot = [&](const QuantWeight& wr, int64_t ebase, int slot, float rw, bool fast) {
                     float acc[R];
                     #pragma unroll
                     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                        if (fast) {
+                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            const float* xp[1] = {&slmh[slot * I]};
+                            for (int base = 0; base < I; base += 256) {
+                                #pragma unroll
+                                for (int r = 0; r < R; ++r) {
+                                    const int o = o_base + r;
+                                    if (o >= H) continue;
+                                    const uint8_t* dp = wr.payload + (ebase + o) * wr.row_bytes
+                                                      + int64_t(base / 256) * BYTES;
+                                    native_qk_block_lane<F, 1>(dp, xp, base, lane, 1, &acc[r]);
+                                }
+                            }
+                        } else {
+                            for (int base = 0; base + GEMV_STEP <= I; base += GEMV_STEP) {
+                                const int k0 = base + lane * GEMV_EPL;
+                                #pragma unroll
+                                for (int r = 0; r < R; ++r) {
+                                    const int o = o_base + r;
+                                    if (o >= H) continue;
+                                    const int64_t d_row = ebase + o;
+                                    const uint8_t* dp = wr.payload + d_row * wr.row_bytes;
+                                    acc[r] += GemvStep<F, GEMV_EPL>::run(wr, dp, &slmh[slot * I],
+                                                    lut, slut, nlut, int(d_row), k0);
+                                }
+                            }
+                        }
+                    } else {
                     for (int base = 0; base + GEMV_STEP <= I; base += GEMV_STEP) {
                         const int k0 = base + lane * GEMV_EPL;
                         #pragma unroll
@@ -334,13 +400,15 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                                                     lut, slut, nlut, int(d_row), k0);
                         }
                     }
+                    }
                     #pragma unroll
                     for (int r = 0; r < R; ++r) {
                         const int o = o_base + r;
                         if (o >= H) continue;
                         const int64_t d_row = ebase + o;
-                        for (int c = (I / GEMV_STEP) * GEMV_STEP + lane; c < I; c += SG_SIZE)
-                            acc[r] = sycl::fma(wr.at(int(d_row), c), slmh[slot * I + c], acc[r]);
+                        if (!fast)
+                            for (int c = (I / GEMV_STEP) * GEMV_STEP + lane; c < I; c += SG_SIZE)
+                                acc[r] = sycl::fma(wr.at(int(d_row), c), slmh[slot * I + c], acc[r]);
                         // Keep the routed sum in per-lane registers. The
                         // sub-group reduction is linear, so scaling each
                         // expert partial by its router weight and reducing
@@ -356,11 +424,11 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                     const int   e  = d_expert[route];
                     const float rw = d_weight[route];
                     if (e < 0 || rw == 0.0f) continue;
-                    slot_dot(w, int64_t(e) * H, slot, rw);
+                    slot_dot(w, int64_t(e) * H, slot, rw, fast_w);
                 }
                 if constexpr (SH) {
                     if (has_sh)                       // shared expert: slot K, its own [H][I]
-                        slot_dot(wd, 0, K, gate_in ? gate_in[token] : 1.0f);
+                        slot_dot(wd, 0, K, gate_in ? gate_in[token] : 1.0f, fast_wd);
                 }
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
@@ -402,6 +470,11 @@ sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
     const int rows_per_wg = WG_SUBGROUPS * R;
     const int groups_per_token = (N + rows_per_wg - 1) / rows_per_wg;
     const int n_groups = M * groups_per_token;
+    const bool fast = [&] {
+        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+            return native_qk_fast_weight<F>(w);
+        return false;
+    }();
 
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
@@ -461,6 +534,36 @@ sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
                     float acc[R];
                     #pragma unroll
                     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                        if (fast) {
+                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            const float* xp[1] = {xs};
+                            for (int base = 0; base < K; base += 256) {
+                                #pragma unroll
+                                for (int r = 0; r < R; ++r) {
+                                    const int n = n_base + r;
+                                    if (n >= N) continue;
+                                    const int64_t row = int64_t(e) * N + n;
+                                    const uint8_t* rp = wc.payload + row * wc.row_bytes
+                                                      + int64_t(base / 256) * BYTES;
+                                    native_qk_block_lane<F, 1>(rp, xp, base, lane, 1, &acc[r]);
+                                }
+                            }
+                        } else {
+                            for (int base = 0; base + GEMV_STEP <= K; base += GEMV_STEP) {
+                                const int k0 = base + lane * GEMV_EPL;
+                                #pragma unroll
+                                for (int r = 0; r < R; ++r) {
+                                    const int n = n_base + r;
+                                    if (n >= N) continue;
+                                    const int64_t row = int64_t(e) * N + n;
+                                    const uint8_t* rp = wc.payload + row * wc.row_bytes;
+                                    acc[r] += GemvStep<F, GEMV_EPL>::run(wc, rp, xs,
+                                                  lut, slut, nlut, int(row), k0);
+                                }
+                            }
+                        }
+                    } else {
                     for (int base = 0; base + GEMV_STEP <= K; base += GEMV_STEP) {
                         const int k0 = base + lane * GEMV_EPL;
                         #pragma unroll
@@ -473,11 +576,12 @@ sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
                                           lut, slut, nlut, int(row), k0);
                         }
                     }
+                    }
                     #pragma unroll
                     for (int r = 0; r < R; ++r) {
                         const int n = n_base + r;
                         const int64_t row = int64_t(e) * N + (n < N ? n : 0);
-                        if (n < N)
+                        if (n < N && !fast)
                             for (int c = (K / GEMV_STEP) * GEMV_STEP + lane; c < K; c += SG_SIZE)
                                 acc[r] = sycl::fma(wc.at(int(row), c), xs[c], acc[r]);
                         // every lane gets the full dot: silu is applied

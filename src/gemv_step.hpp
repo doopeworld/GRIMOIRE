@@ -36,8 +36,27 @@
 #define B70_GEMV_STEP_HPP
 
 #include "kernels.hpp"
+#include "b70/native_qk_gemv.hpp"
+#include <cstdlib>
 
 namespace b70 {
+
+inline bool native_qk_fast_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("GRIMOIRE_GGUF_FAST_GEMV");
+        return !(e && *e == '0');
+    }();
+    return enabled;
+}
+
+template <Fmt F>
+inline bool native_qk_fast_weight(const QuantWeight& w) {
+    static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
+    return native_qk_fast_enabled() && w.fmt == F && w.payload &&
+           !w.scales && !w.zeros && w.row_scales == 0 &&
+           w.K > 0 && w.K % 256 == 0 &&
+           w.row_bytes >= int64_t(w.K / 256) * (F == Fmt::Q4_K ? 144 : 210);
+}
 
 // ---------------------------------------------------------------------
 // FP8 decode is a branchy bit-assembly per element -- subnormal check,
