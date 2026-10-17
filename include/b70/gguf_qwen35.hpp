@@ -9,6 +9,9 @@ namespace b70 {
 bool gguf_qwen35_config(const GGUFFile& file, const std::string& sidecar_json,
                          std::string& config_json, std::string& err);
 bool gguf_qwen35_index(Qwen35Model& model, std::string& err);
+bool gguf_qwen3_config(const GGUFFile& file, const std::string& sidecar_json,
+                       std::string& config_json, std::string& err);
+bool gguf_qwen3_index(Qwen35Model& model, std::string& err);
 bool gguf_gemma4_config(const GGUFFile& file, const std::string& sidecar_json,
                         std::string& config_json, std::string& err);
 bool gguf_gemma4_index(Qwen35Model& model, std::string& err);

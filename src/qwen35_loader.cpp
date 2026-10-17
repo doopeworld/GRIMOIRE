@@ -187,7 +187,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         std::string arch;
         if(!gguf_file->get_string("general.architecture",arch,err))return false;
         if(!(arch=="gemma4" ? gguf_gemma4_config(*gguf_file,sidecar,j,err)
-                            : gguf_qwen35_config(*gguf_file,sidecar,j,err)))return false;
+             : (arch=="qwen3"||arch=="qwen3moe")
+               ? gguf_qwen3_config(*gguf_file,sidecar,j,err)
+               : gguf_qwen35_config(*gguf_file,sidecar,j,err)))return false;
         {
             Tokenizer tok;
             const bool has_sidecar=::access((dir+"/tokenizer.json").c_str(),F_OK)==0;
@@ -243,18 +245,20 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     }
             }
             uint32_t ge=0,gb=0;
-            if(!gguf_file->get_u32("tokenizer.ggml.eos_token_id",ge,err)||
-               !gguf_file->get_u32("tokenizer.ggml.bos_token_id",gb,err))return false;
-            std::printf("  GGUF tokenizer eos/bos %u/%u; tokenizer.json eos/bos %d/%d\n",
-                        ge,gb,tok.eos(),tok.bos());
+            if(!gguf_file->get_u32("tokenizer.ggml.eos_token_id",ge,err))return false;
+            const bool has_bos=gguf_file->get("tokenizer.ggml.bos_token_id")!=nullptr;
+            if(has_bos && !gguf_file->get_u32("tokenizer.ggml.bos_token_id",gb,err))return false;
+            std::printf("  GGUF tokenizer eos/bos %u/%s; tokenizer.json eos/bos %d/%d\n",
+                        ge,has_bos?std::to_string(gb).c_str():"<missing>",tok.eos(),tok.bos());
             if(!sidecar.empty()){
                 try{
                     Json hf=Json::parse(sidecar);
                     const Json* tc=hf.find("text_config");if(!tc)tc=&hf;
                     const Json* he=tc->find("eos_token_id");
                     const Json* hb=tc->find("bos_token_id");
-                    if(he||hb)std::printf("  GGUF eos/bos %u/%u; HF config.json text_config eos/bos %s/%s\n",
-                        ge,gb,he?he->dump().c_str():"<missing>",hb?hb->dump().c_str():"<missing>");
+                    if(he||hb)std::printf("  GGUF eos/bos %u/%s; HF config.json text_config eos/bos %s/%s\n",
+                        ge,has_bos?std::to_string(gb).c_str():"<missing>",
+                        he?he->dump().c_str():"<missing>",hb?hb->dump().c_str():"<missing>");
                 }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
             }
             }
@@ -337,6 +341,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.rope_theta    = cfg_f(cj, "rope_theta", 1e7f);
     cfg.partial_rope  = tcfg_f("partial_rotary_factor", 1.0f);
     cfg.attn_out_gate = tcfg_b("attn_output_gate", false);
+    cfg.is_qwen3 = model_type=="qwen3" || model_type=="qwen3_moe";
+    if (cfg.is_qwen3) {
+        cfg.sliding_window = cfg_i(cj, "sliding_window", 0);
+        cfg.qwen3_attention_bias = cfg_b(cj, "attention_bias", false);
+        try {
+            const Json parsed=Json::parse(cj);
+            if(const Json* rs=parsed.find("rope_scaling"))
+                cfg.qwen3_rope_scaled=rs->kind!=Json::Kind::Null;
+        }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
+    }
     cfg.tie_embeddings= cfg_b(j, "tie_word_embeddings", false);
     cfg.is_gemma4     = gemma4;
     if (gemma4) {
@@ -487,6 +501,18 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     cfg.moe_inter     = cfg_i(j, "moe_intermediate_size", 0);
     cfg.shared_inter  = cfg_i(j, "shared_expert_intermediate_size", 0);
     cfg.dense_inter   = cfg_i(cj, "intermediate_size", 0);
+    if (cfg.is_qwen3 && cfg.is_moe()) {
+        cfg.norm_topk_prob = cfg_b(j, "norm_topk_prob", true);
+        cfg.sparse_step = cfg_i(j, "decoder_sparse_step", 1);
+        cfg.mlp_only_layers.clear();
+        try {
+            const Json parsed = Json::parse(j);
+            if (const Json* v=parsed.find("mlp_only_layers")) {
+                if (v->kind==Json::Kind::Array)
+                    for (const Json& x:v->array) cfg.mlp_only_layers.push_back(x.integer());
+            }
+        } catch (const std::exception& e) { err=std::string("config.json parse: ")+e.what();return false; }
+    }
 
     // ---- activation --------------------------------------------------
     // The engine implements ONE gated MLP: swiglu, silu(gate) * up.  It
@@ -849,7 +875,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 i, cfg.mlp_only_layers.empty() ? nullptr : cfg.mlp_only_layers.data(),
                 int(cfg.mlp_only_layers.size()), cfg.n_experts, cfg.sparse_step);
     }
-    if(use_gguf && !cfg.is_gemma4){
+    if(use_gguf && !cfg.is_gemma4 && !cfg.is_qwen3){
         // Qwen text-only mRoPE uses the same position in every section.
         // Keep the derived sections in the model description; only Agnes
         // previously populated this field, and no execution path reads it.
@@ -867,7 +893,8 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
     if(use_gguf) {
         if(!(cfg.is_gemma4 ? gguf_gemma4_index(*this,err)
-                           : gguf_qwen35_index(*this,err)))return false;
+             : cfg.is_qwen3 ? gguf_qwen3_index(*this,err)
+             : gguf_qwen35_index(*this,err)))return false;
     } else if (::access(native_path.c_str(),F_OK)==0) {
         native_model=std::make_unique<NativeModel>();
         if(!native_model->open(native_path,err))return false;
@@ -1226,7 +1253,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         // intermediate_size MLP under mlp.{gate,up,down}_proj.  cfg.is_moe()
         // is true for the model as a whole, so without this the three dense
         // layers would be sent looking for experts that do not exist.
-        if (cfg.is_k2 && !lay.k2_sparse) {
+        if ((cfg.is_k2 && !lay.k2_sparse) ||
+            (cfg.is_qwen3 && cfg.is_moe() &&
+             (std::find(cfg.mlp_only_layers.begin(),cfg.mlp_only_layers.end(),L)!=cfg.mlp_only_layers.end() ||
+              (cfg.sparse_step>0 && (L+1)%cfg.sparse_step!=0)))) {
             lay.sh_gate = linear(m + "gate_proj");
             lay.sh_up   = linear(m + "up_proj");
             lay.sh_down = linear(m + "down_proj");
@@ -1371,11 +1401,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         } else {
             need(lay.q_proj, "self_attn.q_proj", L);
             need(lay.o_proj, "self_attn.o_proj", L);
+            if (cfg.is_qwen3) {
+                need(lay.q_norm, "self_attn.q_norm", L);
+                need(lay.k_norm, "self_attn.k_norm", L);
+            }
         }
         // K2 mixes both FFN shapes in one model: a dense layer has a plain
         // MLP and no router at all, so requiring mlp.gate everywhere would
         // reject a valid checkpoint.
-        if (cfg.is_k2 && !lay.k2_sparse) {
+        if ((cfg.is_k2 && !lay.k2_sparse) ||
+            (cfg.is_qwen3 && cfg.is_moe() && !lay.router.ok())) {
             need(lay.sh_gate, "mlp.gate_proj", L);
         } else if (cfg.is_moe()) {
             need(lay.router, "mlp.gate", L);

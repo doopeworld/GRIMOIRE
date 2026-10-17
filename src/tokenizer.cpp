@@ -20,6 +20,8 @@
 //  tokenizer.cpp
 // =====================================================================
 #include "b70/tokenizer.hpp"
+#include "b70/unicode_marks.hpp"
+#include "b70/unicode_nfc.hpp"
 #include "b70/gguf.hpp"
 #include <cstdio>
 #include <cstring>
@@ -182,6 +184,24 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
 
     const std::string js = read_file(sidecar);
     if (js.empty()) { err = "cannot read " + sidecar; return false; }
+    // Read the exact Split regex used by Qwen3-8B's tokenizer.json.
+    // Its normalizer is NFC, unlike the qwen35 tokenizer.
+    if (const size_t pt=js.find("\"pre_tokenizer\""); pt!=std::string::npos) {
+        const size_t re=js.find("\"Regex\"",pt);
+        const size_t end=js.find("\"ByteLevel\"",pt);
+        if(re!=std::string::npos && end!=std::string::npos && re<end){
+            size_t quote=js.find('"',js.find(':',re)+1);
+            if(quote!=std::string::npos){
+                const std::string regex=json_string(js,quote);
+                qwen2_pre_=regex.find("[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")!=std::string::npos;
+            }
+        }
+    }
+    if(qwen2_pre_){
+        const size_t norm=js.find("\"normalizer\"");
+        const size_t nfc=norm==std::string::npos?std::string::npos:js.find("\"NFC\"",norm);
+        nfc_normalize_=nfc!=std::string::npos && nfc<js.find("\"pre_tokenizer\"",norm);
+    }
     gemma4_bpe_ = js.find("\"byte_fallback\": true") != std::string::npos &&
                   js.find("\"content\": \"▁\"") != std::string::npos;
     if(gemma4_bpe_ && bos_key==std::string::npos)add_bos_token_=true;
@@ -397,14 +417,14 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
         if (p->type!=8) {err="wrong tokenizer.ggml.pre type";return false;}
         pre=std::get<std::string>(p->data);
     }
-    // llama.cpp 711780ffc75b, llama-vocab.cpp QWEN35: the existing Unicode
-    // splitter implements its Split expression exactly (including marks and
-    // single-codepoint numbers). Other pre names select different regexes.
-    if ((!sentencepiece_ && !gemma4_bpe_ && pre!="qwen35") ||
+    // llama.cpp 711780ffc75b: QWEN2 uses \p{L}, QWEN35 uses [\p{L}\p{M}].
+    qwen2_pre_=pre=="qwen2";
+    nfc_normalize_=qwen2_pre_;
+    if ((!sentencepiece_ && !gemma4_bpe_ && pre!="qwen35" && !qwen2_pre_) ||
         (gemma4_bpe_ && !pre.empty() && pre!="gemma4") ||
         (sentencepiece_ && !pre.empty() && pre!="default")) {
         std::string why;
-        if (!sentencepiece_ && (pre=="qwen2"||pre=="deepseek-r1-qwen"||pre=="kormo"||pre=="f2llmv2"||
+        if (!sentencepiece_ && (pre=="deepseek-r1-qwen"||pre=="kormo"||pre=="f2llmv2"||
                                 pre=="llama3"||pre=="llama-v3"||pre=="llama-bpe"||pre=="smaug-bpe"||
                                 pre=="dbrx"||pre=="falcon3"||pre=="falcon-h1"||pre=="pixtral"||
                                 pre=="midm-2.0"||pre=="lfm2"||pre=="chatglm-bpe"))
@@ -1589,6 +1609,18 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
     while (i < n) {
         const size_t start = i;
         const Char c = char_at(text, i);
+        // The base category table combines L/M for qwen35. Qwen2 needs
+        // distinct mark membership in its second and fourth alternatives.
+        auto letter = [&](const Char& x) {
+            return x.cat=='A' && (!qwen2_pre_ || !unicode_is_mark(x.cp));
+        };
+        auto word = [&](const Char& x) {
+            return x.cat=='A' && (!qwen2_pre_ || !unicode_is_mark(x.cp));
+        };
+        auto punct = [&](const Char& x) {
+            return !is_space(x.cp) && !letter(x) && x.cat!='N' &&
+                   (qwen2_pre_ || x.cat!='A');
+        };
 
         // (?i:'s|'t|'re|'ve|'m|'ll|'d)
         if (c.cp == '\'') {
@@ -1613,12 +1645,12 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
         // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
         {
             size_t j = i;
-            if (!is_nl(c.cp) && c.cat != 'A' && c.cat != 'N') j += c.len;
+            if (!is_nl(c.cp) && !letter(c) && c.cat != 'N') j += c.len;
             if (j < n) {
                 const Char next = char_at(text, j);
-                if (next.cat == 'A') {
+                if (word(next) || (!qwen2_pre_ && next.cat=='A')) {
                     do { j += char_at(text, j).len; }
-                    while (j < n && char_at(text, j).cat == 'A');
+                    while (j < n && (qwen2_pre_ ? letter(char_at(text,j)) : char_at(text,j).cat=='A'));
                     out.push_back(text.substr(start, j - start));
                     i = j;
                     continue;
@@ -1639,7 +1671,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             const size_t punct_start = j;
             while (j < n) {
                 const Char x = char_at(text, j);
-                if (is_space(x.cp) || x.cat == 'A' || x.cat == 'N') break;
+                if (!punct(x)) break;
                 j += x.len;
             }
             if (j > punct_start) {
@@ -1692,14 +1724,20 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_special
     std::vector<int32_t> out;
     if (add_special && add_bos_token_ && bos_>=0) out.push_back(bos_);
 
+    // Qwen3's HF tokenizer.json has normalizer: NFC before Split(qwen2).
+    // The GGUF stores the pre name but not the normalizer; this is the
+    // Qwen2/Qwen3 tokenizer contract, pinned against the real HF JSON.
+    const std::string normalized = nfc_normalize_ ? unicode_nfc(text) : text;
+    const std::string& source = normalized;
+
     size_t i = 0;
-    while (i < text.size()) {
+    while (i < source.size()) {
         // Special tokens bypass the pre-tokenizer and BPE entirely.
         size_t best_len = 0;
         int32_t best_id = -1;
         for (const auto& kv : special_by_text_) {
             const size_t L = kv.first.size();
-            if (L > best_len && text.compare(i, L, kv.first) == 0) {
+            if (L > best_len && source.compare(i, L, kv.first) == 0) {
                 best_len = L;
                 best_id  = kv.second;
             }
@@ -1712,14 +1750,14 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_special
 
         // Find where the next special token begins, and pre-tokenize the
         // plain run up to it.
-        size_t stop = text.size();
+        size_t stop = source.size();
         for (const auto& kv : special_by_text_) {
             if (kv.first.empty()) continue;
-            const size_t p2 = text.find(kv.first, i);
+            const size_t p2 = source.find(kv.first, i);
             if (p2 != std::string::npos && p2 < stop) stop = p2;
         }
 
-        const std::string run = text.substr(i, stop - i);
+        const std::string run = source.substr(i, stop - i);
         if (gemma4_bpe_) {
             auto ids=gemma4_word(run);out.insert(out.end(),ids.begin(),ids.end());
             i=stop;continue;

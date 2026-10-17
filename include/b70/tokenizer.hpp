@@ -139,6 +139,8 @@ private:
     bool add_eos_token_ = false;
     bool sentencepiece_ = false;
     bool gemma4_bpe_ = false; // raw UTF-8 BPE with ▁ spaces and byte fallback
+    bool qwen2_pre_ = false;  // Qwen2 regex distinguishes Unicode letters and marks
+    bool nfc_normalize_ = false;
     std::vector<int32_t> gemma4_word(const std::string& text) const;
     std::string gemma4_chat(const std::vector<ChatMessage>& messages, bool thinking) const;
     bool spm_add_prefix_ = true;

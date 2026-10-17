@@ -207,6 +207,124 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
     out=root.dump();return true;
 }
 
+// Standard Qwen3 uses full-head NeoX RoPE and plain RMSNorm weights. Its
+// converter inherits Qwen2/Qwen2Moe: no Q/K row permutation or norm shift.
+bool gguf_qwen3_config(const GGUFFile& f,const std::string& sidecar,
+                       std::string& out,std::string& err) {
+    std::string arch;
+    if(!f.get_string("general.architecture",arch,err))return false;
+    if(arch!="qwen3"&&arch!="qwen3moe"){
+        err="unsupported GGUF architecture: "+arch;return false;
+    }
+    const bool moe=arch=="qwen3moe";
+    const std::string p=arch+".";
+    auto u=[&](const char* k,uint32_t& v){return f.get_u32(p+k,v,err);};
+    uint32_t blocks=0,h=0,ff=0,heads=0,kv=0,hd=0,vd=0,ctx=0,
+             ne=0,top=0,ei=0,shared=0;
+    float theta=0,eps=0;
+    if(!u("block_count",blocks)||!u("embedding_length",h)||
+       !u("feed_forward_length",ff)||!u("attention.head_count",heads)||
+       !u("attention.head_count_kv",kv)||!u("attention.key_length",hd)||
+       !u("attention.value_length",vd)||!u("context_length",ctx)||
+       !f.get_f32(p+"rope.freq_base",theta,err)||
+       !f.get_f32(p+"attention.layer_norm_rms_epsilon",eps,err)||
+       (moe && (!u("expert_count",ne)||!u("expert_used_count",top)||
+                !u("expert_feed_forward_length",ei))))return false;
+    // Standard Qwen3-MoE has no shared expert. Older GGUFs may omit
+    // the zero-valued metadata key altogether.
+    if(moe && f.get(p+"expert_shared_feed_forward_length") &&
+       !u("expert_shared_feed_forward_length",shared))return false;
+    if(!blocks||!h||!ff||!heads||!kv||heads%kv||!hd||hd!=vd||
+       !ctx||theta<=0||eps<=0||(moe&&(!ne||!top||top>ne||!ei))){
+        err="inconsistent "+arch+" GGUF geometry";return false;
+    }
+    if(shared){err=arch+" expert_shared_feed_forward_length is nonzero; "+
+                    "standard Qwen3-MoE has no shared expert";return false;}
+    const GGUFTensor* emb=f.find("token_embd.weight");
+    if(!emb||emb->n_dims!=2||emb->ne[0]!=h){
+        err=arch+" token_embd.weight shape disagrees with embedding_length";return false;
+    }
+    const bool tied=!f.find("output.weight");
+    std::vector<uint32_t> dense_layers;
+    for(uint32_t i=0;i<blocks;++i){
+        const auto* q=f.find("blk."+std::to_string(i)+".attn_q.weight");
+        if(!q||q->n_dims!=2||q->ne[0]!=h||q->ne[1]!=uint64_t(heads)*hd){
+            err=arch+" attn_q.weight must have heads*head_dim rows (no output gate), layer "+
+                std::to_string(i);return false;
+        }
+        if(moe){
+            const std::string b="blk."+std::to_string(i)+".";
+            if(!f.find(b+"ffn_gate_inp.weight")){
+                for(const char* role:{"ffn_gate.weight","ffn_up.weight","ffn_down.weight"})
+                    if(!f.find(b+role)){
+                        err=arch+" layer "+std::to_string(i)+" has neither a router nor "+role;
+                        return false;
+                    }
+                dense_layers.push_back(i);
+            }
+        }
+    }
+    Json root=obj();
+    auto n=[&](const char* k,double v){put(root,k,num(v));};
+    put(root,"model_type",str(moe?"qwen3_moe":"qwen3"));
+    n("num_hidden_layers",blocks);n("hidden_size",h);n("intermediate_size",ff);
+    n("vocab_size",emb->ne[1]);n("num_attention_heads",heads);
+    n("num_key_value_heads",kv);n("head_dim",hd);n("rope_theta",theta);
+    n("partial_rotary_factor",1);n("rms_norm_eps",eps);
+    n("max_position_embeddings",ctx);
+    put(root,"hidden_act",str("silu"));
+    put(root,"attention_bias",flag(false));
+    put(root,"attn_output_gate",flag(false));
+    put(root,"tie_word_embeddings",flag(tied));
+    if(moe){
+        n("num_experts",ne);n("num_experts_per_tok",top);
+        n("moe_intermediate_size",ei);n("shared_expert_intermediate_size",0);
+        n("decoder_sparse_step",1);
+        Json mlp_only=arr();
+        for(uint32_t i:dense_layers)mlp_only.array.push_back(num(i));
+        put(root,"norm_topk_prob",flag(true));put(root,"mlp_only_layers",mlp_only);
+    }
+    if(!sidecar.empty()){
+        try{
+            Json hf=Json::parse(sidecar);
+            if(moe){
+                const Json* step=hf.find("decoder_sparse_step");
+                const Json* only=hf.find("mlp_only_layers");
+                const int sparse_step=step?step->integer():1;
+                if(sparse_step<=0){err="config.json decoder_sparse_step must be positive";return false;}
+                for(uint32_t i=0;i<blocks;++i){
+                    bool mlp_only=false;
+                    if(only && only->kind==Json::Kind::Array)
+                        for(const Json& x:only->array)mlp_only|=x.integer()==int(i);
+                    const bool hf_dense=mlp_only||(i+1)%sparse_step!=0;
+                    const bool gguf_dense=std::find(dense_layers.begin(),dense_layers.end(),i)!=dense_layers.end();
+                    if(hf_dense!=gguf_dense){
+                        err="GGUF/config.json MoE layer pattern differs at layer "+std::to_string(i);
+                        return false;
+                    }
+                }
+            }
+            for(const auto& kvp:root.object){
+                // The Coder GGUF records feed_forward_length=5472 while
+                // HF config says intermediate_size=6144. All 48 layers are
+                // routed, so neither dense width is used by this file.
+                if(moe&&kvp.first=="intermediate_size"&&dense_layers.empty())continue;
+                if(moe&&(kvp.first=="decoder_sparse_step"||kvp.first=="mlp_only_layers"))continue;
+                const Json* actual=hf.find(kvp.first);
+                if(!actual || !equal_json(kvp.second,*actual)){
+                    // These two values are converter defaults, absent in HF.
+                    if((kvp.first=="partial_rotary_factor"||
+                        kvp.first=="attn_output_gate"||
+                        kvp.first=="shared_expert_intermediate_size")&&!actual)continue;
+                    err="GGUF/config.json mismatch "+kvp.first+": GGUF="+kvp.second.dump()+
+                        " config.json="+(actual?actual->dump():"<missing>");return false;
+                }
+            }
+        }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
+    }
+    out=root.dump();return true;
+}
+
 bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
     using I=TensorRef::GGUFInverse;
     if(!m.gguf_file){err="GGUF source missing";return false;}
@@ -227,7 +345,8 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         }
         m.index.emplace(name,std::move(r));
     };
-    const std::string p="model.language_model.";
+    const std::string p=m.cfg.is_qwen3 ? "model." : "model.language_model.";
+    const I norm_inv=m.cfg.is_qwen3 ? I::NONE : I::NORM;
     for(const auto& t:m.gguf_file->tensors()) {
         const std::string& s=t.name;
         if(s.rfind("nextn.",0)==0||
@@ -251,7 +370,7 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         }
         if(s=="token_embd.weight"){add(t,p+"embed_tokens.weight");continue;}
         if(s=="output.weight"){add(t,"lm_head.weight");continue;}
-        if(s=="output_norm.weight"){add(t,p+"norm.weight",I::NORM);continue;}
+        if(s=="output_norm.weight"){add(t,p+"norm.weight",norm_inv);continue;}
         if(s.rfind("blk.",0)!=0){err="unmapped GGUF tensor: "+s;return false;}
         const size_t dot=s.find('.',4);
         if(dot==std::string::npos){err="unmapped GGUF tensor: "+s;return false;}
@@ -260,8 +379,11 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         if(l<0||l>=m.cfg.n_layers){err="unmapped GGUF layer tensor: "+s;return false;}
         const std::string role=s.substr(dot+1);
         const std::string b=p+"layers."+std::to_string(l)+".";
-        if(!m.cfg.is_moe() && (role=="ffn_gate.weight"||role=="ffn_up.weight"||
-                               role=="ffn_down.weight")){
+        const bool dense_layer=!m.cfg.is_moe() ||
+            (m.cfg.is_qwen3 && std::find(m.cfg.mlp_only_layers.begin(),
+                                        m.cfg.mlp_only_layers.end(),l)!=m.cfg.mlp_only_layers.end());
+        if(dense_layer && (role=="ffn_gate.weight"||role=="ffn_up.weight"||
+                           role=="ffn_down.weight")){
             const bool down=role=="ffn_down.weight";
             if(t.n_dims!=2||t.ne[0]!=uint64_t(down?m.cfg.dense_inter:m.cfg.hidden)||
                t.ne[1]!=uint64_t(down?m.cfg.hidden:m.cfg.dense_inter)){
@@ -270,8 +392,9 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         }
         auto one=[&](const char* from,const char* to,I inv=I::NONE){
             if(role==from){add(t,b+to,inv);return true;}return false;};
-        if(one("attn_norm.weight","input_layernorm.weight",I::NORM)||
-           one("post_attention_norm.weight","post_attention_layernorm.weight",I::NORM)||
+        if(one("attn_norm.weight","input_layernorm.weight",norm_inv)||
+           one("post_attention_norm.weight","post_attention_layernorm.weight",norm_inv)||
+           (m.cfg.is_qwen3&&one("ffn_norm.weight","post_attention_layernorm.weight"))||
            one("attn_qkv.weight","linear_attn.in_proj_qkv.weight",I::QKV_ROWS)||
            one("attn_gate.weight","linear_attn.in_proj_z.weight",I::V_ROWS)||
            one("ssm_alpha.weight","linear_attn.in_proj_a.weight",I::V_ROWS)||
@@ -285,18 +408,18 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
            one("attn_k.weight","self_attn.k_proj.weight")||
            one("attn_v.weight","self_attn.v_proj.weight")||
            one("attn_output.weight","self_attn.o_proj.weight")||
-           one("attn_q_norm.weight","self_attn.q_norm.weight",I::NORM)||
-           one("attn_k_norm.weight","self_attn.k_norm.weight",I::NORM)||
-           (!m.cfg.is_moe() && (one("ffn_gate.weight","mlp.gate_proj.weight")||
+           one("attn_q_norm.weight","self_attn.q_norm.weight",norm_inv)||
+           one("attn_k_norm.weight","self_attn.k_norm.weight",norm_inv)||
+           (dense_layer && (one("ffn_gate.weight","mlp.gate_proj.weight")||
                                 one("ffn_up.weight","mlp.up_proj.weight")||
                                 one("ffn_down.weight","mlp.down_proj.weight")))||
-           (m.cfg.is_moe() &&
+           (m.cfg.is_moe() && !dense_layer &&
             (one("ffn_gate_inp.weight","mlp.gate.weight")||
              one("ffn_gate_inp_shexp.weight","mlp.shared_expert_gate.weight")||
              one("ffn_gate_shexp.weight","mlp.shared_expert.gate_proj.weight")||
              one("ffn_up_shexp.weight","mlp.shared_expert.up_proj.weight")||
              one("ffn_down_shexp.weight","mlp.shared_expert.down_proj.weight"))))continue;
-        if(!m.cfg.is_moe()){err="unmapped GGUF tensor: "+s;return false;}
+        if(dense_layer){err="unmapped GGUF tensor: "+s;return false;}
         const std::string base=b+"mlp.experts.";
         auto experts=[&](const char* from,const char* to){
             if(role!=from)return false;
@@ -322,6 +445,10 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         err="unmapped GGUF tensor: "+s;return false;
     }
     return true;
+}
+
+bool gguf_qwen3_index(Qwen35Model& m,std::string& err){
+    return gguf_qwen35_index(m,err);
 }
 
 bool Qwen35Model::read_gguf_raw_rows(const TensorRef& r,uint8_t* dst,std::string& err,
