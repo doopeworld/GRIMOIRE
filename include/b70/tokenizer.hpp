@@ -81,6 +81,10 @@ public:
     bool add_bos_token() const { return add_bos_token_; }
     bool add_eos_token() const { return add_eos_token_; }
     int32_t eos() const { return eos_; }
+    int32_t unk() const { return unk_; }
+    int32_t pad() const { return pad_; }
+    int32_t mask() const { return mask_; }
+    const std::vector<int32_t>& suppress_tokens() const { return suppress_tokens_; }
     size_t  vocab_size() const { return id_to_tok_.size(); }
     const std::string& raw_token(size_t id) const { return id_to_tok_.at(id); }
     size_t  merge_count() const { return merge_rank_.size(); }
@@ -134,8 +138,12 @@ private:
     bool add_bos_token_ = false;
     bool add_eos_token_ = false;
     bool sentencepiece_ = false;
+    bool gemma4_bpe_ = false; // raw UTF-8 BPE with ▁ spaces and byte fallback
+    std::vector<int32_t> gemma4_word(const std::string& text) const;
+    std::string gemma4_chat(const std::vector<ChatMessage>& messages, bool thinking) const;
     bool spm_add_prefix_ = true;
-    int32_t unk_ = -1, eot_ = -1, pad_ = -1;
+    int32_t unk_ = -1, eot_ = -1, pad_ = -1, mask_ = -1;
+    std::vector<int32_t> suppress_tokens_;
     std::vector<int32_t> token_type_;
     std::vector<float> scores_;
     size_t  bad_merges_ = 0;

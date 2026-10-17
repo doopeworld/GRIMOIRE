@@ -182,6 +182,9 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
 
     const std::string js = read_file(sidecar);
     if (js.empty()) { err = "cannot read " + sidecar; return false; }
+    gemma4_bpe_ = js.find("\"byte_fallback\": true") != std::string::npos &&
+                  js.find("\"content\": \"▁\"") != std::string::npos;
+    if(gemma4_bpe_ && bos_key==std::string::npos)add_bos_token_=true;
 
     // ---- vocab -------------------------------------------------------
     // Scanning for the key rather than parsing the whole document: the
@@ -362,6 +365,19 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
             }
         }
     }
+    if(gemma4_bpe_){
+        // The HF wrapper's eot_token is the turn terminator used as GGUF
+        // eos=106; <eos> is a second end token. Its tokenizer.json has no
+        // TemplateProcessing BOS, but the model convention adds BOS.
+        auto token_id=[&](const char* s){
+            auto it=tok_to_id_.find(s);return it==tok_to_id_.end()?-1:it->second;
+        };
+        eos_=token_id("<turn|>");
+        eos2_=token_id("<eos>");
+        unk_=token_id("<unk>");
+        pad_=token_id("<pad>");
+        mask_=token_id("<mask>");
+    }
 
     return true;
 }
@@ -371,10 +387,11 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
     build_byte_tables();
     std::string model, pre;
     if (!file.get_string("tokenizer.ggml.model",model,err)) return false;
-    if (model!="gpt2" && model!="llama") {
+    if (model!="gpt2" && model!="llama" && model!="gemma4") {
         err="unsupported tokenizer.ggml.model: "+model; return false;
     }
     sentencepiece_=model=="llama";
+    gemma4_bpe_=model=="gemma4";
     if (sentencepiece_) add_bos_token_=true; // llama.cpp SPM default
     if (const GGUFValue* p=file.get("tokenizer.ggml.pre")) {
         if (p->type!=8) {err="wrong tokenizer.ggml.pre type";return false;}
@@ -383,7 +400,8 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
     // llama.cpp 711780ffc75b, llama-vocab.cpp QWEN35: the existing Unicode
     // splitter implements its Split expression exactly (including marks and
     // single-codepoint numbers). Other pre names select different regexes.
-    if ((!sentencepiece_ && pre!="qwen35") ||
+    if ((!sentencepiece_ && !gemma4_bpe_ && pre!="qwen35") ||
+        (gemma4_bpe_ && !pre.empty() && pre!="gemma4") ||
         (sentencepiece_ && !pre.empty() && pre!="default")) {
         std::string why;
         if (!sentencepiece_ && (pre=="qwen2"||pre=="deepseek-r1-qwen"||pre=="kormo"||pre=="f2llmv2"||
@@ -422,7 +440,7 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
             if (t==2 || (t==3 && !visible_qwen_control)) special_ids_[int32_t(i)]=1;
         }
     }
-    if (sentencepiece_) {
+    if (sentencepiece_ || gemma4_bpe_) {
         const GGUFValue* sv=nullptr;
         if (!file.get_array("tokenizer.ggml.scores",sv,err)) return false;
         const auto* scores=std::get_if<std::vector<float>>(&sv->data);
@@ -430,7 +448,8 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
             err="tokenizer.ggml.scores must match tokens";return false;
         }
         scores_=*scores;
-    } else {
+    }
+    if (!sentencepiece_) {
         const GGUFValue* mv=nullptr;
         if (!file.get_array("tokenizer.ggml.merges",mv,err)) return false;
         const auto* merges=std::get_if<std::vector<std::string>>(&mv->data);
@@ -454,8 +473,19 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
     };
     if (!id("tokenizer.ggml.bos_token_id",bos_) || !id("tokenizer.ggml.eos_token_id",eos_) ||
         !id("tokenizer.ggml.eot_token_id",eot_) || !id("tokenizer.ggml.padding_token_id",pad_) ||
-        !id("tokenizer.ggml.unknown_token_id",unk_)) return false;
-    if (sentencepiece_ && unk_<0) {
+        !id("tokenizer.ggml.unknown_token_id",unk_) ||
+        !id("tokenizer.ggml.mask_token_id",mask_)) return false;
+    if(const GGUFValue* p=file.get("tokenizer.ggml.suppress_tokens")){
+        const auto* ids=std::get_if<std::vector<int32_t>>(&p->data);
+        if(p->type!=9||!ids){err="tokenizer.ggml.suppress_tokens must be i32 array";return false;}
+        for(int32_t x:*ids){
+            if(x<0||size_t(x)>=id_to_tok_.size()){
+                err="tokenizer.ggml.suppress_tokens id out of range";return false;
+            }
+            suppress_tokens_.push_back(x);
+        }
+    }
+    if ((sentencepiece_ || gemma4_bpe_) && unk_<0) {
         for (size_t i=0;i<token_type_.size();++i)
             if (token_type_[i]==2) {unk_=int32_t(i);break;}
         if (unk_<0) {
@@ -477,7 +507,19 @@ bool Tokenizer::load_gguf(const GGUFFile& file, std::string& err) {
     if (!flag("tokenizer.ggml.add_bos_token",add_bos_token_) ||
         !flag("tokenizer.ggml.add_eos_token",add_eos_token_) ||
         !flag("tokenizer.ggml.add_space_prefix",spm_add_prefix_)) return false;
+    if(gemma4_bpe_){
+        if(spm_add_prefix_){
+            err="gemma4 tokenizer.ggml.add_space_prefix=true is unsupported";
+            return false;
+        }
+        // llama-vocab.cpp:2787 overrides a false/missing GGUF flag here.
+        add_bos_token_=true;
+    }
     if (eot_>=0 && eot_!=eos_) eos2_=eot_;
+    else if(gemma4_bpe_){
+        auto it=tok_to_id_.find("<eos>");
+        if(it!=tok_to_id_.end()&&it->second!=eos_)eos2_=it->second;
+    }
     else for (const char* s:{"<|eot|>","<|ifm|endoftext|>","<|endoftext|>"}) {
         auto it=special_by_text_.find(s);
         if (it!=special_by_text_.end() && it->second!=eos_) {eos2_=it->second;break;}
@@ -558,6 +600,24 @@ std::vector<int32_t> Tokenizer::spm_word(const std::string& text) const {
         }
     }
     return result;
+}
+
+std::vector<int32_t> Tokenizer::gemma4_word(const std::string& text) const {
+    std::string normalized;
+    for(char c:text)normalized+=c==' ' ? "\xE2\x96\x81" : std::string(1,c);
+    std::vector<int32_t> out;
+    for(const auto& sym:bpe_word(normalized)){
+        auto it=tok_to_id_.find(sym);
+        if(it!=tok_to_id_.end()){out.push_back(it->second);continue;}
+        // HF BPE byte_fallback emits one <0xHH> token for each UTF-8 byte.
+        for(unsigned char byte:sym){
+            char key[7];std::snprintf(key,sizeof key,"<0x%02X>",unsigned(byte));
+            auto b=tok_to_id_.find(key);
+            if(b!=tok_to_id_.end())out.push_back(b->second);
+            else if(unk_>=0)out.push_back(unk_);
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------
@@ -1660,6 +1720,10 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, bool add_special
         }
 
         const std::string run = text.substr(i, stop - i);
+        if (gemma4_bpe_) {
+            auto ids=gemma4_word(run);out.insert(out.end(),ids.begin(),ids.end());
+            i=stop;continue;
+        }
         if (sentencepiece_) {
             auto ids=spm_word(run);out.insert(out.end(),ids.begin(),ids.end());
             i=stop;continue;
@@ -1691,6 +1755,16 @@ std::string Tokenizer::decode_one(int32_t id) const {
     if (id < 0 || size_t(id) >= id_to_tok_.size()) return {};
     const std::string& t = id_to_tok_[size_t(id)];
     if (special_ids_.count(id)) return {};        // don't print control tokens
+
+    if (gemma4_bpe_) {
+        if(t.size()==6&&t.substr(0,3)=="<0x"&&t[5]=='>'){
+            char* end=nullptr;long value=std::strtol(t.substr(3,2).c_str(),&end,16);
+            if(end&&*end==0)return std::string(1,char(value));
+        }
+        std::string out=t;const std::string marker="\xE2\x96\x81";
+        for(size_t p=0;(p=out.find(marker,p))!=std::string::npos;){out.replace(p,marker.size()," ");++p;}
+        return out;
+    }
 
     if (sentencepiece_) {
         if (token_type_[size_t(id)]==6 && t.size()==6 && t.substr(0,3)=="<0x" && t[5]=='>') {
@@ -1734,6 +1808,7 @@ std::string Tokenizer::apply_chat_template(const std::string& user,
 
 std::string Tokenizer::apply_chat_template(
         const std::vector<ChatMessage>& messages) const {
+    if(gemma4_bpe_)return gemma4_chat(messages,false);
     // Muse-Glimmer's current tokenizer is Harmony-style, not ChatML.  Keep
     // this branch keyed to a checkpoint token so Qwen/Ornith retain their
     // existing template.  This mirrors transformers/vLLM's default template,
@@ -1809,6 +1884,36 @@ std::string Tokenizer::apply_chat_template(
     return out;
 }
 
+std::string Tokenizer::gemma4_chat(const std::vector<ChatMessage>& messages,bool thinking) const {
+    // tokenizer.chat_template in the Gemma 4 GGUF: the template prints BOS,
+    // while GRIMOIRE's caller adds it through encode(..., true).
+    auto trim=[](const std::string& s){
+        const size_t first=s.find_first_not_of(" \t\n\r\f\v");
+        if(first==std::string::npos)return std::string();
+        return s.substr(first,s.find_last_not_of(" \t\n\r\f\v")-first+1);
+    };
+    std::string out;
+    size_t first=0;
+    const bool system=!messages.empty() &&
+        (messages[0].role=="system"||messages[0].role=="developer");
+    if(thinking||system){
+        out+="<|turn>system\n";
+        if(thinking)out+="<|think|>\n";
+        if(system){out+=trim(messages[0].content);first=1;}
+        out+="<turn|>\n";
+    }
+    for(size_t i=first;i<messages.size();++i){
+        const auto& message=messages[i];
+        const std::string role=message.role=="assistant"?"model":message.role;
+        if(role!="user"&&role!="model"&&role!="system"&&role!="developer")
+            throw std::invalid_argument("gemma4 chat role is unsupported: "+message.role);
+        out+="<|turn>"+role+"\n"+trim(message.content)+"<turn|>\n";
+    }
+    out+="<|turn>model\n";
+    if(!thinking)out+="<|channel>thought\n<channel|>";
+    return out;
+}
+
 namespace {
 std::string tmpl_trim(const std::string& s) {
     const char* ws = " \t\n\r\f\v";
@@ -1842,6 +1947,11 @@ const char* kEffortLow =
 // anything else keeps the legacy rendering above.
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
                                            const ChatOptions& opt) const {
+    if(gemma4_bpe_){
+        if(!opt.tools.empty())
+            throw std::invalid_argument("gemma4 tool-call template is unsupported");
+        return gemma4_chat(messages,opt.enable_thinking);
+    }
     if (special_by_text_.count("<|begin_of_text|>") || !tmpl_xml_tools_) {
         if (!opt.tools.empty())
             throw std::invalid_argument("this model's chat template has no tool-call format GRIMOIRE renders");

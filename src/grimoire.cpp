@@ -16585,7 +16585,7 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         };
         FinishReason reason;
         const auto start=std::chrono::steady_clock::now();
-        int n=grimoire_serve_generate(e,ids,n_predict,tk.eos(),out,tk.special_id("<|eot|>"),
+        int n=grimoire_serve_generate(e,ids,n_predict,tk.eos(),out,tk.eos2(),
             [&](int32_t t){return decoder.push(t,emit);},&reason);
         decoder.finish(emit);
         std::printf("\n");

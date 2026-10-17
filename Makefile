@@ -38,6 +38,14 @@ bin/test_gguf_qwen35: tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) include/b70/g
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) -o $@
 
+bin/test_gguf_gemma4: tests/test_gguf_gemma4.cpp $(HOST_MODEL_SRC) include/b70/gguf_qwen35.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_gemma4.cpp $(HOST_MODEL_SRC) -o $@
+
+.PHONY: test_gguf_gemma4
+test_gguf_gemma4: bin/test_gguf_gemma4
+	./bin/test_gguf_gemma4
+
 .PHONY: test_gguf_qwen35
 test_gguf_qwen35: bin/test_gguf_qwen35
 	./bin/test_gguf_qwen35
@@ -161,12 +169,13 @@ bin/tok_dump: tools/tok_dump.cpp src/tokenizer.cpp src/gguf.cpp include/b70/toke
 .PHONY: tok_dump
 tok_dump: bin/tok_dump
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_gguf_native bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gguf_tokenizer bin/test_kld bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_gguf_gemma4 bin/test_gguf_native bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gguf_tokenizer bin/test_kld bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
 	@echo ""; echo "=========== gguf ==========="; ./bin/test_gguf
 	@echo ""; echo "=========== gguf qwen35 ==========="; ./bin/test_gguf_qwen35
+	@echo ""; echo "=========== gguf gemma4 ==========="; ./bin/test_gguf_gemma4
 	@echo ""; echo "=========== gguf native ==========="; ./bin/test_gguf_native
 	@echo ""; echo "=========== moe ==========="; ./bin/test_moe
 	@echo ""; echo "=========== deltanet ==========="; ./bin/test_deltanet

@@ -184,7 +184,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         }
         gguf_path=selected;gguf_file=std::make_unique<GGUFFile>();
         if(!gguf_file->open(gguf_path,err))return false;
-        if(!gguf_qwen35_config(*gguf_file,sidecar,j,err))return false;
+        std::string arch;
+        if(!gguf_file->get_string("general.architecture",arch,err))return false;
+        if(!(arch=="gemma4" ? gguf_gemma4_config(*gguf_file,sidecar,j,err)
+                            : gguf_qwen35_config(*gguf_file,sidecar,j,err)))return false;
         {
             Tokenizer tok;
             const bool has_sidecar=::access((dir+"/tokenizer.json").c_str(),F_OK)==0;
@@ -271,7 +274,9 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     // does not implement, and claiming them would be the silent-wrong
     // default the layer_types check above exists to remove.
     const bool gemma4 = model_type == "gemma4" || model_type == "gemma4_text"
-                     || j.find("\"gemma4_text\"") != std::string::npos;
+                     || model_type == "gemma4_unified" ||
+                        j.find("\"gemma4_text\"") != std::string::npos ||
+                        j.find("\"gemma4_unified_text\"") != std::string::npos;
     // Qwen4-Exp (Qwen3.8-Flash-Next).  "qwen4_exp" is the multimodal
     // wrapper and "qwen4_exp_text" the text tower
     // (ref/qwen4_exp_config.py:30,35), so match both and the nested
@@ -844,7 +849,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 i, cfg.mlp_only_layers.empty() ? nullptr : cfg.mlp_only_layers.data(),
                 int(cfg.mlp_only_layers.size()), cfg.n_experts, cfg.sparse_step);
     }
-    if(use_gguf){
+    if(use_gguf && !cfg.is_gemma4){
         // Qwen text-only mRoPE uses the same position in every section.
         // Keep the derived sections in the model description; only Agnes
         // previously populated this field, and no execution path reads it.
@@ -861,7 +866,8 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     std::string native_path=dir+"/model-v3.b70";
     if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
     if(use_gguf) {
-        if(!gguf_qwen35_index(*this,err))return false;
+        if(!(cfg.is_gemma4 ? gguf_gemma4_index(*this,err)
+                           : gguf_qwen35_index(*this,err)))return false;
     } else if (::access(native_path.c_str(),F_OK)==0) {
         native_model=std::make_unique<NativeModel>();
         if(!native_model->open(native_path,err))return false;

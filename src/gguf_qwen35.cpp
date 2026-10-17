@@ -335,8 +335,9 @@ bool Qwen35Model::read_gguf_raw_rows(const TensorRef& r,uint8_t* dst,std::string
         err="native GGUF requires Q4_K/Q6_K and K divisible by 256: "+t.name;return false;
     }
     const int nk=cfg.lin_k_heads,nv=cfg.lin_v_heads,dv=cfg.lin_v_dim,dk=cfg.lin_k_dim;
-    if(nk<=0||nv<=0||nv%nk){err="GGUF V-head geometry invalid";return false;}
     const auto inv=r.gguf_inverse;
+    if(inv!=TensorRef::GGUFInverse::NONE &&
+       (nk<=0||nv<=0||nv%nk)){err="GGUF V-head geometry invalid";return false;}
     for(uint64_t i=0;i<count;++i){
         uint64_t row=first+i;
         if(inv==TensorRef::GGUFInverse::V_ROWS || inv==TensorRef::GGUFInverse::QKV_ROWS){
@@ -364,11 +365,12 @@ bool Qwen35Model::read_gguf_f32(const TensorRef& r,float* dst,std::string& err,
         err="GGUF row width mismatch: "+t.name;return false;
     }
     const int nk=cfg.lin_k_heads,nv=cfg.lin_v_heads,dv=cfg.lin_v_dim,dk=cfg.lin_k_dim;
-    if(nk<=0||nv<=0||nv%nk){err="GGUF V-head geometry invalid";return false;}
+    const auto inv=r.gguf_inverse;
+    if(inv!=TensorRef::GGUFInverse::NONE &&
+       (nk<=0||nv<=0||nv%nk)){err="GGUF V-head geometry invalid";return false;}
     const uint64_t qk=uint64_t(2)*nk*dk;
     std::vector<uint8_t> raw(size_t(t.row_bytes));
     std::vector<float> decoded(size_t(K),0.0f);
-    const auto inv=r.gguf_inverse;
     auto source_row=[&](uint64_t row){
         if(inv==TensorRef::GGUFInverse::V_ROWS || inv==TensorRef::GGUFInverse::QKV_ROWS ||
            inv==TensorRef::GGUFInverse::CONV_ROWS){
@@ -415,6 +417,226 @@ bool Qwen35Model::read_gguf_f32(const TensorRef& r,float* dst,std::string& err,
             if(bad)std::printf("  GGUF %s round-trip mismatches: %llu/%llu\n",t.name.c_str(),
                                (unsigned long long)bad,(unsigned long long)K);
         }
+    }
+    return true;
+}
+
+// Gemma 4's GGUF has the same row-major projection payloads as HF. The
+// converter renames tensors but (unlike Gemma 3) applies no norm offset.
+bool gguf_gemma4_config(const GGUFFile& f,const std::string& sidecar,
+                        std::string& out,std::string& err) {
+    std::string arch;
+    if(!f.get_string("general.architecture",arch,err))return false;
+    if(arch!="gemma4"){err="unsupported GGUF architecture: "+arch;return false;}
+    const std::string p="gemma4.";
+    auto u=[&](const char* k,uint32_t& v){return f.get_u32(p+k,v,err);};
+    auto fl=[&](const char* k,float& v){return f.get_f32(p+k,v,err);};
+    uint32_t blocks=0,h=0,inter=0,heads=0,full_hd=0,swa_hd=0,full_v=0,swa_v=0,
+             rot_full=0,rot_swa=0,window=0,shared=0,per_input=0,ctx=0;
+    float theta_full=0,theta_swa=0,eps=0,softcap=0;
+    if(!u("block_count",blocks)||!u("embedding_length",h)||
+       !u("feed_forward_length",inter)||!u("attention.head_count",heads)||
+       !u("attention.key_length",full_hd)||!u("attention.key_length_swa",swa_hd)||
+       !u("attention.value_length",full_v)||!u("attention.value_length_swa",swa_v)||
+       !u("rope.dimension_count",rot_full)||!u("rope.dimension_count_swa",rot_swa)||
+       !u("attention.sliding_window",window)||!u("attention.shared_kv_layers",shared)||
+       !u("embedding_length_per_layer_input",per_input)||!u("context_length",ctx)||
+       !fl("rope.freq_base",theta_full)||!fl("rope.freq_base_swa",theta_swa)||
+       !fl("attention.layer_norm_rms_epsilon",eps)||
+       !fl("final_logit_softcapping",softcap))return false;
+    if(shared){err="gemma4 attention.shared_kv_layers > 0 is unsupported";return false;}
+    if(per_input){err="gemma4 embedding_length_per_layer_input > 0 is unsupported";return false;}
+    if(f.get(p+"expert_count")||f.get(p+"expert_feed_forward_length")){
+        err="gemma4 expert_count / MoE is unsupported";return false;
+    }
+    if(!blocks||!h||!inter||!heads||!swa_hd||!full_hd||
+       full_v!=full_hd||swa_v!=swa_hd||rot_full!=full_hd||rot_swa!=swa_hd||
+       !window||!ctx||theta_full<=0||theta_swa<=0||eps<=0||softcap<=0){
+        err="inconsistent gemma4 attention, RoPE, or FFN geometry";return false;
+    }
+    const GGUFValue *patternv=nullptr;
+    std::vector<uint32_t> kv;
+    if(!array_u32(f,(p+"attention.head_count_kv").c_str(),kv,err)||
+       !f.get_array(p+"attention.sliding_window_pattern",patternv,err))return false;
+    const auto* pattern=std::get_if<std::vector<uint8_t>>(&patternv->data);
+    if(!pattern||kv.size()!=blocks||pattern->size()!=blocks){
+        err="gemma4 per-layer head_count_kv / sliding_window_pattern must have block_count entries";
+        return false;
+    }
+    uint32_t full_kv=0,swa_kv=0;
+    Json layers=arr();
+    bool any_full=false,any_swa=false,full_v_present=false,full_v_absent=false;
+    for(uint32_t i=0;i<blocks;++i){
+        if((*pattern)[i]>1){err="gemma4 sliding_window_pattern is not boolean";return false;}
+        const bool swa=(*pattern)[i]!=0;
+        uint32_t& expected=swa?swa_kv:full_kv;
+        if(!expected)expected=kv[i];
+        if(!expected||expected!=kv[i]){
+            err="gemma4 per_layer_config head_count_kv differs within attention type at layer "+std::to_string(i);
+            return false;
+        }
+        any_swa|=swa;any_full|=!swa;
+        layers.array.push_back(str(swa?"sliding_attention":"full_attention"));
+        const std::string b="blk."+std::to_string(i)+".";
+        const bool has_v=f.find(b+"attn_v.weight")!=nullptr;
+        if(swa&&!has_v){err="gemma4 sliding layer missing attn_v.weight: "+b;return false;}
+        if(!swa){full_v_present|=has_v;full_v_absent|=!has_v;}
+    }
+    if(!any_full||!any_swa||(full_v_present&&full_v_absent)){
+        err="gemma4 mixed attention or attention_k_eq_v tensor pattern is inconsistent";return false;
+    }
+    const GGUFTensor* emb=f.find("token_embd.weight");
+    if(!emb||emb->n_dims!=2||emb->ne[0]!=h){
+        err="gemma4 token_embd.weight shape disagrees with embedding_length";return false;
+    }
+    const GGUFTensor* rf=f.find("rope_freqs.weight");
+    if(!rf||rf->n_dims!=1||rf->ne[0]!=full_hd/2||rf->type!=0){
+        err="gemma4 rope_freqs.weight must be F32 [global_head_dim/2]";return false;
+    }
+    // conversion/gemma.py:752-762 writes [1]*rotated_pairs +
+    // [1e30]*unrotated_pairs. Header slices have no payload: 0.25 is the
+    // converter's Gemma 4 default, checked against the HF sidecar below.
+    double partial=0.25;
+    if(rf->offset<=f.file_size() && rf->nbytes<=f.file_size()-rf->offset){
+        std::vector<float> freq(size_t(rf->ne[0]));
+        if(!f.read_raw(*rf,freq.data(),err))return false;
+        size_t active=0;
+        while(active<freq.size()&&freq[active]==1.0f)++active;
+        if(!active||active==freq.size()){
+            err="gemma4 rope_freqs.weight has no proportional RoPE cutoff";return false;
+        }
+        for(size_t i=active;i<freq.size();++i)if(freq[i]!=1e30f){
+            err="gemma4 rope_freqs.weight has unsupported frequency factors";return false;
+        }
+        partial=double(2*active)/full_hd;
+    }
+    Json root=obj(),tc=obj(),rp=obj(),full=obj(),swa=obj();
+    auto n=[&](const char* k,double v){put(tc,k,num(v));};
+    n("num_hidden_layers",blocks);n("hidden_size",h);n("intermediate_size",inter);
+    n("vocab_size",emb->ne[1]);n("num_attention_heads",heads);
+    n("num_key_value_heads",swa_kv);n("num_global_key_value_heads",full_kv);
+    n("head_dim",swa_hd);n("global_head_dim",full_hd);
+    n("sliding_window",window);n("max_position_embeddings",ctx);
+    n("rms_norm_eps",eps);n("final_logit_softcapping",softcap);
+    n("num_kv_shared_layers",shared);n("hidden_size_per_layer_input",per_input);
+    put(tc,"attention_k_eq_v",flag(full_v_absent));
+    put(tc,"attention_bias",flag(false));put(tc,"enable_moe_block",flag(false));
+    put(tc,"use_double_wide_mlp",flag(false));
+    put(tc,"use_bidirectional_attention",str("vision"));
+    put(tc,"hidden_activation",str("gelu_pytorch_tanh"));
+    put(tc,"tie_word_embeddings",flag(!f.find("output.weight")));
+    put(tc,"layer_types",std::move(layers));
+    put(full,"rope_type",str("proportional"));
+    put(full,"rope_theta",num(theta_full));
+    put(full,"partial_rotary_factor",num(partial));
+    put(swa,"rope_type",str("default"));put(swa,"rope_theta",num(theta_swa));
+    put(rp,"full_attention",std::move(full));
+    put(rp,"sliding_attention",std::move(swa));
+    put(tc,"rope_parameters",std::move(rp));
+    put(tc,"model_type",str("gemma4_unified_text"));
+    put(root,"model_type",str("gemma4_unified"));
+    put(root,"tie_word_embeddings",*tc.find("tie_word_embeddings"));
+    put(root,"text_config",tc);
+    if(!sidecar.empty())try{
+        Json hf=Json::parse(sidecar);
+        const Json* ht=hf.find("text_config");if(!ht)ht=&hf;
+        for(const auto& entry:tc.object){
+            const Json* actual=ht->find(entry.first);
+            if(!actual||!equal_json(entry.second,*actual)){
+                err="GGUF/config.json mismatch "+entry.first+": GGUF="+entry.second.dump()+
+                    " config.json="+(actual?actual->dump():"<missing>");return false;
+            }
+        }
+        const Json* tied=hf.find("tie_word_embeddings");
+        if(tied&&!equal_json(*root.find("tie_word_embeddings"),*tied)){
+            err="GGUF/config.json mismatch tie_word_embeddings";return false;
+        }
+    }catch(const std::exception& e){err=std::string("config.json parse: ")+e.what();return false;}
+    out=root.dump();return true;
+}
+
+bool gguf_gemma4_index(Qwen35Model& m,std::string& err){
+    if(!m.gguf_file){err="GGUF source missing";return false;}
+    const std::string p="model.language_model.";
+    auto add=[&](const GGUFTensor& t,const std::string& name){
+        TensorRef r;r.gguf=&t;r.t.name=name;r.t.dtype=STDtype::UNKNOWN;
+        if(t.n_dims==1)r.t.shape={int64_t(t.ne[0])};
+        else r.t.shape={int64_t(t.ne[1]),int64_t(t.ne[0])};
+        r.t.begin=0;r.t.end=uint64_t(r.t.numel())*sizeof(float);
+        m.index.emplace(name,std::move(r));
+    };
+    for(const auto& t:m.gguf_file->tensors()){
+        const std::string& s=t.name;
+        auto shape=[&](uint64_t k,uint64_t n=0){
+            if((n ? (t.n_dims==2&&t.ne[0]==k&&t.ne[1]==n)
+                  : (t.n_dims==1&&t.ne[0]==k)))return true;
+            err="gemma4 GGUF tensor shape mismatch: "+s;return false;
+        };
+        const auto* ti=gguf_type_info(t.type);
+        if(!ti){err="unsupported GGUF tensor type: "+s;return false;}
+        std::vector<uint8_t> raw(ti->block_bytes);
+        std::vector<float> decoded(ti->block_elems);
+        std::string why;
+        if(!gguf_dequantize(t.type,raw.data(),ti->block_elems,decoded.data(),why,s)){
+            err="unsupported GGUF tensor decode type: "+s+": "+why;return false;
+        }
+        if(s=="token_embd.weight"){
+            if(m.cfg.hidden>0&&!shape(m.cfg.hidden,m.cfg.vocab))return false;
+            add(t,p+"embed_tokens.weight");continue;
+        }
+        if(s=="output.weight"){
+            if(m.cfg.hidden>0&&!shape(m.cfg.hidden,m.cfg.vocab))return false;
+            add(t,"lm_head.weight");continue;
+        }
+        if(s=="output_norm.weight"){
+            if(m.cfg.hidden>0&&!shape(m.cfg.hidden))return false;
+            add(t,p+"norm.weight");continue;
+        }
+        if(s=="rope_freqs.weight")continue; // consumed and validated in config
+        if(s.rfind("blk.",0)!=0){err="unmapped GGUF tensor: "+s;return false;}
+        const size_t dot=s.find('.',4);
+        uint32_t l=UINT32_MAX;
+        try{l=uint32_t(std::stoul(s.substr(4,dot-4)));}catch(...){}
+        if(dot==std::string::npos||l>=uint32_t(m.cfg.n_layers)){
+            err="unmapped GGUF layer tensor: "+s;return false;
+        }
+        const std::string role=s.substr(dot+1);
+        const std::string b=p+"layers."+std::to_string(l)+".";
+        if(m.cfg.hidden>0){
+            const uint64_t h=m.cfg.hidden, hd=m.cfg.layer_head_dim(int(l));
+            const uint64_t q=uint64_t(m.cfg.n_heads)*hd;
+            const uint64_t kv=uint64_t(m.cfg.layer_kv_heads(int(l)))*hd;
+            const uint64_t ff=m.cfg.dense_inter;
+            bool valid=true;
+            if(role=="layer_output_scale.weight")valid=shape(1);
+            else if(role=="attn_q_norm.weight"||role=="attn_k_norm.weight")valid=shape(hd);
+            else if(role=="attn_norm.weight"||role=="post_attention_norm.weight"||
+                    role=="ffn_norm.weight"||role=="post_ffw_norm.weight")valid=shape(h);
+            else if(role=="attn_q.weight")valid=shape(h,q);
+            else if(role=="attn_k.weight"||role=="attn_v.weight")valid=shape(h,kv);
+            else if(role=="attn_output.weight")valid=shape(q,h);
+            else if(role=="ffn_gate.weight"||role=="ffn_up.weight")valid=shape(h,ff);
+            else if(role=="ffn_down.weight")valid=shape(ff,h);
+            if(!valid)return false;
+        }
+        auto one=[&](const char* from,const char* to){
+            if(role!=from)return false;add(t,b+to);return true;
+        };
+        if(one("attn_norm.weight","input_layernorm.weight")||
+           one("post_attention_norm.weight","post_attention_layernorm.weight")||
+           one("ffn_norm.weight","pre_feedforward_layernorm.weight")||
+           one("post_ffw_norm.weight","post_feedforward_layernorm.weight")||
+           one("layer_output_scale.weight","layer_scalar")||
+           one("attn_q.weight","self_attn.q_proj.weight")||
+           one("attn_k.weight","self_attn.k_proj.weight")||
+           one("attn_v.weight","self_attn.v_proj.weight")||
+           one("attn_output.weight","self_attn.o_proj.weight")||
+           one("attn_q_norm.weight","self_attn.q_norm.weight")||
+           one("attn_k_norm.weight","self_attn.k_norm.weight")||
+           one("ffn_gate.weight","mlp.gate_proj.weight")||
+           one("ffn_up.weight","mlp.up_proj.weight")||
+           one("ffn_down.weight","mlp.down_proj.weight"))continue;
+        err="unmapped GGUF tensor: "+s;return false;
     }
     return true;
 }

@@ -9,6 +9,9 @@ namespace b70 {
 bool gguf_qwen35_config(const GGUFFile& file, const std::string& sidecar_json,
                          std::string& config_json, std::string& err);
 bool gguf_qwen35_index(Qwen35Model& model, std::string& err);
+bool gguf_gemma4_config(const GGUFFile& file, const std::string& sidecar_json,
+                        std::string& config_json, std::string& err);
+bool gguf_gemma4_index(Qwen35Model& model, std::string& err);
 // V head permutation used by the inverse adapter. The forward direction is
 // implemented independently in tests/test_gguf_qwen35.cpp.
 uint64_t gguf_v_tiled_index(uint64_t grouped, uint64_t nk, uint64_t nv);
