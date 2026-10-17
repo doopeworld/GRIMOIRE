@@ -189,6 +189,11 @@ template <> struct GemvGeom<Fmt::MXFP4>    { static constexpr int EPL_DEFAULT = 
 template <> struct GemvGeom<Fmt::INT4>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 4; static constexpr int EPL_MAX = 64; };
 template <> struct GemvGeom<Fmt::Q4_K>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
 template <> struct GemvGeom<Fmt::Q6_K>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+template <> struct GemvGeom<Fmt::Q5_K>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+template <> struct GemvGeom<Fmt::Q8_0>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+template <> struct GemvGeom<Fmt::IQ4_XS>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+template <> struct GemvGeom<Fmt::IQ4_NL>     { static constexpr int EPL_DEFAULT = 16; static constexpr int UNROLL_DEFAULT = 2; static constexpr int EPL_MAX = 16; };
+
 
 // Runtime knobs, read once from the environment.
 int gemv_epl_override();      // 0 = use per-format default
@@ -441,7 +446,7 @@ sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int row
 // the host lists the (expert, m-tile) pairs, moe_grouped_rows() rows each.
 // swiglu: w holds [gate; up] per expert and out is bf16 h [rows][Ne/2].
 int moe_grouped_rows();
-// Native GGUF Q4_K/Q6_K grouped DPAS path. Each matrix has its own format.
+// Native GGUF block grouped DPAS path. Each matrix has its own format.
 // Gate/up writes bf16 SwiGLU rows; down writes fp32 rows.
 bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne);
 sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, int Ne,

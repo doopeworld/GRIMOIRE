@@ -83,7 +83,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
     switch (fmt) {
     case Fmt::BF16: case Fmt::FP8_E4M3: case Fmt::FP8_E5M2:
     case Fmt::INT8: case Fmt::INT4: case Fmt::MXFP8: case Fmt::MXFP4: break;
-    case Fmt::Q4_K: case Fmt::Q6_K:
+    case Fmt::Q4_K: case Fmt::Q6_K: case Fmt::Q5_K: case Fmt::Q8_0:
+    case Fmt::IQ4_XS: case Fmt::IQ4_NL:
         throw std::invalid_argument("quantize: GGUF formats require raw GGUF blocks");
     default: throw std::invalid_argument("quantize: unknown format");
     }
@@ -241,7 +242,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
         });
         break;
     }
-    case Fmt::Q4_K: case Fmt::Q6_K:
+    case Fmt::Q4_K: case Fmt::Q6_K: case Fmt::Q5_K: case Fmt::Q8_0:
+    case Fmt::IQ4_XS: case Fmt::IQ4_NL:
         throw std::invalid_argument("quantize: GGUF formats require raw GGUF blocks");
     }
 

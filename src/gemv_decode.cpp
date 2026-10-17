@@ -1181,8 +1181,8 @@ bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
 }
 } // namespace
 
-// Native GGUF decode: one 16-lane sub-group owns R rows. Eight Q4_K lanes
-// or all sixteen Q6_K lanes stream 16-byte quant chunks per block and use
+// Native GGUF decode: one 16-lane sub-group owns R rows. The format trait
+// sets each block stride and active lane count; lanes use
 // the normal sub-group reduction. The four-row
 // variant exposes 32 independent weight rows per work-group; the M=4
 // variant keeps one row and applies each loaded block to four x rows.
@@ -1190,9 +1190,10 @@ template <Fmt F, int MB>
 sycl::event gemv_native_qk(sycl::queue& q, const QuantWeight& w,
                           const float* x, float* y,
                           const std::vector<sycl::event>& deps, int mc = 1) {
-    static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
+    static_assert(is_native_gguf(F));
     constexpr int R = MB == 1 ? ROWS_PER_SG : 1;
-    constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+    constexpr int BYTES = NativeGGUFBlock<F>::bytes;
+    constexpr int ELEMS = NativeGGUFBlock<F>::elems;
     constexpr int ROWS = WG_SUBGROUPS * R;
     const int blocks = (w.N + ROWS - 1) / ROWS;
     const int cap = gemv_cap();
@@ -1214,13 +1215,13 @@ sycl::event gemv_native_qk(sycl::queue& q, const QuantWeight& w,
                      blk += int(it.get_group_range(0))) {
                     const int first = blk * ROWS + sgid * R;
                     float acc[R][MB] = {};
-                    for (int base = 0; base < wc.K; base += 256) {
+                    for (int base = 0; base < wc.K; base += ELEMS) {
                         #pragma unroll
                         for (int r = 0; r < R; ++r) {
                             const int n = first + r;
                             if (n >= wc.N) continue;
                             const uint8_t* p = wc.payload + int64_t(n) * wc.row_bytes
-                                             + int64_t(base / 256) * BYTES;
+                                             + int64_t(base / ELEMS) * BYTES;
                             native_qk_block_lane<F, MB>(p, xp, base, lane, mc, acc[r]);
                         }
                     }
@@ -1242,7 +1243,7 @@ sycl::event gemv_native_qk(sycl::queue& q, const QuantWeight& w,
 template <Fmt F, int MB = 1>
 sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
                      float* y, const std::vector<sycl::event>& deps, int mc = 1) {
-    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+    if constexpr (is_native_gguf(F))
         if (native_qk_fast_weight<F>(w))
             return gemv_native_qk<F, MB>(q, w, x, y, deps, mc);
     if constexpr (F == Fmt::MXFP4 && MB == 1) {
@@ -1750,6 +1751,10 @@ sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
             case Fmt::MXFP4:    e = dispatch<Fmt::MXFP4, 4>(q, w, xm, ym, d, mc); break;
             case Fmt::Q4_K:     e = dispatch<Fmt::Q4_K, 4>(q, w, xm, ym, d, mc); break;
             case Fmt::Q6_K:     e = dispatch<Fmt::Q6_K, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::Q5_K:     e = dispatch<Fmt::Q5_K, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::Q8_0:     e = dispatch<Fmt::Q8_0, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::IQ4_XS:     e = dispatch<Fmt::IQ4_XS, 4>(q, w, xm, ym, d, mc); break;
+            case Fmt::IQ4_NL:     e = dispatch<Fmt::IQ4_NL, 4>(q, w, xm, ym, d, mc); break;
         }
     }
     return e;
@@ -1768,6 +1773,10 @@ sycl::event launch_gemv(sycl::queue& q, const QuantWeight& w,
         case Fmt::MXFP4:    return dispatch<Fmt::MXFP4>(q, w, x, y, deps);
         case Fmt::Q4_K:     return dispatch<Fmt::Q4_K>(q, w, x, y, deps);
         case Fmt::Q6_K:     return dispatch<Fmt::Q6_K>(q, w, x, y, deps);
+        case Fmt::Q5_K:     return dispatch<Fmt::Q5_K>(q, w, x, y, deps);
+        case Fmt::Q8_0:     return dispatch<Fmt::Q8_0>(q, w, x, y, deps);
+        case Fmt::IQ4_XS:     return dispatch<Fmt::IQ4_XS>(q, w, x, y, deps);
+        case Fmt::IQ4_NL:     return dispatch<Fmt::IQ4_NL>(q, w, x, y, deps);
     }
     return {};
 }

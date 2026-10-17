@@ -51,11 +51,11 @@ inline bool native_qk_fast_enabled() {
 
 template <Fmt F>
 inline bool native_qk_fast_weight(const QuantWeight& w) {
-    static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
+    static_assert(is_native_gguf(F));
     return native_qk_fast_enabled() && w.fmt == F && w.payload &&
            !w.scales && !w.zeros && w.row_scales == 0 &&
-           w.K > 0 && w.K % 256 == 0 &&
-           w.row_bytes >= int64_t(w.K / 256) * (F == Fmt::Q4_K ? 144 : 210);
+           w.K > 0 && w.K % NativeGGUFBlock<F>::elems == 0 &&
+           w.row_bytes >= int64_t(w.K / NativeGGUFBlock<F>::elems) * NativeGGUFBlock<F>::bytes;
 }
 
 // ---------------------------------------------------------------------
@@ -81,6 +81,11 @@ template <Fmt F, int EPL> struct GemvStepGGUF {
 };
 template <int EPL> struct GemvStep<Fmt::Q4_K, EPL> : GemvStepGGUF<Fmt::Q4_K, EPL> {};
 template <int EPL> struct GemvStep<Fmt::Q6_K, EPL> : GemvStepGGUF<Fmt::Q6_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q5_K, EPL> : GemvStepGGUF<Fmt::Q5_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q8_0, EPL> : GemvStepGGUF<Fmt::Q8_0, EPL> {};
+template <int EPL> struct GemvStep<Fmt::IQ4_XS, EPL> : GemvStepGGUF<Fmt::IQ4_XS, EPL> {};
+template <int EPL> struct GemvStep<Fmt::IQ4_NL, EPL> : GemvStepGGUF<Fmt::IQ4_NL, EPL> {};
+
 
 template <int EPL> struct GemvStep<Fmt::BF16, EPL> {
     static inline float run(const QuantWeight& w, const uint8_t* row,

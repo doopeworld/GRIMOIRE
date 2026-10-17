@@ -407,11 +407,16 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps, ldn);
             case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps, ldn);
             case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps, ldn);
+            case Fmt::Q5_K:     return dequant_vnni<Fmt::Q5_K>(q, w, dst, deps, ldn);
+            case Fmt::Q8_0:     return dequant_vnni<Fmt::Q8_0>(q, w, dst, deps, ldn);
+            case Fmt::IQ4_XS:     return dequant_vnni<Fmt::IQ4_XS>(q, w, dst, deps, ldn);
+            case Fmt::IQ4_NL:     return dequant_vnni<Fmt::IQ4_NL>(q, w, dst, deps, ldn);
         }
         return {};
     }
     static const bool no_stream = std::getenv("GRIMOIRE_DEQUANT_TILED") != nullptr;
-    if (!no_stream && w.fmt == Fmt::MXFP4 && w.K % 128 == 0 && w.N % 256 == 0)
+    if (!no_stream && w.fmt == Fmt::MXFP4 && w.payload && w.scales &&
+        w.K % 128 == 0 && w.N % 256 == 0)
         return dequant_mxfp4_stream(q, w, dst, deps);
     if (!no_stream && int4_stream_ok(w))
         return dequant_int4_stream(q, w, dst, deps);
@@ -426,6 +431,10 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::INT4:     return dequant_vnni_tiled<Fmt::INT4>(q, w, dst, deps);
             case Fmt::Q4_K:     return dequant_vnni_tiled<Fmt::Q4_K>(q, w, dst, deps);
             case Fmt::Q6_K:     return dequant_vnni_tiled<Fmt::Q6_K>(q, w, dst, deps);
+            case Fmt::Q5_K:     return dequant_vnni_tiled<Fmt::Q5_K>(q, w, dst, deps);
+            case Fmt::Q8_0:     return dequant_vnni_tiled<Fmt::Q8_0>(q, w, dst, deps);
+            case Fmt::IQ4_XS:     return dequant_vnni_tiled<Fmt::IQ4_XS>(q, w, dst, deps);
+            case Fmt::IQ4_NL:     return dequant_vnni_tiled<Fmt::IQ4_NL>(q, w, dst, deps);
         }
     }
     switch (w.fmt) {
@@ -438,6 +447,10 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
         case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps);
         case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps);
         case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps);
+        case Fmt::Q5_K:     return dequant_vnni<Fmt::Q5_K>(q, w, dst, deps);
+        case Fmt::Q8_0:     return dequant_vnni<Fmt::Q8_0>(q, w, dst, deps);
+        case Fmt::IQ4_XS:     return dequant_vnni<Fmt::IQ4_XS>(q, w, dst, deps);
+        case Fmt::IQ4_NL:     return dequant_vnni<Fmt::IQ4_NL>(q, w, dst, deps);
     }
     return {};
 }
@@ -1372,10 +1385,10 @@ sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int N
                     sb = srow[kb / kMXBlock];
                 } else {
                     qk = kb;
-                    const int block = kb / 256;
+                    const int block = kb / NativeGGUFBlock<F>::elems;
                     if (block != qk_block) {
                         native_qk_block_scales<F>(
-                            prow + block * (F == Fmt::Q4_K ? 144 : 210),
+                            prow + block * NativeGGUFBlock<F>::bytes,
                             qk_scales, qk_mins);
                         qk_block = block;
                     }
@@ -1917,9 +1930,9 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 // the m-tile table in units of moe_grouped_rows() rows per tile.
 int moe_grouped_rows() { return MC2; }
 bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne) {
-    return (w.fmt == Fmt::Q4_K || w.fmt == Fmt::Q6_K) && w.payload &&
+    return is_native_gguf(w.fmt) && w.payload &&
            !w.scales && !w.zeros && Ne > 0 && Ne % NC2 == 0 &&
-           w.K > 0 && w.K % 256 == 0 && w.N % Ne == 0 &&
+           w.K > 0 && w.K % native_gguf_block_elems(w.fmt) == 0 && w.N % Ne == 0 &&
            w.row_bytes == bytes_per_row(w.fmt, w.K);
 }
 sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
@@ -1929,11 +1942,19 @@ sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, i
                                          const std::vector<sycl::event>& deps) {
     if (!moe_native_qk_grouped_supported(w, Ne))
         throw std::runtime_error("launch_moe_native_qk_grouped: unsupported native QK weight or shape");
-    if (w.fmt == Fmt::Q4_K)
-        return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::Q4_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
-                      : gemm_mxfp4_fused_grouped<0, Fmt::Q4_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps);
-    return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::Q6_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
-                  : gemm_mxfp4_fused_grouped<0, Fmt::Q6_K>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps);
+#define B70_GROUPED_NATIVE(F) case Fmt::F: \
+    return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::F>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps) \
+                  : gemm_mxfp4_fused_grouped<0, Fmt::F>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
+    switch (w.fmt) {
+    B70_GROUPED_NATIVE(Q4_K);
+    B70_GROUPED_NATIVE(Q5_K);
+    B70_GROUPED_NATIVE(Q6_K);
+    B70_GROUPED_NATIVE(Q8_0);
+    B70_GROUPED_NATIVE(IQ4_XS);
+    B70_GROUPED_NATIVE(IQ4_NL);
+    default: throw std::runtime_error("unknown native GGUF format");
+    }
+#undef B70_GROUPED_NATIVE
 }
 // Upload the ESIMD MoE kernels' byte -> bf16 table now: its first use waits
 // on the queue, which a queue recording a command graph refuses.

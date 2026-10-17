@@ -331,8 +331,8 @@ bool Qwen35Model::read_gguf_raw_rows(const TensorRef& r,uint8_t* dst,std::string
     const uint64_t K=uint64_t(r.t.shape.back()),N=uint64_t(r.t.numel())/K;
     if(!count)count=N-first;
     if(first>N||count>N-first||t.ne[0]!=K){err="GGUF raw row shape mismatch: "+t.name;return false;}
-    if(K%256 || (t.type!=12 && t.type!=14)){
-        err="native GGUF requires Q4_K/Q6_K and K divisible by 256: "+t.name;return false;
+    if(!is_native_gguf_type(t.type) || K % native_gguf_block_elems(native_gguf_fmt(t.type))){
+        err="native GGUF requires supported block format and aligned K: "+t.name;return false;
     }
     const int nk=cfg.lin_k_heads,nv=cfg.lin_v_heads,dv=cfg.lin_v_dim,dk=cfg.lin_k_dim;
     const auto inv=r.gguf_inverse;

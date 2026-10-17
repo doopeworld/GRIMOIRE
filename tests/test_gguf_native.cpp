@@ -21,21 +21,54 @@ static int bad=0,checked=0;
 #define CHECK(c) do { ++checked; if(!(c)){std::fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#c);++bad;} } while(0)
 static uint32_t u32(const uint8_t* p){return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);}
 
+template <Fmt F> static void tile16(const uint8_t* row,int k,uint32_t* dst,int ld,int n){
+    native_qk_tile_16_vnni<F>(row,k,dst,ld,n);
+}
+static void tile16(Fmt fmt,const uint8_t* row,int k,uint32_t* dst,int ld,int n){
+    switch(fmt){
+    case Fmt::Q4_K: tile16<Fmt::Q4_K>(row,k,dst,ld,n);break;
+    case Fmt::Q5_K: tile16<Fmt::Q5_K>(row,k,dst,ld,n);break;
+    case Fmt::Q6_K: tile16<Fmt::Q6_K>(row,k,dst,ld,n);break;
+    case Fmt::Q8_0: tile16<Fmt::Q8_0>(row,k,dst,ld,n);break;
+    case Fmt::IQ4_XS: tile16<Fmt::IQ4_XS>(row,k,dst,ld,n);break;
+    case Fmt::IQ4_NL: tile16<Fmt::IQ4_NL>(row,k,dst,ld,n);break;
+    default: CHECK(false);break;
+    }
+}
+template <Fmt F> static void tile_scaled(const uint8_t* row,int k,int block_bytes,float* values){
+    float scales[16],mins[8];
+    native_qk_block_scales<F>(row+(k/NativeGGUFBlock<F>::elems)*block_bytes,scales,mins);
+    native_qk_tile_16_scaled<F>(row,k,scales,mins,values);
+}
+static void tile_scaled(Fmt fmt,const uint8_t* row,int k,int block_bytes,float* values){
+    switch(fmt){
+    case Fmt::Q4_K: tile_scaled<Fmt::Q4_K>(row,k,block_bytes,values);break;
+    case Fmt::Q5_K: tile_scaled<Fmt::Q5_K>(row,k,block_bytes,values);break;
+    case Fmt::Q6_K: tile_scaled<Fmt::Q6_K>(row,k,block_bytes,values);break;
+    case Fmt::Q8_0: tile_scaled<Fmt::Q8_0>(row,k,block_bytes,values);break;
+    case Fmt::IQ4_XS: tile_scaled<Fmt::IQ4_XS>(row,k,block_bytes,values);break;
+    case Fmt::IQ4_NL: tile_scaled<Fmt::IQ4_NL>(row,k,block_bytes,values);break;
+    default: CHECK(false);break;
+    }
+}
 static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
     std::ifstream in(std::string("tests/gguf/data/")+name+".bin",std::ios::binary);
     CHECK(bool(in));if(!in)return;
     std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),{});
     CHECK(file.size()>=16);if(file.size()<16)return;
-    const int K=256,N=int(u32(file.data()+8))/K;
+    const int K=native_gguf_block_elems(fmt),N=int(u32(file.data()+8))/K;
     const uint32_t raw_size=u32(file.data()+12);
     CHECK(u32(file.data()+4)==type);
+    CHECK(native_gguf_fmt(type)==fmt && native_gguf_type(fmt)==type);
     CHECK(raw_size==uint32_t(N*block_bytes));
     CHECK(file.size()==16+raw_size+size_t(N)*K*4);
     CHECK(bytes_per_row(fmt,K)==block_bytes);
-    CHECK(bytes_per_row(fmt,255)==0);
+    CHECK(bytes_per_row(fmt,K-1)==0);
     CHECK(scales_per_row(fmt,K)==0);
     CHECK(bits_per_elem(fmt)==double(block_bytes)*8/K);
-    CHECK(std::strcmp(fmt_name(fmt),name==std::string("Q4_K")?"q4_k":"q6_k")==0);
+    CHECK(std::strcmp(fmt_name(fmt),std::string(name)=="Q4_K"?"q4_k":
+            std::string(name)=="Q5_K"?"q5_k":std::string(name)=="Q6_K"?"q6_k":
+            std::string(name)=="Q8_0"?"q8_0":std::string(name)=="IQ4_XS"?"iq4_xs":"iq4_nl")==0);
     QuantWeight w{fmt,N,K,file.data()+16,nullptr,nullptr,block_bytes,0};
     CHECK(w.scales==nullptr && w.zeros==nullptr && w.row_scales==0);
     const QuantWeight sliced=slice_quant_rows(w,1,1);
@@ -45,7 +78,7 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
                             u32(file.data()+16+raw_size+(size_t(K)+k)*4));
     try {
         float dummy[256]{};
-        (void)quantize(dummy,1,256,fmt);
+        (void)quantize(dummy,1,K,fmt);
         CHECK(false); // Native formats have no lossy host quantizer.
     } catch(const std::invalid_argument&) {}
     std::vector<float> decoded(size_t(N)*K);
@@ -66,12 +99,8 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
     for(int n=0;n<N;++n){
         std::vector<uint32_t> tile(size_t(K/2)*256,0xdeadbeefu);
         for(int k=0;k<K;k+=16){
-            if(fmt==Fmt::Q4_K)
-                native_qk_tile_16_vnni<Fmt::Q4_K>(w.payload+size_t(n)*block_bytes,k,
-                                                    tile.data()+size_t(k/2)*256,256,7);
-            else
-                native_qk_tile_16_vnni<Fmt::Q6_K>(w.payload+size_t(n)*block_bytes,k,
-                                                    tile.data()+size_t(k/2)*256,256,7);
+            tile16(fmt,w.payload+size_t(n)*block_bytes,k,
+                   tile.data()+size_t(k/2)*256,256,7);
         }
         for(int p=0;p<K/2;++p){
             const uint32_t expected=uint32_t(f32_to_bf16(decoded[size_t(n)*K+2*p]).bits) |
@@ -96,25 +125,15 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
     std::vector<uint8_t> two(size_t(2)*block_bytes);
     std::memcpy(two.data(),file.data()+16,block_bytes);
     std::memcpy(two.data()+block_bytes,file.data()+16+block_bytes,block_bytes);
-    QuantWeight wide{fmt,1,512,two.data(),nullptr,nullptr,2*block_bytes,0};
-    for(int k=0;k<512;++k)
+    QuantWeight wide{fmt,1,2*K,two.data(),nullptr,nullptr,2*block_bytes,0};
+    for(int k=0;k<2*K;++k)
         CHECK(f32_to_bits(wide.at(0,k))==u32(file.data()+16+raw_size+
-              size_t(k/256)*256*4+size_t(k%256)*4));
-    for(int block=0;block<2;++block){
-        float scales[16],mins[8];
-        if(fmt==Fmt::Q4_K)
-            native_qk_block_scales<Fmt::Q4_K>(two.data()+size_t(block)*block_bytes,scales,mins);
-        else
-            native_qk_block_scales<Fmt::Q6_K>(two.data()+size_t(block)*block_bytes,scales,mins);
-        for(int k=block*256;k<(block+1)*256;k+=16){
-            float values[16];
-            if(fmt==Fmt::Q4_K)
-                native_qk_tile_16_scaled<Fmt::Q4_K>(two.data(),k,scales,mins,values);
-            else
-                native_qk_tile_16_scaled<Fmt::Q6_K>(two.data(),k,scales,mins,values);
-            for(int i=0;i<16;++i)
-                CHECK(f32_to_bf16(values[i]).bits==f32_to_bf16(wide.at(0,k+i)).bits);
-        }
+              size_t(k/K)*K*4+size_t(k%K)*4));
+    for(int k=0;k<2*K;k+=16){
+        float values[16];
+        tile_scaled(fmt,two.data(),k,block_bytes,values);
+        for(int i=0;i<16;++i)
+            CHECK(f32_to_bf16(values[i]).bits==f32_to_bf16(wide.at(0,k+i)).bits);
     }
 }
 
@@ -168,6 +187,14 @@ static void raw_row_test(Fmt fmt,uint32_t type,int row_bytes){
     const int physical=512+2*D;
     CHECK(std::memcmp(copied.data(),raw.data()+size_t(physical)*row_bytes,row_bytes)==0);
     CHECK(bytes_per_row(fmt,K)==row_bytes);
+    // The reader refuses a named raw tensor whose K is not a whole block.
+    GGUFTensor bad_tensor=*r.gguf;
+    bad_tensor.ne[0]=K-1;
+    TensorRef bad_ref=r;
+    bad_ref.gguf=&bad_tensor;
+    bad_ref.t.shape={N,K-1};
+    CHECK(!model.read_gguf_raw_rows(bad_ref,copied.data(),err,0,1));
+    CHECK(err.find(bad_tensor.name)!=std::string::npos);
     ::unlink(path.c_str());
 }
 
@@ -179,27 +206,27 @@ struct HostQK {
     std::vector<bf16_t> tile;
 };
 static HostQK host_qk(Fmt fmt,int N,int K){
-    const bool q4=fmt==Fmt::Q4_K;
-    const char* name=q4?"Q4_K":"Q6_K";
+    const char* name=fmt==Fmt::Q4_K?"Q4_K":fmt==Fmt::Q5_K?"Q5_K":
+        fmt==Fmt::Q6_K?"Q6_K":fmt==Fmt::Q8_0?"Q8_0":
+        fmt==Fmt::IQ4_XS?"IQ4_XS":"IQ4_NL";
     std::ifstream in(std::string("tests/gguf/data/")+name+".bin",std::ios::binary);
     CHECK(bool(in));
     std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),{});
-    const int rb=q4?144:210, src_rows=int(u32(file.data()+8))/256;
+    const int be=native_gguf_block_elems(fmt),rb=bytes_per_row(fmt,be);
+    const int src_rows=int(u32(file.data()+8))/be;
     HostQK w{fmt,N,K,rb,{},{},{}};
-    w.raw.resize(size_t(N)*rb*(K/256));
-    for(int n=0;n<N;++n)for(int b=0;b<K/256;++b)
-        std::memcpy(w.raw.data()+(size_t(n)*(K/256)+b)*rb,
+    w.raw.resize(size_t(N)*rb*(K/be));
+    for(int n=0;n<N;++n)for(int b=0;b<K/be;++b)
+        std::memcpy(w.raw.data()+(size_t(n)*(K/be)+b)*rb,
                     file.data()+16+size_t((n+b)%src_rows)*rb,rb);
     w.independent.resize(size_t(N)*K);
     std::string err;
-    CHECK(gguf_dequantize(q4?12:14,w.raw.data(),size_t(N)*K,w.independent.data(),err));
+    CHECK(gguf_dequantize(native_gguf_type(fmt),
+        w.raw.data(),size_t(N)*K,w.independent.data(),err));
     w.tile.resize(size_t(N)*K);
     for(int n=0;n<N;++n)for(int b=0;b<K;b+=16){
         uint32_t packed[8];
-        if(q4) native_qk_tile_16_vnni<Fmt::Q4_K>(w.raw.data()+size_t(n)*rb*(K/256),
-                                                  b,packed,1,0);
-        else native_qk_tile_16_vnni<Fmt::Q6_K>(w.raw.data()+size_t(n)*rb*(K/256),
-                                                b,packed,1,0);
+        tile16(fmt,w.raw.data()+size_t(n)*rb*(K/be),b,packed,1,0);
         for(int p=0;p<8;++p){
             w.tile[size_t(n)*K+b+2*p]={uint16_t(packed[p])};
             w.tile[size_t(n)*K+b+2*p+1]={uint16_t(packed[p]>>16)};
@@ -213,11 +240,11 @@ static void fast_gemv_case(int K,int mc){
     const HostQK w=host_qk(F,N,K);
     std::vector<float> x(size_t(MB)*K);
     for(int m=0;m<mc;++m)for(int k=0;k<K;++k)
-        x[size_t(m)*K+k]=float(((k*37+m*53+k/256*11)%211)-105)/173.0f;
+        x[size_t(m)*K+k]=float(((k*37+m*53+k/NativeGGUFBlock<F>::elems*11)%211)-105)/173.0f;
     const float* xp[MB];
     for(int m=0;m<MB;++m)xp[m]=x.data()+size_t(m)*K;
     for(int n=0;n<N;++n){
-        const uint8_t* row=w.raw.data()+size_t(n)*w.rb*(K/256);
+        const uint8_t* row=w.raw.data()+size_t(n)*w.rb*(K/NativeGGUFBlock<F>::elems);
         float got[MB]={};
         for(int lane=0;lane<16;++lane){
             float part[MB]={};
@@ -236,9 +263,17 @@ static void fast_gemv_test(){
     for(int K:{512,2048,17408}){
         fast_gemv_case<Fmt::Q4_K,1>(K,1);
         fast_gemv_case<Fmt::Q6_K,1>(K,1);
+        fast_gemv_case<Fmt::Q5_K,1>(K,1);
+        fast_gemv_case<Fmt::Q8_0,1>(K,1);
+        fast_gemv_case<Fmt::IQ4_XS,1>(K,1);
+        fast_gemv_case<Fmt::IQ4_NL,1>(K,1);
     }
     fast_gemv_case<Fmt::Q4_K,4>(2048,4);
     fast_gemv_case<Fmt::Q6_K,4>(2048,4);
+    fast_gemv_case<Fmt::Q5_K,4>(2048,4);
+    fast_gemv_case<Fmt::Q8_0,4>(2048,4);
+    fast_gemv_case<Fmt::IQ4_XS,4>(2048,4);
+    fast_gemv_case<Fmt::IQ4_NL,4>(2048,4);
     // Isolate the terms a decoder can accidentally omit: Q4_K's dmin
     // subtraction and Q6_K's signed -32 offset.
     for(Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
@@ -313,8 +348,8 @@ static std::vector<float> host_moe(const HostQK& gu,const HostQK& dn,bool groupe
 }
 static void grouped_moe_test(){
     constexpr int E=3,H=256,I=256;
-    const HostQK gu=host_qk(Fmt::Q4_K,E*2*I,H);
-    for(const Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
+    for(const Fmt fmt:{Fmt::Q4_K,Fmt::Q5_K,Fmt::Q6_K,Fmt::Q8_0,Fmt::IQ4_XS,Fmt::IQ4_NL}){
+        const HostQK gu=host_qk(fmt,E*2*I,H);
         const HostQK dn=host_qk(fmt,E*H,I);
         const auto grouped=host_moe(gu,dn,true),per_expert=host_moe(gu,dn,false);
         for(size_t i=0;i<grouped.size();++i)
@@ -368,14 +403,26 @@ static void dense_ffn_raw_test(Fmt fmt,uint32_t type){
 int main(){
     format_test(Fmt::Q4_K,12,"Q4_K",144);
     format_test(Fmt::Q6_K,14,"Q6_K",210);
+    format_test(Fmt::Q5_K,13,"Q5_K",176);
+    format_test(Fmt::Q8_0,8,"Q8_0",34);
+    format_test(Fmt::IQ4_XS,23,"IQ4_XS",136);
+    format_test(Fmt::IQ4_NL,20,"IQ4_NL",18);
     gather_test(32);
     gather_test(48);
     raw_row_test(Fmt::Q4_K,12,144);
     raw_row_test(Fmt::Q6_K,14,210);
+    raw_row_test(Fmt::Q5_K,13,176);
+    raw_row_test(Fmt::Q8_0,8,272);
+    raw_row_test(Fmt::IQ4_XS,23,136);
+    raw_row_test(Fmt::IQ4_NL,20,144);
     grouped_moe_test();
     fast_gemv_test();
     dense_ffn_raw_test(Fmt::Q4_K,12);
     dense_ffn_raw_test(Fmt::Q6_K,14);
+    dense_ffn_raw_test(Fmt::Q5_K,13);
+    dense_ffn_raw_test(Fmt::Q8_0,8);
+    dense_ffn_raw_test(Fmt::IQ4_XS,23);
+    dense_ffn_raw_test(Fmt::IQ4_NL,20);
     std::printf("GGUF native: %d assertions, %d failures\n",checked,bad);
     return bad?1:0;
 }

@@ -60,6 +60,10 @@ struct QuantWeight {
             case Fmt::BF16:
             case Fmt::Q4_K:
             case Fmt::Q6_K:
+            case Fmt::Q5_K:
+            case Fmt::Q8_0:
+            case Fmt::IQ4_XS:
+            case Fmt::IQ4_NL:
                 return 1.0f;
             case Fmt::FP8_E4M3:
             case Fmt::FP8_E5M2:
@@ -107,6 +111,10 @@ struct QuantWeight {
             case Fmt::MXFP4:    return decode_elem<Fmt::MXFP4>(row, k, s);
             case Fmt::Q4_K:     return decode_q4_k(row, k);
             case Fmt::Q6_K:     return decode_q6_k(row, k);
+            case Fmt::Q5_K:     return decode_q5_k(row, k);
+            case Fmt::Q8_0:     return decode_q8_0(row, k);
+            case Fmt::IQ4_XS:     return decode_iq4_xs(row, k);
+            case Fmt::IQ4_NL:     return decode_iq4_nl(row, k);
             case Fmt::INT4:     return decode_int4(row, k, s, zero_for(n, k));
         }
         return 0.0f;

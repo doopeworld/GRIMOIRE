@@ -1,4 +1,37 @@
-# Phase 3 step 1: native Q4_K and Q6_K
+# Native GGUF block formats (current)
+
+The original Q4_K/Q6_K implementation is documented below as Phase 3 step 1.
+The current native set is Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS and IQ4_NL.
+`--proj native` retains raw GGML blocks for eligible projections. Q2_K,
+Q3_K, IQ1_*, IQ2_* and IQ3_* still decode at load and use the MXFP4 base.
+The banner prints native and fallback tensor counts and GiB per GGUF type.
+Critical tensors continue to use the BF16 policy. A gate/up pair with
+mismatched GGUF types uses the existing decode and repack fallback.
+
+`NativeGGUFBlock<F>` in `include/b70/formats.hpp` provides each format's
+block width, byte stride, type ID and decode lane count. K must be divisible
+by the block width: 256 for K quants and IQ4_XS, 32 for Q8_0 and IQ4_NL.
+The raw readers and upload paths refuse an unaligned named tensor. Q5_K is
+176 bytes per 256 values, Q8_0 34 bytes per 32, IQ4_XS 136 bytes per 256,
+and IQ4_NL 18 bytes per 32. Both IQ4 formats use the ggml IQ4_NL value table.
+
+The shared element decoder, 16-value VNNI tile decoder, grouped MoE tile
+writer and 16-lane GEMV arithmetic dispatch through the trait. The GEMV
+applies the block or sub-block scale after accumulating the lane's dot; Q5_K
+also applies its minimum term after the input sum, as Q4_K does. Q8_0 and
+IQ4_NL use two 16-value lanes per block. The MXFP4/INT4 ESIMD and bridge
+paths still require their exact formats and side-scale pointers.
+
+`make test_gguf_native` checks each new format against the checked-in upstream
+golden block and independent `gguf_dequantize`, tests the VNNI pair layout,
+fast GEMV at K=512/2048/17408 including M=4, grouped top-k MoE math, raw
+permutations, and dense gate/up/down row handling. The full `make test` host
+gate must pass. No SYCL compiler is available on the Mac; on the B70 build
+with icpx, then compare a Qwen3.8-27B UD-Q4_K_XL native run against BF16 for
+KLD and measure prefill and decode throughput. Check the banner's per-type
+native/fallback counts before interpreting the result.
+
+## Phase 3 step 1: original Q4_K/Q6_K implementation
 
 `--proj native` (CLI or server) or `GRIMOIRE_GGUF_NATIVE=1` enables raw GGUF
 Q4_K/Q6_K weights. Raw retention applies to GGUF inputs only. Without it, the

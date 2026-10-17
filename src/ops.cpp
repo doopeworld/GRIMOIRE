@@ -2095,7 +2095,7 @@ static sycl::event mova_value_packed_impl(
         const std::vector<sycl::event>& deps) {
     const int K = w.K;
     const bool fast = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return native_qk_fast_weight<F>(w);
         return false;
     }();
@@ -2120,10 +2120,10 @@ static sycl::event mova_value_packed_impl(
                     const int64_t row = int64_t(e) * N + n;
                     const uint8_t* rp = wc.payload + row * wc.row_bytes;
                     float a = 0.0f;
-                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                    if constexpr (is_native_gguf(F)) {
                         if (fast) {
                             const float* xp[1] = {xr};
-                            for (int lane = 0; lane < (F == Fmt::Q4_K ? 8 : 16); ++lane) {
+                            for (int lane = 0; lane < (NativeGGUFBlock<F>::lanes); ++lane) {
                                 float partial = 0.0f;
                                 native_qk_row_lane<F, 1>(rp, xp, K, lane, 1, &partial);
                                 a += partial;
@@ -2135,7 +2135,7 @@ static sycl::event mova_value_packed_impl(
                     } else {
                     for (int k = 0; k < K; ++k) {
                         float sc;
-                        if constexpr (F == Fmt::BF16 || F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                        if constexpr (F == Fmt::BF16 || is_native_gguf(F)) {
                             sc = 1.0f;
                         } else if constexpr (F == Fmt::FP8_E4M3 ||
                                              F == Fmt::FP8_E5M2 ||
@@ -2186,6 +2186,10 @@ sycl::event launch_mova_value_packed(
         case Fmt::MXFP4:    return mova_value_packed_impl<Fmt::MXFP4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::Q4_K:     return mova_value_packed_impl<Fmt::Q4_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::Q6_K:     return mova_value_packed_impl<Fmt::Q6_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q5_K:     return mova_value_packed_impl<Fmt::Q5_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q8_0:     return mova_value_packed_impl<Fmt::Q8_0>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::IQ4_XS:     return mova_value_packed_impl<Fmt::IQ4_XS>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::IQ4_NL:     return mova_value_packed_impl<Fmt::IQ4_NL>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
     }
     return {};
 }

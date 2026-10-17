@@ -135,6 +135,10 @@ sycl::event launch_gemm_batched(sycl::queue& q, const QuantWeight& w,
         case Fmt::MXFP4:    return gemm_batched_impl<Fmt::MXFP4, 16>(q, w, x, y, M, deps);
         case Fmt::Q4_K:     return gemm_batched_impl<Fmt::Q4_K, 16>(q, w, x, y, M, deps);
         case Fmt::Q6_K:     return gemm_batched_impl<Fmt::Q6_K, 16>(q, w, x, y, M, deps);
+        case Fmt::Q5_K:     return gemm_batched_impl<Fmt::Q5_K, 16>(q, w, x, y, M, deps);
+        case Fmt::Q8_0:     return gemm_batched_impl<Fmt::Q8_0, 16>(q, w, x, y, M, deps);
+        case Fmt::IQ4_XS:     return gemm_batched_impl<Fmt::IQ4_XS, 16>(q, w, x, y, M, deps);
+        case Fmt::IQ4_NL:     return gemm_batched_impl<Fmt::IQ4_NL, 16>(q, w, x, y, M, deps);
     }
     return {};
 }

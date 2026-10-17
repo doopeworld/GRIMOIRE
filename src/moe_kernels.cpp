@@ -98,12 +98,12 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
     const int groups_per_token = row_groups + (gate_w ? 1 : 0);
     const int n_groups = M * groups_per_token;
     const bool fast_w = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return L.gate_up.K == H && native_qk_fast_weight<F>(L.gate_up);
         return false;
     }();
     const bool fast_ws = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return has_sh && wsh->K == H && native_qk_fast_weight<F>(*wsh);
         return false;
     }();
@@ -201,16 +201,17 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                 // captured QuantWeights put the descriptor in private memory
                 // and slowed every load (1.57 -> 1.81 s per 160 tokens).
                 auto dots = [&](const QuantWeight& wr, bool fast) {
-                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                    if constexpr (is_native_gguf(F)) {
                         if (fast) {
-                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            constexpr int BYTES = NativeGGUFBlock<F>::bytes;
+                            constexpr int ELEMS = NativeGGUFBlock<F>::elems;
                             const float* xp[1] = {xs};
-                            for (int base = 0; base < H; base += 256) {
+                            for (int base = 0; base < H; base += ELEMS) {
                                 #pragma unroll
                                 for (int r = 0; r < R; ++r) {
                                     if (grow[r] < 0) continue;
-                                    const uint8_t* gp = wr.payload + grow[r] * wr.row_bytes + int64_t(base / 256) * BYTES;
-                                    const uint8_t* up = wr.payload + urow[r] * wr.row_bytes + int64_t(base / 256) * BYTES;
+                                    const uint8_t* gp = wr.payload + grow[r] * wr.row_bytes + int64_t(base / ELEMS) * BYTES;
+                                    const uint8_t* up = wr.payload + urow[r] * wr.row_bytes + int64_t(base / ELEMS) * BYTES;
                                     native_qk_block_lane<F, 1>(gp, xp, base, lane, 1, &ga[r]);
                                     native_qk_block_lane<F, 1>(up, xp, base, lane, 1, &ua[r]);
                                 }
@@ -285,12 +286,12 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
     const int groups_per_token = (H + rows_per_wg - 1) / rows_per_wg;
     const int n_groups = M * groups_per_token;
     const bool fast_w = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return L.down.K == I && native_qk_fast_weight<F>(L.down);
         return false;
     }();
     const bool fast_wd = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return has_sh && wdsh->K == I && native_qk_fast_weight<F>(*wdsh);
         return false;
     }();
@@ -359,17 +360,18 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                     float acc[R];
                     #pragma unroll
                     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                    if constexpr (is_native_gguf(F)) {
                         if (fast) {
-                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            constexpr int BYTES = NativeGGUFBlock<F>::bytes;
+                            constexpr int ELEMS = NativeGGUFBlock<F>::elems;
                             const float* xp[1] = {&slmh[slot * I]};
-                            for (int base = 0; base < I; base += 256) {
+                            for (int base = 0; base < I; base += ELEMS) {
                                 #pragma unroll
                                 for (int r = 0; r < R; ++r) {
                                     const int o = o_base + r;
                                     if (o >= H) continue;
                                     const uint8_t* dp = wr.payload + (ebase + o) * wr.row_bytes
-                                                      + int64_t(base / 256) * BYTES;
+                                                      + int64_t(base / ELEMS) * BYTES;
                                     native_qk_block_lane<F, 1>(dp, xp, base, lane, 1, &acc[r]);
                                 }
                             }
@@ -471,7 +473,7 @@ sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
     const int groups_per_token = (N + rows_per_wg - 1) / rows_per_wg;
     const int n_groups = M * groups_per_token;
     const bool fast = [&] {
-        if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K)
+        if constexpr (is_native_gguf(F))
             return native_qk_fast_weight<F>(w);
         return false;
     }();
@@ -534,18 +536,19 @@ sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
                     float acc[R];
                     #pragma unroll
                     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-                    if constexpr (F == Fmt::Q4_K || F == Fmt::Q6_K) {
+                    if constexpr (is_native_gguf(F)) {
                         if (fast) {
-                            constexpr int BYTES = F == Fmt::Q4_K ? 144 : 210;
+                            constexpr int BYTES = NativeGGUFBlock<F>::bytes;
+                            constexpr int ELEMS = NativeGGUFBlock<F>::elems;
                             const float* xp[1] = {xs};
-                            for (int base = 0; base < K; base += 256) {
+                            for (int base = 0; base < K; base += ELEMS) {
                                 #pragma unroll
                                 for (int r = 0; r < R; ++r) {
                                     const int n = n_base + r;
                                     if (n >= N) continue;
                                     const int64_t row = int64_t(e) * N + n;
                                     const uint8_t* rp = wc.payload + row * wc.row_bytes
-                                                      + int64_t(base / 256) * BYTES;
+                                                      + int64_t(base / ELEMS) * BYTES;
                                     native_qk_block_lane<F, 1>(rp, xp, base, lane, 1, &acc[r]);
                                 }
                             }
@@ -1073,6 +1076,10 @@ sycl::event launch_moe_gate_up(sycl::queue& q, const MoeLayer& L,
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, 1, deps);
         case Fmt::Q4_K: return moe_gate_up_impl<Fmt::Q4_K>(q, L, d_expert, x, h, 1, deps);
         case Fmt::Q6_K: return moe_gate_up_impl<Fmt::Q6_K>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::Q5_K: return moe_gate_up_impl<Fmt::Q5_K>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::Q8_0: return moe_gate_up_impl<Fmt::Q8_0>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::IQ4_XS: return moe_gate_up_impl<Fmt::IQ4_XS>(q, L, d_expert, x, h, 1, deps);
+        case Fmt::IQ4_NL: return moe_gate_up_impl<Fmt::IQ4_NL>(q, L, d_expert, x, h, 1, deps);
     }
     return {};
 }
@@ -1094,6 +1101,10 @@ sycl::event launch_moe_gate_up_shared(sycl::queue& q, const MoeLayer& L, const Q
         case Fmt::BF16:     return moe_gate_up_sh<Fmt::BF16>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
         case Fmt::Q4_K: return moe_gate_up_sh<Fmt::Q4_K>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
         case Fmt::Q6_K: return moe_gate_up_sh<Fmt::Q6_K>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::Q5_K: return moe_gate_up_sh<Fmt::Q5_K>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::Q8_0: return moe_gate_up_sh<Fmt::Q8_0>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::IQ4_XS: return moe_gate_up_sh<Fmt::IQ4_XS>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::IQ4_NL: return moe_gate_up_sh<Fmt::IQ4_NL>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
     }
     return {};
 }
@@ -1115,6 +1126,10 @@ sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const Quan
         case Fmt::BF16:     return moe_down_sh<Fmt::BF16>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
         case Fmt::Q4_K: return moe_down_sh<Fmt::Q4_K>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
         case Fmt::Q6_K: return moe_down_sh<Fmt::Q6_K>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::Q5_K: return moe_down_sh<Fmt::Q5_K>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::Q8_0: return moe_down_sh<Fmt::Q8_0>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::IQ4_XS: return moe_down_sh<Fmt::IQ4_XS>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::IQ4_NL: return moe_down_sh<Fmt::IQ4_NL>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
     }
     return {};
 }
@@ -1151,6 +1166,10 @@ sycl::event launch_mova_value_decode(sycl::queue& q, const QuantWeight& w,
         case Fmt::BF16:     return mova_decode_impl<Fmt::BF16>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
         case Fmt::Q4_K: return mova_decode_impl<Fmt::Q4_K>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
         case Fmt::Q6_K: return mova_decode_impl<Fmt::Q6_K>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::Q5_K: return mova_decode_impl<Fmt::Q5_K>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::Q8_0: return mova_decode_impl<Fmt::Q8_0>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::IQ4_XS: return mova_decode_impl<Fmt::IQ4_XS>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::IQ4_NL: return mova_decode_impl<Fmt::IQ4_NL>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
     }
     return {};
 }
@@ -1169,6 +1188,10 @@ sycl::event launch_moe_down(sycl::queue& q, const MoeLayer& L,
         case Fmt::BF16:     return moe_down_impl<Fmt::BF16>(q, L, d_expert, d_weight, h, y, 1, deps);
         case Fmt::Q4_K: return moe_down_impl<Fmt::Q4_K>(q, L, d_expert, d_weight, h, y, 1, deps);
         case Fmt::Q6_K: return moe_down_impl<Fmt::Q6_K>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::Q5_K: return moe_down_impl<Fmt::Q5_K>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::Q8_0: return moe_down_impl<Fmt::Q8_0>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::IQ4_XS: return moe_down_impl<Fmt::IQ4_XS>(q, L, d_expert, d_weight, h, y, 1, deps);
+        case Fmt::IQ4_NL: return moe_down_impl<Fmt::IQ4_NL>(q, L, d_expert, d_weight, h, y, 1, deps);
     }
     return {};
 }
@@ -1187,6 +1210,10 @@ sycl::event launch_moe_gate_up_batched(
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, tokens, deps);
         case Fmt::Q4_K: return moe_gate_up_impl<Fmt::Q4_K>(q, L, d_expert, x, h, tokens, deps);
         case Fmt::Q6_K: return moe_gate_up_impl<Fmt::Q6_K>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::Q5_K: return moe_gate_up_impl<Fmt::Q5_K>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::Q8_0: return moe_gate_up_impl<Fmt::Q8_0>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::IQ4_XS: return moe_gate_up_impl<Fmt::IQ4_XS>(q, L, d_expert, x, h, tokens, deps);
+        case Fmt::IQ4_NL: return moe_gate_up_impl<Fmt::IQ4_NL>(q, L, d_expert, x, h, tokens, deps);
     }
     return {};
 }
@@ -1205,6 +1232,10 @@ sycl::event launch_moe_down_batched(
         case Fmt::BF16:     return moe_down_impl<Fmt::BF16>(q, L, d_expert, d_weight, h, y, tokens, deps);
         case Fmt::Q4_K: return moe_down_impl<Fmt::Q4_K>(q, L, d_expert, d_weight, h, y, tokens, deps);
         case Fmt::Q6_K: return moe_down_impl<Fmt::Q6_K>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::Q5_K: return moe_down_impl<Fmt::Q5_K>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::Q8_0: return moe_down_impl<Fmt::Q8_0>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::IQ4_XS: return moe_down_impl<Fmt::IQ4_XS>(q, L, d_expert, d_weight, h, y, tokens, deps);
+        case Fmt::IQ4_NL: return moe_down_impl<Fmt::IQ4_NL>(q, L, d_expert, d_weight, h, y, tokens, deps);
     }
     return {};
 }
