@@ -1744,11 +1744,11 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const int K  = int(ra.t.shape[1]);
     const int N  = Na + Nb;
 
-    if(ra.gguf && rb.gguf && gguf_native_ref(ck,ra) && gguf_native_ref(ck,rb)){
-        if(ra.gguf->type!=rb.gguf->type || K%256){
-            std::printf("\n  native GGUF concat refused for %s: mismatched types or K=%d\n",what,K);
-            *ok=false;return d;
-        }
+    // Dense UD quants may give gate and up different types (Q4_K vs Q6_K);
+    // those cannot share one raw matrix, so they fall through to the
+    // dequantize-and-repack path below instead of failing the load.
+    if(ra.gguf && rb.gguf && gguf_native_ref(ck,ra) && gguf_native_ref(ck,rb) &&
+       ra.gguf->type==rb.gguf->type && K%256==0){
         const size_t raw_row_bytes=ra.gguf->row_bytes;
         std::vector<uint8_t> raw(size_t(N)*raw_row_bytes);
         std::string rr;

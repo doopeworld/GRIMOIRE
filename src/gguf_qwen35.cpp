@@ -187,6 +187,16 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
                 } else if(!actual && kv.first=="rope_theta") {
                     // HF keeps this under rope_parameters in this release.
                     continue;
+                } else if(kv.first=="mtp_num_hidden_layers" && actual &&
+                          kv.second.kind==Json::Kind::Number && kv.second.number==0) {
+                    // A GGUF may ship WITHOUT the MTP head the original model has
+                    // (unsloth/Qwen3.8-27B-GGUF UD-IQ1_S / UD-IQ2_XXS: block_count 64,
+                    // nextn_predict_layers 0, no nextn.* tensors).  The GGUF is what
+                    // gets loaded, so 0 is authoritative; only "GGUF has MORE MTP
+                    // layers than the model" would be a contradiction.
+                    std::printf("  GGUF ships no MTP head (config.json has %s); MTP unavailable for this file\n",
+                                actual->dump().c_str());
+                    continue;
                 } else if(!actual||!equal_json(kv.second,*actual)) {
                     err="GGUF/config.json mismatch "+kv.first+": GGUF="+kv.second.dump()+
                         " config.json="+(actual?actual->dump():"<missing>");return false;
@@ -222,8 +232,19 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         const std::string& s=t.name;
         if(s.rfind("nextn.",0)==0||
            s.rfind("blk."+std::to_string(m.cfg.n_layers)+".",0)==0)continue;
-        if(t.type!=0&&t.type!=1&&t.type!=8&&t.type!=12&&t.type!=13&&
-           t.type!=14&&t.type!=30){
+        // Ask the decoder itself whether it can decode this type (one zero
+        // block), instead of keeping a second list that drifts from it: a
+        // hard-coded 7-type list here refused Unsloth's Q4_0/IQ* files after
+        // gguf_decode had grown to every ggml type.
+        auto decodable=[](uint32_t type,const std::string& name){
+            const auto* ti=gguf_type_info(type);
+            if(!ti)return false;
+            std::vector<uint8_t> blk(ti->block_bytes,0);
+            std::vector<float> out(ti->block_elems);
+            std::string e;
+            return gguf_dequantize(type,blk.data(),ti->block_elems,out.data(),e,name);
+        };
+        if(!decodable(t.type,s)){
             err="GGUF tensor "+s+" uses unsupported decode type "+
                 (gguf_type_info(t.type)?std::string(gguf_type_info(t.type)->name):std::to_string(t.type));
             return false;

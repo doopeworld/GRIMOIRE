@@ -262,8 +262,8 @@ static void real_headers(){
       CHECK(model.index.count("model.language_model.layers.39.mlp.experts.255.down_proj.weight")==1);
     }
 }
-static void dense_real_header(){
-    const char* path="/Users/ianernst/Desktop/gguf-ref/hdr/q38-Q8_0.bin";
+static void dense_real_header(const std::string& spath){
+    const char* path=spath.c_str();
     std::ifstream probe(path,std::ios::binary);
     if(!probe){std::printf("SKIP real qwen35 GGUF header %s (absent)\n",path);return;}
     std::ifstream cf("tests/gguf/data/qwen38_27b_config.json");CHECK(bool(cf));if(!cf)return;
@@ -282,8 +282,15 @@ static void dense_real_header(){
                          "head_dim","linear_num_key_heads","linear_num_value_heads",
                          "linear_key_head_dim","linear_value_head_dim",
                          "linear_conv_kernel_dim","full_attention_interval",
-                         "mtp_num_hidden_layers","rms_norm_eps","partial_rotary_factor"})
+                         "rms_norm_eps","partial_rotary_factor"})
         CHECK(std::abs(tc.at(key).number-ht.at(key).number)<1e-8);
+    // Some files ship without the MTP head (unsloth UD-IQ1_S / UD-IQ2_XXS:
+    // nextn_predict_layers 0, no nextn.* tensors): the GGUF's own count is the truth,
+    // and it may only be 0 or the original model's count.
+    uint32_t nextn=0;std::string nerr;
+    CHECK(f.get_u32("qwen35.nextn_predict_layers",nextn,nerr));
+    CHECK(tc.at("mtp_num_hidden_layers").number==double(nextn));
+    CHECK(nextn==0 || double(nextn)==ht.at("mtp_num_hidden_layers").number);
     CHECK(tc.at("layer_types").dump()==ht.at("layer_types").dump());
     CHECK(tc.at("rope_parameters").at("mrope_section").dump()==
           ht.at("rope_parameters").at("mrope_section").dump());
@@ -305,7 +312,7 @@ static void dense_real_header(){
         if(t.name.rfind("nextn.",0)==0||t.name.rfind("blk.64.",0)==0){++skipped;continue;}
         CHECK(mapped.count(&t)==1);
     }
-    CHECK(skipped>0);
+    CHECK(nextn ? skipped>0 : skipped==0);  // MTP tensors exist exactly when declared
     for(int layer:{0,3,63})for(const char* role:{"gate","up","down"}){
         const std::string name="model.language_model.layers."+std::to_string(layer)+
                                ".mlp."+role+"_proj.weight";
@@ -319,5 +326,10 @@ static void dense_real_header(){
     CHECK(17408%256==0); // native Q4_K/Q6_K down projection can keep raw blocks
 }
 int main(){a_log_recovery();transforms(4,8);transforms(16,32);transforms(16,48);
-  small_loader();dense_small_loader();real_headers();dense_real_header();
+  small_loader();dense_small_loader();real_headers();
+  for(const char* q:{"Q8_0","Q4_0","UD-IQ1_S","UD-IQ2_XXS","UD-IQ4_XS","UD-Q2_K_XL","UD-Q4_K_XL"}){
+    std::string p=std::string(".ref/q38-")+q+".bin";
+    if(!std::ifstream(p,std::ios::binary))
+      p=std::string("/Users/ianernst/Desktop/gguf-ref/hdr/q38-")+q+".bin";
+    dense_real_header(p);}
   std::printf("GGUF qwen35: %d assertions, %d failures\n",checks,failures);return failures?1:0;}
