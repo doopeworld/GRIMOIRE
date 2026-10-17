@@ -1,4 +1,4 @@
-// GRIMOIRE -- host-only qwen35moe GGUF adapter tests.
+// GRIMOIRE -- host-only qwen35/qwen35moe GGUF adapter tests.
 // Independent forward permutation from conversion/qwen.py:454-646, documented
 // as T4 in docs/gguf/FORMAT_SUPPORT.md. T1/T2 forward use lines 396-403.
 #include "b70/gguf_qwen35.hpp"
@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 using namespace b70;
@@ -233,6 +234,58 @@ static void small_loader(){
     CHECK(sidecar_wins.raw_token(1)=="wrong");
     ::unlink((dir+"/tokenizer.json").c_str());::unlink(file.c_str());::rmdir(dir.c_str());
 }
+static void dense_small_loader(){
+    constexpr int h=16,nk=4,nv=12,inter=8,dk=2,dv=2;
+    std::vector<KV> meta=metadata(nk,nv,h,dk,2,0,inter);
+    for(auto it=meta.begin();it!=meta.end();){
+        if(it->key.find("expert")!=std::string::npos)it=meta.erase(it);
+        else {if(it->key=="general.architecture")*it=kv_string(it->key,"qwen35");
+              const size_t p=it->key.find("qwen35moe.");
+              if(p!=std::string::npos)it->key.replace(p,10,"qwen35.");++it;}
+    }
+    meta.push_back(u32("qwen35.feed_forward_length",inter));
+    std::vector<TS> ts;
+    auto t=[&](std::string name,std::vector<uint64_t> dims){size_t n=1;for(auto d:dims)n*=d;
+        add(ts,name,dims,seq(n));};
+    t("token_embd.weight",{h,4});t("output.weight",{h,4});
+    add(ts,"output_norm.weight",{h},std::vector<float>(h,1.5f));
+    for(int l=0;l<2;++l){const std::string b="blk."+std::to_string(l)+".";
+        add(ts,b+"attn_norm.weight",{h},std::vector<float>(h,1.5f));
+        add(ts,b+"post_attention_norm.weight",{h},std::vector<float>(h,1.5f));
+        if(l==0){
+            t(b+"attn_qkv.weight",{h,2*nk*dk+nv*dv});
+            t(b+"attn_gate.weight",{h,nv*dv});
+            t(b+"ssm_alpha.weight",{h,nv});t(b+"ssm_beta.weight",{h,nv});
+            t(b+"ssm_conv1d.weight",{4,2*nk*dk+nv*dv});
+            add(ts,b+"ssm_a",{nv},std::vector<float>(nv,float(-std::exp(0.5))));
+            t(b+"ssm_dt.bias",{nv});t(b+"ssm_norm.weight",{dv});
+            t(b+"ssm_out.weight",{nv*dv,h});
+        }else{
+            t(b+"attn_q.weight",{h,2*nk*dk});t(b+"attn_k.weight",{h,dk});
+            t(b+"attn_v.weight",{h,dk});t(b+"attn_output.weight",{nk*dk,h});
+            add(ts,b+"attn_q_norm.weight",{dk},std::vector<float>(dk,1.5f));
+            add(ts,b+"attn_k_norm.weight",{dk},std::vector<float>(dk,1.5f));
+        }
+        t(b+"ffn_gate.weight",{h,inter});t(b+"ffn_up.weight",{h,inter});
+        t(b+"ffn_down.weight",{inter,h});
+    }
+    const std::string dir=tmp("dense-model");::mkdir(dir.c_str(),0700);
+    const std::string file=dir+"/tiny.gguf";write(file,build_file(meta,ts));
+    {std::ofstream tok(dir+"/tokenizer.json");
+     tok<<"{\"model\":{\"vocab\":{\"a\":0,\"b\":1,\"c\":2,\"d\":3},\"merges\":[]}}";}
+    Qwen35Model m;std::string err;CHECK(m.load(dir,err));
+    if(!err.empty())std::fprintf(stderr,"dense loader: %s\n",err.c_str());
+    CHECK(!m.cfg.is_moe()&&m.cfg.dense_inter==inter&&m.cfg.n_layers==2);
+    CHECK(m.cfg.lin_k_heads==nk&&m.cfg.lin_v_heads==nv&&m.cfg.mtp_n_layers==1);
+    if(m.layers.size()==2){
+        CHECK(m.layers[0].sh_gate.gguf&&m.layers[0].sh_up.gguf&&m.layers[0].sh_down.gguf);
+        CHECK(m.layers[1].sh_gate.gguf&&m.layers[1].sh_up.gguf&&m.layers[1].sh_down.gguf);
+        std::vector<float> gate(size_t(inter)*h);
+        CHECK(m.read_gguf_f32(m.layers[0].sh_gate,gate.data(),err));
+        CHECK(gate==seq(gate.size()));
+    }
+    ::unlink((dir+"/tokenizer.json").c_str());::unlink(file.c_str());::rmdir(dir.c_str());
+}
 static void real_headers(){
     std::ifstream cf("tests/gguf/data/ornith_config.json");CHECK(bool(cf));if(!cf)return;
     std::string hf((std::istreambuf_iterator<char>(cf)),{});
@@ -252,5 +305,74 @@ static void real_headers(){
       CHECK(model.index.count("model.language_model.layers.39.mlp.experts.255.down_proj.weight")==1);
     }
 }
-int main(){a_log_recovery();transforms(4,8);transforms(16,32);small_loader();real_headers();
+static void dense_real_header(const std::string& spath){
+    const char* path=spath.c_str();
+    std::ifstream probe(path,std::ios::binary);
+    if(!probe){std::printf("SKIP real qwen35 GGUF header %s (absent)\n",path);return;}
+    std::ifstream cf("tests/gguf/data/qwen38_27b_config.json");CHECK(bool(cf));if(!cf)return;
+    const std::string hf((std::istreambuf_iterator<char>(cf)),{});
+    GGUFFile f;std::string err,j;CHECK(f.open(path,err,true));
+    if(!err.empty())std::fprintf(stderr,"header: %s\n",err.c_str());
+    CHECK(gguf_qwen35_config(f,hf,j,err));
+    if(!err.empty())std::fprintf(stderr,"dense config: %s\n",err.c_str());
+    if(j.empty())return;
+    const Json got=Json::parse(j),want=Json::parse(hf);
+    const Json& tc=got.at("text_config"),&ht=want.at("text_config");
+    CHECK(got.at("model_type").string==want.at("model_type").string);
+    CHECK(tc.at("model_type").string==ht.at("model_type").string);
+    for(const char* key:{"num_hidden_layers","hidden_size","vocab_size",
+                         "intermediate_size","num_attention_heads","num_key_value_heads",
+                         "head_dim","linear_num_key_heads","linear_num_value_heads",
+                         "linear_key_head_dim","linear_value_head_dim",
+                         "linear_conv_kernel_dim","full_attention_interval",
+                         "rms_norm_eps","partial_rotary_factor"})
+        CHECK(std::abs(tc.at(key).number-ht.at(key).number)<1e-8);
+    // Some files ship without the MTP head (unsloth UD-IQ1_S / UD-IQ2_XXS:
+    // nextn_predict_layers 0, no nextn.* tensors): the GGUF's own count is the truth,
+    // and it may only be 0 or the original model's count.
+    uint32_t nextn=0;std::string nerr;
+    CHECK(f.get_u32("qwen35.nextn_predict_layers",nextn,nerr));
+    CHECK(tc.at("mtp_num_hidden_layers").number==double(nextn));
+    CHECK(nextn==0 || double(nextn)==ht.at("mtp_num_hidden_layers").number);
+    CHECK(tc.at("layer_types").dump()==ht.at("layer_types").dump());
+    CHECK(tc.at("rope_parameters").at("mrope_section").dump()==
+          ht.at("rope_parameters").at("mrope_section").dump());
+    CHECK(tc.at("rope_theta").number==ht.at("rope_parameters").at("rope_theta").number);
+    CHECK(tc.at("attn_output_gate").boolean==ht.at("attn_output_gate").boolean);
+    CHECK(tc.at("tie_word_embeddings").boolean==ht.at("tie_word_embeddings").boolean);
+    CHECK(!tc.find("num_experts")&&!tc.find("moe_intermediate_size"));
+    Qwen35Model model;model.cfg.n_layers=64;model.cfg.hidden=5120;
+    model.cfg.dense_inter=17408;model.cfg.lin_k_heads=16;model.cfg.lin_v_heads=48;
+    model.cfg.lin_k_dim=128;model.cfg.lin_v_dim=128;
+    model.gguf_file=std::make_unique<GGUFFile>();err.clear();
+    CHECK(model.gguf_file->open(path,err,true));
+    CHECK(gguf_qwen35_index(model,err));
+    if(!err.empty())std::fprintf(stderr,"dense index: %s\n",err.c_str());
+    std::set<const GGUFTensor*> mapped;
+    for(const auto& kv:model.index)if(kv.second.gguf)mapped.insert(kv.second.gguf);
+    size_t skipped=0;
+    for(const auto& t:model.gguf_file->tensors()){
+        if(t.name.rfind("nextn.",0)==0||t.name.rfind("blk.64.",0)==0){++skipped;continue;}
+        CHECK(mapped.count(&t)==1);
+    }
+    CHECK(nextn ? skipped>0 : skipped==0);  // MTP tensors exist exactly when declared
+    for(int layer:{0,3,63})for(const char* role:{"gate","up","down"}){
+        const std::string name="model.language_model.layers."+std::to_string(layer)+
+                               ".mlp."+role+"_proj.weight";
+        const auto it=model.index.find(name);CHECK(it!=model.index.end());
+        if(it!=model.index.end())CHECK(it->second.gguf_inverse==TensorRef::GGUFInverse::NONE);
+    }
+    CHECK(model.index.at("model.language_model.layers.0.mlp.gate_proj.weight").t.shape==
+          std::vector<int64_t>({17408,5120}));
+    CHECK(model.index.at("model.language_model.layers.0.mlp.down_proj.weight").t.shape==
+          std::vector<int64_t>({5120,17408}));
+    CHECK(17408%256==0); // native Q4_K/Q6_K down projection can keep raw blocks
+}
+int main(){a_log_recovery();transforms(4,8);transforms(16,32);transforms(16,48);
+  small_loader();dense_small_loader();real_headers();
+  for(const char* q:{"Q8_0","Q4_0","UD-IQ1_S","UD-IQ2_XXS","UD-IQ4_XS","UD-Q2_K_XL","UD-Q4_K_XL"}){
+    std::string p=std::string(".ref/q38-")+q+".bin";
+    if(!std::ifstream(p,std::ios::binary))
+      p=std::string("/Users/ianernst/Desktop/gguf-ref/hdr/q38-")+q+".bin";
+    dense_real_header(p);}
   std::printf("GGUF qwen35: %d assertions, %d failures\n",checks,failures);return failures?1:0;}

@@ -1,4 +1,4 @@
-// GRIMOIRE -- qwen35moe GGUF source adapter. SPDX-License-Identifier: GPL-3.0-or-later
+// GRIMOIRE -- qwen35/qwen35moe GGUF source adapter. SPDX-License-Identifier: GPL-3.0-or-later
 #include "b70/gguf_qwen35.hpp"
 #include "b70/gguf_decode.hpp"
 #include "b70/json.hpp"
@@ -81,28 +81,34 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
                          std::string& out,std::string& err) {
     std::string arch;
     if(!f.get_string("general.architecture",arch,err)) return false;
-    if(arch!="qwen35moe") {err="unsupported GGUF architecture: "+arch;return false;}
-    const std::string p="qwen35moe.";
+    if(arch!="qwen35moe"&&arch!="qwen35") {err="unsupported GGUF architecture: "+arch;return false;}
+    const bool moe=arch=="qwen35moe";
+    const std::string p=arch+".";
     auto get=[&](const char* key,uint32_t& v){return f.get_u32(p+key,v,err);};
-    uint32_t blocks,mtp,h,heads,kv,hd,vd,rope,ne,top,inter,shared,nk,nv,dk,inner,conv,interval;
-    if(!get("block_count",blocks)||!get("nextn_predict_layers",mtp)||mtp>=blocks||
+    uint32_t blocks,mtp=0,h,heads,kv,hd,vd,rope,ne=0,top=0,inter=0,shared=0,
+             dense_inter=0,nk,nv,dk,inner,conv,interval;
+    if(!get("block_count",blocks)||
+       ((moe||f.get(p+"nextn_predict_layers"))&&!get("nextn_predict_layers",mtp))||
+       mtp>=blocks||
        !get("embedding_length",h)||!get("attention.head_count",heads)||
        !get("attention.head_count_kv",kv)||!get("attention.key_length",hd)||
        !get("attention.value_length",vd)||!get("rope.dimension_count",rope)||
-       !get("expert_count",ne)||!get("expert_used_count",top)||
-       !get("expert_feed_forward_length",inter)||
-       !get("expert_shared_feed_forward_length",shared)||
+       !(moe ? (get("expert_count",ne)&&get("expert_used_count",top)&&
+                 get("expert_feed_forward_length",inter)&&
+                 get("expert_shared_feed_forward_length",shared))
+              : get("feed_forward_length",dense_inter))||
        !get("ssm.group_count",nk)||!get("ssm.time_step_rank",nv)||
        !get("ssm.state_size",dk)||!get("ssm.inner_size",inner)||
        !get("ssm.conv_kernel",conv)||!get("full_attention_interval",interval))return false;
     float theta,eps;
     if(!f.get_f32(p+"rope.freq_base",theta,err)||
        !f.get_f32(p+"attention.layer_norm_rms_epsilon",eps,err)) return false;
-    if(!hd||hd!=vd||!nk||!nv||nv%nk||inner%nv||!interval||!h||!heads||!kv) {
-        err="inconsistent qwen35moe GGUF geometry";return false;
+    if(!hd||hd!=vd||!nk||!nv||nv%nk||inner%nv||!interval||!h||!heads||!kv||
+       (moe ? (!ne||!top||!inter||!shared) : !dense_inter)) {
+        err="inconsistent "+arch+" GGUF geometry";return false;
     }
     std::vector<uint32_t> sections;
-    if(!array_u32(f,"qwen35moe.rope.dimension_sections",sections,err))return false;
+    if(!array_u32(f,(p+"rope.dimension_sections").c_str(),sections,err))return false;
     if(sections.size()<3){err="GGUF mrope dimension_sections needs three values";return false;}
     const GGUFTensor* emb=f.find("token_embd.weight");
     if(!emb||emb->n_dims!=2||emb->ne[0]!=h){err="GGUF token_embd.weight shape disagrees with embedding_length";return false;}
@@ -126,8 +132,11 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
     n("num_hidden_layers",blocks-mtp);n("hidden_size",h);n("vocab_size",emb->ne[1]);
     n("num_attention_heads",heads);n("num_key_value_heads",kv);n("head_dim",hd);
     n("rope_theta",theta);n("partial_rotary_factor",double(rope)/hd);n("rms_norm_eps",eps);
-    n("num_experts",ne);n("num_experts_per_tok",top);n("moe_intermediate_size",inter);
-    n("shared_expert_intermediate_size",shared);n("linear_num_key_heads",nk);
+    if(moe){
+        n("num_experts",ne);n("num_experts_per_tok",top);n("moe_intermediate_size",inter);
+        n("shared_expert_intermediate_size",shared);
+    } else n("intermediate_size",dense_inter);
+    n("linear_num_key_heads",nk);
     n("linear_num_value_heads",nv);n("linear_key_head_dim",dk);
     n("linear_value_head_dim",inner/nv);n("linear_conv_kernel_dim",conv);
     n("mtp_num_hidden_layers",mtp);n("full_attention_interval",interval);
@@ -148,11 +157,12 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
         layers.array.push_back(str(linear?"linear_attention":"full_attention"));
     }
     put(tc,"layer_types",std::move(layers));
-    put(root,"model_type",str("qwen3_5_moe"));
-    // The existing parser reads MoE scalar keys from the outer document.
-    for(const char* k:{"num_experts","num_experts_per_tok","moe_intermediate_size",
-                        "shared_expert_intermediate_size","tie_word_embeddings"})
-        put(root,k,*tc.find(k));
+    put(root,"model_type",str(moe?"qwen3_5_moe":"qwen3_5"));
+    if(!moe)put(tc,"model_type",str("qwen3_5_text"));
+    // The existing parser reads MoE scalar keys and tying from the outer document.
+    if(moe)for(const char* k:{"num_experts","num_experts_per_tok","moe_intermediate_size",
+                            "shared_expert_intermediate_size"})put(root,k,*tc.find(k));
+    put(root,"tie_word_embeddings",*tc.find("tie_word_embeddings"));
     put(root,"text_config",tc);
     if(!sidecar.empty()) {
         try {
@@ -176,6 +186,16 @@ bool gguf_qwen35_config(const GGUFFile& f,const std::string& sidecar,
                     }
                 } else if(!actual && kv.first=="rope_theta") {
                     // HF keeps this under rope_parameters in this release.
+                    continue;
+                } else if(kv.first=="mtp_num_hidden_layers" && actual &&
+                          kv.second.kind==Json::Kind::Number && kv.second.number==0) {
+                    // A GGUF may ship WITHOUT the MTP head the original model has
+                    // (unsloth/Qwen3.8-27B-GGUF UD-IQ1_S / UD-IQ2_XXS: block_count 64,
+                    // nextn_predict_layers 0, no nextn.* tensors).  The GGUF is what
+                    // gets loaded, so 0 is authoritative; only "GGUF has MORE MTP
+                    // layers than the model" would be a contradiction.
+                    std::printf("  GGUF ships no MTP head (config.json has %s); MTP unavailable for this file\n",
+                                actual->dump().c_str());
                     continue;
                 } else if(!actual||!equal_json(kv.second,*actual)) {
                     err="GGUF/config.json mismatch "+kv.first+": GGUF="+kv.second.dump()+
@@ -212,8 +232,19 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         const std::string& s=t.name;
         if(s.rfind("nextn.",0)==0||
            s.rfind("blk."+std::to_string(m.cfg.n_layers)+".",0)==0)continue;
-        if(t.type!=0&&t.type!=1&&t.type!=8&&t.type!=12&&t.type!=13&&
-           t.type!=14&&t.type!=30){
+        // Ask the decoder itself whether it can decode this type (one zero
+        // block), instead of keeping a second list that drifts from it: a
+        // hard-coded 7-type list here refused Unsloth's Q4_0/IQ* files after
+        // gguf_decode had grown to every ggml type.
+        auto decodable=[](uint32_t type,const std::string& name){
+            const auto* ti=gguf_type_info(type);
+            if(!ti)return false;
+            std::vector<uint8_t> blk(ti->block_bytes,0);
+            std::vector<float> out(ti->block_elems);
+            std::string e;
+            return gguf_dequantize(type,blk.data(),ti->block_elems,out.data(),e,name);
+        };
+        if(!decodable(t.type,s)){
             err="GGUF tensor "+s+" uses unsupported decode type "+
                 (gguf_type_info(t.type)?std::string(gguf_type_info(t.type)->name):std::to_string(t.type));
             return false;
@@ -229,6 +260,14 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         if(l<0||l>=m.cfg.n_layers){err="unmapped GGUF layer tensor: "+s;return false;}
         const std::string role=s.substr(dot+1);
         const std::string b=p+"layers."+std::to_string(l)+".";
+        if(!m.cfg.is_moe() && (role=="ffn_gate.weight"||role=="ffn_up.weight"||
+                               role=="ffn_down.weight")){
+            const bool down=role=="ffn_down.weight";
+            if(t.n_dims!=2||t.ne[0]!=uint64_t(down?m.cfg.dense_inter:m.cfg.hidden)||
+               t.ne[1]!=uint64_t(down?m.cfg.hidden:m.cfg.dense_inter)){
+                err="GGUF dense FFN shape mismatch: "+s;return false;
+            }
+        }
         auto one=[&](const char* from,const char* to,I inv=I::NONE){
             if(role==from){add(t,b+to,inv);return true;}return false;};
         if(one("attn_norm.weight","input_layernorm.weight",I::NORM)||
@@ -248,11 +287,16 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
            one("attn_output.weight","self_attn.o_proj.weight")||
            one("attn_q_norm.weight","self_attn.q_norm.weight",I::NORM)||
            one("attn_k_norm.weight","self_attn.k_norm.weight",I::NORM)||
-           one("ffn_gate_inp.weight","mlp.gate.weight")||
-           one("ffn_gate_inp_shexp.weight","mlp.shared_expert_gate.weight")||
-           one("ffn_gate_shexp.weight","mlp.shared_expert.gate_proj.weight")||
-           one("ffn_up_shexp.weight","mlp.shared_expert.up_proj.weight")||
-           one("ffn_down_shexp.weight","mlp.shared_expert.down_proj.weight"))continue;
+           (!m.cfg.is_moe() && (one("ffn_gate.weight","mlp.gate_proj.weight")||
+                                one("ffn_up.weight","mlp.up_proj.weight")||
+                                one("ffn_down.weight","mlp.down_proj.weight")))||
+           (m.cfg.is_moe() &&
+            (one("ffn_gate_inp.weight","mlp.gate.weight")||
+             one("ffn_gate_inp_shexp.weight","mlp.shared_expert_gate.weight")||
+             one("ffn_gate_shexp.weight","mlp.shared_expert.gate_proj.weight")||
+             one("ffn_up_shexp.weight","mlp.shared_expert.up_proj.weight")||
+             one("ffn_down_shexp.weight","mlp.shared_expert.down_proj.weight"))))continue;
+        if(!m.cfg.is_moe()){err="unmapped GGUF tensor: "+s;return false;}
         const std::string base=b+"mlp.experts.";
         auto experts=[&](const char* from,const char* to){
             if(role!=from)return false;

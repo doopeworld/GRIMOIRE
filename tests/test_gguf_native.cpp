@@ -117,8 +117,9 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
     }
 }
 
-static void gather_test(){
-    constexpr int NK=16,NV=32,D=128,M=3,K=NV*D;
+static void gather_test(int nv){
+    constexpr int NK=16,D=128,M=3;
+    const int NV=nv,K=NV*D;
     std::vector<float> grouped(size_t(M)*K),tiled(size_t(M)*K),w(K);
     std::vector<bf16_t> grouped_bf(size_t(M)*K),tiled_bf(size_t(M)*K);
     for(size_t i=0;i<grouped.size();++i)grouped[i]=float(int((i*13)%127)-63)/101.0f;
@@ -259,13 +260,59 @@ static void grouped_moe_test(){
                   1e-5f*std::max(1.0f,std::fabs(per_expert[i])));
     }
 }
+static void dense_ffn_raw_test(Fmt fmt,uint32_t type){
+    using namespace gguf_test_writer;
+    constexpr int H=5120,I=17408,N=2;
+    const int gu_row=bytes_per_row(fmt,H),dn_row=bytes_per_row(fmt,I);
+    CHECK(gu_row>0&&dn_row>0);
+    Bytes gate(size_t(N)*gu_row),up(size_t(N)*gu_row),down(size_t(N)*dn_row);
+    for(size_t i=0;i<gate.size();++i){gate[i]=uint8_t((i*7+1)%251);up[i]=uint8_t((i*11+2)%251);}
+    for(size_t i=0;i<down.size();++i)down[i]=uint8_t((i*13+3)%251);
+    const uint64_t up_off=(gate.size()+63)&~uint64_t(63);
+    const uint64_t dn_off=(up_off+up.size()+63)&~uint64_t(63);
+    const std::string path="/tmp/grimoire-dense-ffn-"+std::to_string(getpid())+
+                           "-"+std::to_string(type)+".gguf";
+    const Bytes file=build_file({{"general.alignment",4,num(64,4)}},
+        {{"blk.0.ffn_gate.weight",{H,N},type,0,gate},
+         {"blk.0.ffn_up.weight",{H,N},type,up_off,up},
+         {"blk.0.ffn_down.weight",{I,N},type,dn_off,down}});
+    {std::ofstream out(path,std::ios::binary);
+     out.write(reinterpret_cast<const char*>(file.data()),file.size());}
+    Qwen35Model m;m.cfg.n_layers=1;m.cfg.lin_k_heads=16;m.cfg.lin_v_heads=48;
+    m.cfg.lin_k_dim=128;m.cfg.lin_v_dim=128;
+    m.gguf_file=std::make_unique<GGUFFile>();
+    std::string err;CHECK(m.gguf_file->open(path,err));
+    const std::string base="model.language_model.layers.0.mlp.";
+    auto ref=[&](const char* role,const char* proj,int K){
+        TensorRef r;r.gguf=m.gguf_file->find(std::string("blk.0.ffn_")+role+".weight");
+        r.t.name=base+proj+"_proj.weight";r.t.shape={N,K};return r;};
+    const TensorRef g=ref("gate","gate",H),u=ref("up","up",H),d=ref("down","down",I);
+    CHECK(g.gguf&&u.gguf&&d.gguf);
+    CHECK(!keep_qwen_bf16(g.t.name)&&!keep_qwen_bf16(u.t.name)&&
+          !keep_qwen_bf16(d.t.name));
+    CHECK(g.t.shape==std::vector<int64_t>({N,H})&&
+          u.t.shape==std::vector<int64_t>({N,H})&&
+          d.t.shape==std::vector<int64_t>({N,I}));
+    // concat_upload_t's native branch uses these reads in gate-then-up row order.
+    Bytes fused(gate.size()+up.size()),got_down(down.size());
+    CHECK(m.read_gguf_raw_rows(g,fused.data(),err));
+    CHECK(m.read_gguf_raw_rows(u,fused.data()+gate.size(),err));
+    CHECK(m.read_gguf_raw_rows(d,got_down.data(),err));
+    CHECK(std::memcmp(fused.data(),gate.data(),gate.size())==0);
+    CHECK(std::memcmp(fused.data()+gate.size(),up.data(),up.size())==0);
+    CHECK(got_down==down);
+    ::unlink(path.c_str());
+}
 int main(){
     format_test(Fmt::Q4_K,12,"Q4_K",144);
     format_test(Fmt::Q6_K,14,"Q6_K",210);
-    gather_test();
+    gather_test(32);
+    gather_test(48);
     raw_row_test(Fmt::Q4_K,12,144);
     raw_row_test(Fmt::Q6_K,14,210);
     grouped_moe_test();
+    dense_ffn_raw_test(Fmt::Q4_K,12);
+    dense_ffn_raw_test(Fmt::Q6_K,14);
     std::printf("GGUF native: %d assertions, %d failures\n",checked,bad);
     return bad?1:0;
 }

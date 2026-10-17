@@ -211,3 +211,24 @@ Not covered by this check: MTP (`blk.40.nextn.*`) names/transforms, and Q4_K_M-s
 behaviour (the quantizer may change which rows/types are used — the inventory in §2 is from the
 real header). HF `config.json` says `eos_token_id = 248044`; the GGUF says 248046
 (`<|im_end|>`) — resolve in the tokenizer check.
+
+## 9. Dense Qwen3.8-27B (`qwen35`)
+
+The same GGUF adapter accepts `general.architecture = qwen35`. Its metadata uses the
+`qwen35.` prefix and `feed_forward_length` in place of MoE keys. The synthesized text
+config has `model_type = qwen3_5_text`, `intermediate_size = 17408`, 64 layers after
+subtracting one `nextn_predict_layers` block, and 48 linear V heads over 16 K heads
+(`num_v_per_k = 3`). The root model type is `qwen3_5`. The dense FFN names
+`ffn_gate`, `ffn_up`, and `ffn_down` map to `mlp.{gate,up,down}_proj` without value
+transforms. Gate and up are concatenated for the existing dense SwiGLU path.
+
+`tests/test_gguf_qwen35.cpp` checks every synthesized field against the independent
+Qwen3.8-27B HF config using the real Unsloth Q8_0 header at revision `4ca72078`;
+it also checks that every non-MTP tensor in the 866-tensor header maps. The r=3
+inverse is tested against an independently written forward permutation, including
+a no-reorder negative control. `tests/test_gguf_native.cpp` checks the r=3 native
+`ssm_out` activation gather and raw Q4_K/Q6_K FFN gate/up concatenation and down
+row reads, including K=17408. The header and host tests establish mapping and
+geometry; dense tensor *values* and B70 generation remain to be compared with the
+safetensors checkpoint. T1–T5 are the same converter transforms verified above
+on Ornith; T6 applies only to MoE experts.
