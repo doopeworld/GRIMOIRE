@@ -109,8 +109,9 @@ static void split_tests() {
     };
     auto shard=[&](uint32_t no,const std::string& name,uint32_t total=2,uint32_t align=64){
         std::vector<KV> kv={{"general.alignment",4,num(align,4)},
-            {"split.count",4,num(2,4)},{"split.no",4,num(no,4)},
-            {"split.tensors.count",4,num(total,4)}};
+            // the exact types llama.cpp's gguf-split writes: u16, u16, i32
+            {"split.count",2,num(2,2)},{"split.no",2,num(no,2)},
+            {"split.tensors.count",5,num(total,4)}};
         return build_file(kv,{{name,{2,2},0,0,Bytes(16,uint8_t(no+1))}},align);
     };
     std::string err; GGUFFile f;

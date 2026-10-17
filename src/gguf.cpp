@@ -28,9 +28,21 @@ std::string shard_name(const std::string& prefix, unsigned part, unsigned count)
 }
 uint64_t unsigned_meta(const GGUFValue* v, const char* name) {
     if (!v) throw std::runtime_error(std::string("missing GGUF metadata: ")+name);
-    if (v->type==2) return std::get<uint16_t>(v->data);
-    if (v->type==4) return std::get<uint32_t>(v->data);
-    if (v->type==10) return std::get<uint64_t>(v->data);
+    // llama.cpp's gguf-split writes split.no / split.count as u16 but
+    // split.tensors.count as i32 (type 5) -- verified on the
+    // unsloth/Qwen3.8-27B-GGUF BF16 shards.  Accept every integer type and
+    // refuse negatives, instead of guessing which width a writer chose.
+    auto neg=[&](){throw std::runtime_error(std::string("negative GGUF metadata: ")+name);};
+    switch (v->type) {
+        case 0:  return std::get<uint8_t>(v->data);
+        case 2:  return std::get<uint16_t>(v->data);
+        case 4:  return std::get<uint32_t>(v->data);
+        case 10: return std::get<uint64_t>(v->data);
+        case 1:  { const auto x=std::get<int8_t>(v->data);  if(x<0)neg(); return uint64_t(x); }
+        case 3:  { const auto x=std::get<int16_t>(v->data); if(x<0)neg(); return uint64_t(x); }
+        case 5:  { const auto x=std::get<int32_t>(v->data); if(x<0)neg(); return uint64_t(x); }
+        case 11: { const auto x=std::get<int64_t>(v->data); if(x<0)neg(); return uint64_t(x); }
+    }
     throw std::runtime_error(std::string("wrong GGUF metadata type: ")+name);
 }
 constexpr uint64_t MAX_STRING = 1ull << 26;
