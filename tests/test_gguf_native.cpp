@@ -303,6 +303,35 @@ static void fast_gemv_test(){
         CHECK(fast==expected);
     }
 }
+
+static void q5_decode_route_test(){
+    // The first prefill token was correct on B70; decode broke as soon as
+    // Q5_K entered the fast GEMV. Pin the shipped decode route and its
+    // actual fallback step against gguf_dequantize's independent values.
+    constexpr int K=512, EPL=16, N=3;
+    const HostQK w=host_qk(Fmt::Q5_K,N,K);
+    QuantWeight q5{Fmt::Q5_K,N,K,w.raw.data(),nullptr,nullptr,
+                   bytes_per_row(Fmt::Q5_K,K),0};
+    CHECK(!native_qk_fast_weight<Fmt::Q5_K>(q5));
+    q5.fmt=Fmt::Q4_K;
+    q5.row_bytes=bytes_per_row(Fmt::Q4_K,K);
+    CHECK(native_qk_fast_weight<Fmt::Q4_K>(q5)==native_qk_fast_enabled());
+    q5.fmt=Fmt::Q6_K;
+    q5.row_bytes=bytes_per_row(Fmt::Q6_K,K);
+    CHECK(native_qk_fast_weight<Fmt::Q6_K>(q5)==native_qk_fast_enabled());
+    std::vector<float> x(K);
+    for(int k=0;k<K;++k)x[k]=float((k*37)%113-56)/71.0f;
+    for(int n=0;n<N;++n){
+        const uint8_t* row=w.raw.data()+size_t(n)*bytes_per_row(Fmt::Q5_K,K);
+        for(int k0=0;k0<K;k0+=EPL){
+            float ref=0.0f;
+            for(int i=0;i<EPL;++i)
+                ref=std::fma(w.independent[size_t(n)*K+k0+i],x[k0+i],ref);
+            const float got=native_qk_scalar_step<Fmt::Q5_K,EPL>(row,x.data(),k0);
+            CHECK(f32_to_bits(got)==f32_to_bits(ref));
+        }
+    }
+}
 static float host_w(const HostQK& w,int n,int k,bool grouped){
     const size_t i=size_t(n)*w.K+k;
     return bf16_to_f32(grouped?w.tile[i]:f32_to_bf16(w.independent[i]));
@@ -417,6 +446,7 @@ int main(){
     raw_row_test(Fmt::IQ4_NL,20,144);
     grouped_moe_test();
     fast_gemv_test();
+    q5_decode_route_test();
     dense_ffn_raw_test(Fmt::Q4_K,12);
     dense_ffn_raw_test(Fmt::Q6_K,14);
     dense_ffn_raw_test(Fmt::Q5_K,13);

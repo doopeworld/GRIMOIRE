@@ -3,9 +3,41 @@
 // 16-value lanes. Q8_0 and IQ4_NL use two 16-value lanes per block.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include "b70/formats.hpp"
+#include "b70/weights.hpp"
+#include <cstdlib>
 
 namespace b70 {
+
+// The packed Q5_K decode lane produces wrong tokens on the B70 although its
+// host arithmetic agrees with ggml. Keep Q5_K raw and use the element GEMV.
+template <Fmt F>
+constexpr bool native_qk_fast_format() { return F != Fmt::Q5_K; }
+
+inline bool native_qk_fast_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("GRIMOIRE_GGUF_FAST_GEMV");
+        return !(e && *e == '0');
+    }();
+    return enabled;
+}
+
+template <Fmt F>
+inline bool native_qk_fast_weight(const QuantWeight& w) {
+    static_assert(is_native_gguf(F));
+    return native_qk_fast_format<F>() && native_qk_fast_enabled() && w.fmt == F && w.payload &&
+           !w.scales && !w.zeros && w.row_scales == 0 &&
+           w.K > 0 && w.K % NativeGGUFBlock<F>::elems == 0 &&
+           w.row_bytes >= int64_t(w.K / NativeGGUFBlock<F>::elems) * NativeGGUFBlock<F>::bytes;
+}
+
+template <Fmt F, int EPL>
+inline float native_qk_scalar_step(const uint8_t* row, const float* x, int k0) {
+    float acc = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < EPL; ++i)
+        acc = __builtin_fmaf(decode_elem<F>(row, k0 + i, 1.0f), x[k0 + i], acc);
+    return acc;
+}
 
 struct NativeQKBytes16 { uint64_t lo, hi; };
 

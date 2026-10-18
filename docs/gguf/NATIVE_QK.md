@@ -22,6 +22,14 @@ also applies its minimum term after the input sum, as Q4_K does. Q8_0 and
 IQ4_NL use two 16-value lanes per block. The MXFP4/INT4 ESIMD and bridge
 paths still require their exact formats and side-scale pointers.
 
+On the B70, adding Q5_K to an otherwise correct native Q4_K/Q6_K run
+preserved the first (prefill) token but broke subsequent decode tokens.
+Until the packed Q5_K device lane can be diagnosed on the card, Q5_K stays
+raw in VRAM but decode uses the element GEMV. Other native types retain the
+packed fast GEMV. `test_gguf_native` checks this dispatch policy and calls
+the same Q5_K element-step template as the device fallback against
+`gguf_dequantize`. Re-run the real-model greedy IDs on the B70 to validate.
+
 `make test_gguf_native` checks each new format against the checked-in upstream
 golden block and independent `gguf_dequantize`, tests the VNNI pair layout,
 fast GEMV at K=512/2048/17408 including M=4, grouped top-k MoE math, raw

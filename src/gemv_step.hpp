@@ -41,23 +41,6 @@
 
 namespace b70 {
 
-inline bool native_qk_fast_enabled() {
-    static const bool enabled = [] {
-        const char* e = std::getenv("GRIMOIRE_GGUF_FAST_GEMV");
-        return !(e && *e == '0');
-    }();
-    return enabled;
-}
-
-template <Fmt F>
-inline bool native_qk_fast_weight(const QuantWeight& w) {
-    static_assert(is_native_gguf(F));
-    return native_qk_fast_enabled() && w.fmt == F && w.payload &&
-           !w.scales && !w.zeros && w.row_scales == 0 &&
-           w.K > 0 && w.K % NativeGGUFBlock<F>::elems == 0 &&
-           w.row_bytes >= int64_t(w.K / NativeGGUFBlock<F>::elems) * NativeGGUFBlock<F>::bytes;
-}
-
 // ---------------------------------------------------------------------
 // FP8 decode is a branchy bit-assembly per element -- subnormal check,
 // exponent rebuild, sign insert. Measured on a B70 that costs ~3x the
@@ -72,11 +55,15 @@ struct GemvStep;
 template <Fmt F, int EPL> struct GemvStepGGUF {
     static inline float run(const QuantWeight&, const uint8_t* row,
                             const float* x, const float*, const float*, const float*, int, int k0) {
-        float acc = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < EPL; ++i)
-            acc = sycl::fma(decode_elem<F>(row, k0 + i, 1.0f), x[k0 + i], acc);
-        return acc;
+        if constexpr (F == Fmt::Q5_K) {
+            return native_qk_scalar_step<F, EPL>(row, x, k0);
+        } else {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPL; ++i)
+                acc = sycl::fma(decode_elem<F>(row, k0 + i, 1.0f), x[k0 + i], acc);
+            return acc;
+        }
     }
 };
 template <int EPL> struct GemvStep<Fmt::Q4_K, EPL> : GemvStepGGUF<Fmt::Q4_K, EPL> {};
