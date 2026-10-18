@@ -33,14 +33,15 @@ Branch `feature/gguf-battlemage` on GitHub. Details: `MODEL_MATRIX.md`, `PERFORM
 | Q4_K + Q6_K | correct |
 | + Q8_0 | correct |
 | + IQ4_XS | correct |
-| + Q5_K | **broken on prior B70 build**; decode now routes through element GEMV, B70 recheck pending |
-| + IQ4_NL | test still running |
+| + Q5_K | was garbage -> **fixed** (B70 rerun: correct) |
+| + IQ4_NL | correct |
+| all 6 native types together | **correct** (B70) |
 
 ## Remaining
 
 | # | Task | State |
 |---|---|---|
-| 1 | Recheck Q5_K native greedy IDs on B70 | element GEMV decode bypass passes host tests; device result pending |
+| 1 | Fast Q5_K decode kernel (now uses the slower safe kernel) | to do |
 | 2 | Native mode speed -> match MXFP4 mode (9,682 / 172) | 5,581 / ~38 now |
 | 3 | Test Qwen3 + Qwen3-MoE on GPU (models downloaded) | code ready |
 | 4 | Accuracy (KLD) for Qwen3.8 + gemma-4 | reference file ready |
