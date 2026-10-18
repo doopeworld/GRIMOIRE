@@ -1350,8 +1350,24 @@ static bool gguf_native_enabled(const Qwen35Model& ck) {
     const char* e=std::getenv("GRIMOIRE_GGUF_NATIVE");
     return ck.gguf_file && e && std::strcmp(e,"1")==0;
 }
+// GRIMOIRE_GGUF_NATIVE_TYPES=q4_k,q6_k,...  restricts which GGUF types stay native
+// (the rest take the MXFP4 fallback).  Unset = every type with a native kernel.  Exists to
+// bisect a device-only fault per format; names are lower-case ggml type names.
+static bool gguf_native_type_allowed(uint32_t type) {
+    static const std::string allow = [] {
+        const char* e = std::getenv("GRIMOIRE_GGUF_NATIVE_TYPES");
+        return e ? "," + std::string(e) + "," : std::string();
+    }();
+    if (allow.empty()) return true;
+    const auto* ti = gguf_type_info(type);
+    if (!ti) return false;
+    std::string n = ti->name;
+    for (char& c : n) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return allow.find("," + n + ",") != std::string::npos;
+}
 static bool gguf_native_ref(const Qwen35Model& ck,const TensorRef& r) {
     return gguf_native_enabled(ck) && r.gguf && is_native_gguf_type(r.gguf->type) &&
+        gguf_native_type_allowed(r.gguf->type) &&
         (r.t.name=="lm_head.weight" || !keep_qwen_bf16(r.t.name));
 }
 static Fmt gguf_ref_fmt(const TensorRef& r) {
