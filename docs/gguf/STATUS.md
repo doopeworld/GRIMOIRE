@@ -13,7 +13,9 @@ Branch `feature/gguf-battlemage` on GitHub. Details: `MODEL_MATRIX.md`, `PERFORM
 | Qwen3.8-27B (qwen35) | BF16 = **identical tokens**; 5 Unsloth quants (incl. IQ2/IQ1) work |
 | gemma-4-12B | 4 files work (BF16, Q4_K_M, UD-Q4_K_XL) |
 | Tokenizer bug (all models) | fixed: now identical to Hugging Face (297,193 tokens) |
-| Qwen3 norm bug (engine) | found + fixed in code (not yet tested on GPU) |
+| Qwen3-8B norm bug (engine) | fixed and GPU-verified: prompt-path max logit difference **9.96 → 0.25**; native Q4_K_M produces coherent, distinct continuations on science and Fibonacci prompts (responses truncated in thinking; final answers not evaluated) |
+| Qwen3-8B accuracy | same Q8_0 file versus llama.cpp: BF16 execution KLD **0.006557**, native execution **0.005382** (16 × 512-token chunks; measured before the prefill fix, using sequential scoring) |
+| Host regression suite | `make -s test` passed after the prefill fix (exit 0) |
 
 ## Test results (Ornith Q4_K_M, gpu0)
 
@@ -43,7 +45,7 @@ Branch `feature/gguf-battlemage` on GitHub. Details: `MODEL_MATRIX.md`, `PERFORM
 |---|---|---|
 | 1 | Fast Q5_K decode kernel (now uses the slower safe kernel) | to do |
 | 2 | Native mode speed -> match MXFP4 mode (9,682 / 172) | 5,581 / ~38 now |
-| 3 | Test Qwen3 + Qwen3-MoE on GPU (models downloaded) | code ready |
+| 3 | Qwen3-MoE GPU validation; broader Qwen3 generation evaluation | Qwen3-8B GPU smoke test passed; MoE not yet GPU-validated |
 | 4 | Accuracy (KLD) for Qwen3.8 + gemma-4 | reference file ready |
 | 5 | New engine support: llama, mistral, qwen2, gpt-oss | not started |
 | 6 | Qwen3.8-Flash-Next (too big for 1 card, needs RAM offload) | not started |
