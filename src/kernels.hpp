@@ -26,6 +26,7 @@
 #include <sycl/ext/oneapi/bfloat16.hpp>
 #include "b70/weights.hpp"
 #include "b70/b70q4.hpp"
+#include "b70/prefill_qk_math.hpp"
 
 namespace b70 {
 
@@ -221,7 +222,7 @@ sycl::event launch_qk_norm_rope_batched_qg(
     sycl::queue& q, float* qdst, const float* qg, float* kv, const bf16_t* qw,
     const bf16_t* kw, int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps = {},
-    float weight_offset = 1.0f);
+    float weight_offset = prefill_default_weight_offset());
 sycl::event launch_gate_sigmoid_mul_bf16_out(sycl::queue& q, const float* x, const float* g,
                                              sycl_bf16* out, size_t n,
                                              const std::vector<sycl::event>& deps = {});
@@ -605,7 +606,7 @@ sycl::event launch_rmsnorm_residual_batched(
     sycl::queue& q, float* h, const float* r0, const float* r1,
     const bf16_t* weight, float* out, int tokens, int hidden, float eps,
     sycl_bf16* out_bf = nullptr,
-    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
+    const std::vector<sycl::event>& deps = {}, float weight_offset = prefill_default_weight_offset());
 sycl::event launch_rmsnorm_residual_f16_batched(
     sycl::queue& q, float* h, const float* residual, const bf16_t* weight,
     float* out, int tokens, int hidden, float eps,
@@ -669,7 +670,6 @@ void set_norm_convention(int groups, float weight_offset);
 void get_norm_convention(int* groups, float* weight_offset);
 bool norm_is_grouped(int hidden);
 extern int   g_norm_groups;
-extern float g_norm_weight_offset;
 sycl::event launch_rmsnorm_grouped(sycl::queue& q, float* h,
     const float* r0, const float* r1, const bf16_t* weight, float* out,
     sycl_bf16* out_bf, int tokens, int hidden, int n_groups, float eps,
@@ -721,7 +721,7 @@ sycl::event launch_qk_norm_rope_batched(
     sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
-    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f);
+    const std::vector<sycl::event>& deps = {}, float weight_offset = prefill_default_weight_offset());
 // gemma-4 full-attention layers.  Same norm, a DIFFERENT rotation --
 // see the definition in prefill.cpp; not interchangeable with the call
 // above by passing a different partial_factor.
@@ -729,7 +729,7 @@ sycl::event launch_qk_norm_rope_proportional_batched(
     sycl::queue& q, float* qv, float* kv, const bf16_t* qw, const bf16_t* kw,
     int tokens, int q_heads, int k_heads, int dim, int start_pos,
     float theta, float partial_factor, float eps,
-    const std::vector<sycl::event>& deps = {}, float weight_offset = 1.0f,
+    const std::vector<sycl::event>& deps = {}, float weight_offset = prefill_default_weight_offset(),
     float freq_divisor = 1.0f);
 sycl::event launch_kv_append_batched(
     sycl::queue& q, const float* k, const float* v, uint8_t* k_cache,
@@ -858,7 +858,7 @@ sycl::event launch_split_qgate_bf16(sycl::queue& q,const sycl_bf16* src,
 sycl::event launch_qk_norm_rope_bf16_batched(sycl::queue& q,sycl_bf16* qv,
     sycl_bf16* kv,const bf16_t* qw,const bf16_t* kw,int tokens,int q_heads,
     int k_heads,int dim,int start_pos,float theta,float partial_factor,float eps,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, float weight_offset = prefill_default_weight_offset());
 sycl::event launch_kv_append_bf16_batched(sycl::queue& q,const sycl_bf16* k,
     const sycl_bf16* v,uint8_t* k_cache,uint8_t* v_cache,int tokens,int start_pos,
     int n_kv_heads,int head_dim,int seq_cap,
@@ -941,7 +941,7 @@ bool causal_conv1d_rows_ok(int kernel);
 sycl::event launch_qk_norm_rope_rows(sycl::queue& q, float* qv, float* kv, const bf16_t* qw,
     const bf16_t* kw, int rows, int q_heads, int k_heads, int dim, const RowSlots& rs,
     float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps = {},
-    float weight_offset = 1.0f);
+    float weight_offset = prefill_default_weight_offset());
 sycl::event launch_kv_append_rows(sycl::queue& q, const float* k, const float* v,
     uint8_t* k_base, uint8_t* v_base, int64_t kv_stride, const RowSlots& rs, int rows,
     int n_kv_heads, int head_dim, int seq_cap, const std::vector<sycl::event>& deps = {});

@@ -40,7 +40,8 @@ namespace b70 {
 // The norm convention for the loaded model, set once by Grimoire::build.
 // K2 takes the variance per contiguous group and applies the weight
 // DIRECTLY (its parameter is initialised to ones); Qwen3.5 takes it over
-// the whole row and applies (1 + w).  Holding it here rather than at ~60
+// the whole row and applies (1 + w); Qwen3 uses plain w. Holding it here
+// rather than at ~60
 // call sites means a path cannot silently keep the wrong one.
 int   g_norm_groups = 1;
 float g_norm_weight_offset = 1.0f;

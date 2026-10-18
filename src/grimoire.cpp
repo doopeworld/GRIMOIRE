@@ -5493,7 +5493,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     // pass.  Two independent choices: how many groups a row is split into,
     // and what is added to the stored weight.
     //
-    //   Qwen / Muse   whole row, (1 + w)   -- zero-centered
+    //   Qwen3.5 / Muse whole row, (1 + w) -- zero-centered
+    //   Qwen3          whole row, w
     //   K2            grouped,    w
     //   gemma-4       whole row,  w
     //
