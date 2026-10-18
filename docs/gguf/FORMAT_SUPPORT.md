@@ -1,4 +1,10 @@
-# GGUF format support — Ornith-1.5-35B-A3B (`qwen35moe`)
+# GGUF format support
+
+Standard Qwen3 dense (`qwen3`) and Qwen3-MoE (`qwen3moe`) are supported by
+the GGUF adapter. Their engine conventions, real-header checks, tokenizer
+verification, and B70 gate are documented in [QWEN3_AUDIT.md](QWEN3_AUDIT.md).
+
+## Ornith-1.5-35B-A3B (`qwen35moe`)
 
 Status: **GGUF adapter and native Q4_K/Q6_K path implemented; B70 execution pending.** Transforms were verified against real tensor values (2026-10-15, §7). Everything marked *(header)* was read from
 the real GGUF headers (first 16 MiB of each file, fetched by HTTP range request on

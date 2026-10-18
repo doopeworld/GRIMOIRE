@@ -4079,6 +4079,16 @@ bool Grimoire::tp_shard_rows(DevQuant& d,sycl::queue& owner,std::string& err){
 
 // ---------------------------------------------------------------------
 std::string Grimoire::unsupported_reason() const {
+    if (cfg.is_qwen3 && cfg.is_moe() && cfg.sparse_step <= 0)
+        return "qwen3_moe decoder_sparse_step must be positive";
+    if (cfg.is_qwen3 && cfg.sliding_window > 0)
+        return "qwen3 sliding_window is not implemented for this attention path";
+    if (cfg.is_qwen3 && cfg.qwen3_attention_bias)
+        return "qwen3 attention_bias is not implemented by the projection uploader";
+    if (cfg.is_qwen3 && cfg.qwen3_rope_scaled)
+        return "qwen3 rope_scaling is not implemented by the RoPE kernels";
+    if (cfg.is_qwen3 && cfg.is_moe() && !cfg.norm_topk_prob)
+        return "qwen3_moe norm_topk_prob=false is not implemented by the router kernels";
     if(ck.gguf_file && mtp_enabled())
         return "GGUF MTP (GRIMOIRE_MTP) is not mapped: blk."+
                std::to_string(cfg.n_layers)+".* and nextn.*";
@@ -5141,7 +5151,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         // into sh_gate/sh_up/sh_down.  Asking such a layer for mlp.gate
         // fails the upload -- and the engine then walked on and
         // dereferenced the router it never got.
-        d.moe_layer = cfg.is_moe() && !(cfg.is_k2 && !src.k2_sparse);
+        d.moe_layer = cfg.is_moe() && !(cfg.is_k2 && !src.k2_sparse) &&
+            !(cfg.is_qwen3 && !src.router.ok());
         if (d.moe_layer) {
             const int I=cfg.moe_inter,Efull=cfg.n_experts;
             d.expert_begin=tp_enabled()?(Efull*tp_rank)/tp_world:0;
@@ -5368,16 +5379,18 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
 
             // gate and up share an input and are consumed together by
             // SwiGLU: one [2*I][H] matrix, one launch.
-            d.sh_gu   = concat_upload_t(lq, ck, src.sh_gate, src.sh_up, PF,
-                                        "shared.gate_up", &ok);
-            d.sh_down = quantize_upload_t(lq, ck, src.sh_down, PF, "shared.down_proj", &ok);
-            shard(d.sh_gu,lq);shard(d.sh_down,lq);
-            if (src.sh_gate_w.ok()) {
-                d.sh_gate_q = quantize_upload_t(lq, ck, src.sh_gate_w, Fmt::BF16, "shared_expert_gate", &ok);
-                shard(d.sh_gate_q,lq);
-                d.has_sh_gate = true;
+            if (cfg.shared_inter > 0) {
+                d.sh_gu   = concat_upload_t(lq, ck, src.sh_gate, src.sh_up, PF,
+                                            "shared.gate_up", &ok);
+                d.sh_down = quantize_upload_t(lq, ck, src.sh_down, PF, "shared.down_proj", &ok);
+                shard(d.sh_gu,lq);shard(d.sh_down,lq);
+                if (src.sh_gate_w.ok()) {
+                    d.sh_gate_q = quantize_upload_t(lq, ck, src.sh_gate_w, Fmt::BF16, "shared_expert_gate", &ok);
+                    shard(d.sh_gate_q,lq);
+                    d.has_sh_gate = true;
+                }
+                acct(size_t(d.sh_gu.w.bytes() + d.sh_down.w.bytes()));
             }
-            acct(size_t(d.sh_gu.w.bytes() + d.sh_down.w.bytes()));
         } else if (src.pf_gate.ok() && src.pf_up.ok() && src.pf_down.ok()) {
             // Agnes: fold the parallel SwiGLU into the main one.  The
             // SwiGLU kernel reads gate_up as [all gate rows][all up rows]
@@ -5473,7 +5486,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     // ref/gemma4.py:211 is unambiguous -- `normed_output * self.weight`,
     // no offset.  Applying (1 + w) instead leaves the model fluent and
     // shifts every normalised activation.
-    const float norm_offset = (cfg.is_k2 || cfg.is_gemma4) ? 0.0f : 1.0f;
+    const float norm_offset = cfg.norm_weight_offset();
     set_norm_convention(cfg.is_k2 ? cfg.norm_groups : 1, norm_offset);
 
     // MoVA scratch: router logits, the top-k table and one expert output
@@ -9317,6 +9330,7 @@ const float* Grimoire::forward_dag(int token) {
             sycl::event e_routed = launch_moe_down(
                 q, d.moe, s.d_expert, s.d_weight, s.moe_h, s.moe_y, deps({e_gu}));
 
+            if (d.sh_gu.output_rows() > 0) {
             sycl::event e_shgu = gemv_any(d.sh_gu, s.h2, s.sh_g,
                 deps({(dag_mask & 4) ? e_h : e_routed}));
             const int SI = d.sh_gu.output_rows() / 2;
@@ -9332,6 +9346,7 @@ const float* Grimoire::forward_dag(int token) {
                     q, s.sh_out, s.sh_gate_val, H, deps({e_shdown, e_gq}));
             }
             e_moe = launch_add(q, s.moe_y, s.sh_out, H, deps({e_routed, e_shared}));
+            } else e_moe = e_routed;
             }
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
@@ -10645,7 +10660,8 @@ const float* Grimoire::forward(int token) {
             MK("  moe_down");
             if (i == probe_layer) probe("L0 moe routed", s.moe_y, H);
 
-            // always-on shared expert, added to the routed result
+            // Shared expert is optional: standard Qwen3-MoE has none.
+            if (d.sh_gu.output_rows() > 0) {
             const int SI = d.sh_gu.output_rows() / 2;
             ffn_gemv(d, true, s.h2, s.sh_g, none);
             launch_swiglu(q, s.sh_g, s.sh_g + SI, s.sh_g, SI, none);
@@ -10658,6 +10674,7 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("L0 shared out", s.sh_out, H);
             if (!(fusion_mask & 4)) launch_add(q, s.moe_y, s.sh_out, H, none);
             else sh_out_dirty = true;
+            }
             MK("  add shared");
             if (i == probe_layer) probe("L0 moe total", s.moe_y, H);
             }
@@ -15974,7 +15991,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             pp_mark("routed MoE");
             if(moe_rows_done) q.memset(r1,0,size_t(M)*H*sizeof(float));   // shared expert is in r0
             else if(shared_aux) wait_on(q,shared_ready);
-            else {
+            else if (d.sh_gu.output_rows() > 0) {
                 if(!mlp_bf16(d.sh_gu,d.sh_down,r1,li)){
                     const int SI=d.sh_gu.output_rows()/2;
                     // One expert of M rows through the grouped ESIMD GEMM (SwiGLU
@@ -16007,7 +16024,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 }
                 pp_mark("shared expert FFN");
                 if(d.has_sh_gate && !sh_gate_done){mm(d.sh_gate_q,bn,t2);launch_scale_by_sigmoid_batched(q,r1,t2,M,H);}
-            }
+            } else q.memset(r1,0,size_t(M)*H*sizeof(float));
             pp_mark("shared expert");
         }else{
             if(!mlp_bf16(d.sh_gu,d.sh_down,r0,li)){

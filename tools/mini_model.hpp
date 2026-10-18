@@ -398,19 +398,19 @@ inline Arch dense(int L = 4, bool mtp = false) {
 })JSON";
     Arch a{mtp ? "dense+mtp" : "dense", c.str(), {}, V, L};
     auto& t = a.tensors;
-    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}, ones(H)},
           {"lm_head.weight", {V,H}} };
     for (int l = 0; l < L; ++l) {
         const std::string b = "model.layers." + std::to_string(l) + ".";
-        t.push_back({b+"input_layernorm.weight", {H}});
-        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        t.push_back({b+"input_layernorm.weight", {H}, ones(H)});
+        t.push_back({b+"post_attention_layernorm.weight", {H}, ones(H)});
         const std::string s = b + "self_attn.";
         t.push_back({s+"q_proj.weight", {Q,H}});
         t.push_back({s+"k_proj.weight", {KV,H}});
         t.push_back({s+"v_proj.weight", {KV,H}});
         t.push_back({s+"o_proj.weight", {H,Q}});
-        t.push_back({s+"q_norm.weight", {16}});
-        t.push_back({s+"k_norm.weight", {16}});
+        t.push_back({s+"q_norm.weight", {16}, ones(16)});
+        t.push_back({s+"k_norm.weight", {16}, ones(16)});
         const std::string m = b + "mlp.";
         t.push_back({m+"gate_proj.weight", {I,H}});
         t.push_back({m+"up_proj.weight",   {I,H}});
@@ -866,33 +866,32 @@ inline Arch qwen4_exp(int L = 4, bool fp8_table = false) {
 // ---- routed MoE with a shared expert (Qwen3-MoE shape) ----------------
 // Exercises the routed path, the shared expert and TP expert sharding.
 inline Arch moe(int L = 4, bool mtp = false) {
-    const int H=64, Q=64, KV=32, MI=32, SI=32, E=8, V=128;
+    const int H=64, Q=64, KV=32, MI=32, E=8, V=128;
     std::ostringstream c;
     c << R"JSON({
   "model_type": "qwen3_moe", "hidden_size": 64, "num_hidden_layers": )JSON" << L
       << R"JSON(, "vocab_size": 128,
   "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
   "intermediate_size": 128, "moe_intermediate_size": 32,
-  "shared_expert_intermediate_size": 32,
   "num_experts": 8, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
   "mlp_only_layers": [], "norm_topk_prob": true,
   "rms_norm_eps": 1e-06, "tie_word_embeddings": false, "rope_theta": 1000000.0
 })JSON";
     Arch a{mtp ? "moe+mtp" : "moe", c.str(), {}, V, L};
     auto& t = a.tensors;
-    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}},
+    t = { {"model.embed_tokens.weight", {V,H}}, {"model.norm.weight", {H}, ones(H)},
           {"lm_head.weight", {V,H}} };
     for (int l = 0; l < L; ++l) {
         const std::string b = "model.layers." + std::to_string(l) + ".";
-        t.push_back({b+"input_layernorm.weight", {H}});
-        t.push_back({b+"post_attention_layernorm.weight", {H}});
+        t.push_back({b+"input_layernorm.weight", {H}, ones(H)});
+        t.push_back({b+"post_attention_layernorm.weight", {H}, ones(H)});
         const std::string s = b + "self_attn.";
         t.push_back({s+"q_proj.weight", {Q,H}});
         t.push_back({s+"k_proj.weight", {KV,H}});
         t.push_back({s+"v_proj.weight", {KV,H}});
         t.push_back({s+"o_proj.weight", {H,Q}});
-        t.push_back({s+"q_norm.weight", {16}});
-        t.push_back({s+"k_norm.weight", {16}});
+        t.push_back({s+"q_norm.weight", {16}, ones(16)});
+        t.push_back({s+"k_norm.weight", {16}, ones(16)});
         const std::string m = b + "mlp.";
         t.push_back({m+"gate.weight", {E,H}});
         for (int e = 0; e < E; ++e) {
@@ -901,10 +900,6 @@ inline Arch moe(int L = 4, bool mtp = false) {
             t.push_back({x+"up_proj.weight",   {MI,H}});
             t.push_back({x+"down_proj.weight", {H,MI}});
         }
-        t.push_back({m+"shared_expert.gate_proj.weight", {SI,H}});
-        t.push_back({m+"shared_expert.up_proj.weight",   {SI,H}});
-        t.push_back({m+"shared_expert.down_proj.weight", {H,SI}});
-        t.push_back({m+"shared_expert_gate.weight",      {1,H}});
     }
     if (mtp) add_mtp(t, H, Q, KV, 16, 0, E, MI);
     return a;

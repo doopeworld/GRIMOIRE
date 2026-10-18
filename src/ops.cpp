@@ -828,6 +828,7 @@ sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                                 float partial_factor, float eps,
                                 const std::vector<sycl::event>& deps) {
     const int rot = int(dim * partial_factor) & ~1;
+    const float weight_offset = g_norm_weight_offset;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(q_heads + k_heads) * SG_SIZE, SG_SIZE),
@@ -848,7 +849,7 @@ sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
                     const float scale = sycl::rsqrt(ss / float(dim) + eps);
                     for (int i = lane; i < dim; i += SG_SIZE)
-                        p[i] *= scale * (1.0f + bf16_to_f32(w[i]));
+                        p[i] *= scale * (weight_offset + bf16_to_f32(w[i]));
                 }
                 sycl::group_barrier(sg);
                 const int pos = *d_pos;
@@ -869,6 +870,7 @@ sycl::event launch_rmsnorm_heads(sycl::queue& q, float* x, const bf16_t* w,
                                  int n_heads, int dim, float eps,
                                  bool zero_centered,
                                  const std::vector<sycl::event>& deps = {}) {
+    const float weight_offset = zero_centered ? g_norm_weight_offset : 0.0f;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(
@@ -886,7 +888,7 @@ sycl::event launch_rmsnorm_heads(sycl::queue& q, float* x, const bf16_t* w,
                 //   RMSNorm       (q/k norms) init zeros -> (1 + w) * x
                 for (int i = lane; i < dim; i += SG_SIZE) {
                     const float wv = bf16_to_f32(w[i]);
-                    p[i] = p[i] * s * (zero_centered ? (1.0f + wv) : wv);
+                    p[i] = p[i] * s * (weight_offset + wv);
                 }
             });
     });

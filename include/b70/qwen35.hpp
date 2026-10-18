@@ -81,6 +81,9 @@ struct Qwen35Config {
     float rope_theta    = 1e7f;
     float partial_rope  = 1.0f;   // fraction of head_dim that gets RoPE
     bool  attn_out_gate = false;
+    bool  is_qwen3     = false;   // standard Qwen3/Qwen3-MoE, plain-w norms
+    bool  qwen3_attention_bias = false;
+    bool  qwen3_rope_scaled = false;
     // Qwen4-Exp "output_gate_type": "sigmoid" -- the DeltaNet output norm
     // gates with sigmoid(z) instead of silu(z).
     bool  dn_gate_sigmoid = false;
@@ -280,6 +283,9 @@ struct Qwen35Config {
     std::vector<bool> muse_sliding_attention;
 
     bool is_moe() const { return n_experts > 0; }
+    float norm_weight_offset() const {
+        return (is_k2 || is_gemma4 || is_qwen3) ? 0.0f : 1.0f;
+    }
 
     // Bytes of recurrent state per linear-attention layer.
     int64_t deltanet_state_bytes() const {
