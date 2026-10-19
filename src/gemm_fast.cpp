@@ -1742,11 +1742,19 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
 #endif
                                 es::simd<float, 16> f0 = es::convert<float>(q0) * scf - mnf;
                                 es::simd<float, 16> f1 = es::convert<float>(q1) * scf - mnf;
+#ifdef NQ_MANUAL_RNE
                                 es::simd<uint32_t, 16> u0 = f0.template bit_cast_view<uint32_t>().read();
                                 es::simd<uint32_t, 16> u1 = f1.template bit_cast_view<uint32_t>().read();
                                 es::simd<uint32_t, 16> r0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;
                                 es::simd<uint32_t, 16> r1 = (u1 + 0x7FFFu + ((u1 >> 16) & 1u)) & 0xFFFF0000u;
                                 vb.template select<16, 1>(P * 16) = r1 | r0;
+#else
+                                // hardware float -> bf16 conversion (RNE), packed [lo=k even | hi=k odd]
+                                es::simd<sycl_bf16, 32> pk;
+                                pk.template select<16, 2>(0) = es::simd<sycl_bf16, 16>(f0);
+                                pk.template select<16, 2>(1) = es::simd<sycl_bf16, 16>(f1);
+                                vb.template select<16, 1>(P * 16) = pk.template bit_cast_view<uint32_t>().read();
+#endif
                             }
                         }
                         es::slm_block_store<uint32_t, 256>(base + unsigned((mxc * CG + cg) * 2) * 512u, vb);
