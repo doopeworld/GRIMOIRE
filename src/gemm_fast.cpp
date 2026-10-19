@@ -1736,6 +1736,10 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
                                 const int sh0 = 16 * (P & 1);
                                 es::simd<uint32_t, 16> q0 = (wx >> (sh0 + 4 * nsel)) & 15u;
                                 es::simd<uint32_t, 16> q1 = (wx >> (sh0 + 8 + 4 * nsel)) & 15u;
+#ifdef NQ_EXPERIMENT_SKIP
+                                vb.template select<16, 1>(P * 16) = q0 | (q1 << 16);
+                                continue;
+#endif
                                 es::simd<float, 16> f0 = es::convert<float>(q0) * scf - mnf;
                                 es::simd<float, 16> f1 = es::convert<float>(q1) * scf - mnf;
                                 es::simd<uint32_t, 16> u0 = f0.template bit_cast_view<uint32_t>().read();
