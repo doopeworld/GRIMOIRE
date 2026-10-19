@@ -1730,31 +1730,25 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
                             es::simd<float, 16> mfl = mh.template bit_cast_view<sycl::half>().read();
                             es::simd<float, 16> scf = dfl * es::convert<float>(scq);
                             es::simd<float, 16> mnf = mfl * es::convert<float>(mnq);
+                            // One dword per row-lane = 4 consecutive K bytes. Select the nibble
+                            // of all four bytes at once, then read the bytes as strided u8 regions.
                             #pragma unroll
-                            for (int P = 0; P < 16; ++P) {
-                                es::simd<uint32_t, 16> wx = tw.template select<16, 1>(128 * i + (P >> 1) * 16);
-                                const int sh0 = 16 * (P & 1);
-                                es::simd<uint32_t, 16> q0 = (wx >> (sh0 + 4 * nsel)) & 15u;
-                                es::simd<uint32_t, 16> q1 = (wx >> (sh0 + 8 + 4 * nsel)) & 15u;
-#ifdef NQ_EXPERIMENT_SKIP
-                                vb.template select<16, 1>(P * 16) = q0 | (q1 << 16);
-                                continue;
-#endif
-                                es::simd<float, 16> f0 = es::convert<float>(q0) * scf - mnf;
-                                es::simd<float, 16> f1 = es::convert<float>(q1) * scf - mnf;
-#ifdef NQ_MANUAL_RNE
-                                es::simd<uint32_t, 16> u0 = f0.template bit_cast_view<uint32_t>().read();
-                                es::simd<uint32_t, 16> u1 = f1.template bit_cast_view<uint32_t>().read();
-                                es::simd<uint32_t, 16> r0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;
-                                es::simd<uint32_t, 16> r1 = (u1 + 0x7FFFu + ((u1 >> 16) & 1u)) & 0xFFFF0000u;
-                                vb.template select<16, 1>(P * 16) = r1 | r0;
-#else
-                                // hardware float -> bf16 conversion (RNE), packed [lo=k even | hi=k odd]
-                                es::simd<sycl_bf16, 32> pk;
-                                pk.template select<16, 2>(0) = es::simd<sycl_bf16, 16>(f0);
-                                pk.template select<16, 2>(1) = es::simd<sycl_bf16, 16>(f1);
-                                vb.template select<16, 1>(P * 16) = pk.template bit_cast_view<uint32_t>().read();
-#endif
+                            for (int dwi = 0; dwi < 8; ++dwi) {
+                                es::simd<uint32_t, 16> wx = tw.template select<16, 1>(128 * i + dwi * 16);
+                                es::simd<uint32_t, 16> tq = (wx >> (4 * nsel)) & 0x0F0F0F0Fu;
+                                es::simd<uint8_t, 64> tb = tq.template bit_cast_view<uint8_t>().read();
+                                #pragma unroll
+                                for (int jj = 0; jj < 2; ++jj) {
+                                    const int P = 2 * dwi + jj;
+                                    es::simd<uint8_t, 16> qa = tb.template select<16, 4>(2 * jj);
+                                    es::simd<uint8_t, 16> qb = tb.template select<16, 4>(2 * jj + 1);
+                                    es::simd<float, 16> f0 = es::convert<float>(qa) * scf - mnf;
+                                    es::simd<float, 16> f1 = es::convert<float>(qb) * scf - mnf;
+                                    es::simd<sycl_bf16, 32> pk;
+                                    pk.template select<16, 2>(0) = es::simd<sycl_bf16, 16>(f0);
+                                    pk.template select<16, 2>(1) = es::simd<sycl_bf16, 16>(f1);
+                                    vb.template select<16, 1>(P * 16) = pk.template bit_cast_view<uint32_t>().read();
+                                }
                             }
                         }
                         es::slm_block_store<uint32_t, 256>(base + unsigned((mxc * CG + cg) * 2) * 512u, vb);
