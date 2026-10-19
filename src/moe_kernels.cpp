@@ -946,8 +946,8 @@ sycl::event moe_gu_native_esimd(sycl::queue& q, const QuantWeight& w,
                         int64_t(t) * NativeGGUFBlock<F>::bytes;
                     const uint8_t* up = pay + (row0 + I + r) * rb +
                         int64_t(t) * NativeGGUFBlock<F>::bytes;
-                    red[2 * r] = native_qk_esdot_256<F>(gp, xs);
-                    red[2 * r + 1] = native_qk_esdot_256<F>(up, xs);
+                    red[2 * r] = native_qk_esdot_256<F>(gp, xs, 0);
+                    red[2 * r + 1] = native_qk_esdot_256<F>(up, xs, 0);
                 }
                 es::slm_block_store<float, 4>(t * 16, red);
                 es::barrier();
@@ -994,9 +994,10 @@ sycl::event moe_dn_native_esimd(sycl::queue& q, const QuantWeight& w,
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const uint8_t* p = pay + (row0 + r) * rb;
-                    part[r] = (native_qk_esdot_256<F>(p, xs.template select<256, 1>(0)) +
-                               native_qk_esdot_256<F>(p + NativeGGUFBlock<F>::bytes,
-                                                       xs.template select<256, 1>(256))) * wt;
+                    nq_acc_t<F> acc = 0.0f;
+                    native_qk_esacc_256<F>(p, xs, 0, acc);
+                    native_qk_esacc_256<F>(p + NativeGGUFBlock<F>::bytes, xs, 256, acc);
+                    part[r] = nqes::reduce<float>(acc, std::plus<>()) * wt;
                 }
                 es::slm_block_store<float, RP>(s * RP * 4, part);
                 es::barrier();
