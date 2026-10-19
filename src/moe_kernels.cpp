@@ -913,9 +913,10 @@ sycl::event moe_gu_native_esimd(sycl::queue& q, const QuantWeight& w,
                 if (g == (TK + 1) * rg) {
                     es::simd<float, 16> a = 0.0f;
                     for (int k = kb; k < kb + KP; k += 16) {
-                        const es::simd<uint16_t, 16> gb = es::block_load<uint16_t, 16>(gate_w + k);
-                        const es::simd<uint32_t, 16> gu = es::convert<uint32_t>(gb) << 16;
-                        a += gu.template bit_cast_view<float>() * es::block_load<float, 16>(x + k);
+                        es::simd<uint16_t, 16> gb = es::block_load<uint16_t, 16>(gate_w + k);
+                        es::simd<uint32_t, 16> gu = es::convert<uint32_t>(gb) << 16;
+                        es::simd<float, 16> gf = gu.template bit_cast_view<float>();
+                        a += gf * es::block_load<float, 16>(x + k);
                     }
                     es::simd<float, 4> v = 0.0f;
                     v[0] = es::reduce<float>(a, std::plus<>());
@@ -923,9 +924,9 @@ sycl::event moe_gu_native_esimd(sycl::queue& q, const QuantWeight& w,
                     es::barrier();
                     if (t == 0) {
                         float sum = 0.0f;
-                        const es::simd<float, 4 * KS> all = es::slm_block_load<float, 4 * KS>(0);
+                        es::simd<float, 4 * KS> pv = es::slm_block_load<float, 4 * KS>(0);
                         #pragma unroll
-                        for (int j = 0; j < KS; ++j) sum += all[4 * j];
+                        for (int j = 0; j < KS; ++j) sum += pv[4 * j];
                         gate_out[0] = 1.0f / (1.0f + sycl::exp(-sum));
                     }
                     return;
