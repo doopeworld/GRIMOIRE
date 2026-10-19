@@ -1184,7 +1184,7 @@ bool native_moe_esimd_on() {
 }
 template <Fmt F>
 bool native_moe_rows_ok(const QuantWeight& w) {
-    return native_qk_fast_weight<F>(w);
+    return native_qk_es_layout_ok<F>(w);
 }
 bool native_moe_gu_ok(const MoeLayer& L, const QuantWeight& ws) {
     if (!native_moe_esimd_on() || L.cfg.hidden != 2048 || L.cfg.inter != 512 ||

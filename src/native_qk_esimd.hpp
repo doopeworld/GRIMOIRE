@@ -148,6 +148,20 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
     });
 }
 
+// Layout the vector kernels rely on: whole rows of an EVEN number of blocks
+// (K % 512 == 0), packed row stride, and a payload aligned for the loads they
+// issue (Q4_K: 16 B, 144-byte blocks; Q6_K: 4 B, because an odd 210-byte block
+// is read from two bytes before its start). Anything else keeps the checked
+// SIMT GEMV (GRIMOIRE_GGUF_ESGEMV / GRIMOIRE_MOE_NATIVE_ESIMD select it too).
+template <Fmt F>
+inline bool native_qk_es_layout_ok(const QuantWeight& w) {
+    constexpr int BB = NativeGGUFBlock<F>::bytes;
+    constexpr uintptr_t AL = F == Fmt::Q4_K ? 16 : 4;
+    return native_qk_fast_weight<F>(w) && w.K % 512 == 0 &&
+           w.row_bytes == int64_t(w.K / 256) * BB && w.row_bytes % int64_t(AL) == 0 &&
+           reinterpret_cast<uintptr_t>(w.payload) % AL == 0;
+}
+
 inline bool native_qk_esgemv_try(sycl::queue& q, const QuantWeight& w,
                                   const float* x, float* y,
                                   const std::vector<sycl::event>& deps,
@@ -159,11 +173,11 @@ inline bool native_qk_esgemv_try(sycl::queue& q, const QuantWeight& w,
     if (!enabled || !native_qk_fast_enabled() || !w.payload || w.scales || w.zeros ||
         w.row_scales || w.K < 512 || w.K % 512 || w.K / 512 > 32)
         return false;
-    if (w.fmt == Fmt::Q4_K && native_qk_fast_weight<Fmt::Q4_K>(w)) {
+    if (w.fmt == Fmt::Q4_K && native_qk_es_layout_ok<Fmt::Q4_K>(w)) {
         out = native_qk_esgemv<Fmt::Q4_K>(q, w, x, y, deps);
         return true;
     }
-    if (w.fmt == Fmt::Q6_K && native_qk_fast_weight<Fmt::Q6_K>(w)) {
+    if (w.fmt == Fmt::Q6_K && native_qk_es_layout_ok<Fmt::Q6_K>(w)) {
         out = native_qk_esgemv<Fmt::Q6_K>(q, w, x, y, deps);
         return true;
     }
