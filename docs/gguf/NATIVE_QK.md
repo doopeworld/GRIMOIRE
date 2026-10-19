@@ -22,13 +22,62 @@ also applies its minimum term after the input sum, as Q4_K does. Q8_0 and
 IQ4_NL use two 16-value lanes per block. The MXFP4/INT4 ESIMD and bridge
 paths still require their exact formats and side-scale pointers.
 
-On the B70, adding Q5_K to an otherwise correct native Q4_K/Q6_K run
-preserved the first (prefill) token but broke subsequent decode tokens.
-Until the packed Q5_K device lane can be diagnosed on the card, Q5_K stays
-raw in VRAM but decode uses the element GEMV. Other native types retain the
-packed fast GEMV. `test_gguf_native` checks this dispatch policy and calls
-the same Q5_K element-step template as the device fallback against
-`gguf_dequantize`. Re-run the real-model greedy IDs on the B70 to validate.
+### Q5_K packed decode lane: B70 root cause and fix (task `q5k`)
+
+Symptom: with Q5_K in the packed fast GEMV, Qwen3.8-27B UD-Q4_K_XL
+`--proj native` kept the prefill token but produced garbage on later decode
+tokens, while every host test passed (commit 1f6a438 routed Q5_K through the
+element GEMV as a workaround, ~4.5x slower decode).
+
+Root cause: a **compiler (icpx/IGC) miscompile on the B70**, not a layout or
+alignment bug. The old 8-lane form took the high-bit plane straight from the
+block with unrolled `uchar` loads shifted by a per-lane amount,
+`((p[32 + i] >> lane) & 1) << 4`. For `lane != 0` the device returns wrong bits
+(lane 0, shift 0, is right, which is why the first token looked fine).
+`tools/test_q5k_bits.cpp` reproduces it in isolation on gpu0: summing
+`(p[16+i] >> lane) & 1` over 32 bytes is wrong in 7 of 8 lanes for the plain
+form, with or without the `lane < 8` guard, with a shift of `lane >> 1` or
+`lane & 7`, and even when the values go through a local array. It is right
+when the loop is `#pragma unroll 1` or when the bytes are first extracted
+from a 64-bit pair (the `native_qk_byte` form). Host emulation cannot see it.
+The unaligned 176-byte block base, padded row strides and lane mapping were
+all ruled out by `tools/test_q5k_device.cpp` (below).
+
+Fix (`include/b70/native_qk_gemv.hpp`): Q5_K now uses all 16 sub-group lanes
+(`NativeGGUFBlock<Q5_K>::lanes = 16`): lane `2*g + h` owns the 16 values
+`[g*32 + h*16, +16)` of sub-block `g`. The header (d, dmin, scales/mins), the
+16 qs bytes and the 16 qh bytes are each taken with one `native_qk_load16`
+and every byte comes out through `native_qk_byte`; no raw `p[i] >> variable`
+remains in the Q5_K lane. The workaround `native_qk_fast_format()` is gone:
+Q5_K uses the packed GEMV like every other native type, and
+`GRIMOIRE_GGUF_FAST_GEMV=0` still selects the checked element GEMV as the
+reference. The same A/B on Q4_K/Q6_K/Q8_0/IQ4 lanes never needed this (they
+already read bytes through `native_qk_byte`).
+
+B70 verification (gpu0; logs under `/mnt/user/isos/grimoire-runs/gguf-q5k/`):
+`bin/test_q5k_device` runs the real `native_qk_block_lane<Q5_K>` in a 16-lane
+sub-group against `decode_q5_k` in double: 94 cases = real-model N/K shapes
+(3x256 ... 17408x5120), 64-byte-aligned and +1/+4-byte offset bases, row
+padding 0/1/16 bytes, MB=1 and MB=4 (mc=2,4); 0 errors, worst error 2e-8 of
+the term magnitude.
+End to end on Qwen3.8-27B UD-Q4_K_XL `--proj native`: identical 48-token
+greedy ids and coherent text, fast versus reference, on two prompts, and
+decode 9.0 tok/s versus 2.0 tok/s (graph replay) with the reference; WikiText
+ppl (512 ctx, 1 chunk, decode-path scoring) 4.28985 fast vs 4.28959 reference.
+
+Ornith-1.5-35B Q4_K_M `--proj native` (Q4_K and Q6_K only, no Q5_K tensors):
+48-token greedy ids with this branch are byte-identical to the 10-18 build of
+the base commit (main-clone `bin/grimoire`) on prompt 1, text coherent
+("The sky is blue because of a phenomenon called Rayleigh scattering...");
+prompt 2 fast = reference ids. Prompt 1 fast vs `GRIMOIRE_GGUF_FAST_GEMV=0`
+differs from token 16 on (float summation order, both coherent), as it did
+before this change. Graph-replay decode 43.7 tok/s fast vs 11.8 reference.
+
+**Separate open bug found on the way (not Q5_K):** with the *IQ4_NL* tensors
+(3 native tensors in this file) on the packed fast GEMV, decode vs batched
+prefill logits drift by 3.5-4.0 (max abs) and ppl rises; the reference path
+and every other type combination are at 0.2-0.8. Allowlisting
+`GRIMOIRE_GGUF_NATIVE_TYPES=q4_k,q6_k,q5_k,q8_0,iq4_xs` avoids it.
 
 `make test_gguf_native` checks each new format against the checked-in upstream
 golden block and independent `gguf_dequantize`, tests the VNNI pair layout,
