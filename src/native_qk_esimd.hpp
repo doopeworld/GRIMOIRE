@@ -19,7 +19,7 @@ template <Fmt F> using nq_acc_t = nqes::simd<float, nq_acc_lanes<F>()>;
 // bytes: 144-byte blocks are 16-byte aligned so plain block loads are legal)
 // and the scales are decoded as vectors, so the loads of several rows/blocks
 // overlap. Q6_K blocks are 210 bytes (2-byte aligned only): byte gathers.
-template <Fmt F, int NX>
+template <Fmt F, bool ODD, int NX>
 SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
         const uint8_t* p, nqes::simd<float, NX>& x, int xoff, nq_acc_t<F>& acc) {
     static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
@@ -53,33 +53,54 @@ SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
             acc += (fhi * sh - mh) * x.template select<32, 1>(xoff + 64 * j + 32);
         }
     } else {
-        const float d = f16_to_f32(uint16_t(p[208]) | (uint16_t(p[209]) << 8));
-        const nqes::simd<uint32_t, 16> ix(0, 1);
+        // Q6_K: 210-byte blocks. Block 2k of a row starts 4-byte aligned, block
+        // 2k+1 two bytes later (ODD). Every load starts on a 4-byte boundary:
+        // an odd block reads from p-2 and addresses its bytes at +2. 212 bytes
+        // cover ql(128) qh(64) scales(16) d(2) for both parities, and never
+        // cross the end of the row (rows hold an even number of blocks here).
+        constexpr int S = ODD ? 2 : 0;
+        const uint8_t* b = p - S;
+        nqes::simd<uint8_t, 212> raw;
+        raw.template select<128, 1>(0) = nqes::block_load<uint8_t, 128>(b);
+        raw.template select<64, 1>(128) = nqes::block_load<uint8_t, 64>(b + 128);
+        raw.template select<16, 1>(192) = nqes::block_load<uint8_t, 16>(b + 192);
+        raw.template select<4, 1>(208) = nqes::block_load<uint8_t, 4>(b + 208);
+        const float d = float(sycl::bit_cast<sycl::half>(
+            uint16_t(uint32_t(raw[S + 208]) | (uint32_t(raw[S + 209]) << 8))));
+        nqes::simd<uint8_t, 16> sc8 = raw.template select<16, 1>(S + 192);
+        nqes::simd<int8_t, 16> sci = sc8.template bit_cast_view<int8_t>();
+        nqes::simd<float, 16> scf = nqes::convert<float>(sci) * d;
         #pragma unroll
-        for (int g = 0; g < 16; ++g) {
-            const int half = g / 8, quarter = (g % 8) / 2;
-            const int off = (g & 1) * 16;
-            const nqes::simd<uint8_t, 16> lo = nqes::gather<uint8_t, 16>(
-                p + half * 64 + (quarter % 2) * 32 + off, ix);
-            const nqes::simd<uint8_t, 16> hi = nqes::gather<uint8_t, 16>(
-                p + 128 + half * 32 + off, ix);
-            nqes::simd<uint16_t, 16> q = (nqes::simd<uint16_t, 16>(lo) >>
-                ((quarter / 2) * 4)) & 15;
-            q |= ((nqes::simd<uint16_t, 16>(hi) >> (quarter * 2)) & 3) << 4;
-            const nqes::simd<float, 16> w =
-                (nqes::convert<float>(q) - 32.0f) *
-                (d * float(int8_t(p[192 + g])));
-            acc += w * x.template select<16, 1>(xoff + g * 16);
+        for (int h = 0; h < 2; ++h) {
+            nqes::simd<uint8_t, 32> qA = raw.template select<32, 1>(S + 64 * h);
+            nqes::simd<uint8_t, 32> qB = raw.template select<32, 1>(S + 64 * h + 32);
+            nqes::simd<uint8_t, 32> qh = raw.template select<32, 1>(S + 128 + 32 * h);
+            nqes::simd<uint8_t, 32> v[4];
+            v[0] = (qA & 15) | ((qh & 3) << 4);
+            v[1] = (qB & 15) | ((qh & 12) << 2);
+            v[2] = (qA >> 4) | (qh & 48);
+            v[3] = (qB >> 4) | ((qh & 192) >> 2);
+            #pragma unroll
+            for (int qd = 0; qd < 4; ++qd) {
+                #pragma unroll
+                for (int sb = 0; sb < 2; ++sb) {
+                    const float sc = scf[h * 8 + qd * 2 + sb];
+                    nqes::simd<uint8_t, 16> vb = v[qd].template select<16, 1>(16 * sb);
+                    nqes::simd<float, 16> f = nqes::convert<float>(vb);
+                    acc += (f * sc - 32.0f * sc) *
+                           x.template select<16, 1>(xoff + h * 128 + qd * 32 + sb * 16);
+                }
+            }
         }
     }
 }
 
 // One block's dot, reduced (for kernels that want a scalar).
-template <Fmt F, int NX>
+template <Fmt F, bool ODD, int NX>
 SYCL_ESIMD_FUNCTION inline float native_qk_esdot_256(
         const uint8_t* p, nqes::simd<float, NX>& x, int xoff) {
     nq_acc_t<F> acc = 0.0f;
-    native_qk_esacc_256<F>(p, x, xoff, acc);
+    native_qk_esacc_256<F, ODD>(p, x, xoff, acc);
     return nqes::reduce<float>(acc, std::plus<>());
 }
 
@@ -110,8 +131,8 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
                     const uint8_t* p = pay + int64_t(row0 + r) * rb +
                         int64_t(kb / 256) * BB;
                     nq_acc_t<F> acc = 0.0f;
-                    native_qk_esacc_256<F>(p, xv, 0, acc);
-                    native_qk_esacc_256<F>(p + BB, xv, 256, acc);
+                    native_qk_esacc_256<F, false>(p, xv, 0, acc);
+                    native_qk_esacc_256<F, true>(p + BB, xv, 256, acc);
                     part[r] = nqes::reduce<float>(acc, std::plus<>());
                 }
                 nqes::slm_block_store<float, RP>(t * RP * 4, part);
