@@ -64,6 +64,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
     const int groups = (w.N + R - 1) / R;
     const uint8_t* pay = w.payload;
     const int64_t rb = w.row_bytes;
+    const int N = w.N;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(groups) * ks, ks),
@@ -76,7 +77,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
                 nqes::simd<float, RP> part = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
-                    if (row0 + r >= w.N) continue;
+                    if (row0 + r >= N) continue;
                     const uint8_t* p = pay + int64_t(row0 + r) * rb +
                         int64_t(kb / 256) * NativeGGUFBlock<F>::bytes;
                     part[r] = native_qk_esdot_256<F>(p, xv.template select<256, 1>(0)) +
@@ -91,7 +92,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
                     sum += nqes::slm_block_load<float, RP>(j * RP * 4);
                 #pragma unroll
                 for (int r = 0; r < R; ++r)
-                    if (row0 + r < w.N) y[row0 + r] = sum[r];
+                    if (row0 + r < N) y[row0 + r] = sum[r];
             });
     });
 }
