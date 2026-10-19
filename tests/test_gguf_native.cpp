@@ -274,6 +274,29 @@ static void fast_gemv_test(){
     fast_gemv_case<Fmt::Q8_0,4>(2048,4);
     fast_gemv_case<Fmt::IQ4_XS,4>(2048,4);
     fast_gemv_case<Fmt::IQ4_NL,4>(2048,4);
+    // A Q5_K row is 176 bytes per block. Exercise a legal padded row
+    // stride and a one-byte payload offset, including every qh bit lane.
+    {
+        constexpr int K=2048, N=3, RB=176*(K/256)+1;
+        const HostQK w=host_qk(Fmt::Q5_K,N,K);
+        std::vector<uint8_t> storage(size_t(N)*RB+1);
+        std::vector<float> x(K);
+        for(int k=0;k<K;++k)x[k]=float((k*37)%113-56)/71.0f;
+        const float* xp[1]={x.data()};
+        for(int n=0;n<N;++n){
+            uint8_t* row=storage.data()+1+size_t(n)*RB;
+            std::memcpy(row,w.raw.data()+size_t(n)*(RB-1),RB-1);
+            for(int lane=0;lane<8;++lane){
+                float got=0.0f,ref=0.0f;
+                native_qk_row_lane<Fmt::Q5_K,1>(row,xp,K,lane,1,&got);
+                for(int b=0;b<K/256;++b)for(int i=0;i<32;++i){
+                    const int k=b*256+lane*32+i;
+                    ref=std::fma(w.independent[size_t(n)*K+k],x[k],ref);
+                }
+                CHECK(std::fabs(got-ref)<=2e-3f*std::max(1.0f,std::fabs(ref)));
+            }
+        }
+    }
     // Isolate the terms a decoder can accidentally omit: Q4_K's dmin
     // subtraction and Q6_K's signed -32 offset.
     for(Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
