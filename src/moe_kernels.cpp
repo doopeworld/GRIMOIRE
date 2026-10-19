@@ -937,7 +937,7 @@ sycl::event moe_gu_native_esimd(sycl::queue& q, const QuantWeight& w,
                 int e = sh ? 0 : d_expert[slot];
                 if (e < 0) e = 0;
                 const int64_t row0 = sh ? int64_t(i0) : int64_t(e) * 2 * I + i0;
-                const es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+                es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
                 es::simd<float, 4> red = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
@@ -988,7 +988,7 @@ sycl::event moe_dn_native_esimd(sycl::queue& q, const QuantWeight& w,
                 float wt = sh ? (gate_in ? gate_in[0] : 1.0f) : d_weight[s];
                 if (e < 0) { e = 0; wt = 0.0f; }
                 const int64_t row0 = sh ? int64_t(o0) : int64_t(e) * H + o0;
-                const es::simd<float, I> xs = es::block_load<float, I>(h + int64_t(s) * I);
+                es::simd<float, I> xs = es::block_load<float, I>(h + int64_t(s) * I);
                 es::simd<float, RP> part = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {

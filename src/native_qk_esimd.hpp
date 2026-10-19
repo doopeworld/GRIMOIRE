@@ -11,7 +11,7 @@ namespace nqes = sycl::ext::intel::esimd;
 
 template <Fmt F>
 SYCL_ESIMD_FUNCTION inline float native_qk_esdot_256(
-        const uint8_t* p, const nqes::simd<float, 256>& x) {
+        const uint8_t* p, nqes::simd<float, 256> x) {
     static_assert(F == Fmt::Q4_K || F == Fmt::Q6_K);
     if constexpr (F == Fmt::Q4_K) {
         const float d = f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
@@ -72,7 +72,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
                 const int t = int(it.get_local_id(0));
                 const int row0 = int(it.get_group(0)) * R;
                 const int kb = t * KP;
-                const nqes::simd<float, KP> xv = nqes::block_load<float, KP>(x + kb);
+                nqes::simd<float, KP> xv = nqes::block_load<float, KP>(x + kb);
                 nqes::simd<float, RP> part = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
