@@ -47,10 +47,10 @@ SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
             nqes::simd<uint8_t, 32> hi = b >> 4;
             nqes::simd<float, 32> flo = nqes::convert<float>(lo);
             nqes::simd<float, 32> fhi = nqes::convert<float>(hi);
-            acc += (flo * scf[2 * j] - mnf[2 * j]) *
-                   x.template select<32, 1>(xoff + 64 * j);
-            acc += (fhi * scf[2 * j + 1] - mnf[2 * j + 1]) *
-                   x.template select<32, 1>(xoff + 64 * j + 32);
+            const float sl = scf[2 * j], ml = mnf[2 * j];
+            const float sh = scf[2 * j + 1], mh = mnf[2 * j + 1];
+            acc += (flo * sl - ml) * x.template select<32, 1>(xoff + 64 * j);
+            acc += (fhi * sh - mh) * x.template select<32, 1>(xoff + 64 * j + 32);
         }
     } else {
         const float d = f16_to_f32(uint16_t(p[208]) | (uint16_t(p[209]) << 8));
