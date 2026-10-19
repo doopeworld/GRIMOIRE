@@ -6,6 +6,7 @@
 #include "b70/native_model.hpp"
 #include "b70/native_qk_tile.hpp"
 #include "b70/native_qk_gemv.hpp"
+#include "b70/native_qk_vector_math.hpp"
 #include "gguf/test_writer.hpp"
 #include <cmath>
 #include <cstdio>
@@ -134,6 +135,46 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
         tile_scaled(fmt,two.data(),k,block_bytes,values);
         for(int i=0;i<16;++i)
             CHECK(f32_to_bf16(values[i]).bits==f32_to_bf16(wide.at(0,k+i)).bits);
+    }
+}
+
+static void vector_group_test(Fmt fmt,uint32_t type,const char* name,int bytes){
+    std::ifstream in(std::string("tests/gguf/data/")+name+".bin",std::ios::binary);
+    CHECK(bool(in));if(!in)return;
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),{});
+    const int rows=int(u32(file.data()+8))/256;
+    std::vector<float> ref(size_t(rows)*256);
+    std::string err;
+    CHECK(gguf_dequantize(type,file.data()+16,size_t(rows)*256,ref.data(),err));
+    for(int row=0;row<rows;++row){
+        const uint8_t* p=file.data()+16+size_t(row)*bytes;
+        for(int g=0;g<(fmt==Fmt::Q4_K?8:16);++g){
+            const float sc=fmt==Fmt::Q4_K?native_q4_group(p,g).scale:
+                native_q6_group_scale(p,g);
+            const float mn=fmt==Fmt::Q4_K?native_q4_group(p,g).minimum:0.0f;
+            const int width=fmt==Fmt::Q4_K?32:16;
+            for(int i=0;i<width;++i){
+                const int code=fmt==Fmt::Q4_K?native_q4_group_code(p,g,i):
+                    native_q6_group_code(p,g,i);
+                const float got=sc*float(code)-mn;
+                CHECK(f32_to_bits(got)==f32_to_bits(ref[size_t(row)*256+g*width+i]));
+            }
+        }
+        // The ESIMD dot reduces each block in vector lanes; compare its
+        // block-weighted result with a separately dequantized GGUF row.
+        float packed=0.0f,decoded=0.0f;
+        for(int k=0;k<256;++k){
+            const int g=k/(fmt==Fmt::Q4_K?32:16),i=k%(fmt==Fmt::Q4_K?32:16);
+            const float scale=fmt==Fmt::Q4_K?native_q4_group(p,g).scale:
+                native_q6_group_scale(p,g);
+            const float minimum=fmt==Fmt::Q4_K?native_q4_group(p,g).minimum:0.0f;
+            const int code=fmt==Fmt::Q4_K?native_q4_group_code(p,g,i):
+                native_q6_group_code(p,g,i);
+            const float x=float((k*19+row*7)%53-26)/37.0f;
+            packed+=(scale*float(code)-minimum)*x;
+            decoded+=ref[size_t(row)*256+k]*x;
+        }
+        CHECK(std::fabs(packed-decoded)<1e-5f);
     }
 }
 
@@ -436,6 +477,8 @@ int main(){
     format_test(Fmt::Q8_0,8,"Q8_0",34);
     format_test(Fmt::IQ4_XS,23,"IQ4_XS",136);
     format_test(Fmt::IQ4_NL,20,"IQ4_NL",18);
+    vector_group_test(Fmt::Q4_K,12,"Q4_K",144);
+    vector_group_test(Fmt::Q6_K,14,"Q6_K",210);
     gather_test(32);
     gather_test(48);
     raw_row_test(Fmt::Q4_K,12,144);
