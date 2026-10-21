@@ -1,5 +1,20 @@
 # GGUF work — brief for coding agents (orchestrated session, 2026-10-19)
 
+## >>> 2026-10-21 DIRECTION (Ian) — overrides everything below <<<
+
+GRIMOIRE serves GGUF models in exactly TWO runtime formats: **MXFP4** and **one 8-bit format**
+(FP8_E4M3 / MXFP8 / INT8: pick by MEASURED accuracy + speed). Any Hugging Face GGUF (ideally
+BF16) is converted once into a GRIMOIRE GGUF in that format and then loaded with a direct upload,
+like NVIDIA's NVFP4 GGUF. It runs on ONE or BOTH B70s, and with every existing speed tool (MTP,
+DFlash2, batching, TP/PP). **Goal: faster than llama.cpp SYCL and Vulkan on the same file.**
+Native-GGUF-format kernel work (Q4_K/Q5_K/IQ*) is no longer the direction; do not extend it.
+Targets (llama-bench, gpu0, same UD-Q4_K_XL file, logs in /mnt/user/isos/grimoire-runs/target/):
+Qwen3.8-27B llama.cpp SYCL pp512 907, pp4096 1,349, tg128 23.0 tok/s; Ornith Q4_K_M llama.cpp
+SYCL pp4096 1,959 tg 104, Vulkan 1,833 / 50. GRIMOIRE today, GGUF read into MXFP4 at load:
+Qwen3.8 pp4096 2,066, ~32 tok/s generation; Ornith 5,904 pp4096.
+Coding agents are Claude Sonnet 5.5 (they can run ssh/git now) and Codex when its quota allows.
+Report with PRECISE numbers (tok/s, KLD, top-1 %), never adjectives.
+
 ## >>> 2026-10-21 UPDATE — overrides anything below that conflicts <<<
 
 - **Scope (Ian, binding): Ornith-1.5, Qwen3.8-27B, Qwen3.8-Flash-Next ONLY.** No other model
