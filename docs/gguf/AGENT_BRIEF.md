@@ -1,5 +1,25 @@
 # GGUF work — brief for coding agents (orchestrated session, 2026-10-19)
 
+## >>> 2026-10-21 UPDATE — overrides anything below that conflicts <<<
+
+- **Scope (Ian, binding): Ornith-1.5, Qwen3.8-27B, Qwen3.8-Flash-Next ONLY.** No other model
+  families. **No downloads of any kind without the orchestrator asking Ian first.** Do only your
+  assigned task; anything else you notice goes in your report, not into code.
+- Base is now `feature/gguf-battlemage` at defb03c (Q5_K fast decode + native speed merged).
+  Branch your work from there (your worktree is already on it).
+- Flash-Next file (downloading now, done in roughly an hour; check `fetch.log` for `ALL-DONE`):
+  `/mnt/models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000{1..4}-of-00004.gguf`
+  (111 GB, arch `qwen4exp`). Do not touch the `.parts` dirs or `fetch.sh` while it runs.
+- **Both B70s are allowed for Flash-Next work (Ian, 10-21: "both need to work").** gpu0 =
+  0000:03:00.0, gpu1 = **0000:07:00.0** (moved from 0b:00.0 after a reboot; `tools/gpunode.sh`
+  may still expect 0b:00.0, so check it and fix it on your branch if needed). Locks: `gpu0.lock`
+  and `gpu1.lock` in `/mnt/user/isos/grimoire-runs/`. A two-card run takes BOTH, always in the
+  order gpu0 then gpu1 (`flock gpu0.lock flock gpu1.lock cmd`), to avoid deadlock. gpu1 dropped
+  off the PCIe bus under load on 10-03: check its AER counters and dmesg before and after every
+  gpu1 run, and stop and report on any new error.
+- The GPU host has 93 GB RAM. Leave ≥ 12 GB free for the OS. Note that `/mnt/models` will have
+  only ~56 GB free once the download completes.
+
 Orchestrator: Claude Opus 5.5. Coding agents: Codex (gpt-6.1-sol) and Claude Code (Sonnet 5.5).
 Each agent owns ONE task from `docs/gguf/STATUS.md` "Remaining". Read, in this order:
 `docs/gguf/STATUS.md`, this file, `grimoire-gguf/CLAUDE.md` (rules 1-22 are binding; the
