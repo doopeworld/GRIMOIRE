@@ -274,6 +274,30 @@ static void fast_gemv_test(){
     fast_gemv_case<Fmt::Q8_0,4>(2048,4);
     fast_gemv_case<Fmt::IQ4_XS,4>(2048,4);
     fast_gemv_case<Fmt::IQ4_NL,4>(2048,4);
+    // A Q5_K row is 176 bytes per block. Exercise a legal padded row
+    // stride and a one-byte payload offset, including every qh bit lane.
+    {
+        constexpr int K=2048, N=3, RB=176*(K/256)+1;
+        const HostQK w=host_qk(Fmt::Q5_K,N,K);
+        std::vector<uint8_t> storage(size_t(N)*RB+1);
+        std::vector<float> x(K);
+        for(int k=0;k<K;++k)x[k]=float((k*37)%113-56)/71.0f;
+        const float* xp[1]={x.data()};
+        for(int n=0;n<N;++n){
+            uint8_t* row=storage.data()+1+size_t(n)*RB;
+            std::memcpy(row,w.raw.data()+size_t(n)*(RB-1),RB-1);
+            // Q5_K lane = 2*g + h owns values [g*32+h*16, +16) of sub-block g.
+            for(int lane=0;lane<16;++lane){
+                float got=0.0f,ref=0.0f;
+                native_qk_row_lane<Fmt::Q5_K,1>(row,xp,K,lane,1,&got);
+                for(int b=0;b<K/256;++b)for(int i=0;i<16;++i){
+                    const int k=b*256+(lane/2)*32+(lane%2)*16+i;
+                    ref=std::fma(w.independent[size_t(n)*K+k],x[k],ref);
+                }
+                CHECK(std::fabs(got-ref)<=2e-3f*std::max(1.0f,std::fabs(ref)));
+            }
+        }
+    }
     // Isolate the terms a decoder can accidentally omit: Q4_K's dmin
     // subtraction and Q6_K's signed -32 offset.
     for(Fmt fmt:{Fmt::Q4_K,Fmt::Q6_K}){
@@ -305,14 +329,17 @@ static void fast_gemv_test(){
 }
 
 static void q5_decode_route_test(){
-    // The first prefill token was correct on B70; decode broke as soon as
-    // Q5_K entered the fast GEMV. Pin the shipped decode route and its
-    // actual fallback step against gguf_dequantize's independent values.
+    // The first prefill token was correct on B70; decode broke when the old
+    // 8-lane Q5_K lane entered the fast GEMV (compiler bug on the card, see
+    // NATIVE_QK.md). Q5_K now takes the 16-lane packed route like every other
+    // native type; GRIMOIRE_GGUF_FAST_GEMV=0 still selects the element step
+    // below. Pin both against gguf_dequantize's independent values.
     constexpr int K=512, EPL=16, N=3;
     const HostQK w=host_qk(Fmt::Q5_K,N,K);
     QuantWeight q5{Fmt::Q5_K,N,K,w.raw.data(),nullptr,nullptr,
                    bytes_per_row(Fmt::Q5_K,K),0};
-    CHECK(!native_qk_fast_weight<Fmt::Q5_K>(q5));
+    CHECK(native_qk_fast_weight<Fmt::Q5_K>(q5)==native_qk_fast_enabled());
+    CHECK(NativeGGUFBlock<Fmt::Q5_K>::lanes==16); // callers sum lanes 0..lanes-1
     q5.fmt=Fmt::Q4_K;
     q5.row_bytes=bytes_per_row(Fmt::Q4_K,K);
     CHECK(native_qk_fast_weight<Fmt::Q4_K>(q5)==native_qk_fast_enabled());

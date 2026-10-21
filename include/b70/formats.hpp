@@ -326,7 +326,7 @@ template <Fmt F> struct NativeGGUFBlock;
     static constexpr int elems = E, bytes = B, type = T, lanes = L; \
 };
 B70_NATIVE_GGUF(Q4_K, 256, 144, 12, 8)
-B70_NATIVE_GGUF(Q5_K, 256, 176, 13, 8)
+B70_NATIVE_GGUF(Q5_K, 256, 176, 13, 16)
 B70_NATIVE_GGUF(Q6_K, 256, 210, 14, 16)
 B70_NATIVE_GGUF(Q8_0, 32, 34, 8, 2)
 B70_NATIVE_GGUF(IQ4_XS, 256, 136, 23, 8)
