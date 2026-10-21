@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "gemv_step.hpp"
+#include "native_qk_esimd.hpp"
 #include <sycl/ext/intel/esimd.hpp>
 #include <cstdlib>
 
@@ -1763,6 +1764,8 @@ sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
 sycl::event launch_gemv(sycl::queue& q, const QuantWeight& w,
                         const float* x, float* y,
                         const std::vector<sycl::event>& deps) {
+    sycl::event native_esimd;
+    if (native_qk_esgemv_try(q, w, x, y, deps, native_esimd)) return native_esimd;
     switch (w.fmt) {
         case Fmt::BF16:     return dispatch<Fmt::BF16>(q, w, x, y, deps);
         case Fmt::FP8_E4M3: return dispatch<Fmt::FP8_E4M3>(q, w, x, y, deps);

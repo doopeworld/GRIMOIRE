@@ -91,3 +91,47 @@ close to MXFP4 (DN qkv 43 vs 37 ms, DN out 52 vs 33 ms). Decode with the generic
 
 Open speed items: grouped native MoE 369 -> ~164 ms (MXFP4 kernel parity), native DN out/qkv
 projections, fast native decode GEMV + MoE decode.
+
+## 6. Native-mode speed work (`gguf/speed`, 2026-10-19, gpu0)
+
+Logs: `/mnt/user/isos/grimoire-runs/gguf-speed/` (`baseline/` = main-clone binary, `r1/`, `r2/` = this branch;
+`bench/` = kernel microbenchmarks; `runp.sh`/`runb.sh` = the locked wrappers used). Ornith Q4_K_M, `--proj native`,
+80-token greedy decode of the sky-blue prompt, `GRIMOIRE_TIME_LAYER=all`, graph capture on.
+
+| | baseline (57ec09e) | this branch | MXFP4 (Strategy A) |
+|---|---:|---:|---:|
+| decode, 80 tokens | 2.012 s (~40 tok/s) | **0.607 s (~132 tok/s)** | 0.495 s (~162 tok/s) |
+| decode, one token, per-kernel timeline (graph off) | 22.6 ms | **5.55 ms** | 4.87 ms |
+| prefill pp4096 (`--prefill-only 4096`, layer timing on) | 5,522 tok/s | **5,886 tok/s** | 8,659 tok/s |
+| KLD vs BF16, 16 x 512 | 0.064 | **0.0649** (top-1 88.78 %) | 0.239 |
+
+Greedy ids are identical to the baseline binary for both prompts (sky-blue 80 tokens; autumn-rain poem 64 tokens) and
+with each new path switched off separately. The generated text (rule 8) is the same coherent reasoning text as the
+baseline ("The user wants me to explain why the sky is blue to a ten-year-old. Let me think about the key components ...").
+
+What changed (decode):
+
+- `src/native_qk_esimd.hpp`: ESIMD dense GEMV for Q4_K / Q6_K (one work-group = 2 rows x K/512 threads; each thread
+  streams its 2 blocks per row with 4-byte-aligned block loads - header + 128 quant bytes for Q4_K; for Q6_K a 212-byte
+  window read from 2 bytes earlier for the odd 210-byte block - decodes scales as vectors, one vector accumulator per
+  row, one reduction). Microbench (`tools/bench_native_esgemv.cpp`, cold weights): Q6_K lm_head 1182 -> 701 us
+  (595 GB/s), Q4_K 4096x2048 15.6 -> 8.7 us (540 GB/s), all within 1.1e-8 relative of an fp64 `decode_elem` reference.
+  `GRIMOIRE_GGUF_ESGEMV=0` selects the previous SIMT GEMV.
+- `src/moe_kernels.cpp`: the fused routed + shared-expert decode pair for native Q4_K/Q6_K (gate/up+SwiGLU, down with the
+  routing weights), same structure as the MXFP4 ESIMD pair. Microbench (`tools/bench_native_moe.cpp`): gate_up 82 -> 27 us,
+  down 41 -> 17 us (Q4_K), 240 -> 23 us (Q6_K down, which was the worst kernel in the timeline: 20 of 40 layers).
+  `GRIMOIRE_MOE_NATIVE_ESIMD=0` selects the previous path.
+- Both kernels are only entered for the exact layout they assume (K % 512 == 0, packed rows, 16 B / 4 B aligned payload,
+  no side scales, Ornith H/I geometry for MoE); everything else keeps the checked kernels.
+- Per-token timeline now: lm_head 6.05 -> 0.71 ms, la_qkv 199 -> 31 us, moe_gate_up 73 -> 28 us, moe_down 236 -> 17 us.
+
+What changed (prefill): `moe_mxfp4_esimd<EPI, Q4_K>` in `src/gemm_fast.cpp` - the MXFP4 grouped tile (B tile decoded once per
+work-group into SLM, DPAS from SLM) with a Q4_K decoder (2-D transposed payload loads, vector scale decode, hardware
+f32->bf16 conversion). Kernel microbench (`tools/bench_native_moe_grouped.cpp`, host fp64 reference, ragged expert
+counts incl. empty/partial tiles): gate_up 1310 -> 939 us, down 630 -> 495 us at 64 experts; in the model the routed MoE
+is 369 -> 335 ms. Q6_K down matrices (row stride 420 B is not 16-byte aligned, so no 2-D block loads) still use the
+joint_matrix kernel. `GRIMOIRE_MOE_NATIVE_ESIMD_GROUPED=0` selects it.
+
+Not done / next: the remaining prefill gap to MXFP4 is the routed MoE (335 vs 167 ms, Q4_K dequant arithmetic is ~2x the
+DPAS time in the tile; with the dequant removed the same tile runs at 66-79 TFLOP/s vs 38 now) and the Q6_K down tiles,
+then the shared expert (17.5 ms through the generic GEMM) and DeltaNet out (53 vs 34 ms).

@@ -136,7 +136,7 @@ Attention/router ESIMD and benchmarks in that grep do not read a `QuantWeight`.
 
 | Site | Disposition |
 |---|---|
-| `src/gemv_decode.cpp` dense and batched dispatch | FP8/INT4/MXFP4 ESIMD attempts require exact formats, intact payload and side scales. Q4_K/Q6_K use the native super-block GEMV when its format, payload, K and row stride pass the guard; `GRIMOIRE_GGUF_FAST_GEMV=0` selects `GemvStepGGUF`. |
+| `src/gemv_decode.cpp` dense and batched dispatch | FP8/INT4/MXFP4 ESIMD attempts require exact formats, intact payload and side scales. Q4_K/Q6_K first try the ESIMD GEMV (`src/native_qk_esimd.hpp`; needs K % 512 == 0, packed rows, 16 B / 4 B aligned payload; `GRIMOIRE_GGUF_ESGEMV=0` skips it), then the native super-block GEMV when its format, payload, K and row stride pass the guard; `GRIMOIRE_GGUF_FAST_GEMV=0` selects `GemvStepGGUF`. |
 | `src/gemv_decode.cpp:1391-1408` | FP8 small-M requires its exact format; the INT4 small-M caller uses `int4_smallm_ok`. |
 | `src/gemm_fast.cpp:127-228,399-440` | VNNI simple and tiled dequant stage Q4_K/Q6_K with `scale=1` and `decode_elem`; no native side-scale access. MXFP4 and INT4 streaming branches require exact formats. |
 | `src/gemm_fast.cpp:348-353,1883-1904` | INT4 stream, fused MXFP4, and grouped MXFP4/ESIMD predicates require their own formats, payload and side scales. |
@@ -144,7 +144,7 @@ Attention/router ESIMD and benchmarks in that grep do not read a `QuantWeight`.
 | `src/gemm_fast.cpp:3609-3674` | MXFP4, BF16, INT4, and grouped MXFP4 small-M predicates check exact formats and pointers. |
 | `src/gemm_xmx.cpp:145-165,473-487` | Float XMX staging starts at `scale=1`, branches on scale-bearing formats, and dispatches Q4_K/Q6_K. The integer pipeline at `:525` dispatches INT8/INT4 only. |
 | `src/prefill.cpp:70-140` | Plain SYCL batched GEMM calls `GemvStepGGUF` for Q4_K/Q6_K and uses no side scale. |
-| `src/moe_kernels.cpp` routed, shared, batched and MoVA decode | Each Q4_K/Q6_K matrix uses the native super-block dot when its own descriptor passes the guard. The original `GemvStepGGUF` path remains the reference under `GRIMOIRE_GGUF_FAST_GEMV=0`. |
+| `src/moe_kernels.cpp` routed, shared, batched and MoVA decode | Single-token decode with Ornith geometry (H 2048, I 512, top_k <= 15) and Q4_K/Q6_K gate_up/down of matching shared-expert type uses the fused ESIMD pair `moe_gu_native_esimd` / `moe_dn_native_esimd` (same layout guard as the dense ESIMD GEMV; `GRIMOIRE_MOE_NATIVE_ESIMD=0` skips). Otherwise each Q4_K/Q6_K matrix uses the native super-block dot when its own descriptor passes the guard. The original `GemvStepGGUF` path remains the reference under `GRIMOIRE_GGUF_FAST_GEMV=0`. |
 | `src/moe_kernels.cpp:630-954` | ESIMD kernels read side scales, but `mx4_rows_ok` at `:941` requires MXFP4, payload and scales. |
 | `src/ops.cpp` MoVA packed fallback | Q4_K/Q6_K use the host-tested super-block dot under the same guard; the element decoder remains the reference. Router ESIMD reads logits, not weights. |
 | `src/grimoire.cpp:1388-1423,1747-1763` | Raw upload and gate/up concatenation copy complete rows; mismatched gate/up types or K not divisible by 256 are refused by tensor name. |
@@ -182,7 +182,7 @@ the MXFP4 tile. Two B-tile writers cover the two halves of each 32-K step.
 The grouped path requires exact native formats, payloads without side scales,
 K divisible by 256, output width divisible by 256, the expected expert matrix
 shapes, top_k 8, and at most 1024 experts. A failed guard takes the existing
-per-expert path. `GRIMOIRE_MOE_NATIVE_GROUPED=0` selects that reference for
+per-expert path. Q4_K matrices with a 16-byte-aligned row stride run in `moe_mxfp4_esimd<EPI, Q4_K>` (ESIMD, SLM-staged DPAS); `GRIMOIRE_MOE_NATIVE_ESIMD_GROUPED=0` selects the joint_matrix kernel; Q6_K stays on joint_matrix. `GRIMOIRE_MOE_NATIVE_GROUPED=0` selects that reference for
 B70 A/B; `GRIMOIRE_MOE_GROUPED_OFF=1` also disables grouped dispatch.
 
 The host test checks the VNNI pair layout against `gguf_dequantize` rounded
@@ -223,3 +223,12 @@ uses decode, so it checks the changed summation order in the live path.
    Q4_K_M KLD target is near llama.cpp's 0.061 against BF16, compared with
    Strategy A's measured 0.216 for Q4_K_M and 0.196 for BF16 GGUF
    re-quantized to MXFP4.
+
+## Phase 3 step 3: decode and prefill speed (2026-10-19)
+
+See `PERFORMANCE_REPORT.md` section 6 for numbers. Host coverage: `test_gguf_native` mirrors the byte/bit arithmetic of the
+ESIMD kernels (vector Q4_K scale decode from the header bytes, the Q6_K u8 bit tricks, the 4-byte-aligned 212-byte window
+for even/odd blocks incl. alignment and end-of-row bounds) against `gguf_dequantize`. Device coverage (B70 only):
+`tools/bench_native_esgemv.cpp`, `tools/bench_native_moe.cpp`, `tools/bench_native_moe_grouped.cpp` (each checks against a
+double-precision host reference built from `decode_elem` and prints GB/s or TFLOP/s). The fp32 summation order of the
+ESIMD kernels differs from the SIMT reference (the reference stays selectable with the env switches above).

@@ -6,6 +6,7 @@
 #include "b70/native_model.hpp"
 #include "b70/native_qk_tile.hpp"
 #include "b70/native_qk_gemv.hpp"
+#include "b70/native_qk_vector_math.hpp"
 #include "gguf/test_writer.hpp"
 #include <cmath>
 #include <cstdio>
@@ -134,6 +135,102 @@ static void format_test(Fmt fmt,uint32_t type,const char* name,int block_bytes){
         tile_scaled(fmt,two.data(),k,block_bytes,values);
         for(int i=0;i<16;++i)
             CHECK(f32_to_bf16(values[i]).bits==f32_to_bf16(wide.at(0,k+i)).bits);
+    }
+}
+
+static void vector_group_test(Fmt fmt,uint32_t type,const char* name,int bytes){
+    std::ifstream in(std::string("tests/gguf/data/")+name+".bin",std::ios::binary);
+    CHECK(bool(in));if(!in)return;
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)),{});
+    const int rows=int(u32(file.data()+8))/256;
+    std::vector<float> ref(size_t(rows)*256);
+    std::string err;
+    CHECK(gguf_dequantize(type,file.data()+16,size_t(rows)*256,ref.data(),err));
+    for(int row=0;row<rows;++row){
+        const uint8_t* p=file.data()+16+size_t(row)*bytes;
+        for(int g=0;g<(fmt==Fmt::Q4_K?8:16);++g){
+            const float sc=fmt==Fmt::Q4_K?native_q4_group(p,g).scale:
+                native_q6_group_scale(p,g);
+            const float mn=fmt==Fmt::Q4_K?native_q4_group(p,g).minimum:0.0f;
+            const int width=fmt==Fmt::Q4_K?32:16;
+            for(int i=0;i<width;++i){
+                const int code=fmt==Fmt::Q4_K?native_q4_group_code(p,g,i):
+                    native_q6_group_code(p,g,i);
+                const float got=sc*float(code)-mn;
+                CHECK(f32_to_bits(got)==f32_to_bits(ref[size_t(row)*256+g*width+i]));
+            }
+        }
+        // The ESIMD dot reduces each block in vector lanes; compare its
+        // block-weighted result with a separately dequantized GGUF row.
+        float packed=0.0f,decoded=0.0f;
+        for(int k=0;k<256;++k){
+            const int g=k/(fmt==Fmt::Q4_K?32:16),i=k%(fmt==Fmt::Q4_K?32:16);
+            const float scale=fmt==Fmt::Q4_K?native_q4_group(p,g).scale:
+                native_q6_group_scale(p,g);
+            const float minimum=fmt==Fmt::Q4_K?native_q4_group(p,g).minimum:0.0f;
+            const int code=fmt==Fmt::Q4_K?native_q4_group_code(p,g,i):
+                native_q6_group_code(p,g,i);
+            const float x=float((k*19+row*7)%53-26)/37.0f;
+            packed+=(scale*float(code)-minimum)*x;
+            decoded+=ref[size_t(row)*256+k]*x;
+        }
+        CHECK(std::fabs(packed-decoded)<1e-5f);
+    }
+}
+
+// Mirrors of the ESIMD kernels' byte arithmetic (vector scale decode, the Q6_K
+// u8 bit tricks, the 4-byte-aligned 212-byte window) against gguf_dequantize,
+// on a multi-row, multi-block (even K/256) random tensor.
+static void vector_kernel_math_test(){
+    constexpr int ROWS=5,NB=4;
+    for(int fmtv=0;fmtv<2;++fmtv){
+        const bool q4=fmtv==0;
+        const int bb=q4?144:210;
+        const uint32_t type=q4?12:14;
+        std::vector<uint8_t> raw(size_t(ROWS)*NB*bb+64);
+        uint32_t s=0x1234567u+fmtv;
+        for(auto& b:raw){s=s*1664525u+1013904223u;b=uint8_t(s>>24);}
+        for(int r=0;r<ROWS*NB;++r){ // sane f16 scales
+            uint8_t* p=raw.data()+size_t(r)*bb;
+            if(q4){p[0]=0x00;p[1]=0x25;p[2]=0x00;p[3]=0x24;}else{p[208]=0x00;p[209]=0x25;}
+        }
+        std::vector<float> ref(size_t(ROWS)*NB*256);
+        std::string err;
+        CHECK(gguf_dequantize(type,raw.data(),ref.size(),ref.data(),err));
+        for(int blk=0;blk<ROWS*NB;++blk){
+            const uint8_t* p=raw.data()+size_t(blk)*bb;
+            const float* want=ref.data()+size_t(blk)*256;
+            if(q4){
+                for(int g=0;g<8;++g){
+                    const auto a=native_q4_group_codes(p,g),b=native_q4_group_codes_vec(p,g);
+                    CHECK(a.scale==b.scale&&a.minimum==b.minimum);
+                }
+            }else{
+                // row start r*NB*210 is a multiple of 4; block k of a row starts at 210k
+                const int k=blk%NB;
+                const bool odd=(k&1)!=0;
+                const auto w=native_q6_window(p,odd);
+                CHECK((w.base-raw.data())%4==0);               // legal block_load start
+                CHECK(w.s==(odd?2:0));
+                const uint8_t* ql=w.base+w.s;                  // field offsets inside the window
+                const uint8_t* qh=w.base+w.s+128;
+                const uint8_t* sc=w.base+w.s+192;
+                CHECK(ql==p&&qh==p+128&&sc==p+192);
+                CHECK(w.s+210<=w.len);                         // d at +208/+209 inside 212
+                // end of the window must not pass the row end for the last (odd) block
+                if(odd) CHECK(w.base+w.len<=raw.data()+size_t(blk-k)*bb+size_t(NB)*bb);
+                const float d=f16_to_f32(uint16_t(p[208])|(uint16_t(p[209])<<8));
+                for(int h=0;h<2;++h){
+                    uint8_t v[4][32];
+                    native_q6_half_codes(ql+64*h,ql+64*h+32,qh+32*h,v);
+                    for(int qd=0;qd<4;++qd)for(int l=0;l<32;++l){
+                        const float scale=d*float(int8_t(sc[h*8+qd*2+l/16]));
+                        const float got=(float(v[qd][l])-32.0f)*scale;
+                        CHECK(f32_to_bits(got)==f32_to_bits(want[h*128+qd*32+l]));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -463,6 +560,9 @@ int main(){
     format_test(Fmt::Q8_0,8,"Q8_0",34);
     format_test(Fmt::IQ4_XS,23,"IQ4_XS",136);
     format_test(Fmt::IQ4_NL,20,"IQ4_NL",18);
+    vector_group_test(Fmt::Q4_K,12,"Q4_K",144);
+    vector_group_test(Fmt::Q6_K,14,"Q6_K",210);
+    vector_kernel_math_test();
     gather_test(32);
     gather_test(48);
     raw_row_test(Fmt::Q4_K,12,144);
