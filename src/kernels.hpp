@@ -235,6 +235,16 @@ bool gemm_fast_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
                              const std::vector<sycl::event>& deps = {});
+// launch_gemm_fast in two halves: dequantize W once into wdq
+// (gemm_fast_predq_elems(w) bf16), then the GEMM over any block of rows --
+// bit-identical rows (TP prefill's chunked FFN).
+bool gemm_fast_predq_supported(const QuantWeight& w, int M);
+size_t gemm_fast_predq_elems(const QuantWeight& w);
+sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_bf16* wdq,
+                                     const std::vector<sycl::event>& deps = {});
+sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
+                                   const sycl_bf16* x, float* y, int M,
+                                   const std::vector<sycl::event>& deps = {});
 // Matrix-unit causal prefill attention (src/gemm_fast.cpp);
 // launch_flash_prefill() takes it whenever the geometry fits.
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads);

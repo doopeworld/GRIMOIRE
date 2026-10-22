@@ -3048,6 +3048,35 @@ sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const 
     return gemm_fast_run<1>(q, w, x, h, M, deps);
 }
 
+// The two halves of launch_gemm_fast for a weight that serves several row
+// blocks (TP prefill's chunked FFN, grimoire.cpp): dequantize W ONCE into the
+// caller's buffer, then run the GEMM over any block of rows.  Same scratch
+// layout and kernels as gemm_fast_run<0>, so each output row is bit-identical.
+bool gemm_fast_predq_supported(const QuantWeight& w, int M) {
+    return gemm_fast_supported(w, M) && !fused_mxfp4_ok(w);
+}
+
+size_t gemm_fast_predq_elems(const QuantWeight& w) {
+    return size_t((w.N + NC2 - 1) / NC2 * NC2) * size_t(w.K);
+}
+
+sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_bf16* wdq,
+                                     const std::vector<sycl::event>& deps) {
+    const int Np = (w.N + NC2 - 1) / NC2 * NC2;
+    if (Np != w.N) {
+        const sycl::event e = q.memset(wdq, 0, size_t(Np) * w.K * sizeof(sycl_bf16), deps);
+        return dequant_any(q, w, wdq, {e}, Np);
+    }
+    return dequant_any(q, w, wdq, deps);
+}
+
+sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
+                                   const sycl_bf16* x, float* y, int M,
+                                   const std::vector<sycl::event>& deps) {
+    const int Np = (w.N + NC2 - 1) / NC2 * NC2;
+    return gemm_bf16_vnni<0>(q, x, wdq, y, M, w.N, w.K, deps, Np);
+}
+
 // One tiered NVFP4 expert's whole FFN for its M rows, the block read only
 // by the first three launches:
 //   gate|up decoded SwiGLU-interleaved -> GEMM with silu(g*sg)*(u*su) fused,

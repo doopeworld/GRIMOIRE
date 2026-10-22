@@ -3,30 +3,37 @@
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
 **2026-10-22: two B70s on Ian's new redriver M.2-OCuLink adapter -- all three dual targets run.**
-Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers).
+Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers; sec. 7 = afternoon).
 
 ### Findings
 - gpu1 is now 0000:08:00.0 = renderD130 behind root port 00:06.2 (Gen4 x4). gpu0 03:00.0 =
-  renderD128. No drop in ~20 two-card runs. Correctable AER only: host->card RxErr ~5/s even idle;
-  card->host 0-8 per heavy TP-prefill run (replayed, no retrain, 0 uncorrectable). PP/decode: ~0.
+  renderD128. No drop in ~30 two-card runs. Correctable AER only: host->card RxErr ~5/s even idle;
+  card->host 0-8 per heavy TP-prefill run (replayed, no retrain, 0 uncorrectable).
 - Qwen3.8 checkpoints moved to /mnt/models (new disk). Unraid DUAL templates still map
   /mnt/storage/Models and the old render nodes -- Ian edits his templates himself.
-- Two cards, c1, llama-benchy pp512 / pp2048 / tg128:
-  Qwen3.8-27B-FP8 PP 825 / 1,436 / 20.5; TP+MTP 1,030 / 1,408 / 50-59 (coding probe 77, PASS);
-  Ornith-1.5-FP8 PP plain 3,880 / 6,886 / 111 (MTP under PP is SLOWER: 67-69);
-  Flash-Next-NVFP4 PP tiered 273 / 652 / 16.1.
-- TP prefill all-reduce rewritten (tp_pipe_allreduce): pipelined bf16 pieces, zero-copy receive
-  (add kernel reads the peer piece from its own pinned ring). TP plain pp2048 510 -> 1,483.
-  Floor now = gpu1's x4 link card->host (~3.6 ms per 22 MB call, 128 calls per chunk).
+- Two cards, c1, llama-benchy: Qwen3.8-27B-FP8 PP 825 / 1,436 / 20.5; Ornith-1.5-FP8 PP plain
+  3,880 / 6,886 / 111 (MTP under PP is SLOWER); Flash-Next-NVFP4 PP tiered 273 / 652 / 16.1.
+- Qwen3.8-27B-FP8 TP prefill (pp512 / pp2048): 510 -> 1,483 (pipelined bf16 all-reduce) ->
+  **1,039 / 1,805 lossless** (chunked FFN, streamed all-reduces, copy-engine receive; default;
+  bit-identical answers). int8 payload (GRIMOIRE_TP_AR_INT8=1, LOSSY, opt-in) 1,240 / 2,269.
+  TP plain tg 32; TP+MTP tg 50-78.
+- gpu1's x4 link moves ~7 GB/s TOTAL when the GPU pulls data (read requests queue behind its
+  writes). CPU writes into gpu1's VRAM through its BAR run FULL DUPLEX with its D2H (probe,
+  tools/bar_write_probe.cpp) -- not in the server yet: Ian's OK needed (changes one step of his
+  10-07 transport chain; still no P2P).
+- P2P is impossible on the Tower: Linux 6.18 P2PDMA allows root-port-to-root-port P2P only for
+  AMD Zen or whitelisted Xeon host bridges; the Core Ultra 285H (8086:7d06) is neither. (The
+  2x B70 P2P all-reduce in vllm-xpu-kernels #570 runs on a different platform.)
 - Power governor default OFF everywhere (Ian: the cards run 280 W fine).
-- FAILED: device-side all-reduce probe (tools/tp_devar_probe.cpp) hung and caused a gpu0 engine
-  reset (recovered). Do not rerun without global abort + short spin bounds + uncached loads.
+- FAILED: tools/tp_devar_probe.cpp (device-side poll) hung -> gpu0 engine reset; the duplex probe's
+  narrow host stores -> gpu1 engine reset. Both recovered. Probes need internal time budgets.
 
 ### Next steps
-1. TP prefill overlap: two half-chunks one layer apart, each half's all-reduce hidden behind the
-   other half's compute (estimate pp2048 1,480 -> ~2,500). Ian's target ~3,500.
-2. Faster TP prefill compute: QKV/z projections still on launch_gemm_xmx (GEMMs 85-93 TFLOP/s).
-3. TP plain decode 32 -> 40+ tok/s: device-side all-reduce, only with hang-safe polling.
+1. With Ian's OK: BAR receive + a receiver thread (CPU copies in/out run in parallel) -> the
+   copy engine only does D2H; estimate pp2048 bf16 ~2,100-2,300.
+2. Hide the attention block too: chunk QKV / o_proj so the next layer starts on early rows
+   (full wavefront). Ian's target pp ~3,500 needs this AND faster GEMMs (85-93 TFLOP/s now).
+3. TP plain decode 32 -> 40: the 128 CPU-staged decode all-reduces cost ~6.5 ms per token.
 
 **The 2026-10-10 pause below is historical.**
 

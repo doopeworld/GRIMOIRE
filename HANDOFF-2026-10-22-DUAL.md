@@ -159,3 +159,121 @@ Faster Flash-Next needs its own work (TP for the HC residual, fused HC decode, d
 | Ornith-1.5-FP8 | PP 20/20 + MTP | 3,971 | 6,771 | 66.8 / 69.0 |
 | Flash-Next-NVFP4 | PP 24/24, tiered | 273 | 652 | 16.1 |
 Ian's Qwen3.8-FP8 targets: tg 40-45 (met with MTP), pp ~3,500 (not yet: 1,408).
+
+## 6. Why TP prefill stops at ~1,500: gpu1's x4 link does not overlap our two directions
+tools/pcie_duplex_probe.cpp (plain copies + kernels, host waits only; 22 MB, 20 reps), 13:06:
+| per 22 MB | gpu0 (x8 dock) | gpu1 (x4 M.2 redriver) |
+|---|---:|---:|
+| D2H copy (own queue) | 1.63 ms, 14.2 GB/s | 3.24 ms, 7.1 GB/s |
+| zero-copy read kernel (host->dev) | 1.96 ms, 11.8 GB/s | 3.96 ms, 5.8 GB/s |
+| H2D copy | 1.83 ms, 12.6 GB/s | 3.44 ms, 6.7 GB/s |
+| D2H + zero-copy read together | 2.41 ms (73% overlap) | 6.13 ms (33% overlap) |
+| D2H + H2D copies together | serialized (0%) | serialized (0%) |
+Reading: two copies share one copy engine; and on gpu1 the GPU's read requests (host->device pull) queue
+behind its own saturating device->host posted writes on the x4 upstream. Without P2P every bf16
+all-reduce therefore costs >= ~6.2 ms per 22 MB on gpu1 -> TP prefill no-overlap ceiling ~1,500 tok/s
+(measured 1,483), overlap ceiling ~2,700 (compute 0.74 s per 2,153 tokens).
+P2P (GPU writes into the peer's VRAM) would make both directions posted writes = full duplex, ~3.3 ms
+per call, no CPU copies -- likely how vLLM gets its prompt speed. Asked Ian (his 10-07 rule: no P2P).
+
+### 6.1 P2P: NOT available. Probe mistake: gpu1 engine reset (recovered)
+- tools/p2p_query.cpp (device queries only): Level Zero reports **no peer access** 0->1 or 1->0 between
+  the two B70s on this board. P2P is not an option; every byte goes through host memory.
+- 13:10 extended pcie_duplex_probe on gpu1 with "kernel D2H" (a kernel with 4-64 work-groups storing
+  bf16 2 bytes at a time into pinned host memory): 1.69-1.73 SECONDS per 22 MB (0.01 GB/s) -- narrow
+  stores to host memory are pathological. The run hit tune.sh's 180 s limit, the launcher killed the
+  container with that kernel still running -> xe "Engine reset: engine_class=ccs" on 0000:08:00.0 at
+  13:12:49. gpu1 stayed on the bus (config e2238086, runtime active, DLActive+, BWMgmt-, 0 uncorrectable;
+  root port correctable +12 during the probe). Same mechanism as gpu0's 12:16 reset.
+  RULE: every probe variant needs an internal time budget (stop its reps when over), a tiny first
+  rep, and a launcher limit that can never fire while a kernel runs. No narrow stores to host memory.
+
+### 6.1 P2P: NOT available. Probe mistake: gpu1 engine reset (recovered)
+- tools/p2p_query.cpp (device queries only): Level Zero reports **no peer access** 0->1 or 1->0 between
+  the two B70s on this board. P2P is not an option; every byte goes through host memory.
+- 13:10 extended pcie_duplex_probe on gpu1 with "kernel D2H" (a kernel with 4-64 work-groups storing
+  bf16 2 bytes at a time into pinned host memory): 1.69-1.73 SECONDS per 22 MB (0.01 GB/s) -- narrow
+  stores to host memory are pathological. The run hit the 180 s launcher limit, which killed the
+  container with that kernel still running -> xe "Engine reset: engine_class=ccs" on 0000:08:00.0 at
+  13:12:49. gpu1 stayed on the bus (config e2238086, runtime active, DLActive+, BWMgmt-, 0 uncorrectable;
+  root port correctable +12 during the probe). Same mechanism as the gpu0 reset at 12:16.
+  RULE: every probe variant needs an internal time budget (stop its reps when over), a tiny first
+  rep, and a launcher limit that can never fire while a kernel runs. No narrow stores to host memory.
+
+
+## 7. Afternoon 10-22: int8 payload, CPU->VRAM BAR writes, chunked FFN overlap
+
+### 7.1 int8 all-reduce payload (GRIMOIRE_TP_AR_INT8=1, opt-in, LOSSY)
+- Each 32 values -> 32 int8 + one fp32 scale (absmax/127): 1.125 B/value instead of 2 (bf16).
+  Both ranks add the SAME dequantized terms in RANK order (rank 0's term first), so even a
+  fused multiply-add rounds alike and the ranks keep identical bits. Zero-copy receive only.
+- Qwen3.8-27B-FP8 TP, no MTP (logs tp-q8 vs tp-zc):
+  | | bf16 | int8 |
+  |---|---:|---:|
+  | pp512 | 1,035 | 1,235 |
+  | pp2048 | 1,483 | 1,799 |
+  | tg32 | 31.9 | 32.0 |
+  | code probe TTFT (2,153 tok) | 1.47-1.54 s | 1.20 s, PASS |
+- Numerics: code-probe answer IDENTICAL to bf16 (1,282 chars, both trials). Greedy gen
+  (gencmp.py vs PP baseline): bf16 TP = identical on capital/story, code differs at char 173;
+  int8 TP: story differs at char 139, code at char 158. Small but real -> stays opt-in.
+- int8 per-call all-reduce ~3.65 ms vs bf16 ~5.9 ms (2,153 rows): still link-bound at ~6.8 GB/s
+  combined -- gpu1's link moves ~7 GB/s TOTAL whatever the direction mix (GPU-pulled reads).
+
+### 7.2 CPU writes straight into gpu1's VRAM through the 32 GB BAR: FULL DUPLEX
+- tools/bar_write_probe.cpp (one card, no device-side waits, internal time budgets): device
+  allocation via SYCL memory-export (sycl::ext::oneapi::experimental::alloc_exportable_device_mem,
+  opaque fd = dma-buf), mmap'd by the CPU of the SAME process. One GPU driver, no P2P, nothing
+  shared with the other card.
+- gpu1 results: export + mmap OK; buffer lives in VRAM (GPU reads it at VRAM speed);
+  CPU -> BAR 5.46 GB/s (AVX2 non-temporal stores, 64 B write TLPs); GPU sees the data bit-exact
+  (0 wrong of 5.77 M); **D2H alone 3.25 ms + CPU->BAR alone 4.30 ms, together 4.13 ms: overlap
+  1.05 = full duplex** (zero-copy read path: 0.24-0.33). Root-port RxErr +0, switch +1.
+- Both B70s have the full 32 GB BAR (Resizable BAR active).
+- Use: the receiving rank's own CPU copies the peer piece shm -> its own VRAM ring (instead of
+  -> pinned ring, then GPU reads it over PCIe). Changes one step of Ian's 10-07 transport chain
+  ("peer's own pinned -> peer GPU" becomes "CPU -> peer GPU's own VRAM via BAR"); still no P2P,
+  no buffer in two GPU drivers. ASK IAN before making it default.
+
+### 7.3 Chunked FFN with streamed all-reduces (GRIMOIRE_TP_FFN_CHUNK, default 768; 0 = off)
+- Dense TP layers, prompts >= 1,024 rows: the attention all-reduce goes out whole (packed into a
+  device staging region, so its device->host copies never wait behind compute), the FFN runs in
+  768-row chunks (post-norm, gate_up, SwiGLU, down) as soon as that chunk's rows are reduced, and
+  each chunk's FFN all-reduce is pushed right after its down projection. tp_stream_push /
+  tp_stream_wait keep pieces strictly in order with the same slots, flags, sequence and adds as
+  tp_pipe_allreduce. FFN weights are dequantized once per layer (gemm_fast predq API) instead of
+  once per GEMM call, overlapped with the attention all-reduce.
+- BIT-IDENTICAL: the 2,153-token code-probe answer matches the unchunked run exactly (bf16 and
+  int8, both trials) -- codecmp.py.
+- Receive matters: with the zero-copy read the incoming bytes move INSIDE the add kernel, which
+  waits on q behind the next chunk's FFN -> 21 ms/layer, only -2.4 ms. Copy-engine receive (pinned
+  -> device ring on qh2d, ring = two layers of pieces) -> 18.5 ms/layer. GRIMOIRE_TP_STREAM_ZC=1 =
+  old behaviour.
+
+| Qwen3.8-27B-FP8 TP, no MTP | pp512 | pp2048 | tg32 | code TTFT (2,153) |
+|---|---:|---:|---:|---:|
+| bf16, unchunked (morning) | 1,035 | 1,483 | 31.9 | 1.47-1.54 s |
+| bf16, chunked, zero-copy rx | (769 +-69, transient) | 1,626 | 31.8 | 1.38-1.43 s |
+| **bf16, chunked, copy-engine rx (default now)** | **1,039** | **1,805** | 32.1 | 1.22-1.28 s |
+| int8, unchunked | 1,235 | 1,799 | 32.0 | 1.20 s |
+| int8, chunked, zero-copy rx | 1,242 | 1,954 | 32.2 | 1.12-1.17 s |
+| **int8, chunked, copy-engine rx** | **1,240** | **2,269** | 31.9 | 0.97-1.02 s |
+
+All code probes PASS; link: root rx +0-1 per run, 0 uncorrectable.
+
+### 7.4 P2P: works on other 2x B70 machines, NOT possible on the Tower (kernel P2PDMA rules)
+- vllm-xpu-kernels #570 (open) + vllm #54768 (open), RFC vllm #54766: a 2-rank all-reduce over
+  Level Zero IPC (dma-buf fd exchange, zeMemOpenIpcHandle), handshake in-kernel with system-scope
+  atomics, for messages <= 64 KiB (decode); 6.6-10.8 us per call on 2x B70 PCIe Gen5 x8. Larger
+  messages stay on oneCCL. Their hazards: volatile polls see stale lines (need CrossDevice-scope
+  atomics); peer PCIe writes corrupted the device's OWN writes elsewhere in the same allocation
+  (separate page-aligned region, flag page the device never writes). IPC import needs
+  libze_intel_gpu 1.15.39122 (1.15.37833 fails, 1.14.37435 one direction) -- ours IS 1.15.39122.
+- The Tower: Intel Core Ultra 9 285H, host bridge 8086:7d06, gpu0 on root port #12, gpu1 on #11.
+  Linux 6.18 drivers/pci/p2pdma.c allows P2P between root ports only for AMD Zen CPUs or a
+  whitelist of Xeon host bridges; 8086:7d06 is neither. xe_dma_buf_attach then drops peer2peer
+  and, for a VRAM-only allocation, returns -EOPNOTSUPP -- matches our SYCL peer query ("no" both
+  ways). Not fixable by settings; would need a patched kernel AND the SoC routing P2P between its
+  root ports.
+- Other PRs worth reading (ideas only, nothing linked): #638 fast e4m3->half KV conversion on Xe2
+  (fp8-KV prefill +75%); #622-#626 Xe2 fp8 decode GEMV with fused norm prologues.

@@ -2202,23 +2202,62 @@ struct Grimoire {
         // device->host copies (22 MB call: 3.4 + 3.4 ms on gpu1's x4 link);
         // a kernel read on the compute engine overlaps the copy engine instead.
         bool pipe_zc = true;
+        // int8 payload (GRIMOIRE_TP_AR_INT8=1, opt-in, zero-copy receive only):
+        // each 32 values -> 32 int8 + one fp32 scale (absmax/127), 1.125 bytes
+        // per value instead of 2 -- gpu1's link carries both directions and is
+        // the prefill limit.  Lossy.  Both ranks add the SAME dequantized
+        // terms in rank order, so they keep identical bits.
+        bool pipe_q8 = false;
         size_t pipe_off = 0;         // byte offset of those slots in the segment
         uint64_t pseq = 0;
         uint8_t* pout = nullptr;     // USM host ring: my pieces, device -> host
         uint8_t* pin = nullptr;      // USM host ring: the peer's pieces, host -> device
-        uint8_t* dpk = nullptr;      // device ring: bf16 copy of my pieces
+        uint8_t* dpk = nullptr;      // device ring: bf16 / int8 copy of my pieces
         uint8_t* dpeer = nullptr;    // device ring: the peer's pieces
         std::vector<sycl::event> ev_d2h, ev_h2d, ev_add;   // last use of each ring slot
         std::unique_ptr<sycl::queue> qd2h, qh2d;
         double t_ms = 0, mb = 0; uint64_t calls = 0;       // GRIMOIRE_TP_AR_TIMING
         double ph[6] = {0, 0, 0, 0, 0, 0};  // first d2h (incl. producer), d2h, cp out, peer, h2d slot, cp in
         TpCopyPool pool;
+        // Streamed all-reduce (tp_stream_push / tp_stream_wait): several blocks
+        // in flight, so a block's transfer overlaps compute queued after it --
+        // TP prefill's chunked FFN (GRIMOIRE_TP_FFN_CHUNK).  Same shared-RAM
+        // slots, flags, sequence and adds as tp_pipe_allreduce, pieces still
+        // finished strictly in order, so the sums are bit-identical.  A block
+        // is packed WHOLE into a device staging region when it is pushed, so
+        // its device->host copies never wait behind compute queued later.
+        struct StreamJob { float* dev; size_t elems, np; uint64_t g0; uint8_t* packed; sycl::event pk; };
+        std::deque<StreamJob> sjobs;
+        uint64_t s_end = 0, s_d2h = 0, s_sent = 0, s_done = 0;   // pieces queued / copy-out issued / sent / finished
+        uint8_t* s_stage = nullptr; size_t s_region = 0;   // device: 2 regions of s_region bytes
+        uint8_t* s_out = nullptr; uint8_t* s_in = nullptr; // USM host rings (own context)
+        // Receive: by default the peer's piece goes pinned ring -> device ring
+        // on the copy engine (qh2d) and the add reads device memory.  The
+        // zero-copy read (GRIMOIRE_TP_STREAM_ZC=1) moves the bytes INSIDE the
+        // add, which waits on q behind the next chunk's FFN -- measured 10-22:
+        // 21 ms per layer, only 2.4 ms under the unchunked path.  The device
+        // ring holds two layers of pieces (s_rin), so a slot's last add is
+        // long done when the copy engine refills it.
+        bool s_zc = false;
+        uint8_t* s_din = nullptr;                          // device ring (copy receive)
+        int s_rout = 8, s_rin = 0;
+        std::vector<sycl::event> s_ev_d2h, s_ev_add, s_ev_h2d;
+        double s_wait_ms = 0, s_block_ms = 0; uint64_t s_blocks = 0;   // GRIMOIRE_TP_AR_TIMING
     } tshm;
     bool tp_shm_setup(std::string& err);
     bool tp_shm_allreduce(float* dev, size_t elems);
     bool tp_pipe_allreduce(float* dev, size_t elems);
+    bool tp_stream_reserve(size_t rows);
+    uint64_t tp_stream_push(float* dev, size_t elems, int region, size_t row0);
+    void tp_stream_issue();
+    bool tp_stream_wait(uint64_t upto);
+    // TP prefill's chunked FFN: rows per chunk (GRIMOIRE_TP_FFN_CHUNK, 0 = off)
+    // and both FFN weights dequantized once per layer for all chunks.
+    int tp_ffn_chunk = 0;
+    sycl_bf16* tp_wq_gu = nullptr; sycl_bf16* tp_wq_dn = nullptr;
+    size_t tp_wq_gu_cap = 0, tp_wq_dn_cap = 0;
     // Power governor: keep THIS card's average power under
-    // GRIMOIRE_POWER_LIMIT_W (default 240; 0 = off).  The B70 is rated
+    // GRIMOIRE_POWER_LIMIT_W (default off since 10-22; was 240).  The B70 is rated
     // 275 W sustained, but its firmware lets short bursts go above that, and
     // GRIMOIRE's prompt kernels reach them: 300-326 W over 200 ms windows on
     // gpu0 (pipeline prompt ladder, 10-08).  At every prompt layer and every
@@ -4434,6 +4473,19 @@ bool Grimoire::tp_shm_setup(std::string& err){
         tshm.pipe_bf16=!(be&&*be=='0');
         const char* ze=std::getenv("GRIMOIRE_TP_AR_ZC");
         tshm.pipe_zc=!(ze&&*ze=='0');
+        const char* qe=std::getenv("GRIMOIRE_TP_AR_INT8");
+        tshm.pipe_q8=qe&&*qe&&*qe!='0';
+        if(tshm.pipe_q8&&(!tshm.pipe_zc||cfg.hidden%32!=0)){
+            std::printf("  GRIMOIRE_TP_AR_INT8 needs zero-copy receive and hidden %% 32 == 0 -- using bf16\n");
+            tshm.pipe_q8=false;
+        }
+        // chunked FFN (streamed all-reduces): bf16 / int8 payload, zero-copy receive
+        if(tshm.pipe_zc&&(tshm.pipe_bf16||tshm.pipe_q8)){
+            tp_ffn_chunk=768;
+            if(const char* e=std::getenv("GRIMOIRE_TP_FFN_CHUNK"); e&&*e)tp_ffn_chunk=std::max(0,std::atoi(e))/256*256;
+            const char* sz=std::getenv("GRIMOIRE_TP_STREAM_ZC");
+            tshm.s_zc=sz&&*sz&&*sz!='0';
+        }
         tshm.pipe_off=tshm.bytes;
         tshm.bytes+=size_t(W)*size_t(tshm.pipe_slots)*tshm.pipe_piece*sizeof(float);
     }
@@ -4480,7 +4532,7 @@ bool Grimoire::tp_shm_setup(std::string& err){
         const size_t rb=tshm.pipe_piece*sizeof(float)*size_t(tshm.pipe_ring);
         tshm.pout=sycl::malloc_host<uint8_t>(rb,q);
         tshm.pin=sycl::malloc_host<uint8_t>(rb,q);
-        tshm.dpk=sycl::malloc_device<uint8_t>(rb/2,q);
+        tshm.dpk=sycl::malloc_device<uint8_t>(tshm.pipe_q8?rb:rb/2,q);   // int8: 2*ring slots
         tshm.dpeer=sycl::malloc_device<uint8_t>(rb,q);
         if(!tshm.pout||!tshm.pin||!tshm.dpk||!tshm.dpeer){err="TP pipelined staging allocation failed";return false;}
         tshm.ev_d2h.assign(size_t(tshm.pipe_ring),sycl::event{});
@@ -4495,8 +4547,13 @@ bool Grimoire::tp_shm_setup(std::string& err){
         if(const char* e=std::getenv("GRIMOIRE_TP_AR_THREADS"); e&&*e)nthr=std::clamp(std::atoi(e),0,15);
         tshm.pool.start(nthr);
         std::printf("  TP all-reduce (prefill blocks): pipelined, %zu rows x %d per piece, ring %d, %s payload, %d copy threads, %s\n",
-                    tshm.pipe_piece/size_t(cfg.hidden),cfg.hidden,tshm.pipe_ring,tshm.pipe_bf16?"bf16":"fp32",nthr+1,
+                    tshm.pipe_piece/size_t(cfg.hidden),cfg.hidden,tshm.pipe_ring,
+                    tshm.pipe_q8?"int8 (groups of 32, LOSSY)":tshm.pipe_bf16?"bf16":"fp32",nthr+1,
                     tshm.pipe_zc?"zero-copy receive":"host->device copies");
+        if(tp_ffn_chunk)
+            std::printf("  TP prefill dense FFN: %d-row chunks, all-reduces streamed under the next chunk's compute,"
+                        " %s receive (GRIMOIRE_TP_FFN_CHUNK=0 = off)\n",tp_ffn_chunk,
+                        tshm.s_zc?"zero-copy":"copy-engine");
     }
     return true;
 }
@@ -4510,7 +4567,9 @@ bool Grimoire::tp_shm_setup(std::string& err){
 bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
     const int peer=1-tp_rank;
     const size_t P=tshm.pipe_piece; const size_t R=size_t(tshm.pipe_ring); const uint64_t D=uint64_t(tshm.pipe_slots);
-    const bool bf=tshm.pipe_bf16; const size_t eb=bf?2:4;
+    const bool q8=tshm.pipe_q8, bf=tshm.pipe_bf16&&!q8; const size_t eb=bf?2:4;
+    // payload bytes of an n-value piece (int8: the values, then one fp32 scale per 32)
+    auto pb=[&](size_t n){return q8?n+n/8:n*eb;};
     const size_t np=(elems+P-1)/P;
     auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
     auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
@@ -4519,11 +4578,33 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
     sycl::queue& qd=*tshm.qd2h; sycl::queue& qh=*tshm.qh2d;
     // fp32 payload: the copies read dev straight after what q has queued so far
     // (the projection that produced it)
-    const sycl::event produced=bf?sycl::event{}:q.ext_oneapi_submit_barrier();
+    const sycl::event produced=(bf||q8)?sycl::event{}:q.ext_oneapi_submit_barrier();
+    // int8: my copy of piece k sits in device slot k % 2*ring until its add
+    // has read it; the pack of piece k+2*ring is queued on q after that add
+    auto q8slot=[&](size_t k){return reinterpret_cast<int8_t*>(tshm.dpk+(k%(2*R))*P*2);};
     auto issue=[&](size_t k){
         const size_t n=std::min(P,elems-k*P), sl=k%R;
         uint8_t* host=tshm.pout+sl*P*sizeof(float);
-        if(bf){
+        if(q8){
+            // one sub-group per 32 values, two per lane
+            int8_t* qv=q8slot(k); float* sc=reinterpret_cast<float*>(qv+n);
+            const float* src=dev+k*P;
+            const size_t ng=n/32, gl=(ng*16+255)/256*256;
+            const sycl::event pk=q.parallel_for(sycl::nd_range<1>(gl,256),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t g=it.get_global_linear_id()/16;
+                if(g>=ng)return;
+                const size_t i=g*32+2*(it.get_global_linear_id()%16);
+                const float x0=src[i], x1=src[i+1];
+                const float m=sycl::reduce_over_group(it.get_sub_group(),
+                    sycl::fmax(sycl::fabs(x0),sycl::fabs(x1)),sycl::maximum<float>());
+                const float inv=m>0.f?127.f/m:0.f;
+                qv[i]=int8_t(sycl::clamp(int(sycl::rint(x0*inv)),-127,127));
+                qv[i+1]=int8_t(sycl::clamp(int(sycl::rint(x1*inv)),-127,127));
+                if(i%32==0)sc[g]=m*(1.f/127.f);
+            });
+            tshm.ev_d2h[sl]=qd.memcpy(host,qv,pb(n),pk);
+        }else if(bf){
             sycl_bf16* dst=reinterpret_cast<sycl_bf16*>(tshm.dpk)+sl*P;
             const float* src=dev+k*P;
             const sycl::event prev=tshm.ev_d2h[sl];          // last copy out of this slot
@@ -4544,7 +4625,7 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
         const size_t n=std::min(P,elems-k*P), sl=k%R;
         const uint64_t s=++tshm.pseq;
         tshm.ev_d2h[sl].wait(); lap(k==0?0:1);
-        tshm.pool.copy(pslot(tp_rank,s),tshm.pout+sl*P*sizeof(float),n*eb); lap(2);
+        tshm.pool.copy(pslot(tp_rank,s),tshm.pout+sl*P*sizeof(float),pb(n)); lap(2);
         pflag(tp_rank)->store(s,std::memory_order_release);
         if(k+R<np)issue(k+R);                                 // this ring slot is free again
         {
@@ -4563,8 +4644,18 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
         if(tshm.pipe_zc){
             // my pinned in-slot is free once the add that read it is done
             tshm.ev_add[sl].wait(); lap(4);
-            tshm.pool.copy(hin,pslot(peer,s),n*eb); lap(5);
-            if(bf){
+            tshm.pool.copy(hin,pslot(peer,s),pb(n)); lap(5);
+            if(q8){
+                // rank 0's term first on both ranks: the same expression on the
+                // same values, so even a fused multiply-add rounds alike
+                const int8_t* mine=q8slot(k);
+                const int8_t* qa=tp_rank==0?mine:reinterpret_cast<const int8_t*>(hin);
+                const int8_t* qb=tp_rank==0?reinterpret_cast<const int8_t*>(hin):mine;
+                const float* sa=reinterpret_cast<const float*>(qa+n);
+                const float* sb=reinterpret_cast<const float*>(qb+n);
+                tshm.ev_add[sl]=q.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(qa[i])*sa[i/32]+float(qb[i])*sb[i/32];});
+            }else if(bf){
                 const sycl_bf16* pp=reinterpret_cast<const sycl_bf16*>(hin);
                 tshm.ev_add[sl]=q.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
                     d[i]=float(sycl_bf16(d[i]))+float(pp[i]);});
@@ -4595,7 +4686,7 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
     }
     if(timing){
         tshm.t_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
-        tshm.mb+=double(elems*eb)/1048576.0;
+        tshm.mb+=double(q8?elems+elems/8:elems*eb)/1048576.0;
         if(++tshm.calls%128==0){
             const double c=double(tshm.calls);
             std::printf("  TP pipelined all-reduce rank %d: %llu calls, %.2f ms/call host, %.1f MB/call, %.2f GB/s"
@@ -4605,6 +4696,165 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
             std::fflush(stdout);
         }
     }
+    return true;
+}
+
+// Streamed all-reduce (see TpShm): staging for blocks of up to `rows` rows
+// in each of the two regions, and the pinned rings.  Only between blocks.
+bool Grimoire::tp_stream_reserve(size_t rows){
+    const size_t H=size_t(cfg.hidden), P=tshm.pipe_piece;
+    // <= 2 bytes per value either way (bf16, or int8 + an fp32 scale per 32),
+    // and a block's last piece keeps its full stride
+    const size_t region=(rows*H+P)*2;
+    // receive ring: two layers' pieces (two all-reduces each) and some slack
+    const int rin=int(2*2*((rows*H+P-1)/P))+8;
+    if(!tshm.s_out){
+        tshm.s_out=sycl::malloc_host<uint8_t>(size_t(tshm.s_rout)*P*2,q);
+        if(!tshm.s_out)return false;
+        tshm.s_ev_d2h.assign(size_t(tshm.s_rout),sycl::event{});
+    }
+    if(rin>tshm.s_rin){
+        q.wait(); tshm.qh2d->wait();
+        if(tshm.s_in)sycl::free(tshm.s_in,q);
+        if(tshm.s_din)sycl::free(tshm.s_din,q);
+        tshm.s_in=sycl::malloc_host<uint8_t>(size_t(rin)*P*2,q);
+        tshm.s_din=tshm.s_zc?nullptr:sycl::malloc_device<uint8_t>(size_t(rin)*P*2,q);
+        if(!tshm.s_in||(!tshm.s_zc&&!tshm.s_din)){tshm.s_rin=0;return false;}
+        tshm.s_rin=rin;
+        tshm.s_ev_add.assign(size_t(rin),sycl::event{});
+        tshm.s_ev_h2d.assign(size_t(rin),sycl::event{});
+    }
+    if(region<=tshm.s_region)return true;
+    q.wait();
+    if(tshm.s_stage)sycl::free(tshm.s_stage,q);
+    tshm.s_stage=sycl::malloc_device<uint8_t>(2*region,q);
+    tshm.s_region=tshm.s_stage?region:0;
+    return tshm.s_stage!=nullptr;
+}
+
+// Queue a block: pack it whole (bf16, or int8 + scales per piece) into staging
+// region `region` at row `row0`, issue the device->host copies the ring has
+// room for.  Returns the block's first global piece id.
+uint64_t Grimoire::tp_stream_push(float* dev,size_t elems,int region,size_t row0){
+    const size_t P=tshm.pipe_piece, H=size_t(cfg.hidden);
+    uint8_t* packed=tshm.s_stage+size_t(region)*tshm.s_region+row0*H*2;
+    sycl::event pk;
+    if(tshm.pipe_q8){
+        // as tp_pipe_allreduce: one sub-group per 32 values; piece p at
+        // packed + p*P*2 holds its n int8, then its n/32 fp32 scales
+        const size_t ng=elems/32, gl=(ng*16+255)/256*256;
+        pk=q.parallel_for(sycl::nd_range<1>(gl,256),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t g=it.get_global_linear_id()/16;
+            if(g>=ng)return;
+            const size_t i=g*32+2*(it.get_global_linear_id()%16);
+            const size_t p=i/P, n=sycl::min(P,elems-p*P), j=i-p*P;
+            int8_t* qv=reinterpret_cast<int8_t*>(packed+p*P*2);
+            float* sc=reinterpret_cast<float*>(qv+n);
+            const float x0=dev[i], x1=dev[i+1];
+            const float m=sycl::reduce_over_group(it.get_sub_group(),
+                sycl::fmax(sycl::fabs(x0),sycl::fabs(x1)),sycl::maximum<float>());
+            const float inv=m>0.f?127.f/m:0.f;
+            qv[j]=int8_t(sycl::clamp(int(sycl::rint(x0*inv)),-127,127));
+            qv[j+1]=int8_t(sycl::clamp(int(sycl::rint(x1*inv)),-127,127));
+            if(j%32==0)sc[j/32]=m*(1.f/127.f);
+        });
+    }else{
+        sycl_bf16* dst=reinterpret_cast<sycl_bf16*>(packed);
+        const float* src=dev;
+        pk=q.parallel_for(sycl::range<1>(elems),[=](sycl::id<1> i){dst[i]=sycl_bf16(src[i]);});
+    }
+    const uint64_t g0=tshm.s_end;
+    tshm.sjobs.push_back({dev,elems,(elems+P-1)/P,g0,packed,pk});
+    tshm.s_end+=tshm.sjobs.back().np;
+    tp_stream_issue();
+    return g0;
+}
+
+// Device->host copies for queued pieces, as far as the out ring has room.
+void Grimoire::tp_stream_issue(){
+    const size_t P=tshm.pipe_piece; const uint64_t RO=uint64_t(tshm.s_rout);
+    const bool q8=tshm.pipe_q8;
+    while(tshm.s_d2h<tshm.s_end&&tshm.s_d2h<tshm.s_sent+RO){
+        const auto& j=*std::find_if(tshm.sjobs.begin(),tshm.sjobs.end(),[&](const TpShm::StreamJob& x){
+            return tshm.s_d2h<x.g0+x.np;});
+        const size_t p=size_t(tshm.s_d2h-j.g0), n=std::min(P,j.elems-p*P), o=size_t(tshm.s_d2h%RO);
+        tshm.s_ev_d2h[o]=tshm.qd2h->memcpy(tshm.s_out+o*P*2,j.packed+p*P*2,q8?n+n/8:n*2,j.pk);
+        ++tshm.s_d2h;
+    }
+}
+
+// Finish every piece with global id below `upto`, in order: my piece to my
+// shared-RAM slot, the peer's into my pinned ring, the add on q -- exactly
+// tp_pipe_allreduce's steps, so the same bits.
+bool Grimoire::tp_stream_wait(uint64_t upto){
+    const int peer=1-tp_rank;
+    const size_t P=tshm.pipe_piece; const uint64_t D=uint64_t(tshm.pipe_slots);
+    const uint64_t RO=uint64_t(tshm.s_rout), RI=uint64_t(tshm.s_rin);
+    const bool q8=tshm.pipe_q8;
+    auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
+    auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
+    static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
+    const auto t0=std::chrono::steady_clock::now();
+    while(tshm.s_done<upto){
+        const uint64_t g=tshm.s_done;
+        const TpShm::StreamJob& j=tshm.sjobs.front();      // pieces finish in order
+        const size_t p=size_t(g-j.g0), n=std::min(P,j.elems-p*P), nb=q8?n+n/8:n*2;
+        const size_t o=size_t(g%RO), ii=size_t(g%RI);
+        const uint64_t s=++tshm.pseq;
+        tshm.s_ev_d2h[o].wait();
+        tshm.pool.copy(pslot(tp_rank,s),tshm.s_out+o*P*2,nb);
+        pflag(tp_rank)->store(s,std::memory_order_release);
+        ++tshm.s_sent;
+        tp_stream_issue();                                    // this out slot is free again
+        {
+            auto* f=pflag(peer); uint64_t spins=0; const auto tw=std::chrono::steady_clock::now();
+            while(f->load(std::memory_order_acquire)<s){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&std::chrono::steady_clock::now()-tw>std::chrono::seconds(120)){
+                    std::fprintf(stderr,"TP rank %d: streamed all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                    return false;
+                }
+            }
+        }
+        uint8_t* hin=tshm.s_in+ii*P*2;
+        const uint8_t* src=hin;                               // what the add reads
+        sycl::event cp;
+        if(tshm.s_zc){
+            tshm.s_ev_add[ii].wait();                         // my pinned in-slot is free
+            tshm.pool.copy(hin,pslot(peer,s),nb);
+        }else{
+            tshm.s_ev_h2d[ii].wait();                         // copy engine done with the in-slot
+            tshm.pool.copy(hin,pslot(peer,s),nb);
+            uint8_t* din=tshm.s_din+ii*P*2;
+            cp=tshm.qh2d->memcpy(din,hin,nb,tshm.s_ev_add[ii]);   // that add is a layer old
+            tshm.s_ev_h2d[ii]=cp;
+            src=din;
+        }
+        float* d=j.dev+p*P;
+        if(q8){
+            const int8_t* mine=reinterpret_cast<const int8_t*>(j.packed+p*P*2);
+            const int8_t* qa=tp_rank==0?mine:reinterpret_cast<const int8_t*>(src);
+            const int8_t* qb=tp_rank==0?reinterpret_cast<const int8_t*>(src):mine;
+            const float* sa=reinterpret_cast<const float*>(qa+n);
+            const float* sb=reinterpret_cast<const float*>(qb+n);
+            tshm.s_ev_add[ii]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(qa[i])*sa[i/32]+float(qb[i])*sb[i/32];});
+            });
+        }else{
+            const sycl_bf16* pp=reinterpret_cast<const sycl_bf16*>(src);
+            tshm.s_ev_add[ii]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(sycl_bf16(d[i]))+float(pp[i]);});
+            });
+        }
+        ++tshm.s_done;
+        if(tshm.s_done==j.g0+j.np)tshm.sjobs.pop_front();
+    }
+    if(timing)tshm.s_wait_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
     return true;
 }
 
@@ -8965,6 +9215,12 @@ void Grimoire::release() {
     if (tshm.pin) { sycl::free(tshm.pin, q); tshm.pin = nullptr; }
     if (tshm.dpk) { sycl::free(tshm.dpk, q); tshm.dpk = nullptr; }
     if (tshm.dpeer) { sycl::free(tshm.dpeer, q); tshm.dpeer = nullptr; }
+    if (tshm.s_stage) { sycl::free(tshm.s_stage, q); tshm.s_stage = nullptr; }
+    if (tshm.s_out) { sycl::free(tshm.s_out, q); tshm.s_out = nullptr; }
+    if (tshm.s_in) { sycl::free(tshm.s_in, q); tshm.s_in = nullptr; }
+    if (tshm.s_din) { sycl::free(tshm.s_din, q); tshm.s_din = nullptr; }
+    if (tp_wq_gu) { sycl::free(tp_wq_gu, q); tp_wq_gu = nullptr; tp_wq_gu_cap = 0; }
+    if (tp_wq_dn) { sycl::free(tp_wq_dn, q); tp_wq_dn = nullptr; tp_wq_dn_cap = 0; }
     tshm.qd2h.reset(); tshm.qh2d.reset();
     if (tshm.base) { ::munmap(tshm.base, tshm.bytes); tshm.base = nullptr; }
     if (tp_act) { sycl::free(tp_act, q); tp_act = nullptr; tp_act_elems = 0; }
@@ -16395,6 +16651,80 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             }
             pp_mark("full attention");
+        }
+        // Megatron TP, two ranks, dense FFN on FP8 / BF16 weights: post-norm
+        // and FFN in row chunks of tp_ffn_chunk rows, both all-reduces
+        // streamed, so chunk c's FFN computes while the attention all-reduce
+        // of chunk c+1 and the FFN all-reduce of chunk c-1 are on the link.
+        // Bit-identical to the path below: the same kernels per row (each
+        // FFN weight dequantized once per layer instead of once per GEMM) and
+        // the same all-reduce pieces, payload and adds.
+        const int FIc=d.sh_gu.output_rows()/2;
+        auto wq_ready=[&](sycl_bf16*& p,size_t& cap,size_t need){
+            if(need<=cap)return true;
+            q.wait(); if(p)sycl::free(p,q);
+            p=sycl::malloc_device<sycl_bf16>(need,q); cap=p?need:0;
+            return p!=nullptr;
+        };
+        const bool ffn_chunked=tp_ffn_chunk>0&&tp_mega&&tp_world==2&&!r0_in_h&&!d.moe_layer&&
+            !exact_verify&&M>=tp_ffn_chunk+256&&!g_bestla_ready&&
+            !(a8&&a8s&&xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4)&&
+            d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+            !d.sh_gu.has_i4()&&!d.sh_down.has_i4()&&
+            d.sh_gu.w.N==2*FIc&&d.sh_down.w.K==FIc&&d.sh_down.w.N==H&&
+            !gemm_fast_swiglu_supported(d.sh_gu.w,M)&&
+            gemm_fast_predq_supported(d.sh_gu.w,M)&&gemm_fast_predq_supported(d.sh_down.w,M)&&
+            tshm.sjobs.empty()&&tp_stream_reserve(size_t(M))&&
+            wq_ready(tp_wq_gu,tp_wq_gu_cap,gemm_fast_predq_elems(d.sh_gu.w))&&
+            wq_ready(tp_wq_dn,tp_wq_dn_cap,gemm_fast_predq_elems(d.sh_down.w));
+        if(ffn_chunked){
+            static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
+            const auto tb=std::chrono::steady_clock::now();
+            const size_t Hs=size_t(H), P=tshm.pipe_piece, NG=size_t(d.sh_gu.w.N), FIs=size_t(FIc);
+            // the attention block's partial sums go out; both weights
+            // dequantize on the device meanwhile
+            const uint64_t a1=tp_stream_push(r0,size_t(M)*Hs,0,0);
+            launch_gemm_fast_dequant(q,d.sh_gu.w,tp_wq_gu);
+            launch_gemm_fast_dequant(q,d.sh_down.w,tp_wq_dn);
+            for(int a=0;a<M;){
+                int mc=std::min(tp_ffn_chunk,M-a);
+                if(M-a-mc<256)mc=M-a;                         // no short tail chunk
+                if(!tp_stream_wait(a1+(size_t(a+mc)*Hs+P-1)/P))   // these rows reduced
+                    throw std::runtime_error("TP prefill attention all-reduce failed");
+                const size_t o=size_t(a);
+                launch_rmsnorm_residual_batched(q,bh+o*Hs,r0+o*Hs,nullptr,d.post_norm,
+                    (norm_bf_only||dense_pure)?nullptr:bn+o*Hs,mc,H,cfg.rms_eps,bn_bf+o*Hs);
+                launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o*Hs,t0+o*NG,mc);
+                launch_swiglu_batched(q,t0+o*NG,t1+o*FIs,mc,FIc);
+                launch_f32_to_bf16(q,t1+o*FIs,xb+o*FIs,size_t(mc)*FIs);
+                launch_gemm_fast_predq(q,d.sh_down.w,tp_wq_dn,xb+o*FIs,r0+o*Hs,mc);
+                tp_stream_push(r0+o*Hs,size_t(mc)*Hs,1,o);
+                a+=mc;
+            }
+            if(!tp_stream_wait(tshm.s_end))
+                throw std::runtime_error("TP prefill FFN all-reduce failed");
+            r0_in_h=false;
+            a8_cached_src=nullptr;
+            a8_cached_bf=nullptr;
+            bn_bf_sync=!exact_verify && !norm_bf_only && !dense_pure;
+            if(!dense_pure) q.memset(r1,0,size_t(M)*H*sizeof(float));
+            pp_mark("dense FFN, TP chunked (both all-reduces)");
+            if(timing){
+                tshm.s_block_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tb).count();
+                if(++tshm.s_blocks%64==0){
+                    std::printf("  TP chunked FFN rank %d: %llu layers, %.2f ms/layer host, %.2f of it waiting on transfers\n",
+                        tp_rank,(unsigned long long)tshm.s_blocks,tshm.s_block_ms/double(tshm.s_blocks),
+                        tshm.s_wait_ms/double(tshm.s_blocks));
+                    std::fflush(stdout);
+                }
+            }
+            if(prefill_host_progress){
+                q.wait_and_throw();
+                std::fprintf(stderr,"    prefill host progress: layer %d/%d complete\n",
+                    li+1,prefill_layer_limit);
+                std::fflush(stderr);
+            }
+            continue;
         }
         // Megatron TP: o_proj / out_proj ran on this rank's heads only.
         if(!r0_in_h && !tp_block_reduce(r0,size_t(M)*H))
