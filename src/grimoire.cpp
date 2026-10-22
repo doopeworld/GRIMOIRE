@@ -2106,6 +2106,59 @@ struct Grimoire {
     bool tp_take_vec_rows(bf16_t*& v, int row_elems,
                           const std::vector<std::pair<int,int>>& blocks,
                           sycl::queue& owner, std::string& err);
+    // Parallel memcpy for the pipelined TP all-reduce: the caller and N helper
+    // threads each copy one stripe.  Helpers spin briefly between jobs (a
+    // prefill hands them one per piece), then sleep, so an idle server burns
+    // no CPU.  GRIMOIRE_TP_AR_THREADS helpers (default 0 = plain memcpy).
+    struct TpCopyPool {
+        std::vector<std::thread> th;
+        std::atomic<uint64_t> gen{0};
+        std::atomic<int> done{0}, sleepers{0};
+        std::atomic<bool> stop{false};
+        std::mutex m; std::condition_variable cv;
+        uint8_t* dst = nullptr; const uint8_t* src = nullptr; size_t bytes = 0; int parts = 1;
+        void part(int i) {
+            const size_t a = (bytes * size_t(i) / size_t(parts)) & ~size_t(63);
+            const size_t e = i == parts - 1 ? bytes : (bytes * size_t(i + 1) / size_t(parts)) & ~size_t(63);
+            if (e > a) std::memcpy(dst + a, src + a, e - a);
+        }
+        void start(int n) {
+            for (int i = 0; i < n; ++i) th.emplace_back([this, i] {
+                uint64_t seen = 0;
+                for (;;) {
+                    uint64_t g = gen.load();
+                    for (int sp = 0; g == seen && sp < 200000 && !stop.load(); ++sp) {
+                        __builtin_ia32_pause(); g = gen.load(); }
+                    if (g == seen && !stop.load()) {
+                        std::unique_lock<std::mutex> l(m);
+                        sleepers.fetch_add(1);
+                        cv.wait(l, [&] { return stop.load() || gen.load() != seen; });
+                        sleepers.fetch_sub(1);
+                        g = gen.load();
+                    }
+                    if (stop.load()) return;
+                    seen = g;
+                    part(i + 1);
+                    done.fetch_add(1);
+                }
+            });
+        }
+        void copy(void* d, const void* sp, size_t b) {
+            if (th.empty() || b < (size_t(1) << 18)) { std::memcpy(d, sp, b); return; }
+            dst = static_cast<uint8_t*>(d); src = static_cast<const uint8_t*>(sp); bytes = b;
+            parts = int(th.size()) + 1;
+            done.store(0);
+            gen.fetch_add(1);
+            if (sleepers.load()) { std::lock_guard<std::mutex> l(m); cv.notify_all(); }
+            part(0);
+            while (done.load() < parts - 1) __builtin_ia32_pause();
+        }
+        ~TpCopyPool() {
+            stop = true;
+            { std::lock_guard<std::mutex> l(m); cv.notify_all(); }
+            for (auto& t : th) t.join();
+        }
+    };
     // Megatron TP all-reduce through POSIX shared memory (tp_shm_setup).
     //
     // Each GPU stays in its OWN process and context, and no memory is ever
@@ -2132,9 +2185,38 @@ struct Grimoire {
         float* res = nullptr;        // USM host: the CPU sum, copied to the device
         float* peer = nullptr;       // USM host: a peer's slot, staged for the device add
         float* dtmp = nullptr;       // device: a peer's partial, for the device add
+        // Pipelined path for prefill-size blocks, two ranks (tp_pipe_allreduce):
+        // pieces of pipe_piece floats go GPU -> my pinned ring (copy queue) ->
+        // my shared-RAM slot (CPU) -> the peer's pinned ring (its CPU) -> its
+        // GPU (copy queue) -> add, so the device->host copy of one piece, the
+        // CPU copies of another and the host->device copy of a third overlap.
+        // Same rule as above: the segment is CPU-only, every GPU copy uses this
+        // rank's own buffers.  Optional bf16 payload (GRIMOIRE_TP_AR_BF16).
+        size_t pipe_piece = 0;       // floats per piece (rows x hidden); 0 = off
+        int pipe_ring = 0;           // ring slots (pieces in flight)
+        int pipe_slots = 4;          // shared-RAM slots per rank, by sequence
+        bool pipe_bf16 = true;
+        // Zero-copy receive (GRIMOIRE_TP_AR_ZC, default on): the add kernel reads
+        // the peer's piece straight from my pinned ring over PCIe.  Measured
+        // 10-22: the separate host->device copy ran back to back with the
+        // device->host copies (22 MB call: 3.4 + 3.4 ms on gpu1's x4 link);
+        // a kernel read on the compute engine overlaps the copy engine instead.
+        bool pipe_zc = true;
+        size_t pipe_off = 0;         // byte offset of those slots in the segment
+        uint64_t pseq = 0;
+        uint8_t* pout = nullptr;     // USM host ring: my pieces, device -> host
+        uint8_t* pin = nullptr;      // USM host ring: the peer's pieces, host -> device
+        uint8_t* dpk = nullptr;      // device ring: bf16 copy of my pieces
+        uint8_t* dpeer = nullptr;    // device ring: the peer's pieces
+        std::vector<sycl::event> ev_d2h, ev_h2d, ev_add;   // last use of each ring slot
+        std::unique_ptr<sycl::queue> qd2h, qh2d;
+        double t_ms = 0, mb = 0; uint64_t calls = 0;       // GRIMOIRE_TP_AR_TIMING
+        double ph[6] = {0, 0, 0, 0, 0, 0};  // first d2h (incl. producer), d2h, cp out, peer, h2d slot, cp in
+        TpCopyPool pool;
     } tshm;
     bool tp_shm_setup(std::string& err);
     bool tp_shm_allreduce(float* dev, size_t elems);
+    bool tp_pipe_allreduce(float* dev, size_t elems);
     // Power governor: keep THIS card's average power under
     // GRIMOIRE_POWER_LIMIT_W (default 240; 0 = off).  The B70 is rated
     // 275 W sustained, but its firmware lets short bursts go above that, and
@@ -4340,6 +4422,21 @@ bool Grimoire::tp_shm_setup(std::string& err){
     if(const char* e=std::getenv("GRIMOIRE_TP_SHM_ROWS"); e&&*e)rows=size_t(std::max(1,std::atoi(e)));
     tshm.slot_elems=rows*size_t(cfg.hidden);
     tshm.bytes=kTpShmHeader+size_t(2*W)*tshm.slot_elems*sizeof(float);
+    // Pipelined prefill path (two ranks; GRIMOIRE_TP_AR_PIPE=0 = off).  Both
+    // ranks read the same environment, so they size the segment alike.
+    if(const char* pe=std::getenv("GRIMOIRE_TP_AR_PIPE"); W==2&&!(pe&&*pe=='0')){
+        size_t prow=128;
+        if(const char* e=std::getenv("GRIMOIRE_TP_AR_ROWS"); e&&*e)prow=size_t(std::max(1,std::atoi(e)));
+        tshm.pipe_piece=prow*size_t(cfg.hidden);
+        tshm.pipe_ring=8;
+        if(const char* e=std::getenv("GRIMOIRE_TP_AR_RING"); e&&*e)tshm.pipe_ring=std::clamp(std::atoi(e),2,64);
+        const char* be=std::getenv("GRIMOIRE_TP_AR_BF16");
+        tshm.pipe_bf16=!(be&&*be=='0');
+        const char* ze=std::getenv("GRIMOIRE_TP_AR_ZC");
+        tshm.pipe_zc=!(ze&&*ze=='0');
+        tshm.pipe_off=tshm.bytes;
+        tshm.bytes+=size_t(W)*size_t(tshm.pipe_slots)*tshm.pipe_piece*sizeof(float);
+    }
     // Named after rank 0's PID, which it sends with the go-ahead: unique per
     // server even when several containers share the host's /dev/shm
     // (--ipc=host).
@@ -4379,6 +4476,135 @@ bool Grimoire::tp_shm_setup(std::string& err){
     if(!tshm.stage||!tshm.res||!tshm.peer||!tshm.dtmp){err="TP shm staging allocation failed";return false;}
     std::printf("  TP all-reduce: host-staged through shared RAM (own pinned buffers, no P2P), "
                 "%zu rows x %d per piece\n",rows,cfg.hidden);
+    if(tshm.pipe_piece){
+        const size_t rb=tshm.pipe_piece*sizeof(float)*size_t(tshm.pipe_ring);
+        tshm.pout=sycl::malloc_host<uint8_t>(rb,q);
+        tshm.pin=sycl::malloc_host<uint8_t>(rb,q);
+        tshm.dpk=sycl::malloc_device<uint8_t>(rb/2,q);
+        tshm.dpeer=sycl::malloc_device<uint8_t>(rb,q);
+        if(!tshm.pout||!tshm.pin||!tshm.dpk||!tshm.dpeer){err="TP pipelined staging allocation failed";return false;}
+        tshm.ev_d2h.assign(size_t(tshm.pipe_ring),sycl::event{});
+        tshm.ev_h2d.assign(size_t(tshm.pipe_ring),sycl::event{});
+        tshm.ev_add.assign(size_t(tshm.pipe_ring),sycl::event{});
+        tshm.qd2h=std::make_unique<sycl::queue>(q.get_context(),q.get_device(),sycl::property::queue::in_order{});
+        tshm.qh2d=std::make_unique<sycl::queue>(q.get_context(),q.get_device(),sycl::property::queue::in_order{});
+        // Helpers default OFF: measured 10-22 (Qwen3.8 FP8, two B70s) they cut the
+        // CPU copies ~2x but the time moved to waiting on gpu1's x4 link --
+        // pp2048 1,387 -> 1,384 tok/s with 3 helpers.
+        int nthr=0;
+        if(const char* e=std::getenv("GRIMOIRE_TP_AR_THREADS"); e&&*e)nthr=std::clamp(std::atoi(e),0,15);
+        tshm.pool.start(nthr);
+        std::printf("  TP all-reduce (prefill blocks): pipelined, %zu rows x %d per piece, ring %d, %s payload, %d copy threads, %s\n",
+                    tshm.pipe_piece/size_t(cfg.hidden),cfg.hidden,tshm.pipe_ring,tshm.pipe_bf16?"bf16":"fp32",nthr+1,
+                    tshm.pipe_zc?"zero-copy receive":"host->device copies");
+    }
+    return true;
+}
+
+// Pipelined all-reduce for prefill-size blocks, two ranks (see TpShm).  The
+// host waits only for a piece's device->host copy and for the peer's flag, so
+// the device->host copy of piece k+ring, the CPU copies of piece k and the
+// host->device copies of the pieces before it overlap.  With a bf16 payload
+// both ranks add the SAME bf16-rounded partials (own and peer) in fp32, so
+// they keep identical bits; fp32 adds of two terms are order-free as well.
+bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
+    const int peer=1-tp_rank;
+    const size_t P=tshm.pipe_piece; const size_t R=size_t(tshm.pipe_ring); const uint64_t D=uint64_t(tshm.pipe_slots);
+    const bool bf=tshm.pipe_bf16; const size_t eb=bf?2:4;
+    const size_t np=(elems+P-1)/P;
+    auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
+    auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
+    static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
+    const auto t0=std::chrono::steady_clock::now();
+    sycl::queue& qd=*tshm.qd2h; sycl::queue& qh=*tshm.qh2d;
+    // fp32 payload: the copies read dev straight after what q has queued so far
+    // (the projection that produced it)
+    const sycl::event produced=bf?sycl::event{}:q.ext_oneapi_submit_barrier();
+    auto issue=[&](size_t k){
+        const size_t n=std::min(P,elems-k*P), sl=k%R;
+        uint8_t* host=tshm.pout+sl*P*sizeof(float);
+        if(bf){
+            sycl_bf16* dst=reinterpret_cast<sycl_bf16*>(tshm.dpk)+sl*P;
+            const float* src=dev+k*P;
+            const sycl::event prev=tshm.ev_d2h[sl];          // last copy out of this slot
+            const sycl::event pk=q.submit([&](sycl::handler& h){
+                h.depends_on(prev);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){dst[i]=sycl_bf16(src[i]);});
+            });
+            tshm.ev_d2h[sl]=qd.memcpy(host,dst,n*2,pk);
+        }else{
+            tshm.ev_d2h[sl]=qd.memcpy(host,dev+k*P,n*4,produced);
+        }
+    };
+    for(size_t k=0;k<std::min(np,R);++k)issue(k);
+    auto tl=std::chrono::steady_clock::now();
+    auto lap=[&](int i){ if(!timing)return; const auto t=std::chrono::steady_clock::now();
+        tshm.ph[i]+=std::chrono::duration<double,std::milli>(t-tl).count(); tl=t; };
+    for(size_t k=0;k<np;++k){
+        const size_t n=std::min(P,elems-k*P), sl=k%R;
+        const uint64_t s=++tshm.pseq;
+        tshm.ev_d2h[sl].wait(); lap(k==0?0:1);
+        tshm.pool.copy(pslot(tp_rank,s),tshm.pout+sl*P*sizeof(float),n*eb); lap(2);
+        pflag(tp_rank)->store(s,std::memory_order_release);
+        if(k+R<np)issue(k+R);                                 // this ring slot is free again
+        {
+            auto* f=pflag(peer); uint64_t spins=0; const auto tw=std::chrono::steady_clock::now();
+            while(f->load(std::memory_order_acquire)<s){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&std::chrono::steady_clock::now()-tw>std::chrono::seconds(120)){
+                    std::fprintf(stderr,"TP rank %d: pipelined all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                    return false;
+                }
+            }
+        }
+        lap(3);
+        uint8_t* hin=tshm.pin+sl*P*sizeof(float);
+        float* d=dev+k*P;
+        if(tshm.pipe_zc){
+            // my pinned in-slot is free once the add that read it is done
+            tshm.ev_add[sl].wait(); lap(4);
+            tshm.pool.copy(hin,pslot(peer,s),n*eb); lap(5);
+            if(bf){
+                const sycl_bf16* pp=reinterpret_cast<const sycl_bf16*>(hin);
+                tshm.ev_add[sl]=q.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(sycl_bf16(d[i]))+float(pp[i]);});
+            }else{
+                const float* pp=reinterpret_cast<const float*>(hin);
+                tshm.ev_add[sl]=q.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){d[i]+=pp[i];});
+            }
+            continue;
+        }
+        tshm.ev_h2d[sl].wait(); lap(4);                       // my pinned in-slot is free
+        tshm.pool.copy(hin,pslot(peer,s),n*eb); lap(5);
+        uint8_t* dp=tshm.dpeer+sl*P*sizeof(float);
+        tshm.ev_h2d[sl]=qh.memcpy(dp,hin,n*eb,tshm.ev_add[sl]); // after the last add read dp
+        const sycl::event cp=tshm.ev_h2d[sl];
+        if(bf){
+            const sycl_bf16* pp=reinterpret_cast<const sycl_bf16*>(dp);
+            tshm.ev_add[sl]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){d[i]=float(sycl_bf16(d[i]))+float(pp[i]);});
+            });
+        }else{
+            const float* pp=reinterpret_cast<const float*>(dp);
+            tshm.ev_add[sl]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){d[i]+=pp[i];});
+            });
+        }
+    }
+    if(timing){
+        tshm.t_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+        tshm.mb+=double(elems*eb)/1048576.0;
+        if(++tshm.calls%128==0){
+            const double c=double(tshm.calls);
+            std::printf("  TP pipelined all-reduce rank %d: %llu calls, %.2f ms/call host, %.1f MB/call, %.2f GB/s"
+                        " | per call ms: first-d2h %.2f d2h %.2f cp-out %.2f peer %.2f h2d-slot %.2f cp-in %.2f\n",
+                        tp_rank,(unsigned long long)tshm.calls,tshm.t_ms/c,tshm.mb/c,tshm.mb/1024.0/(tshm.t_ms/1000.0),
+                        tshm.ph[0]/c,tshm.ph[1]/c,tshm.ph[2]/c,tshm.ph[3]/c,tshm.ph[4]/c,tshm.ph[5]/c);
+            std::fflush(stdout);
+        }
+    }
     return true;
 }
 
@@ -4391,6 +4617,7 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
     };
     static const size_t cpu_max=[]{const char* e=std::getenv("GRIMOIRE_TP_SHM_CPU_MAX");
         return e&&*e?size_t(std::atoll(e)):size_t(65536);}();
+    if(tshm.pipe_piece&&elems>cpu_max)return tp_pipe_allreduce(dev,elems);
     for(size_t off=0;off<elems;off+=tshm.slot_elems){
         const size_t n=std::min(tshm.slot_elems,elems-off);
         const uint64_t s=++tshm.seq;
@@ -4460,14 +4687,15 @@ static bool read_u64_file(const std::string& p, uint64_t& v) {
 
 void Grimoire::power_gov_init() {
     const char* e = std::getenv("GRIMOIRE_POWER_LIMIT_W");
-    // Default 240 W only for a rank of several GPUs: the governor is part of the
-    // multi-GPU stability work (2026-10-08).  On one GPU it is off by default -- the
-    // card's own firmware holds its 275 W rating, and the governor's pauses cost prompt
-    // speed (pp4096 1.97 -> 2.00 s on Qwen3.8 MXFP4; 14-18% on the heaviest prompts).
-    pgov.limit_w = e && *e ? std::atof(e) : (upload_ranked() ? 240.0 : 0.0);
+    // Off by default, one GPU or several: the card's own firmware holds its power
+    // rating (Ian, 2026-10-22: the B70s run at ~280 W without trouble), and the
+    // governor's pauses cost prompt speed (14-18% on the heaviest prompts).  It was
+    // 240 W for ranked runs from 2026-10-08 (gpu1-drop work); GRIMOIRE_POWER_LIMIT_W
+    // still sets one.
+    pgov.limit_w = e && *e ? std::atof(e) : 0.0;
     if (pgov.limit_w <= 0) {
         std::printf("  power governor: off (%s)\n",
-                    e && *e ? "GRIMOIRE_POWER_LIMIT_W=0" : "one GPU; GRIMOIRE_POWER_LIMIT_W=<watts> sets one");
+                    e && *e ? "GRIMOIRE_POWER_LIMIT_W=0" : "default; GRIMOIRE_POWER_LIMIT_W=<watts> sets one");
         return;
     }
     std::string pci;
@@ -8731,6 +8959,13 @@ void Grimoire::release() {
     if (tshm.res) { sycl::free(tshm.res, q); tshm.res = nullptr; }
     if (tshm.peer) { sycl::free(tshm.peer, q); tshm.peer = nullptr; }
     if (tshm.dtmp) { sycl::free(tshm.dtmp, q); tshm.dtmp = nullptr; }
+    if (tshm.qd2h) tshm.qd2h->wait();
+    if (tshm.qh2d) tshm.qh2d->wait();
+    if (tshm.pout) { sycl::free(tshm.pout, q); tshm.pout = nullptr; }
+    if (tshm.pin) { sycl::free(tshm.pin, q); tshm.pin = nullptr; }
+    if (tshm.dpk) { sycl::free(tshm.dpk, q); tshm.dpk = nullptr; }
+    if (tshm.dpeer) { sycl::free(tshm.dpeer, q); tshm.dpeer = nullptr; }
+    tshm.qd2h.reset(); tshm.qh2d.reset();
     if (tshm.base) { ::munmap(tshm.base, tshm.bytes); tshm.base = nullptr; }
     if (tp_act) { sycl::free(tp_act, q); tp_act = nullptr; tp_act_elems = 0; }
     if(tp_expert){sycl::free(tp_expert,q);tp_expert=nullptr;}
@@ -16966,6 +17201,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             std::printf("      %-28s %9.3f ms  %5.1f%%\n",name.c_str(),
                         tl_sums[name],100.0*tl_sums[name]/tot);
         std::printf("      %-28s %9.3f ms\n","TOTAL (timed regions)",tot);
+        std::fflush(stdout);             // servers write to a pipe: block-buffered
     }
     if(pp_marks.size()>1){
         std::map<std::string,double> sums;

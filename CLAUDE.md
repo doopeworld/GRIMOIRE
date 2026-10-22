@@ -2,6 +2,34 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-22: two B70s on Ian's new redriver M.2-OCuLink adapter -- all three dual targets run.**
+Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers).
+
+### Findings
+- gpu1 is now 0000:08:00.0 = renderD130 behind root port 00:06.2 (Gen4 x4). gpu0 03:00.0 =
+  renderD128. No drop in ~20 two-card runs. Correctable AER only: host->card RxErr ~5/s even idle;
+  card->host 0-8 per heavy TP-prefill run (replayed, no retrain, 0 uncorrectable). PP/decode: ~0.
+- Qwen3.8 checkpoints moved to /mnt/models (new disk). Unraid DUAL templates still map
+  /mnt/storage/Models and the old render nodes -- Ian edits his templates himself.
+- Two cards, c1, llama-benchy pp512 / pp2048 / tg128:
+  Qwen3.8-27B-FP8 PP 825 / 1,436 / 20.5; TP+MTP 1,030 / 1,408 / 50-59 (coding probe 77, PASS);
+  Ornith-1.5-FP8 PP plain 3,880 / 6,886 / 111 (MTP under PP is SLOWER: 67-69);
+  Flash-Next-NVFP4 PP tiered 273 / 652 / 16.1.
+- TP prefill all-reduce rewritten (tp_pipe_allreduce): pipelined bf16 pieces, zero-copy receive
+  (add kernel reads the peer piece from its own pinned ring). TP plain pp2048 510 -> 1,483.
+  Floor now = gpu1's x4 link card->host (~3.6 ms per 22 MB call, 128 calls per chunk).
+- Power governor default OFF everywhere (Ian: the cards run 280 W fine).
+- FAILED: device-side all-reduce probe (tools/tp_devar_probe.cpp) hung and caused a gpu0 engine
+  reset (recovered). Do not rerun without global abort + short spin bounds + uncached loads.
+
+### Next steps
+1. TP prefill overlap: two half-chunks one layer apart, each half's all-reduce hidden behind the
+   other half's compute (estimate pp2048 1,480 -> ~2,500). Ian's target ~3,500.
+2. Faster TP prefill compute: QKV/z projections still on launch_gemm_xmx (GEMMs 85-93 TFLOP/s).
+3. TP plain decode 32 -> 40+ tok/s: device-side all-reduce, only with hang-safe polling.
+
+**The 2026-10-10 pause below is historical.**
+
 **2026-10-10 evening: PAUSED by Ian after Swift validation and backup.**
 
 All agent GPU jobs ended normally. No GPU containers, queued jobs or automatic
