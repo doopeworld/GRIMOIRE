@@ -50,7 +50,7 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 | Qwen3.8-27B | FP8 | tensor parallel, `GRIMOIRE_TP_AR_BAR=1` (opt-in) | 2,455 | **2,568** | -- | 30.9 |
 | Qwen3.8-27B + MTP | FP8 | tensor parallel | -- | -- | -- | **50-73** (77-78 on code) |
 | **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
-| **Qwen3.8-Flash-Next** | NVFP4; 360 of 512 experts per layer in VRAM on each card | pipeline 24 / 24 | 771 | 911 | **1,105** | **23.9** |
+| **Qwen3.8-Flash-Next** | NVFP4; 360 of 512 experts per layer in VRAM on each card | pipeline 24 / 24 | 904 | 1,081 | **1,269** | **25.6** |
 
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
 1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,002 - 2,568 and
@@ -229,7 +229,8 @@ Qwen3.8-Flash-Next on two cards (branch `dual-1022`): `multi` with `--proj bf16`
 `GRIMOIRE_PP_SPLIT=24`, `GRIMOIRE_EXPERT_VRAM_PER_LAYER=360`, `GRIMOIRE_PLE_FILE=` (the flattened
 n-gram table, made by `tools/ple_flatten.py`) and `GRIMOIRE_EXPERT_HITS=` (routing counts: GRIMOIRE
 updates this file as it serves, and the most-used experts go to VRAM at the next start). The experts
-that stay outside VRAM take ~20 GB of pinned host RAM; the n-gram table (51 GB) is read from disk.
+that stay outside VRAM take ~20 GB of pinned host RAM; the n-gram table (51 GB) is copied into RAM in
+the background when there is room (`GRIMOIRE_PLE_RAM=0` keeps reading it from disk).
 
 ### About the `-MXFP4-GRIMOIRE` folders in older results
 
