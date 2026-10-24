@@ -46,15 +46,14 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 
 | Model | Weights | Mode | pp2048 | pp4096 | pp8192 | Decode, 1 user |
 |---|---|---|---:|---:|---:|---:|
-| **Qwen3.8-27B** | FP8 | tensor parallel | 1,805 | **2,002** | -- | **30.9** |
-| Qwen3.8-27B | FP8 | tensor parallel, `GRIMOIRE_TP_AR_BAR=1` (opt-in) | 2,455 | **2,568** | -- | 30.9 |
-| Qwen3.8-27B + MTP | FP8 | tensor parallel | -- | -- | -- | **50-73** (77-78 on code) |
+| **Qwen3.8-27B** | FP8 | tensor parallel | 2,494 | **2,494** | -- | **31.5** |
+| **Qwen3.8-27B + MTP** | FP8 | tensor parallel, `GRIMOIRE_MTP=1` | 2,430 | 2,486 | -- | **48.7** (77.4 on code) |
 | **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
 | **Qwen3.8-Flash-Next** | NVFP4; 360 of 512 experts per layer in VRAM on each card | pipeline 24 / 24 | 904 | 1,081 | **1,269** | **25.6** |
 
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
-1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,002 - 2,568 and
-30.9, peaking at 43 GB.** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
+1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,494 and 30.9
+(48.8 with MTP), peaking at 43 GB.** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
 above gives exactly the same answer, character for character, as the code before it, and every
 two-GPU answer to that prompt passes its unit tests.
 
@@ -202,8 +201,8 @@ serves HTTP. Each GPU stays in its own process and exchanges data through host m
 on boards without GPU-to-GPU P2P. Two layouts:
 
 - `multi TP` (tensor parallel): both cards work on every token, each holding half of every layer.
-  Use it for dense models such as Qwen3.8-27B-FP8 (on `dual-1022`: 2,002 - 2,568 tok/s prompt,
-  30.9 decode, 50-73 with MTP).
+  Use it for dense models such as Qwen3.8-27B-FP8 (on `dual-1022`: ~2,490 tok/s prompt, 31
+  decode, 49 with MTP and 77 on code).
 - `multi PP` (pipeline parallel): each card holds a block of layers. Use it for MoE models such as
   Ornith-1.5-35B-A3B-FP8 and Qwen3.8-Flash-Next.
 
