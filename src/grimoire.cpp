@@ -53,6 +53,8 @@
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <sycl/ext/oneapi/memory_export.hpp>
+#include <immintrin.h>
 #include <memory>
 #include <functional>
 #include <type_traits>
@@ -2226,7 +2228,7 @@ struct Grimoire {
         // finished strictly in order, so the sums are bit-identical.  A block
         // is packed WHOLE into a device staging region when it is pushed, so
         // its device->host copies never wait behind compute queued later.
-        struct StreamJob { float* dev; size_t elems, np; uint64_t g0; uint8_t* packed; sycl::event pk; };
+        struct StreamJob { float* dev; size_t elems, np; uint64_t g0, s0; uint8_t* packed; sycl::event pk; };
         std::deque<StreamJob> sjobs;
         uint64_t s_end = 0, s_d2h = 0, s_sent = 0, s_done = 0;   // pieces queued / copy-out issued / sent / finished
         uint8_t* s_stage = nullptr; size_t s_region = 0;   // device: 2 regions of s_region bytes
@@ -2243,6 +2245,26 @@ struct Grimoire {
         int s_rout = 8, s_rin = 0;
         std::vector<sycl::event> s_ev_d2h, s_ev_add, s_ev_h2d;
         double s_wait_ms = 0, s_block_ms = 0; uint64_t s_blocks = 0;   // GRIMOIRE_TP_AR_TIMING
+        uint64_t s_next_seq = 0;                           // sequence of the next pushed piece
+        // Receive thread (GRIMOIRE_TP_STREAM_RX=1): takes each peer piece -- waits
+        // for its flag, copies it shared RAM -> my ring, raises my CONSUMED flag
+        // (base+3072+64*rank), queues its add -- while the main thread copies my
+        // pieces out, so the two CPU copies run at once.  My shared-RAM slot for
+        // sequence s is then reused only once the peer's consumed flag passed
+        // s - slots (blocking pieces raise it too).
+        // GRIMOIRE_TP_AR_BAR=1 (implies the thread): the ring is this card's OWN
+        // VRAM, written by the CPU through the 32 GB BAR -- an exportable
+        // allocation mmap'd by this process, one GPU driver, no P2P.  Then the
+        // link carries posted writes both ways (10-22 bar_write_probe: full
+        // duplex on gpu1) and the copy engine only copies out.
+        bool s_rxt = false, s_bar = false;
+        std::thread s_rx;
+        std::atomic<uint64_t> s_pub{0}, s_added{0};
+        std::atomic<bool> s_stop{false}, s_rx_err{false};
+        std::mutex s_mu; std::condition_variable s_cv;
+        static constexpr int kJobs = 64;
+        StreamJob s_jt[kJobs]; uint64_t s_njobs = 0;      // the jobs, as the receiver sees them
+        uint8_t* s_bar_cpu = nullptr; uint8_t* s_bar_dev = nullptr; int s_bar_fd = -1; size_t s_bar_bytes = 0;
     } tshm;
     bool tp_shm_setup(std::string& err);
     bool tp_shm_allreduce(float* dev, size_t elems);
@@ -2251,6 +2273,8 @@ struct Grimoire {
     uint64_t tp_stream_push(float* dev, size_t elems, int region, size_t row0);
     void tp_stream_issue();
     bool tp_stream_wait(uint64_t upto);
+    bool tp_stream_drain();
+    void tp_stream_rx_main();
     // TP prefill's chunked FFN: rows per chunk (GRIMOIRE_TP_FFN_CHUNK, 0 = off)
     // and both FFN weights dequantized once per layer for all chunks.
     int tp_ffn_chunk = 0;
@@ -4485,6 +4509,11 @@ bool Grimoire::tp_shm_setup(std::string& err){
             if(const char* e=std::getenv("GRIMOIRE_TP_FFN_CHUNK"); e&&*e)tp_ffn_chunk=std::max(0,std::atoi(e))/256*256;
             const char* sz=std::getenv("GRIMOIRE_TP_STREAM_ZC");
             tshm.s_zc=sz&&*sz&&*sz!='0';
+            const char* bb=std::getenv("GRIMOIRE_TP_AR_BAR");
+            const char* rx=std::getenv("GRIMOIRE_TP_STREAM_RX");
+            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&bb&&*bb&&*bb!='0';
+            tshm.s_rxt=tp_ffn_chunk&&!tshm.s_zc&&(tshm.s_bar||(rx&&*rx&&*rx!='0'));
+            if(tshm.s_rxt)tshm.pipe_slots=8;                  // slack for the receiver's lag
         }
         tshm.pipe_off=tshm.bytes;
         tshm.bytes+=size_t(W)*size_t(tshm.pipe_slots)*tshm.pipe_piece*sizeof(float);
@@ -4546,14 +4575,16 @@ bool Grimoire::tp_shm_setup(std::string& err){
         int nthr=0;
         if(const char* e=std::getenv("GRIMOIRE_TP_AR_THREADS"); e&&*e)nthr=std::clamp(std::atoi(e),0,15);
         tshm.pool.start(nthr);
+        if(tshm.s_rxt)tshm.s_rx=std::thread([this]{ tp_stream_rx_main(); });
         std::printf("  TP all-reduce (prefill blocks): pipelined, %zu rows x %d per piece, ring %d, %s payload, %d copy threads, %s\n",
                     tshm.pipe_piece/size_t(cfg.hidden),cfg.hidden,tshm.pipe_ring,
                     tshm.pipe_q8?"int8 (groups of 32, LOSSY)":tshm.pipe_bf16?"bf16":"fp32",nthr+1,
                     tshm.pipe_zc?"zero-copy receive":"host->device copies");
         if(tp_ffn_chunk)
             std::printf("  TP prefill dense FFN: %d-row chunks, all-reduces streamed under the next chunk's compute,"
-                        " %s receive (GRIMOIRE_TP_FFN_CHUNK=0 = off)\n",tp_ffn_chunk,
-                        tshm.s_zc?"zero-copy":"copy-engine");
+                        " %s receive%s (GRIMOIRE_TP_FFN_CHUNK=0 = off)\n",tp_ffn_chunk,
+                        tshm.s_zc?"zero-copy":tshm.s_bar?"CPU -> own VRAM through the BAR":"copy-engine",
+                        tshm.s_rxt?" on a receive thread":"");
     }
     return true;
 }
@@ -4572,6 +4603,8 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
     auto pb=[&](size_t n){return q8?n+n/8:n*eb;};
     const size_t np=(elems+P-1)/P;
     auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
+    // consumed flags: the receive thread's backpressure (tp_stream_rx_main) counts these pieces too
+    auto cflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
     auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
     static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
     const auto t0=std::chrono::steady_clock::now();
@@ -4645,6 +4678,7 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
             // my pinned in-slot is free once the add that read it is done
             tshm.ev_add[sl].wait(); lap(4);
             tshm.pool.copy(hin,pslot(peer,s),pb(n)); lap(5);
+            cflag(tp_rank)->store(s,std::memory_order_release);
             if(q8){
                 // rank 0's term first on both ranks: the same expression on the
                 // same values, so even a fused multiply-add rounds alike
@@ -4667,6 +4701,7 @@ bool Grimoire::tp_pipe_allreduce(float* dev,size_t elems){
         }
         tshm.ev_h2d[sl].wait(); lap(4);                       // my pinned in-slot is free
         tshm.pool.copy(hin,pslot(peer,s),n*eb); lap(5);
+        cflag(tp_rank)->store(s,std::memory_order_release);
         uint8_t* dp=tshm.dpeer+sl*P*sizeof(float);
         tshm.ev_h2d[sl]=qh.memcpy(dp,hin,n*eb,tshm.ev_add[sl]); // after the last add read dp
         const sycl::event cp=tshm.ev_h2d[sl];
@@ -4714,12 +4749,42 @@ bool Grimoire::tp_stream_reserve(size_t rows){
         tshm.s_ev_d2h.assign(size_t(tshm.s_rout),sycl::event{});
     }
     if(rin>tshm.s_rin){
+        // only between blocks: the receive thread is idle until the next push
         q.wait(); tshm.qh2d->wait();
-        if(tshm.s_in)sycl::free(tshm.s_in,q);
-        if(tshm.s_din)sycl::free(tshm.s_din,q);
-        tshm.s_in=sycl::malloc_host<uint8_t>(size_t(rin)*P*2,q);
-        tshm.s_din=tshm.s_zc?nullptr:sycl::malloc_device<uint8_t>(size_t(rin)*P*2,q);
-        if(!tshm.s_in||(!tshm.s_zc&&!tshm.s_din)){tshm.s_rin=0;return false;}
+        if(tshm.s_in){sycl::free(tshm.s_in,q);tshm.s_in=nullptr;}
+        if(tshm.s_din){sycl::free(tshm.s_din,q);tshm.s_din=nullptr;}
+        namespace sx=sycl::ext::oneapi::experimental;
+        if(tshm.s_bar_cpu){
+            ::munmap(tshm.s_bar_cpu,tshm.s_bar_bytes); ::close(tshm.s_bar_fd);
+            sx::free_exportable_memory(tshm.s_bar_dev,q);
+            tshm.s_bar_cpu=nullptr; tshm.s_bar_dev=nullptr; tshm.s_bar_fd=-1; tshm.s_bar_bytes=0;
+        }
+        const size_t rb=size_t(rin)*P*2;
+        if(tshm.s_bar){
+            // this card's own VRAM, mapped for the CPU through the BAR
+            void* dv=nullptr; int fd=-1; void* cpu=MAP_FAILED;
+            try{
+                dv=sx::alloc_exportable_device_mem(65536,rb,sx::external_mem_handle_type::opaque_fd,q);
+                fd=sx::export_device_mem_handle<sx::external_mem_handle_type::opaque_fd>(dv,q);
+                if(fd>=0)cpu=::mmap(nullptr,rb,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+            }catch(const std::exception& e){
+                std::printf("  TP stream: BAR receive ring failed (%s)\n",e.what());
+            }
+            if(cpu==MAP_FAILED){
+                std::printf("  TP stream: no CPU mapping of the receive ring -- copy-engine receive instead\n");
+                if(fd>=0)::close(fd);
+                if(dv)sx::free_exportable_memory(dv,q);
+                tshm.s_bar=false;
+            }else{
+                tshm.s_bar_cpu=static_cast<uint8_t*>(cpu); tshm.s_bar_dev=static_cast<uint8_t*>(dv);
+                tshm.s_bar_fd=fd; tshm.s_bar_bytes=rb;
+            }
+        }
+        if(!tshm.s_bar){
+            tshm.s_in=sycl::malloc_host<uint8_t>(rb,q);
+            tshm.s_din=tshm.s_zc?nullptr:sycl::malloc_device<uint8_t>(rb,q);
+            if(!tshm.s_in||(!tshm.s_zc&&!tshm.s_din)){tshm.s_rin=0;return false;}
+        }
         tshm.s_rin=rin;
         tshm.s_ev_add.assign(size_t(rin),sycl::event{});
         tshm.s_ev_h2d.assign(size_t(rin),sycl::event{});
@@ -4765,10 +4830,120 @@ uint64_t Grimoire::tp_stream_push(float* dev,size_t elems,int region,size_t row0
         pk=q.parallel_for(sycl::range<1>(elems),[=](sycl::id<1> i){dst[i]=sycl_bf16(src[i]);});
     }
     const uint64_t g0=tshm.s_end;
-    tshm.sjobs.push_back({dev,elems,(elems+P-1)/P,g0,packed,pk});
+    // sequence numbers continue the blocking path's when the stream is idle
+    if(tshm.s_sent==tshm.s_end)tshm.s_next_seq=tshm.pseq+1;
+    tshm.sjobs.push_back({dev,elems,(elems+P-1)/P,g0,tshm.s_next_seq,packed,pk});
+    tshm.s_next_seq+=tshm.sjobs.back().np;
     tshm.s_end+=tshm.sjobs.back().np;
+    if(tshm.s_rxt){
+        tshm.s_jt[tshm.s_njobs%TpShm::kJobs]=tshm.sjobs.back();
+        ++tshm.s_njobs;
+        { std::lock_guard<std::mutex> l(tshm.s_mu); tshm.s_pub.store(tshm.s_end,std::memory_order_release); }
+        tshm.s_cv.notify_one();
+    }
     tp_stream_issue();
     return g0;
+}
+
+// CPU -> write-combined BAR mapping: 64-byte lines of non-temporal stores,
+// then a fence and one read back, which returns only after the posted writes
+// ahead of it reached the card.
+static void tp_bar_copy(uint8_t* dst,const uint8_t* src,size_t n){
+    size_t i=0;
+    if(((reinterpret_cast<uintptr_t>(dst)|reinterpret_cast<uintptr_t>(src))&15)==0)
+        for(;i+64<=n;i+=64){
+            const __m128i a=_mm_load_si128(reinterpret_cast<const __m128i*>(src+i));
+            const __m128i b=_mm_load_si128(reinterpret_cast<const __m128i*>(src+i+16));
+            const __m128i c=_mm_load_si128(reinterpret_cast<const __m128i*>(src+i+32));
+            const __m128i d=_mm_load_si128(reinterpret_cast<const __m128i*>(src+i+48));
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i),a);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+16),b);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+32),c);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+48),d);
+        }
+    if(i<n)std::memcpy(dst+i,src+i,n-i);
+    _mm_sfence();
+    if(n>=4)(void)*reinterpret_cast<volatile const uint32_t*>(dst+((n-4)&~size_t(3)));
+}
+
+// The receive thread (TpShm): every published piece in order -- the peer's
+// flag, its slot -> my ring (BAR or pinned + copy engine), my consumed flag,
+// the add on q.  Same adds as tp_stream_wait, so the same bits.
+void Grimoire::tp_stream_rx_main(){
+    const int peer=1-tp_rank;
+    const size_t P=tshm.pipe_piece; const uint64_t D=uint64_t(tshm.pipe_slots);
+    const bool q8=tshm.pipe_q8;
+    auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
+    auto cflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
+    auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
+    uint64_t g=0, jn=0;
+    while(!tshm.s_stop.load()){
+        if(g>=tshm.s_pub.load(std::memory_order_acquire)){
+            for(int sp=0;sp<200000&&g>=tshm.s_pub.load(std::memory_order_acquire)&&!tshm.s_stop.load();++sp)
+                __builtin_ia32_pause();
+            if(g>=tshm.s_pub.load(std::memory_order_acquire)){
+                std::unique_lock<std::mutex> l(tshm.s_mu);
+                tshm.s_cv.wait(l,[&]{return tshm.s_stop.load()||tshm.s_pub.load(std::memory_order_acquire)>g;});
+            }
+            continue;
+        }
+        const TpShm::StreamJob& j=tshm.s_jt[jn%TpShm::kJobs];
+        if(g>=j.g0+j.np){++jn;continue;}
+        const size_t p=size_t(g-j.g0), n=std::min(P,j.elems-p*P), nb=q8?n+n/8:n*2;
+        const uint64_t s=j.s0+p;
+        {
+            auto* f=pflag(peer); uint64_t spins=0; const auto tw=std::chrono::steady_clock::now();
+            while(f->load(std::memory_order_acquire)<s){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&(tshm.s_stop.load()||
+                   std::chrono::steady_clock::now()-tw>std::chrono::seconds(120))){
+                    if(!tshm.s_stop.load())
+                        std::fprintf(stderr,"TP rank %d: receive thread waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                    tshm.s_rx_err.store(true);
+                    return;
+                }
+            }
+        }
+        const size_t ii=size_t(g%uint64_t(tshm.s_rin));
+        const uint8_t* src;
+        sycl::event cp;
+        if(tshm.s_bar){
+            tshm.s_ev_add[ii].wait();                         // the slot's last add (a layer old)
+            tp_bar_copy(tshm.s_bar_cpu+ii*P*2,pslot(peer,s),nb);
+            src=tshm.s_bar_dev+ii*P*2;
+        }else{
+            tshm.s_ev_h2d[ii].wait();                         // copy engine done with the in-slot
+            uint8_t* hin=tshm.s_in+ii*P*2;
+            std::memcpy(hin,pslot(peer,s),nb);
+            uint8_t* din=tshm.s_din+ii*P*2;
+            cp=tshm.qh2d->memcpy(din,hin,nb,tshm.s_ev_add[ii]);
+            tshm.s_ev_h2d[ii]=cp;
+            src=din;
+        }
+        cflag(tp_rank)->store(s,std::memory_order_release); // the peer may reuse its slot
+        float* d=j.dev+p*P;
+        if(q8){
+            const int8_t* mine=reinterpret_cast<const int8_t*>(j.packed+p*P*2);
+            const int8_t* qa=tp_rank==0?mine:reinterpret_cast<const int8_t*>(src);
+            const int8_t* qb=tp_rank==0?reinterpret_cast<const int8_t*>(src):mine;
+            const float* sa=reinterpret_cast<const float*>(qa+n);
+            const float* sb=reinterpret_cast<const float*>(qb+n);
+            tshm.s_ev_add[ii]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(qa[i])*sa[i/32]+float(qb[i])*sb[i/32];});
+            });
+        }else{
+            const sycl_bf16* pp=reinterpret_cast<const sycl_bf16*>(src);
+            tshm.s_ev_add[ii]=q.submit([&](sycl::handler& h){
+                h.depends_on(cp);
+                h.parallel_for(sycl::range<1>(n),[=](sycl::id<1> i){
+                    d[i]=float(sycl_bf16(d[i]))+float(pp[i]);});
+            });
+        }
+        tshm.s_added.store(g+1,std::memory_order_release);
+        ++g;
+    }
 }
 
 // Device->host copies for queued pieces, as far as the out ring has room.
@@ -4794,14 +4969,53 @@ bool Grimoire::tp_stream_wait(uint64_t upto){
     const bool q8=tshm.pipe_q8;
     auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
     auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
+    auto cflag0=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
     static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
     const auto t0=std::chrono::steady_clock::now();
+    if(tshm.s_rxt){
+        // send side only; the receive thread finishes the pieces
+        auto cflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
+        auto spin=[&](auto&& done,const char* what){
+            uint64_t spins=0; const auto tw=std::chrono::steady_clock::now();
+            while(!done()){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFF)==0&&(tshm.s_rx_err.load()||
+                   std::chrono::steady_clock::now()-tw>std::chrono::seconds(120))){
+                    std::fprintf(stderr,"TP rank %d: streamed all-reduce gave up waiting for %s\n",tp_rank,what);
+                    return false;
+                }
+            }
+            return true;
+        };
+        while(tshm.s_sent<upto){
+            const uint64_t g=tshm.s_sent;
+            const auto& j=*std::find_if(tshm.sjobs.begin(),tshm.sjobs.end(),[&](const TpShm::StreamJob& x){
+                return g<x.g0+x.np;});
+            const size_t p=size_t(g-j.g0), n=std::min(P,j.elems-p*P), nb=q8?n+n/8:n*2, o=size_t(g%RO);
+            const uint64_t s=j.s0+p;
+            tshm.s_ev_d2h[o].wait();
+            // my slot for s last held s - D: the peer's receiver must have taken it
+            if(s>D&&!spin([&]{return cflag(peer)->load(std::memory_order_acquire)>=s-D;},"the peer's receiver"))
+                return false;
+            tshm.pool.copy(pslot(tp_rank,s),tshm.s_out+o*P*2,nb);
+            pflag(tp_rank)->store(s,std::memory_order_release);
+            tshm.pseq=s;
+            ++tshm.s_sent;
+            tp_stream_issue();
+        }
+        if(!spin([&]{return tshm.s_added.load(std::memory_order_acquire)>=upto;},"its receive thread"))
+            return false;
+        tshm.s_done=std::max(tshm.s_done,upto);
+        while(!tshm.sjobs.empty()&&tshm.sjobs.front().g0+tshm.sjobs.front().np<=tshm.s_done)tshm.sjobs.pop_front();
+        if(timing)tshm.s_wait_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+        return true;
+    }
     while(tshm.s_done<upto){
         const uint64_t g=tshm.s_done;
         const TpShm::StreamJob& j=tshm.sjobs.front();      // pieces finish in order
         const size_t p=size_t(g-j.g0), n=std::min(P,j.elems-p*P), nb=q8?n+n/8:n*2;
         const size_t o=size_t(g%RO), ii=size_t(g%RI);
-        const uint64_t s=++tshm.pseq;
+        const uint64_t s=j.s0+p; tshm.pseq=s;
         tshm.s_ev_d2h[o].wait();
         tshm.pool.copy(pslot(tp_rank,s),tshm.s_out+o*P*2,nb);
         pflag(tp_rank)->store(s,std::memory_order_release);
@@ -4823,9 +5037,11 @@ bool Grimoire::tp_stream_wait(uint64_t upto){
         if(tshm.s_zc){
             tshm.s_ev_add[ii].wait();                         // my pinned in-slot is free
             tshm.pool.copy(hin,pslot(peer,s),nb);
+            cflag0(tp_rank)->store(s,std::memory_order_release);
         }else{
             tshm.s_ev_h2d[ii].wait();                         // copy engine done with the in-slot
             tshm.pool.copy(hin,pslot(peer,s),nb);
+            cflag0(tp_rank)->store(s,std::memory_order_release);
             uint8_t* din=tshm.s_din+ii*P*2;
             cp=tshm.qh2d->memcpy(din,hin,nb,tshm.s_ev_add[ii]);   // that add is a layer old
             tshm.s_ev_h2d[ii]=cp;
@@ -4855,6 +5071,23 @@ bool Grimoire::tp_stream_wait(uint64_t upto){
         if(tshm.s_done==j.g0+j.np)tshm.sjobs.pop_front();
     }
     if(timing)tshm.s_wait_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    return true;
+}
+
+// Every queued piece finished, and the peer's receiver done with all of mine:
+// after this my shared-RAM slots may be reused by the blocking path.
+bool Grimoire::tp_stream_drain(){
+    if(!tp_stream_wait(tshm.s_end))return false;
+    if(!tshm.s_rxt)return true;
+    auto cflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
+    const uint64_t last=tshm.pseq; uint64_t spins=0; const auto tw=std::chrono::steady_clock::now();
+    while(cflag(1-tp_rank)->load(std::memory_order_acquire)<last){
+        __builtin_ia32_pause();
+        if((++spins&0xFFFF)==0&&(tshm.s_rx_err.load()||std::chrono::steady_clock::now()-tw>std::chrono::seconds(120))){
+            std::fprintf(stderr,"TP rank %d: the peer's receiver never took my last pieces\n",tp_rank);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -9209,6 +9442,11 @@ void Grimoire::release() {
     if (tshm.res) { sycl::free(tshm.res, q); tshm.res = nullptr; }
     if (tshm.peer) { sycl::free(tshm.peer, q); tshm.peer = nullptr; }
     if (tshm.dtmp) { sycl::free(tshm.dtmp, q); tshm.dtmp = nullptr; }
+    if (tshm.s_rx.joinable()) {
+        { std::lock_guard<std::mutex> l(tshm.s_mu); tshm.s_stop.store(true); }
+        tshm.s_cv.notify_all();
+        tshm.s_rx.join();
+    }
     if (tshm.qd2h) tshm.qd2h->wait();
     if (tshm.qh2d) tshm.qh2d->wait();
     if (tshm.pout) { sycl::free(tshm.pout, q); tshm.pout = nullptr; }
@@ -9219,6 +9457,11 @@ void Grimoire::release() {
     if (tshm.s_out) { sycl::free(tshm.s_out, q); tshm.s_out = nullptr; }
     if (tshm.s_in) { sycl::free(tshm.s_in, q); tshm.s_in = nullptr; }
     if (tshm.s_din) { sycl::free(tshm.s_din, q); tshm.s_din = nullptr; }
+    if (tshm.s_bar_cpu) {
+        ::munmap(tshm.s_bar_cpu, tshm.s_bar_bytes); ::close(tshm.s_bar_fd);
+        sycl::ext::oneapi::experimental::free_exportable_memory(tshm.s_bar_dev, q);
+        tshm.s_bar_cpu = nullptr; tshm.s_bar_dev = nullptr; tshm.s_bar_fd = -1;
+    }
     if (tp_wq_gu) { sycl::free(tp_wq_gu, q); tp_wq_gu = nullptr; tp_wq_gu_cap = 0; }
     if (tp_wq_dn) { sycl::free(tp_wq_dn, q); tp_wq_dn = nullptr; tp_wq_dn_cap = 0; }
     tshm.qd2h.reset(); tshm.qh2d.reset();
@@ -16701,7 +16944,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 tp_stream_push(r0+o*Hs,size_t(mc)*Hs,1,o);
                 a+=mc;
             }
-            if(!tp_stream_wait(tshm.s_end))
+            if(!tp_stream_drain())
                 throw std::runtime_error("TP prefill FFN all-reduce failed");
             r0_in_h=false;
             a8_cached_src=nullptr;

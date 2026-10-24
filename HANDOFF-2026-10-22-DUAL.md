@@ -277,3 +277,43 @@ All code probes PASS; link: root rx +0-1 per run, 0 uncorrectable.
   root ports.
 - Other PRs worth reading (ideas only, nothing linked): #638 fast e4m3->half KV conversion on Xe2
   (fp8-KV prefill +75%); #622-#626 Xe2 fp8 decode GEMV with fused norm prologues.
+
+## 8. 2026-10-24: Tower rebooted with gpu1 on another M.2 port; receive thread + BAR receive
+
+### 8.1 Hardware after the reboot
+- gpu0 0000:03:00.0 = renderD129 (root port 00:01.0, x8). gpu1 0000:07:00.0 = renderD130, now
+  behind root port **00:06.0** (Gen4 x4) -> card switch 05:00.0 -> 06:01.0. iGPU = renderD128.
+  dual.sh finds the chain from sysfs, so its guards follow. Idle host->card RxErr at 05:00.0
+  ~1/s (old port ~5/s); root port rx +0-1 per run, 0 uncorrectable.
+
+### 8.2 Ian's vLLM image vs GRIMOIRE, same test (Qwen3.8-27B-FP8, TP=2, no MTP, llama-benchy)
+- vLLM (Ian, his latest image): pp4096 1,400, tg128 21, 56 GB VRAM over both cards.
+- GRIMOIRE f03a7d4 defaults: pp4096 2,002, tg128 30.9 (int8 payload: 2,790 / 31.4).
+- GRIMOIRE VRAM (xe debugfs vram0_mm, whole card): 19.3 GB per card after load, peak 21.5-21.7 GB
+  per card with 4K prompts = 43.1-43.5 GB total (tools: bench-1022/vram_peak.sh).
+
+### 8.3 Receive thread (GRIMOIRE_TP_STREAM_RX=1) and BAR receive (GRIMOIRE_TP_AR_BAR=1), both opt-in
+- Receive thread: each peer piece -> my ring + its add on a second CPU thread while the main
+  thread copies my pieces out; explicit backpressure through consumed flags (base+3072+64*rank,
+  raised by every path that takes a peer slot); 8 shared-RAM slots per rank.
+- BAR receive: the ring is the card's OWN VRAM (SYCL memory-export allocation, mmap'd by the same
+  process), written with non-temporal stores + sfence + one read back; the copy engine only
+  copies out. One GPU driver, no P2P -- but it changes one step of Ian's 10-07 chain.
+- All code-probe answers IDENTICAL to the morning-10-22 bf16 path (1,282 chars, both trials).
+
+| Qwen3.8-27B-FP8 TP, no MTP | pp2048 | pp4096 | tg128 | code TTFT (2,153) |
+|---|---:|---:|---:|---:|
+| copy-engine receive (default) | 1,805* | 2,002 | 30.9 | 1.22-1.28 s |
+| + receive thread | 1,995 | 1,998 | 31.4 / 30.8 | 1.11-1.17 s |
+| **+ BAR receive (thread implied)** | **2,455** | **2,568** | 31.4 / 30.9 | 0.90-0.99 s |
+(*10-22 run, tg32.) At 4K the receive thread alone gains nothing: the copy engine, carrying both
+directions, is the limit -- BAR takes the incoming direction off it.
+| int8 payload (LOSSY, opt-in) + BAR receive | 2,566 | 2,886 | 31.4 / 30.9 | 0.86-0.92 s |
+With BAR the int8 payload gains little (TTFT 0.90-0.99 -> 0.86-0.92 s): the link is no longer the
+limit; compute and the exposed attention block are.
+
+### 8.4 Next
+1. Ian's call: make BAR receive (+ receive thread) the default. Without it, the receive thread alone
+   could be the default (+10% at 2K, bit-identical).
+2. Hide the attention block (chunk QKV / o_proj; full wavefront) -- the remaining exposed part.
+3. Then Qwen3.8-Flash-Next on two cards (Ian's next priority).

@@ -2,6 +2,12 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-24: Qwen3.8-27B-FP8 TP=2 vs Ian's vLLM (pp4096 / tg128): vLLM 1,400 / 21, 56 GB VRAM;
+GRIMOIRE default 2,002 / 30.9, with BAR receive 2,568 / 30.9 (lossless), 43 GB peak.** Read
+HANDOFF-2026-10-22-DUAL.md section 8 first (Tower rebooted: gpu1 = 07:00.0 on root port 00:06.0,
+render nodes gpu0 renderD129, gpu1 renderD130). BAR receive (GRIMOIRE_TP_AR_BAR=1) waits for Ian's
+OK to become the default. Next after that: Qwen3.8-Flash-Next on two cards (Ian's priority).
+
 **2026-10-22: two B70s on Ian's new redriver M.2-OCuLink adapter -- all three dual targets run.**
 Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers; sec. 7 = afternoon).
 
