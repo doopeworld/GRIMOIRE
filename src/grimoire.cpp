@@ -2496,6 +2496,17 @@ struct Grimoire {
     // recordsize is small (ZFS reads whole records: 128K per 160-byte row
     // at the default).
     int       ple_fd = -1;
+    // GRIMOIRE_PLE_RAM (default on when RAM allows): the flat file copied into
+    // process memory by a background thread started at the first PLE use, so
+    // decode's 16 rows per token stop going to disk.  On the Tower the file
+    // sits on a USB SSD (~0.2 ms per row) and the model load evicts it from
+    // the page cache: 4 of 39 ms per Flash-Next token (10-24).  Detached
+    // thread, shared state: a served process may exit without release.
+    struct PleRam { std::atomic<bool> ready{false}, stop{false}, done{false};
+                    uint8_t* buf = nullptr; size_t bytes = 0; };
+    std::shared_ptr<PleRam> ple_ram;
+    bool ple_ram_tried = false;
+    void ple_ram_start(size_t bytes);
     // GRIMOIRE_Q4_TIMING decode totals: ple, hc, deltanet, full attn, moe, head
     double    q4d_ms[6] = {0, 0, 0, 0, 0, 0};  long q4d_tokens = 0;
 
@@ -9593,6 +9604,14 @@ void Grimoire::release() {
                      q4d_ms[3] / q4d_tokens, q4d_ms[4] / q4d_tokens, q4d_ms[5] / q4d_tokens);
     cx_ms = 0.0; cx_calls = 0; px_cap = 0;
     ple_stage_cap = ple_iota_cap = 0;
+    if (ple_ram) {
+        ple_ram->stop.store(true);
+        for (int i = 0; i < 10000 && !ple_ram->done.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (ple_ram->done.load()) std::free(ple_ram->buf);   // else leak it rather than race the reader
+        ple_ram.reset();
+    }
+    ple_ram_tried = false;
     if (ple_fd >= 0) { ::close(ple_fd); ple_fd = -1; }
     tm_cap = 0; tm_any = false; tm_vram_per_layer = -1; tm_vram_bytes = tm_host_bytes = 0;
     if (tm_cq) { tm_cq->wait(); tm_cq.reset(); }
@@ -11148,6 +11167,21 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         }
     };
     if (q4t) { q.wait(); q4clk = std::chrono::steady_clock::now(); ++q4d_tokens; }
+    // GRIMOIRE_TIMELINE=1: device time per region of one steady token (marker
+    // gaps: the commands between two markers AND any idle time the host left
+    // there, e.g. waiting for the CPU experts) -- dump_timeline() at the exit.
+    auto tlm = [&](int li, const char* kind) {
+        if (!timeline || tl_done || tl_tok != kTlToken) return;
+        char tag[40]; std::snprintf(tag, sizeof tag, "L%02d %s", li, kind);
+        mark(tag);
+    };
+    auto tl_end = [&]() {
+        if (!timeline) return;
+        q.wait();
+        if (!tl_done && tl_tok == kTlToken) { dump_timeline(); tl_done = true; tl.clear(); }
+        ++tl_tok;
+    };
+    mark("start");
 
     // mix(), fused with a pending combine when there is one.  Returns the
     // block input in `block_out` and, when this hyper-connection has an
@@ -11234,11 +11268,13 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         }
 
         q4lap(0);
+        tlm(i, "ple");
         // ---- attention hyper-connection -------------------------------
         hc_mix(d.hc_attn, pending ? q4_pend : nullptr,
                pending ? q4_pinj : nullptr, q4_inj, s.h2);
         pending = false;
         q4lap(1);
+        tlm(i, "hc-attn");
 
         if (d.kind == LayerKind::LINEAR_ATTN) {
             const int qkv_ch = d.la_qkv.output_rows();
@@ -11407,11 +11443,13 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         }
 
         q4lap(d.kind == LayerKind::LINEAR_ATTN ? 2 : 3);
+        tlm(i, d.kind == LayerKind::LINEAR_ATTN ? "deltanet" : "attn");
         // ---- FFN hyper-connection -------------------------------------
         // combine_and_mix: this layer's attention output and the
         // injection its own mix produced, then the next block input.
         hc_mix(d.hc_mlp, s.moe_y, q4_inj, q4_pinj, s.h2);
         q4lap(1);
+        tlm(i, "hc-mlp");
 
         if (d.moe_layer) {
             const int I = cfg.moe_inter;
@@ -11485,6 +11523,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         }
         pending = true;    // (q4_pend, q4_pinj) travel to the next layer
         q4lap(4);
+        tlm(i, "moe");
     }
 
     // Pipeline: a stage that does not own the head lands the deferred
@@ -11503,7 +11542,9 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             launch_incr_pos(q, s.d_seq_len, none);
         }
         q4lap(5);
+        mark("send");
         q4_periodic();
+        tl_end();
         ++pos;
         return s.logits;
     }
@@ -11521,7 +11562,9 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         launch_incr_pos(q, s.d_seq_len, none);
     }
     q4lap(5);
+    mark("head");
     q4_periodic();
+    tl_end();
     ++pos;
     return s.logits;
 }
@@ -14029,6 +14072,12 @@ bool Grimoire::ple_fetch_rows(const LayerDev& d, int p0, int M) {
         q.memcpy(ple_iota, io.data(), n * sizeof(int64_t)).wait();
     }
     if (q4_tok_h.size() < size_t(p0 + M)) return false;
+    if (ple_fd >= 0 && !ple_ram_tried) {
+        ple_ram_tried = true;
+        struct stat st{};
+        if (::fstat(ple_fd, &st) == 0) ple_ram_start(size_t(st.st_size));
+    }
+    const PleRam* pr = ple_ram && ple_ram->ready.load(std::memory_order_acquire) ? ple_ram.get() : nullptr;
     std::vector<int64_t> ids(n);
     for (int m = 0; m < M; ++m)
         qwen4_exp::ple_ngram_ids(q4_tok_h[size_t(p0 + m)], q4_tok_h.data(), p0 + m,
@@ -14044,6 +14093,7 @@ bool Grimoire::ple_fetch_rows(const LayerDev& d, int p0, int M) {
             uint8_t* dst = ple_stage + i * rowb;
             const int64_t r = ids[i];
             if (r < 0 || r >= d.ple_rows) { std::memset(dst, 0, rowb); continue; }
+            if (pr) { std::memcpy(dst, pr->buf + size_t(r) * rowb, rowb); continue; }
             if (ple_fd >= 0) {
                 if (::pread(ple_fd, dst, rowb, off_t(r) * off_t(rowb)) != ssize_t(rowb)) bad = true;
                 continue;
@@ -14067,6 +14117,51 @@ bool Grimoire::ple_fetch_rows(const LayerDev& d, int p0, int M) {
         std::chrono::steady_clock::now() - t0).count();
     ple_read_rows += long(n);
     return !bad;
+}
+
+static size_t mem_available_bytes();
+
+// GRIMOIRE_PLE_RAM: copy the flat PLE file into memory in the background
+// when it fits with 8 GB to spare (see PleRam).  Until it is complete the
+// rows keep coming from the file.
+void Grimoire::ple_ram_start(size_t bytes) {
+    const char* e = std::getenv("GRIMOIRE_PLE_RAM");
+    if (e && *e == '0') return;
+    const size_t avail = mem_available_bytes();
+    if (avail < bytes + (size_t(8) << 30)) {   // the tiered experts' headroom
+        std::fprintf(stderr, "  PLE table stays on disk: %.1f GB would leave less than 8 GB of the %.1f GB "
+                     "available (GRIMOIRE_PLE_RAM)\n", bytes / 1e9, avail / 1e9);
+        return;
+    }
+    auto st = std::make_shared<PleRam>();
+    st->buf = static_cast<uint8_t*>(std::malloc(bytes));
+    const int fd = ::dup(ple_fd);
+    if (!st->buf || fd < 0) { std::free(st->buf); if (fd >= 0) ::close(fd); return; }
+    st->bytes = bytes;
+    ple_ram = st;
+    std::thread([st, fd]() {
+        const auto t0 = std::chrono::steady_clock::now();
+        constexpr size_t kChunk = size_t(64) << 20;
+        bool ok = true;
+        for (size_t off = 0; off < st->bytes && ok && !st->stop.load(); off += kChunk) {
+            const size_t n = std::min(kChunk, st->bytes - off);
+            size_t got = 0;
+            while (got < n) {
+                const ssize_t r = ::pread(fd, st->buf + off + got, n - got, off_t(off + got));
+                if (r <= 0) { ok = false; break; }
+                got += size_t(r);
+            }
+        }
+        ::close(fd);
+        if (ok && !st->stop.load()) {
+            st->ready.store(true, std::memory_order_release);
+            std::fprintf(stderr, "  PLE table in memory: %.1f GB in %.0f s; rows no longer read from disk\n",
+                         st->bytes / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        st->done.store(true);
+    }).detach();
+    std::fprintf(stderr, "  PLE table: copying %.1f GB into memory in the background (GRIMOIRE_PLE_RAM=0 = off)\n",
+                 bytes / 1e9);
 }
 
 // ---------------------------------------------------------------------

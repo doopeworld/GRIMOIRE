@@ -374,3 +374,18 @@ bench-1022/flash-next.hits.20261010), GRIMOIRE_POWER_LIMIT_W=0. No thread or chu
    DeltaNet / attention / shared expert, experts by index (as the vLLM recipe and devan-carlin's
    XPU fork do). Today TP refuses MoE and qwen4_exp (tp_mega_refusal).
 3. MTP: the NVFP4 checkpoint has an MTP layer (needs the PRE-mixer multi-stream state).
+
+### 9.6 Device timeline and the PLE table (10-24 late)
+- GRIMOIRE_TIMELINE=1 now covers forward_qwen4_exp (markers per layer: ple, hc-attn,
+  deltanet/attn, hc-mlp, moe; send / head; dumped on each rank's 3rd decode token).
+  One token, 39 ms: rank 0 21.6 ms (PLE 5.8, MoE 6.0, DeltaNet 5.2, HC 2.7, attn 1.8),
+  rank 1 17.5 ms (MoE 5.3, DeltaNet 5.2, HC 2.6, head 2.4, attn 1.8).
+- PLE = layer 1 only, 4.1-5.8 ms: its 16 rows per token are pread from the flat file, which sits
+  on a USB SSD (~0.2 ms per random read) and is evicted from the page cache by the model load
+  (fincore: 8.4 of 47.7 GiB resident after load).
+- Fix: GRIMOIRE_PLE_RAM (default on when MemAvailable > table + 8 GB): at the first PLE use a
+  detached thread copies the flat file into process memory (51.2 GB in 66 s from ZFS); rows come
+  from memory once it is complete. Rank 0 only (the PLE layer).
+- Result (360/layer, everything else as 9.3): pp2048 771 -> 904, pp4096 911 -> 1,081, pp8192
+  1,105 -> 1,269, tg128 23.9 / 23.3 / 21.8 -> 25.6 / 24.3 / 22.7. VRAM peak unchanged 32.3 GB.
+  While the copy runs (first ~66 s) decode is slower (16.9-18.6 on the code probe).
