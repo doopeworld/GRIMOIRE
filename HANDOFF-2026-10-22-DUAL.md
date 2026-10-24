@@ -389,3 +389,9 @@ bench-1022/flash-next.hits.20261010), GRIMOIRE_POWER_LIMIT_W=0. No thread or chu
 - Result (360/layer, everything else as 9.3): pp2048 771 -> 904, pp4096 911 -> 1,081, pp8192
   1,105 -> 1,269, tg128 23.9 / 23.3 / 21.8 -> 25.6 / 24.3 / 22.7. VRAM peak unchanged 32.3 GB.
   While the copy runs (first ~66 s) decode is slower (16.9-18.6 on the code probe).
+
+## 10. 2026-10-24 night: BAR receive is the default (Ian: "yes if it is faster and gives correct results")
+- No environment: TP plain pp2048 2,494 / pp4096 2,494 / tg128 31.5 / 30.9; TP + MTP pp2048 2,430 /
+  pp4096 2,486 / tg128 48.7 / 48.8 (book text), coding probe 77.4 tok/s (4.34 tokens per step).
+- Answers: plain identical to the 10-22 bf16 reference; MTP identical to plain (1,282 chars, both
+  trials). GRIMOIRE_TP_AR_BAR=0 restores the copy-engine receive.

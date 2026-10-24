@@ -2252,8 +2252,8 @@ struct Grimoire {
         // pieces out, so the two CPU copies run at once.  My shared-RAM slot for
         // sequence s is then reused only once the peer's consumed flag passed
         // s - slots (blocking pieces raise it too).
-        // GRIMOIRE_TP_AR_BAR=1 (implies the thread): the ring is this card's OWN
-        // VRAM, written by the CPU through the 32 GB BAR -- an exportable
+        // GRIMOIRE_TP_AR_BAR (default on; =0 = copy engine; implies the thread):
+        // the ring is this card's OWN VRAM, written by the CPU through the 32 GB BAR -- an exportable
         // allocation mmap'd by this process, one GPU driver, no P2P.  Then the
         // link carries posted writes both ways (10-22 bar_write_probe: full
         // duplex on gpu1) and the copy engine only copies out.
@@ -4526,7 +4526,9 @@ bool Grimoire::tp_shm_setup(std::string& err){
             tshm.s_zc=sz&&*sz&&*sz!='0';
             const char* bb=std::getenv("GRIMOIRE_TP_AR_BAR");
             const char* rx=std::getenv("GRIMOIRE_TP_STREAM_RX");
-            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&bb&&*bb&&*bb!='0';
+            // BAR receive by default since 10-24 (Ian: yes): pp4096 2,002 -> 2,568, answers
+            // bit-identical; it falls back to the copy engine if the mapping fails.
+            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&!(bb&&*bb=='0');
             tshm.s_rxt=tp_ffn_chunk&&!tshm.s_zc&&(tshm.s_bar||(rx&&*rx&&*rx!='0'));
             if(tshm.s_rxt)tshm.pipe_slots=8;                  // slack for the receiver's lag
         }

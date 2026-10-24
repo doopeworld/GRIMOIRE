@@ -3,10 +3,9 @@
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
 **2026-10-24: Qwen3.8-27B-FP8 TP=2 vs Ian's vLLM (pp4096 / tg128): vLLM 1,400 / 21, 56 GB VRAM;
-GRIMOIRE default 2,002 / 30.9, with BAR receive 2,568 / 30.9 (lossless), 43 GB peak.** Read
+GRIMOIRE default (BAR receive, on since 10-24) 2,494 / 30.9, with MTP 2,486 / 48.8 (77 on code), 43 GB peak.** Read
 HANDOFF-2026-10-22-DUAL.md section 8 first (Tower rebooted: gpu1 = 07:00.0 on root port 00:06.0,
-render nodes gpu0 renderD129, gpu1 renderD130). BAR receive (GRIMOIRE_TP_AR_BAR=1) waits for Ian's
-OK to become the default.
+render nodes gpu0 renderD129, gpu1 renderD130). BAR receive is the default (Ian said yes 10-24).
 **Qwen3.8-Flash-Next two cards (PP 24/24, tiered experts): tg128 16.1 -> 25.6, pp2048 652 -> 904, pp8192
 1,269** after real routing statistics, CPU expert threads = cores / ranks, PP chunks <= 2048 rows, PLE table in RAM
 (section 9). Next: per-layer host sync of the CPU-expert path, then expert-parallel TP.
