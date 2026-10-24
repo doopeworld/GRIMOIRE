@@ -8,16 +8,83 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page; [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.9.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+>
+> Work in progress on branches (not in a release image yet): **two-GPU speed** on [`dual-1022`](https://github.com/doopeworld/GRIMOIRE/tree/dual-1022) and **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage). Their results are in [Results at a glance](#results-at-a-glance), marked by branch.
+
+## Our test system
+
+Every number on this page was measured on one machine:
+
+| Part | What we use |
+|---|---|
+| Host | Beelink GTi15 Ultra mini PC, Intel Core Ultra 9 285H (16 cores: 6 P + 8 E + 2 LP-E), 96 GB DDR5-5600, Unraid (Linux 6.18), Docker |
+| GPU 0 | Intel Arc Pro B70, 32 GB, on the Beelink EX Pro dock: **PCIe Gen4 x8** |
+| GPU 1 | Intel Arc Pro B70, 32 GB, on an **M.2-to-OCuLink adapter with a PCIe redriver**: **PCIe Gen4 x4** (a passive adapter made the card drop off the bus under load; the redriver fixed it) |
+| Power | each GPU on its own 550 W supply; GRIMOIRE runs the cards at their own firmware limit (no governor) |
+| GPU-to-GPU | **no peer-to-peer**: Linux does not allow PCIe P2P between these two root ports on this CPU, so every byte between the cards goes through host memory |
+| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), one GRIMOIRE process per GPU |
+| Benchmark | [llama-benchy](https://github.com/eugr/llama-benchy) 0.4.0 through GRIMOIRE's OpenAI-compatible server, one user unless noted, greedy decoding |
+
+This is a small desktop with one card on a x4 link, not a workstation with two x16 slots. Two-GPU
+results on a board with full-width slots should be better, not worse.
+
+## Results at a glance
+
+Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-benchy `tg128`).
+
+### One Arc Pro B70 (release v1.9.0 unless marked)
+
+| Model | Weights | Prompt | Decode, 1 user | Decode, 8 users |
+|---|---|---:|---:|---:|
+| **Qwen3.8-27B** + MTP | GPTQ-Int4 with MTP head, `GRIMOIRE_MTP_K=6`, `GRIMOIRE_MTP_DRAFT_VOCAB=65536` | 1,979 (pp4096) | **69.6** (66-70; **113-126 on code**) | **197.9** |
+| Qwen3.8-27B, plain | FP8 release, quantized to MXFP4 at load | ~2,050 (pp4096, v1.7) | 33.1 (v1.7) | 162.2 (v1.7) |
+| **Ornith-1.5-35B-A3B** | BF16 / FP8 / NVFP4 release, MXFP4 at load | 6,529 (pp512), 9,430 (pp4096) | **193.7** | **461.3** |
+| Qwen3.8-Flash-Next | NVFP4; 112 of 512 experts per layer in VRAM, the rest in pinned RAM | -- | 22 (v1.8.x, one 128-token request) | -- |
+
+### Two Arc Pro B70s (branch `dual-1022`, 2026-10-22 / 24)
+
+| Model | Weights | Mode | pp2048 | pp4096 | pp8192 | Decode, 1 user |
+|---|---|---|---:|---:|---:|---:|
+| **Qwen3.8-27B** | FP8 | tensor parallel | 1,805 | **2,002** | -- | **30.9** |
+| Qwen3.8-27B | FP8 | tensor parallel, `GRIMOIRE_TP_AR_BAR=1` (opt-in) | 2,455 | **2,568** | -- | 30.9 |
+| Qwen3.8-27B + MTP | FP8 | tensor parallel | -- | -- | -- | **50-73** (77-78 on code) |
+| **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
+| **Qwen3.8-Flash-Next** | NVFP4; 360 of 512 experts per layer in VRAM on each card | pipeline 24 / 24 | 771 | 911 | **1,105** | **23.9** |
+
+Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
+1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,002 - 2,568 and
+30.9, peaking at 43 GB.** Each tensor-parallel speed-up gives a character-identical answer to the
+previous two-GPU code on a 2,153-token coding prompt, and every two-GPU answer to it passes its unit
+tests.
+
+### GGUF files, one Arc Pro B70 (branch `feature/gguf-battlemage`, 2026-10-15 / 21)
+
+Ornith-1.5-35B-A3B, the official `Q4_K_M` GGUF; accuracy = mean KL divergence against the BF16
+model on WikiText-2 (lower is better).
+
+| Engine and mode | Prompt (pp4096) | Decode | KLD |
+|---|---:|---:|---:|
+| **GRIMOIRE, native GGUF kernels** (`--proj native`) | 5,886 (CLI) | **132** | **0.064** |
+| GRIMOIRE, GGUF converted to MXFP4 at load (`--proj mxfp4`) | **9,682** | **172** | 0.216 |
+| llama.cpp SYCL, same file | 1,959 | 104 | 0.061 |
+| llama.cpp Vulkan, same file | 1,833 | 50 | -- |
+
+Qwen3.8-27B: the BF16 GGUF gives **token-identical** output to the safetensors release; Unsloth's
+UD-Q4_K_XL, UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (native decode
+~10 tok/s so far, being worked on). Qwen3.8-Flash-Next GGUF: not supported yet.
 
 ## Run a model
 
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.8.2/grimoire-b70-v1.8.2.tar.gz
-docker load < grimoire-b70-v1.8.2.tar.gz        # -> grimoire-b70:latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.9.0/grimoire-b70-v1.9.0.tar.gz
+docker load < grimoire-b70-v1.9.0.tar.gz        # -> grimoire-b70:latest
 ```
+
+v1.9.0 note: when you use MTP, keep `GRIMOIRE_SEQ_SLOTS` at 2 or more (the commands here use 8);
+with one slot this binary can skip or repeat parts of an answer. Fixed in the source after v1.9.0.
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
 build the image yourself: `docker build -t grimoire-b70 .`
@@ -130,9 +197,17 @@ path as MXFP4: 2,069 - 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.
 
 ### Two GPUs (models that do not fit one card)
 
-The image's `multi` mode runs one server rank per GPU in the same container (pipeline parallel:
-each card holds a block of layers; only the first rank serves HTTP). Map exactly the render nodes
-you want, in order, and set `ZE_AFFINITY_MASK` to match:
+The image's `multi` mode runs one server rank per GPU in the same container; only the first rank
+serves HTTP. Each GPU stays in its own process and exchanges data through host memory, so it works
+on boards without GPU-to-GPU P2P. Two layouts:
+
+- `multi TP` (tensor parallel): both cards work on every token, each holding half of every layer.
+  Use it for dense models such as Qwen3.8-27B-FP8 (on `dual-1022`: 2,002 - 2,568 tok/s prompt,
+  30.9 decode, 50-73 with MTP).
+- `multi PP` (pipeline parallel): each card holds a block of layers. Use it for MoE models such as
+  Ornith-1.5-35B-A3B-FP8 and Qwen3.8-Flash-Next.
+
+Map exactly the render nodes you want, in order, and set `ZE_AFFINITY_MASK` to match:
 
 ```
 docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-size=10g \
@@ -145,11 +220,33 @@ docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-si
     multi --model /models/Ornith-1.5-35B-A3B-FP8 --proj fp8 --ctx 32000 --port 8000
 ```
 
-`GRIMOIRE_PP_SPLIT` is the number of layers the first GPU keeps (Ornith has 40; Qwen3.8-27B has 64,
-e.g. `--proj bf16` with split 32). `multi TP` selects tensor parallel instead; it is slower here
-(every projection is gathered through host memory) and is meant only for experiments. Measured:
-Ornith-1.5-35B-A3B-FP8 on two Arc Pro B70s, 77 tok/s for one 128-token request. Use this only for
-checkpoints that do not fit one card -- a model that fits runs faster on one GPU.
+`GRIMOIRE_PP_SPLIT` is the number of layers the first GPU keeps (Ornith has 40, Qwen3.8-Flash-Next
+48). For tensor parallel, replace `multi --model ...` with `multi TP --model /models/Qwen3.8-27B-FP8
+--proj fp8 ...` and leave out `GRIMOIRE_PP_SPLIT`. Use two GPUs only for checkpoints that do not fit
+one card -- a model that fits runs faster on one GPU.
+
+Qwen3.8-Flash-Next on two cards (branch `dual-1022`): `multi` with `--proj bf16`,
+`GRIMOIRE_PP_SPLIT=24`, `GRIMOIRE_EXPERT_VRAM_PER_LAYER=360`, `GRIMOIRE_PLE_FILE=` (the flattened
+n-gram table, made by `tools/ple_flatten.py`) and `GRIMOIRE_EXPERT_HITS=` (routing counts: GRIMOIRE
+updates this file as it serves, and the most-used experts go to VRAM at the next start). The experts
+that stay outside VRAM take ~20 GB of pinned host RAM; the n-gram table (51 GB) is read from disk.
+
+## GGUF support (branch `feature/gguf-battlemage`)
+
+GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp inside.
+
+- Load a bare `.gguf` path (split files too): the tokenizer and chat template come from the file.
+- All 35 ggml tensor types are decoded, bit-exact against the reference implementation.
+- `--proj native` keeps the K-quant and IQ4_XS blocks as they are and runs them in GRIMOIRE's
+  kernels (on Ornith Q4_K_M: llama.cpp-level accuracy); `--proj mxfp4` converts the weights to MXFP4
+  at load (fastest, less accurate).
+- Validated on real Hugging Face files: Ornith-1.5-35B-A3B (official GGUF, BF16 and Q4_K_M),
+  Qwen3.8-27B (Unsloth BF16 and five quants, from Q8_0 down to IQ2_XXS), gemma-4-12B.
+- Qwen3.8-Flash-Next GGUF needs the RAM expert tiering and is not supported yet. MTP / DFlash on GGUF
+  files is not measured yet (the Qwen3.8-27B and Ornith GGUFs do carry the MTP head, the `nextn`
+  block).
+
+Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-branch-featuregguf-battlemage-2026-10-15--21).
 
 ### About the `-MXFP4-GRIMOIRE` folders in older results
 
@@ -231,9 +328,12 @@ attention, or MoE code, not as a one-time check.
 All seven weight formats (BF16, FP8 E4M3/E5M2, INT8, INT4, MXFP8, MXFP4) run through one
 decode path shared by every model above and by the host-side tests.
 
-Tensor-parallel and pipeline-parallel both run correctly across two B70s, but they exist
-for checkpoints whose own footprint doesn't fit one card's VRAM — every model in the
-table fits a single B70 and runs fastest that way.
+Tensor-parallel and pipeline-parallel both run correctly across two B70s. They exist for
+checkpoints whose own footprint doesn't fit one card's VRAM (Qwen3.8-27B in FP8, Ornith in FP8,
+Qwen3.8-Flash-Next); a model that fits a single B70 runs fastest there.
+
+GGUF files of Ornith-1.5-35B-A3B and Qwen3.8-27B load directly on the `feature/gguf-battlemage`
+branch (see [GGUF support](#gguf-support-branch-featuregguf-battlemage)).
 
 Speculative decoding is faster than plain decoding on Qwen3.8-27B since v1.7 (MTP ~1.5x,
 DFlash2 ~1.7x for one user). On the other models it is not faster yet, so leave it off there.
