@@ -2274,6 +2274,7 @@ struct Grimoire {
     void tp_stream_issue();
     bool tp_stream_wait(uint64_t upto);
     bool tp_stream_drain();
+    void tm_save_hits();
     void tp_stream_rx_main();
     // TP prefill's chunked FFN: rows per chunk (GRIMOIRE_TP_FFN_CHUNK, 0 = off)
     // and both FFN weights dequantized once per layer for all chunks.
@@ -2453,6 +2454,7 @@ struct Grimoire {
     // Tiered NVFP4 experts (b70/tiered_moe.hpp, FLASH-NEXT-TIERED.md).
     NvExpertLayout tm_lay;
     bool      tm_any = false;           // any layer tiered
+    uint64_t  tm_save_tick = 0;         // decode tokens since load (hits saved every 256)
     int       tm_vram_per_layer = -1;   // decided at the first tiered layer
     size_t    tm_vram_bytes = 0, tm_host_bytes = 0;
     uint8_t*  tm_stage = nullptr;       // pinned staging for VRAM-bound blocks
@@ -2475,7 +2477,7 @@ struct Grimoire {
     int32_t*  cx_route = nullptr;  float* cx_wt = nullptr;
     float*    cx_x = nullptr;      float* cx_y = nullptr;
     float*    cx_dy = nullptr;     int32_t* cx_vexp = nullptr;
-    double    cx_ms = 0.0;         long cx_calls = 0;
+    double    cx_ms = 0.0;         long cx_calls = 0;   long cx_nexp = 0;   // + RAM experts computed
     // the same, M rows at a time (short-prompt prefill), grown on demand
     size_t    px_cap = 0;
     int32_t*  px_route = nullptr;  float* px_wt = nullptr;
@@ -2532,6 +2534,8 @@ struct Grimoire {
         std::vector<uint8_t> tm_tier_h;              // host copy: 0 VRAM, 1 host
         uint8_t* tm_tier_d = nullptr;                // device [E]: 0 VRAM, 1 host
         std::vector<uint64_t> tm_hits;               // routes per expert, this run
+        std::vector<uint64_t> tm_hits_saved;         // the part of them already in the hits file
+        int tm_moe_idx = -1;                         // this layer's row in the hits file
         uint8_t *gu_pack = nullptr, *gu_scale = nullptr, *gu_zero = nullptr;
         uint8_t *dn_pack = nullptr, *dn_scale = nullptr, *dn_zero = nullptr;
         bool xe2_signed_int4 = false;
@@ -9493,20 +9497,7 @@ void Grimoire::release() {
         if (all > 0) {
             std::fprintf(stderr, "  expert routes: %.0f over %d layers; the hottest 22%% of experts "
                          "took %.1f%% of them\n", all, layers, 100.0 * top / all);
-            if (const char* hf = std::getenv("GRIMOIRE_EXPERT_HITS")) {
-                std::vector<uint64_t> prev(flat.size(), 0);
-                if (FILE* f = std::fopen(hf, "rb")) {
-                    if (std::fread(prev.data(), sizeof(uint64_t), prev.size(), f) != prev.size())
-                        std::fill(prev.begin(), prev.end(), 0);
-                    std::fclose(f);
-                }
-                for (size_t i = 0; i < flat.size(); ++i) prev[i] += flat[i];
-                if (FILE* f = std::fopen(hf, "wb")) {
-                    std::fwrite(prev.data(), sizeof(uint64_t), prev.size(), f);
-                    std::fclose(f);
-                    std::fprintf(stderr, "  expert hits accumulated into %s\n", hf);
-                }
-            }
+            tm_save_hits();
         }
     }
     for (auto& d : L) {
@@ -11064,6 +11055,31 @@ const float* Grimoire::forward_gemma4(int token) {
 //  Reference: ref/qwen4_exp_nvidia_model.py and the three modules it
 //  pulls in; the derivation of every operator is in b70/qwen4_exp.hpp.
 // ---------------------------------------------------------------------
+// Expert routing counts -> GRIMOIRE_EXPERT_HITS ([moe layer][expert] uint64,
+// the rows the loader reads): adds what this process counted since its last
+// save to ITS layers' rows only, so the two pipeline ranks never touch the
+// same bytes.  Called from serving (buffer release, which wrote the whole
+// file from row 0, is not reached by a served process).
+void Grimoire::tm_save_hits() {
+    const char* hf = std::getenv("GRIMOIRE_EXPERT_HITS");
+    if (!hf || !*hf || !tm_any) return;
+    const int fd = ::open(hf, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return;
+    const size_t E = size_t(cfg.n_experts);
+    std::vector<uint64_t> row(E);
+    for (auto& d : L) {
+        if (!d.tiered || d.tm_hits.size() != E || d.tm_moe_idx < 0) continue;
+        if (d.tm_hits_saved.size() != E) d.tm_hits_saved.assign(E, 0);
+        const off_t off = off_t(size_t(d.tm_moe_idx) * E * sizeof(uint64_t));
+        const ssize_t got = ::pread(fd, row.data(), E * sizeof(uint64_t), off);
+        if (got != ssize_t(E * sizeof(uint64_t))) std::fill(row.begin(), row.end(), 0);
+        for (size_t e = 0; e < E; ++e) row[e] += d.tm_hits[e] - d.tm_hits_saved[e];
+        if (::pwrite(fd, row.data(), E * sizeof(uint64_t), off) == ssize_t(E * sizeof(uint64_t)))
+            d.tm_hits_saved = d.tm_hits;
+    }
+    ::close(fd);
+}
+
 const float* Grimoire::forward_qwen4_exp(int token) {
     power_gov_tick();
     const int H  = cfg.hidden;
@@ -11108,6 +11124,22 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         const auto t = std::chrono::steady_clock::now();
         q4d_ms[k] += std::chrono::duration<double, std::milli>(t - q4clk).count();
         q4clk = t;
+    };
+    // every exit of a decode step (a pipeline stage without the head returns
+    // early): routes saved every 256 tokens; GRIMOIRE_Q4_TIMING totals every 64
+    auto q4_periodic = [&]() {
+        // the totals above print at buffer release, which a served process may
+        // never reach: show them every 64 tokens too
+        if (++tm_save_tick % 256 == 0) tm_save_hits();
+        if (q4t && q4d_tokens % 64 == 0) {
+            const double n = double(q4d_tokens);
+            std::fprintf(stderr, "  qwen4_exp decode per token (%ld tokens, synced): PLE %.2f  HC %.2f  "
+                         "DeltaNet %.2f  full-attn %.2f  MoE %.2f  head %.2f ms; CPU experts %ld calls %.3f ms each, "
+                         "%.2f RAM experts per call\n",
+                         q4d_tokens, q4d_ms[0] / n, q4d_ms[1] / n, q4d_ms[2] / n, q4d_ms[3] / n, q4d_ms[4] / n,
+                         q4d_ms[5] / n, cx_calls, cx_calls ? cx_ms / double(cx_calls) : 0.0,
+                         cx_calls ? double(cx_nexp) / double(cx_calls) : 0.0);
+        }
     };
     if (q4t) { q.wait(); q4clk = std::chrono::steady_clock::now(); ++q4d_tokens; }
 
@@ -11432,6 +11464,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                     blk[n] = d.tm_hptr[size_t(e)]; wt[n] = cx_wt[k]; ++n;
                 }
                 cpu_exp.ffn(tm_lay, blk, wt, n, cx_x, cx_y);
+                cx_nexp += n;
                 cx_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
                 ++cx_calls;
@@ -11463,6 +11496,8 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             launch_incr_pos(q, s.d_pos, none);
             launch_incr_pos(q, s.d_seq_len, none);
         }
+        q4lap(5);
+        q4_periodic();
         ++pos;
         return s.logits;
     }
@@ -11480,6 +11515,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         launch_incr_pos(q, s.d_seq_len, none);
     }
     q4lap(5);
+    q4_periodic();
     ++pos;
     return s.logits;
 }
@@ -14147,9 +14183,10 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
     {
         std::vector<int> order(static_cast<size_t>(E));
         for (int e = 0; e < E; ++e) order[size_t(e)] = e;
+        int moe_idx = 0;
+        for (int l = 0; l < layer; ++l) if (!ck.layers[size_t(l)].e_gate_p.empty()) ++moe_idx;
+        d.tm_moe_idx = moe_idx;
         if (const char* hf = std::getenv("GRIMOIRE_EXPERT_HITS")) {
-            int moe_idx = 0;
-            for (int l = 0; l < layer; ++l) if (!ck.layers[size_t(l)].e_gate_p.empty()) ++moe_idx;
             std::vector<uint64_t> hits(static_cast<size_t>(E), 0);
             if (FILE* f = std::fopen(hf, "rb")) {
                 if (std::fseek(f, long(size_t(moe_idx) * E * sizeof(uint64_t)), SEEK_SET) == 0 &&
@@ -14864,6 +14901,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         pos += M;
         set_cursor(pos);
         cleanup();
+        tm_save_hits();
         return true;
     }
 
@@ -14905,6 +14943,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     set_cursor(pos);
     cleanup();
     ++g_qwen4_exp_batched_prefills;
+    tm_save_hits();                     // a prompt's routes are the bulk of the statistics
     return true;
 }
 
