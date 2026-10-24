@@ -54,9 +54,9 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
 1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,002 - 2,568 and
-30.9, peaking at 43 GB.** Each tensor-parallel speed-up gives a character-identical answer to the
-previous two-GPU code on a 2,153-token coding prompt, and every two-GPU answer to it passes its unit
-tests.
+30.9, peaking at 43 GB.** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
+above gives exactly the same answer, character for character, as the code before it, and every
+two-GPU answer to that prompt passes its unit tests.
 
 ### GGUF files, one Arc Pro B70 (branch `feature/gguf-battlemage`, 2026-10-15 / 21)
 
@@ -231,6 +231,17 @@ n-gram table, made by `tools/ple_flatten.py`) and `GRIMOIRE_EXPERT_HITS=` (routi
 updates this file as it serves, and the most-used experts go to VRAM at the next start). The experts
 that stay outside VRAM take ~20 GB of pinned host RAM; the n-gram table (51 GB) is read from disk.
 
+### About the `-MXFP4-GRIMOIRE` folders in older results
+
+Some older results and commit notes name `Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE` or
+`Qwen3.8-27B-MXFP4-GRIMOIRE`. These are **not on Hugging Face**: they are pre-converted copies
+made on the developer's machine with GRIMOIRE's offline converter (`tools/b70_compile_model.cpp`)
+from the official BF16 releases ([ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B),
+[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)). You do not need them: loading the
+BF16 (or FP8 / NVFP4) release with `--proj mxfp4` quantizes to the same MXFP4 format at startup
+and runs at the same speed (measured: 193 tok/s on Ornith from the FP8 and NVFP4 releases and
+from the converted copy). The converted copy only starts faster.
+
 ## GGUF support (branch `feature/gguf-battlemage`)
 
 GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp inside.
@@ -247,17 +258,6 @@ GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp insi
   block).
 
 Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-branch-featuregguf-battlemage-2026-10-15--21).
-
-### About the `-MXFP4-GRIMOIRE` folders in older results
-
-Some older results and commit notes name `Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE` or
-`Qwen3.8-27B-MXFP4-GRIMOIRE`. These are **not on Hugging Face**: they are pre-converted copies
-made on the developer's machine with GRIMOIRE's offline converter (`tools/b70_compile_model.cpp`)
-from the official BF16 releases ([ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B),
-[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)). You do not need them: loading the
-BF16 (or FP8 / NVFP4) release with `--proj mxfp4` quantizes to the same MXFP4 format at startup
-and runs at the same speed (measured: 193 tok/s on Ornith from the FP8 and NVFP4 releases and
-from the converted copy). The converted copy only starts faster.
 
 ## Why GRIMOIRE was created
 
