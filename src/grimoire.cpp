@@ -9240,12 +9240,18 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
                 }
                 return true;
             }
-            if (pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
+            // At most pp_chunk rows per prefill, in EQUAL chunks: no tiny tail,
+            // and the scratch is bounded.  (Until 10-24 a prompt shorter than
+            // 2 * pp_chunk went in whole: Flash-Next at 380 experts/layer in
+            // VRAM peaked at 33.6 of 34.2 GB on 2,153 rows.)
+            if (pp_chunk <= 0 || int(tail.size()) <= pp_chunk)
                 return prefill(tail, nullptr, nullptr, false);
-            std::fprintf(stderr, "    PP chunked prefill: %zu tokens in chunks of %d (rank %d)\n",
-                         tail.size(), pp_chunk, pp_rank);
-            for (size_t off = 0; off < tail.size(); off += size_t(pp_chunk)) {
-                const size_t len = std::min(size_t(pp_chunk), tail.size() - off);
+            const size_t nchunks = (tail.size() + size_t(pp_chunk) - 1) / size_t(pp_chunk);
+            const size_t step = (tail.size() + nchunks - 1) / nchunks;
+            std::fprintf(stderr, "    PP chunked prefill: %zu tokens in %zu chunks of <= %zu (rank %d)\n",
+                         tail.size(), nchunks, step, pp_rank);
+            for (size_t off = 0; off < tail.size(); off += step) {
+                const size_t len = std::min(step, tail.size() - off);
                 const std::vector<int32_t> chunk(tail.begin() + off, tail.begin() + off + len);
                 if (!prefill(chunk, nullptr, nullptr, false)) return false;
             }
@@ -14245,7 +14251,13 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         const char* ce = std::getenv("GRIMOIRE_CPU_EXPERTS");
         if (!(ce && *ce == '0')) {
             const char* tn = std::getenv("GRIMOIRE_CPU_EXPERT_THREADS");
-            cpu_exp.start(tn ? std::atoi(tn) : 0);
+            // Ranks on one host share its cores: each pool takes its share, or
+            // the idle rank's spinning workers take the busy rank's cores
+            // (10-24, pipeline on the 16-core 285H: 15 + 15 threads cost
+            // 0.33 ms per layer call, 8 + 8 cost 0.07).
+            const int ranks = std::max(pp_enabled() ? pp_world : 1, tp_ranked() ? tp_world : 1);
+            const int share = std::max(1, int(std::thread::hardware_concurrency()) / ranks);
+            cpu_exp.start(tn ? std::atoi(tn) : ranks > 1 ? share : 0);
             const int K = cfg.top_k;
             cx_route = sycl::malloc_host<int32_t>(size_t(K), lq);
             cx_wt    = sycl::malloc_host<float>(size_t(K), lq);

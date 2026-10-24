@@ -317,3 +317,60 @@ limit; compute and the exposed attention block are.
    could be the default (+10% at 2K, bit-identical).
 2. Hide the attention block (chunk QKV / o_proj; full wavefront) -- the remaining exposed part.
 3. Then Qwen3.8-Flash-Next on two cards (Ian's next priority).
+
+
+## 9. 2026-10-24 evening: Qwen3.8-Flash-Next-NVFP4 on two cards (pipeline 24/24, tiered experts)
+
+### 9.1 What others do (research first)
+- vLLM recipe (recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next): TP + expert parallel (TEP); pipeline
+  parallel is NOT supported with the n-gram embedding; MTP with 3 speculative tokens.
+- devan-carlin/Qwen3.8-Flash-Next-W4A16 (HF) on 4x B70, vLLM fork xpu-qwen4exp: TP4 + EP,
+  XPU graphs, ~19 GB weights per card, PLE table (~96 GB) mmap'd from host RAM: 53.4 tok/s decode,
+  TTFT ~0.11 s. MTP not wired (GDN causal_conv1d limits on XPU). Their model file replicates the
+  hyper-connection mix/combine and PLE on every rank and splits DeltaNet / attention / MoE (QSA
+  layers run as dense attention there).
+- On two B70s (64 GB) ~1/4-1/3 of each layer's experts must live in host RAM whatever the layout,
+  so placement and how RAM experts are computed decide decode.
+
+### 9.2 Found and fixed
+1. Routing statistics (GRIMOIRE_EXPERT_HITS) held ~1,092 tokens from 10-10, so VRAM placement
+   beyond the experts in that sample was arbitrary: 2.4-2.9 RAM experts per layer-token on rank 0.
+   They were saved only at buffer release (never reached by a served process), as a whole-file
+   rewrite from row 0 (in a pipeline: rank 1's layers over rank 0's), and a stage without the head
+   returned before any save. Now tm_save_hits() adds each process's new counts to its own rows
+   (pread/pwrite), after every prompt and every 256 decode tokens, on every exit.
+   Two collection runs: RAM experts per call 0.57 (rank 0) / 0.37 (rank 1) at 340/layer.
+2. CPU expert threads: each rank started 15 workers, 30 on the 16-core 285H; the idle rank's
+   spinning workers took the busy rank's cores. 8 per rank: 0.55 -> 0.07 ms per layer call. The
+   default is now cores / ranks on this host (GRIMOIRE_CPU_EXPERT_THREADS overrides).
+3. Pipeline prefill chunks: a prompt shorter than 2 x GRIMOIRE_PP_CHUNK went in whole (up to
+   4,095 rows): at 380 experts/layer VRAM peaked at 33.6 of 34.2 GB. Now at most PP_CHUNK rows,
+   in equal chunks.
+4. GRIMOIRE_Q4_TIMING decode totals print every 64 tokens for both ranks (CPU calls, ms per call,
+   RAM experts per call).
+
+### 9.3 Measured (llama-benchy c1; ctest = 128-token decode)
+| config | pp2048 | pp4096 | pp8192 | tg128 | code probe decode | VRAM peak/card |
+|---|---:|---:|---:|---:|---:|---:|
+| 10-22 (340/layer, 15 thr, old hits, 240 W gov) | 652 | - | - | 16.1 | - | - |
+| 340/layer, 15 thr, timing on (fn-collect) | 631 | 852 | - | 15-16 | 13-15 | - |
+| 380/layer, 8 thr | 790 | 990 | - | 24.8 / 23.9 | 23.9-24.5 | 33.6 GB (too thin) |
+| 380/layer, GPU reads RAM experts (CPU_EXPERTS=0) | 786 | 954 | - | 24.6 / 24.0 | 20.5 (worse) | 33.6 GB |
+| 360/layer, 8 thr, PP_CHUNK=1024 | 643 | 777 | 821 | 23.5 / 22.1 | 22.1-23.8 | 31.3 GB |
+| **360/layer, 8 thr (auto), PP chunks <= 2048 equal (default now)** | **771** | **911** | **1,105** | **23.9 / 21.8** | 21.9-23.4 | **32.3 GB** |
+Greedy text depends on placement (a VRAM expert runs on the GPU, a RAM one on the CPU, rounding
+differs): story prompt differs from char 97 between 340 and 380/layer. All code probes PASS.
+Link (gpu1 root port 00:06.0): root rx +0 per run, 0 uncorrectable.
+
+### 9.4 Recommended DUAL-FLASH-NEXT settings (Ian edits the template; needs an image with this code)
+GRIMOIRE_EXPERT_VRAM_PER_LAYER=360, GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits (now
+real statistics, ~217K / 465K routes per layer for rank 0 / rank 1 layers; backup of the 10-10 file:
+bench-1022/flash-next.hits.20261010), GRIMOIRE_POWER_LIMIT_W=0. No thread or chunk variables needed.
+
+### 9.5 Next for Flash-Next
+1. Remove the per-layer host sync of the CPU-expert path (cx_ready.wait() drains the queue 24x per
+   rank per token): e.g. GPU-side handling when no routed expert is RAM-resident.
+2. Expert-parallel TP (both cards on every token): replicate HC mix/combine + PLE, split
+   DeltaNet / attention / shared expert, experts by index (as the vLLM recipe and devan-carlin's
+   XPU fork do). Today TP refuses MoE and qwen4_exp (tp_mega_refusal).
+3. MTP: the NVFP4 checkpoint has an MTP layer (needs the PRE-mixer multi-stream state).

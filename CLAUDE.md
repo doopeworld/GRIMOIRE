@@ -6,7 +6,10 @@
 GRIMOIRE default 2,002 / 30.9, with BAR receive 2,568 / 30.9 (lossless), 43 GB peak.** Read
 HANDOFF-2026-10-22-DUAL.md section 8 first (Tower rebooted: gpu1 = 07:00.0 on root port 00:06.0,
 render nodes gpu0 renderD129, gpu1 renderD130). BAR receive (GRIMOIRE_TP_AR_BAR=1) waits for Ian's
-OK to become the default. Next after that: Qwen3.8-Flash-Next on two cards (Ian's priority).
+OK to become the default.
+**Qwen3.8-Flash-Next two cards (PP 24/24, tiered experts): tg128 16.1 -> 23.9, pp2048 652 -> 771, pp8192
+1,105** after real routing statistics, CPU expert threads = cores / ranks, PP chunks <= 2048 rows
+(section 9). Next: per-layer host sync of the CPU-expert path, then expert-parallel TP.
 
 **2026-10-22: two B70s on Ian's new redriver M.2-OCuLink adapter -- all three dual targets run.**
 Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers; sec. 7 = afternoon).
