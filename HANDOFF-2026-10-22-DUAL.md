@@ -395,3 +395,13 @@ bench-1022/flash-next.hits.20261010), GRIMOIRE_POWER_LIMIT_W=0. No thread or chu
   pp4096 2,486 / tg128 48.7 / 48.8 (book text), coding probe 77.4 tok/s (4.34 tokens per step).
 - Answers: plain identical to the 10-22 bf16 reference; MTP identical to plain (1,282 chars, both
   trials). GRIMOIRE_TP_AR_BAR=0 restores the copy-engine receive.
+
+## 11. End of 10-24: what the next Flash-Next step should be (measured, not guessed)
+- Timeline with every expert on the GPU (GRIMOIRE_CPU_EXPERTS=0, no per-layer host sync):
+  MoE 6.6 / 6.9 ms per rank-token, total 20.5 + 18.6 ms -- the SAME 39 ms as the CPU-expert path
+  (MoE 6.0 / 5.3 + sync). So the per-layer CPU round trip is NOT the big cost: prefetching RAM
+  experts into VRAM would save little. The MoE region costs ~0.25 ms per layer even when nothing
+  waits on the host -> next: kernel-level profile of the tiered MoE decode kernels (router GEMV,
+  top-k, tmoe gate_up/down, shared expert), then DeltaNet (5.2 ms per 18 layers, BF16 weights).
+- Tower idle at the end: no containers, both locks free, book server stopped. dual-1022 = 17c5d1f,
+  main = c0aefd0.
