@@ -15,9 +15,10 @@ compiler (third_party/onednn, gitignored; tools/bench/onednn/build_onednn.sh), n
 - int8 x int8 (W8A8, lossy) runs 273 TOPS = 2x bf16: the lever for Ian's pp ~3,500 target.
 - GRIMOIRE_ONEDNN=1 routes gemm_fast (+ TP chunked FFN) FP8-row/BF16 weights to src/onednn_gemm.cpp:
   host-checked PASS, same times as benchdnn. **Two cards, Qwen3.8-27B-FP8 TP: pp2048 2,460 -> 2,717
-  (+10.5%), pp4096 2,537 -> 2,677 (+5.5%), tg128 31.5 unchanged, code probe PASS.** NOT default yet:
-  one primitive per prompt length makes the first prompt of each new length ~0.5 s slower (run-time
-  M falls back to ocl:ref:any, 700x slower -- rejected); next = row buckets created at load.
+  (+10.5%), pp4096 2,537 -> 2,667 (+5%), new lengths 1024-2500 +2-26%, tg128 31.5 unchanged, code
+  probe PASS.** First-request cost (one-time kernel variants, TTFT 1.42 s) is paid by a server warm-up
+  at start (2.2 s): cold TTFT 0.83 s (off 0.97). Widest weights (N >= 32768) run in row pieces; run-time
+  M = ocl:ref:any, 700x slower, rejected. NOT default yet: regress_all_g0.sh with it on comes first.
 - gpu1's root port 00:06.0 logs card->host errors ~1.3/s since 10-25 07:40 even idle (clean on
   10-24); under the A/B load +11K corrected in 2 min, 0 uncorrectable, no drop. Ian chose to run.
 - Radiance (AMD R9700 engine, Apache-2.0, codeberg StillDeadcode/radiance): 2x R9700 Qwen3.8-27B

@@ -82,3 +82,52 @@ this has to go before GRIMOIRE_ONEDNN=1 can be the default.
   `ocl:ref:any` (benchdnn mm4: FP8 512 x 34816 1,001 ms vs 1.39; BF16 466 ms vs 1.42).
 - To try: primitives for row buckets (multiples of 256, created at load) run over padded rows, or
   oneDNN's (experimental) persistent kernel cache for Level Zero.
+
+## 6. Afternoon (after Ian's 15:13 reboot -- gpu1's link clean again: 2 corrected in 5 rounds)
+
+What creating a primitive costs (dnnl_create_probe.cpp, one B70): kernel selection 17-48 ms per
+new row count on the 34816-wide weights, ~0.1 ms on 5120-wide ones; a kernel variant not
+compiled yet 94-597 ms, once per process. Row pieces (1024/768/512/256 + a padded tail) for wide
+weights: gemm_fast_probe wall time within 0-7% of exact M (FP8 2153 x 34816: 6.03 vs 6.17 ms;
+narrow weights and < 512 rows stay exact -- pieces there were +50-70%).
+
+Two cards, Qwen3.8-27B-FP8 TP (tools/bench/onednn/tp_onednn_ab2.sh). Standard llama-benchy:
+
+| | pp2048 | pp4096 | tg128 | code probe TTFT cold / repeat |
+|---|---:|---:|---:|---|
+| oneDNN, pieces from 16384 wide | **2,705** | **2,674** | 31.4 / 30.9 | 1.42 / 0.84 s, PASS 2/2 |
+| off | 2,448 | 2,542 | 31.3 / 30.9 | 0.97 / 0.91 s, PASS 2/2 |
+
+Prompts of NEW lengths, no warm-up, one run each (pp tok/s; the first row is the first request
+after the start):
+
+| prompt | off | oneDNN exact M | oneDNN pieces (>= 16384) |
+|---:|---:|---:|---:|
+| 1024 (first) | 1,807 | 1,576 | 1,570 |
+| 1100 | 1,967 | 2,403 | 2,385 |
+| 1300 | 2,018 | 2,448 | 2,391 |
+| 1500 | 2,132 | 2,490 | 2,444 |
+| 1700 | 2,156 | 2,457 | 2,416 |
+| 1900 | 2,342 | 2,591 | 2,576 |
+| 2100 | 2,377 | 2,525 | 2,495 |
+| 2300 | 2,432 | 2,521 | 2,501 |
+| 2500 | 2,400 | 2,625 | 2,594 |
+
+On two cards only the FIRST request pays (one-time kernel variants); new lengths after it are
++4-22% over off, and exact M beats pieces by 0.6-2.3% (the TP ranks' widest weight is 17408).
+So: pieces only from N >= 32768 (one-card full-width weights), and the server warms up at start
+(four one-token prompts, 73-2153 tokens, through the normal request path; GRIMOIRE_SERVER_WARMUP=0
+skips it).
+
+## 7. With the start-up warm-up (tools/bench/onednn/tp_onednn_warm.sh; warm-up 2.2-2.3 s)
+
+| | pp2048 | pp4096 | tg128 | code probe TTFT cold / repeat |
+|---|---:|---:|---:|---|
+| oneDNN + warm-up (tp-warm2) | **2,703** | **2,667** | 31.5 / 31.0 | **0.83** / 0.83 s, PASS 2/2 |
+| oneDNN + warm-up (tp-warm, first try) | 2,705 | 2,577 | 31.4 / 30.9 | 0.83 / 0.83 s, PASS 2/2 |
+| off (tp-off2) | 2,448 | 2,542 | 31.3 / 30.9 | 0.97 / 0.91 s, PASS 2/2 |
+
+New lengths, no warm-up by the client (nl-warm), pp tok/s: 1024 2,218 (first request; 1,570
+without the server warm-up, 1,807 off), 1100 2,392, 1300 2,544, 1500 2,601, 1700 2,571,
+1900 2,732, 2100 2,711, 2300 2,475, 2500 2,610 -- +2% to +26% over off at every length.
+(tp-warm's pp4096 2,577 did not repeat: tp-warm2 2,667, as the two earlier oneDNN runs.)

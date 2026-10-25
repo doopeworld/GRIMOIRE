@@ -168,6 +168,25 @@ int main(int argc, char** argv) {
             timed("whole", [&](int c) {
                 return launch_gemm_fast(q, view(c), reinterpret_cast<const sycl_bf16*>(dx), dy, M);
             });
+            {
+                // Host wall time of the whole call on an idle queue: every kernel the call
+                // submits (a oneDNN call cut into row pieces returns only its LAST event).
+                std::vector<double> ts;
+                const auto t_start = std::chrono::steady_clock::now();
+                for (int r = 0; r < 200; ++r) {
+                    q.wait();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    launch_gemm_fast(q, view((r + 1) % ncopy), reinterpret_cast<const sycl_bf16*>(dx),
+                                     dy, M).wait();
+                    ts.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+                    if (r >= 4 && std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_start).count() > 4.0) break;
+                }
+                const double ms = median(ts);
+                std::printf("  %-8s %9.3f ms  %7.1f TFLOP/s  (n=%zu)\n", "wall", ms,
+                            flop / (ms * 1e-3) * 1e-12, ts.size());
+            }
             if (ok_predq) {
                 const size_t ne = gemm_fast_predq_elems(w0);
                 sycl_bf16* wdq = sycl::malloc_device<sycl_bf16>(ne, q);
