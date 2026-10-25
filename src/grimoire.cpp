@@ -5141,16 +5141,27 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
     static const size_t cpu_max=[]{const char* e=std::getenv("GRIMOIRE_TP_SHM_CPU_MAX");
         return e&&*e?size_t(std::atoll(e)):size_t(65536);}();
     if(tshm.pipe_piece&&elems>cpu_max)return tp_pipe_allreduce(dev,elems);
+    // GRIMOIRE_TP_SMALL_AR_TIME=1 (diagnostic, adds two waits per call): where a
+    // small all-reduce's time goes, per row class -- compute still queued when
+    // it was called, the device->host copy, the CPU copy into shared RAM, the
+    // wait for the peer, the CPU sum, the host->device copy.
+    static const bool st=std::getenv("GRIMOIRE_TP_SMALL_AR_TIME")!=nullptr;
+    using clk=std::chrono::steady_clock;
+    static double st_acc[3][6]={}; static uint64_t st_n[3]={};
     for(size_t off=0;off<elems;off+=tshm.slot_elems){
         const size_t n=std::min(tshm.slot_elems,elems-off);
         const uint64_t s=++tshm.seq;
+        clk::time_point t0{},t1{},t2{},t3{},t4{},t5{};
+        if(st){t0=clk::now();q.wait();t1=clk::now();}
         // My partial into my own pinned buffer, then by the CPU into my slot
         // of this parity.  The wait also retires everything queued before it
         // (the projection that produced it, and the previous call's copy back
         // out of tshm.res / tshm.peer).
         q.memcpy(tshm.stage,dev+off,n*sizeof(float)).wait();
+        if(st)t2=clk::now();
         std::memcpy(slot(tp_rank,s),tshm.stage,n*sizeof(float));
         flag(tp_rank)->store(s,std::memory_order_release);
+        if(st)t3=clk::now();
         for(int r=0;r<W;++r){
             if(r==tp_rank)continue;
             auto* f=flag(r);
@@ -5164,6 +5175,7 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
                 }
             }
         }
+        if(st)t4=clk::now();
         // Every rank sums the slots in RANK ORDER, so all get the same bits.
         // A slot is not overwritten until its owner is two calls further on,
         // and nobody passes call s+1 before everyone has finished call s.
@@ -5175,9 +5187,26 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
                 const float* sr=slot(r,s);
                 for(size_t i=0;i<n;++i)out[i]+=sr[i];
             }
+            if(st)t5=clk::now();
             // no wait: the queue is in order, and the next call's first
             // wait retires this copy before tshm.res is written again
             q.memcpy(dev+off,out,n*sizeof(float));
+            if(st){
+                q.wait();
+                const auto t6=clk::now();
+                const size_t rows=n/size_t(cfg.hidden);
+                const int b=rows<=1?0:rows<=16?1:2;
+                const clk::time_point tp[7]={t0,t1,t2,t3,t4,t5,t6};
+                for(int i=0;i<6;++i)st_acc[b][i]+=std::chrono::duration<double,std::micro>(tp[i+1]-tp[i]).count();
+                if(++st_n[b]%2048==0){
+                    const double c=double(st_n[b]);
+                    std::printf("  TP small all-reduce rank %d, %s rows: %llu calls, us per call: queued compute %.1f,"
+                                " d2h %.1f, cpu copy in %.1f, peer wait %.1f, cpu sum %.1f, h2d %.1f\n",
+                                tp_rank,b==0?"1":b==1?"2-16":"17+",(unsigned long long)st_n[b],
+                                st_acc[b][0]/c,st_acc[b][1]/c,st_acc[b][2]/c,st_acc[b][3]/c,st_acc[b][4]/c,st_acc[b][5]/c);
+                    std::fflush(stdout);
+                }
+            }
         }else{
             // device add in rank order: dev = slot 0, then += slot 1, 2, ...
             // (rank 0's dev already holds slot 0's values).  Each peer slot

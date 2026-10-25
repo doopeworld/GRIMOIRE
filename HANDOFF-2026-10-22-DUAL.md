@@ -462,3 +462,52 @@ C++/HIP engine for AMD R9700 (RDNA4): core 128K lines, kernels (libr4d) 66K line
 3. Template advice (Ian edits): two-card Qwen3.8 DFlash2 = GRIMOIRE_MTP=0,
    GRIMOIRE_DFLASH_MODEL=<Qwen3.8-27B-DFlash2 dir>.
 4. Flash-Next TP (12.3).
+
+### 12.5 The 8-row verify, region by region (DFlash2 code probe, GRIMOIRE_TIME_LAYER=all, 25th verify)
+Both ranks alike; total 42.4 ms. The weights alone (per rank, 602 GB/s) take ~22.5 ms.
+| region | ms | weights floor / note |
+|---|---:|---|
+| FFN gate_up | 11.49 | 9.5 (FP8, 89 MB per layer per rank) |
+| post norm | 6.41 | the mixer all-reduce (~100 us x 64 layers) + residual norm |
+| dense FFN (down) | 6.17 | 4.7 |
+| DN qkv projection | 2.99 | 2.1 |
+| final norm + logits | 2.42 | 2.1 (lm_head 1.27 GB, whole on each rank) |
+| DN norm + output projection | 2.24 | 1.25 |
+| DN z projection | 2.01 | 1.25 |
+| input norm | 1.45 | |
+| DN recurrence | 1.21 | |
+| attn q projection | 1.14 | 0.84 |
+| attn flash 0.88, full attention 0.79, DN conv 0.72, attn kv 0.65, DN gate 0.61, SwiGLU 0.52, DN qk norm 0.49, rope 0.24 | | |
+Every all-reduce of <= 65,536 floats (tp_shm_allreduce: 1-row decode and 8-row verify, 128 per
+step) is a full host round trip: device->host copy + wait, CPU copy into shared RAM, flag spin, CPU
+sum, host->device copy; the GPU idles throughout. gpu0's link is Gen4 x8, gpu1's Gen4 x4 (160 KB
+each way ~23 us on gpu1).
+- Diagnostic in the source (not yet run): GRIMOIRE_TP_SMALL_AR_TIME=1 prints, every 2,048 calls per
+  row class (1 / 2-16 rows), the us per call of: compute still queued, d2h, CPU copy in, peer wait,
+  CPU sum, h2d. Adds two waits per call. Run: tools/bench/onednn/tp_ar_time.sh (DFlash2 + plain).
+- Then, depending on what dominates: kernel stores to pinned host memory + host polling a flag
+  instead of copy + event wait; the CPU writes the sum straight into the card's own VRAM through
+  the BAR (exportable memory, as the prefill receive does) instead of a host->device copy; a bf16
+  payload halves the bytes but is lossy (opt-in only).
+
+### 12.6 Unraid containers (Ian 10-25: "clean ... and fix all containers to the new settings so i just need to click play")
+All ten GRIMOIRE containers recreated from their templates (create_from_template.php = Unraid's
+xmlToCommand, label net.unraid.docker.managed=dockerman), stopped, image grimoire-b70:v1.10-dev.
+- GPUs bound by PCI slot instead of renderD numbers (those moved on the 10-24 and 10-25 reboots):
+  `--mount type=bind,src=/dev/dri/by-path/pci-0000:03:00.0-render,dst=/dev/dri/renderD128`
+  (+ `pci-0000:07:00.0-render` -> renderD129 for two-card ones) `--device-cgroup-rule='c 226:* rwm'`.
+  `--device` cannot take the by-path name (its colons break docker's parser). Level Zero finds the
+  PCI address from the node's major:minor, not from its name: devq (bench-1003/templates-backup/
+  2026-10-25/devq.cpp) with gpu0 bound as renderD130 reports 0000:03:00.0 and runs a kernel.
+- Second checkpoint disk mapped in every template: /mnt/models -> /models2 (Qwen3.8 checkpoints).
+- GRIMOIRE-DUAL renamed GRIMOIRE-DUAL-ORNITH (PP 20/20, 8 slots, no MTP). GRIMOIRE-DUAL-QWEN3.8 =
+  multi TP + GRIMOIRE_DFLASH_MODEL=/models2/Qwen3.8-27B-DFlash2, GRIMOIRE_MTP=0 (PP_SPLIT/PP_CHUNK
+  removed). GRIMOIRE-DUAL-FLASH-NEXT = 360 experts per layer (9.4).
+- Backups: bench-1003/templates-backup/2026-10-25 (old templates, docker inspect of every old
+  container; fix_templates.py, apply_templates.sh, ctest2.sh, ctest_all.sh).
+- Test of every container (bench-1003/ctest_all.sh: start, /health, ctest.py, graceful stop):
+| container | result |
+|---|---|
+| GRIMOIRE-ORNITH | ready 43 s, Paris, 200.5 tok/s, AER unchanged |
+| GRIMOIRE-QWEN3.8 | ready 73 s, Paris, 73.0 tok/s, AER unchanged |
+| the other eight | NOT tested: Ian stopped the work ("pause") -- test them with bench-1003/ctest2.sh NAME PORT [dual] |
