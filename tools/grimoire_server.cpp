@@ -75,6 +75,10 @@ static std::string tool_calls_json(const std::vector<b70::ParsedToolCall>& calls
 }
 
 int main(int argc, char** argv) {
+    // Line-buffered stdout: a served process writes to a pipe (docker logs), where
+    // full buffering held the engine's printf lines (GRIMOIRE_SPEC_TIME, spec
+    // stats) until exit -- and a stopped container never flushed them.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     // Level Zero sysman reports the card's free VRAM, which sizes prefill
     // chunks (Grimoire::prefill_token_budget); it must be on before SYCL starts.
     setenv("ZES_ENABLE_SYSMAN", "1", 0);

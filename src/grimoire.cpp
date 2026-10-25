@@ -13039,10 +13039,11 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                                         M,QH,KVH,HD,position,theta,1.0f,eps,{},0.0f);
             launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
                                      M,position,KVH,HD,max_seq);
+            // the key range in slices on separate work-groups (prefill.cpp)
             launch_dflash2_block_attention(q,dflash2.q,d.k_cache,d.v_cache,
                 dflash2.attn,M,position,QH,KVH,HD,max_seq,
                 d.window,d.causal,
-                1.0f/std::sqrt(float(HD)));
+                1.0f/std::sqrt(float(HD)),{},true);
         }
         checkpoint("block attention");
         draft_mark("attention convert");
@@ -15860,7 +15861,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // tok/s against 9.4 without speculation.
         const bool dpas_f8 = smallm_dpas && M>=2 && M<=8 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && fp8_smallm_ok(w.w,M,nullptr,y);
-        const bool dpas_ok = dpas_bf || dpas_i4 || dpas_f8 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+        // FP8 / BF16 weights at 2..16 rows (a verify block) through oneDNN rather
+        // than the small-M kernels.  MEASURED 2026-10-25, Qwen3.8-27B-FP8 + DFlash2
+        // on two cards: verify 48.5 -> 42.9 ms per step, decode 100 -> 108 tok/s,
+        // code probe answers identical to plain decode.  GRIMOIRE_SMALLM_ONEDNN=0
+        // keeps the small-M kernels.
+        static const bool smallm_dnnl = [] {
+            const char* v = std::getenv("GRIMOIRE_SMALLM_ONEDNN");
+            return !(v && *v == '0');
+        }();
+        const bool dnnl_small = smallm_dnnl && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                                !w.has_i4() && onednn_gemm_ok(w.w,M);
+        const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
@@ -15875,7 +15887,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 const sycl_bf16* xin = from_bn ? bn_bf : smallm_bf;
                 if(!from_bn) launch_f32_to_bf16(q,x,smallm_bf,need);
                 if(dpas_ok){
-                    if(dpas_i4) launch_int4_smallm(q,w.w,xin,y,M);
+                    if(dnnl_small) onednn_gemm(q,w.w,xin,y,M,false);
+                    else if(dpas_i4) launch_int4_smallm(q,w.w,xin,y,M);
                     else if(dpas_f8) launch_fp8_smallm(q,w.w,xin,y,M);
                     else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
                     else launch_mxfp4_smallm(q,w.w,xin,y,M);

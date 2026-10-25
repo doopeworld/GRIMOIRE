@@ -788,12 +788,14 @@ sycl::event launch_flash_prefill(
 // DFlash query attention. Query K/V rows have already been appended at
 // [context_len, context_len + tokens). Some trained heads use a non-causal
 // block while sliding-attention heads such as Muse are causal.
+// split_keys: a draft block (<= 16 queries) over a long key range runs the
+// range in slices on separate work-groups plus a merge (prefill.cpp).
 sycl::event launch_dflash2_block_attention(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
     int sliding_window, bool causal, float softmax_scale,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, bool split_keys = false);
 
 // DFlash2-only elementwise and selector kernels.  Activations remain f32 in
 // Grimoire; the explicit bf16 round points mirror the reference model.
