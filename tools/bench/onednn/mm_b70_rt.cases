@@ -1,0 +1,6 @@
+# Runtime M: one primitive for every prompt length (--runtime_dims_masks=1:0 = src dim 0 known
+# only at execution).  Compare with the fixed-M rows of mm_b70.cases.   KNOBS ;; PROBLEMS
+
+--dt=bf16:f8_e4m3:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_dim_1 --runtime_dims_masks=1:0 ;; 64x5120:5120x34816 512x5120:5120x34816 512x17408:17408x5120 2048x5120:5120x34816 2153x5120:5120x34816 4096x5120:5120x17408 4096x8704:8704x5120 2153x5120:5120x5120 2153x5120:5120x48
+--dt=bf16:f8_e4m3:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_dim_1 ;; 2153x5120:5120x34816 2153x5120:5120x5120 2153x5120:5120x48
+--dt=bf16:bf16:bf16 --stag=ab --wtag=ba --dtag=ab --runtime_dims_masks=1:0 ;; 64x5120:5120x34816 512x5120:5120x34816 512x17408:17408x5120 2048x5120:5120x34816 4096x5120:5120x17408

@@ -7,7 +7,7 @@ while IFS= read -r line; do
     knobs="${line%%;;*}"; prbs="${line#*;;}"
     echo "### $knobs"
     ./benchdnn --matmul --engine=gpu --mode=P --cold-cache=wei --max-ms-per-prb=1500 \
-        "--perf-template=perf,%impl%,%prb%,%Gops%,%-time%,%-Gflops%,%0time%,%0Gflops%" \
+        "--perf-template=perf,%impl%,%prb%,%Gops%,%-time%,%-Gflops%,%0time%,%0Gflops%,%+ctime%" \
         $knobs $prbs 2>&1
     echo "### rc=$?"
 done < "$1"

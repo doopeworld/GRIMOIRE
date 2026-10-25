@@ -57,8 +57,28 @@ PASS on every shape (FP8 1.1-1.9e-4 of sum|x*w| -- the reference rounds w*scale 
 path; oneDNN applies the scale to the fp32 sum), times = benchdnn's: FP8 512 x 34816 1.35 ms,
 512 x 5120 x 17408 0.62, 4096 x 17408 5.48, 64 rows 0.37; BF16 512 x 34816 1.34.
 
-Whole-model numbers: NOT measured yet. The two-card Qwen3.8-27B-FP8 run (tp-dnnl, 08:06) was
-stopped by dual.sh's link guard during the model load: gpu1's root port 00:06.0 has logged
-card->host BadDLLP/BadTLP/RxErr ~1.3/s since 07:40 even with gpu1 idle (0 per run on 10-24;
-host->card errors at 05:00.0 ~2/s since boot as before). Nothing ran on gpu1; the server was
-stopped gracefully after its load.
+## 4. Whole model, two B70s (Qwen3.8-27B-FP8, TP, no MTP, llama-benchy c1, --runs 2)
+
+The first attempt (08:06) was stopped by dual.sh's link guard during the load: gpu1's root port
+00:06.0 has logged card->host BadDLLP/BadTLP/RxErr ~1.3/s since 07:40 even idle (0 per run on
+10-24). Ian chose to run anyway (09:0x, RP_WIN/RP_RUN raised; every other guard kept). Same new
+binary (onednn-1025 6cbd37c), one row per setting, back to back (tools/bench/onednn/tp_onednn_ab.sh):
+
+| | pp2048 | pp4096 | tg128 | code probe (2,153 tokens): TTFT cold / repeat, decode, tests |
+|---|---:|---:|---:|---|
+| GRIMOIRE_ONEDNN=1 | **2,717 +- 3** | **2,677 +- 2** | 31.5 / 30.9 | 1.39 / 0.83 s, 31.4 tok/s, 2/2 PASS |
+| off (same binary) | 2,460 +- 1 | 2,537 +- 17 | 31.5 / 30.9 | 0.98 / 0.90 s, 31.5 tok/s, 2/2 PASS |
+| 10-24 default (17c5d1f) | 2,494 | 2,494 | 31.5 / 30.9 | 0.98 / 0.90 s, 31.5 tok/s, 2/2 PASS |
+
++10.5% at pp2048, +5.5% at pp4096; decode unchanged. Link during the two rounds: root port rx
+4,208 -> 8,933 -> 20,008 corrected (replay Timeout 5 -> 38), 0 uncorrectable, no drop.
+
+## 5. The cold-TTFT cost, and what does not fix it
+
+One primitive per (format, M, N, K): the FIRST prompt of each new length creates its
+primitives (code probe TTFT 1.39 s cold vs 0.83 s repeated). Served prompts vary in length, so
+this has to go before GRIMOIRE_ONEDNN=1 can be the default.
+- Run-time M (DNNL_RUNTIME_DIM_VAL, one primitive per weight): REJECTED -- oneDNN serves it with
+  `ocl:ref:any` (benchdnn mm4: FP8 512 x 34816 1,001 ms vs 1.39; BF16 466 ms vs 1.42).
+- To try: primitives for row buckets (multiples of 256, created at load) run over padded rows, or
+  oneDNN's (experimental) persistent kernel cache for Level Zero.
