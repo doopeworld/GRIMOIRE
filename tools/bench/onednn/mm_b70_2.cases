@@ -1,0 +1,11 @@
+# Second set: 4-bit weights, per-token int8 activations, W4A8, FP8 with 128x128 block scales,
+# and the deterministic attribute.   KNOBS ;; PROBLEMS   (src MxK : wei KxN)
+
+--dt=bf16:s4:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_ocic:bf16:128x1 --attr-fpmath=bf16:true ;; 1x5120:5120x34816 8x5120:5120x34816 64x5120:5120x34816 512x5120:5120x34816 512x17408:17408x5120 2048x5120:5120x34816
+--dt=bf16:u4:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_ocic:bf16:128x1 --attr-zero-points=wei:per_ocic:u8:128x1 --attr-fpmath=bf16:true ;; 1x5120:5120x34816 512x5120:5120x34816 2048x5120:5120x34816
+--dt=s8:s8:bf16 --stag=ab --wtag=any --dtag=ab --attr-scales=src:per_ocic:f32:1x5120+wei:per_dim_1 ;; 512x5120:5120x34816 2048x5120:5120x34816 4096x5120:5120x17408
+--dt=s8:s8:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=src:common:0.25+wei:per_dim_1 ;; 512x5120:5120x34816 2048x5120:5120x34816 4096x5120:5120x17408
+--dt=s8:s4:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=src:common:0.25+wei:per_ocic:f32:128x1 ;; 512x5120:5120x34816 2048x5120:5120x34816 64x5120:5120x34816
+--dt=bf16:f8_e4m3:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_ocic:f32:128x128 ;; 1x5120:5120x34816 64x5120:5120x34816 512x5120:5120x34816 2048x5120:5120x34816 4096x5120:5120x17408
+--dt=bf16:f8_e4m3:bf16 --stag=ab --wtag=ba --dtag=ab --attr-scales=wei:per_dim_1 --attr-deterministic=true ;; 512x5120:5120x34816 512x17408:17408x5120 2048x5120:5120x34816 4096x8704:8704x5120
+--dt=bf16:bf16:bf16 --stag=ab --wtag=ba --dtag=ab --attr-deterministic=true ;; 512x5120:5120x34816 512x17408:17408x5120 2048x5120:5120x34816

@@ -2,6 +2,26 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-25: oneDNN (Ian: developers asked for it) -- measured, wired in opt-in (branch `onednn-1025`).**
+Read tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md. oneDNN v3.13.4 built from source with our
+compiler (third_party/onednn, gitignored; tools/bench/onednn/build_onednn.sh), no torch, no vLLM.
+- One B70, weights cold: GRIMOIRE's prompt GEMM pays a dequantize pass first (FP8 -> bf16 at ~200
+  GB/s, BF16 re-layout ~255 GB/s) that costs as much as the GEMM at 512 rows. oneDNN decodes inside
+  the GEMM: FP8 512 x 34816 x 5120 4.09 -> 1.39 ms, BF16 4.23 -> 1.42, 64 rows 3.38 -> 0.37, TP-rank
+  4096 rows 7.22 -> 5.30. Our bf16 GEMM alone equals oneDNN's. Decode (1 row): oneDNN 586 GB/s,
+  no gain over our ESIMD decode kernels (near the 602 GB/s roofline; not re-measured at this shape).
+- oneDNN also serves FP8 with 128x128 block scales (the official Qwen checkpoint) at the same speed;
+  GRIMOIRE today re-rounds that checkpoint to one scale per row at load (a second quantization).
+- int8 x int8 (W8A8, lossy) runs 273 TOPS = 2x bf16: the lever for Ian's pp ~3,500 target.
+- GRIMOIRE_ONEDNN=1 routes gemm_fast (+ TP chunked FFN) FP8-row/BF16 weights to src/onednn_gemm.cpp:
+  host-checked PASS, same times as benchdnn. Whole-model numbers NOT measured: the two-card run was
+  stopped by the link guard -- gpu1's root port 00:06.0 logs card->host errors ~1.3/s since 07:40
+  even idle (clean on 10-24). No gpu1 run until Ian decides.
+- Radiance (AMD R9700 engine, Apache-2.0, codeberg StillDeadcode/radiance): 2x R9700 Qwen3.8-27B
+  decode 222 tok/s greedy with DFlash2 x7, Flash-Next c1 177 tok/s (TP2 + MTP 3, half of every
+  expert per rank, int8 trunk, 4-bit codebook experts). Its 66K lines of kernels are HIP/RDNA4-only;
+  porting its design to GRIMOIRE (Flash-Next TP with half-width experts, 8-bit trunk, MTP) is the plan.
+
 **2026-10-24: Qwen3.8-27B-FP8 TP=2 vs Ian's vLLM (pp4096 / tg128): vLLM 1,400 / 21, 56 GB VRAM;
 GRIMOIRE default (BAR receive, on since 10-24) 2,494 / 30.9, with MTP 2,486 / 48.8 (77 on code), 43 GB peak.** Read
 HANDOFF-2026-10-22-DUAL.md section 8 first (Tower rebooted: gpu1 = 07:00.0 on root port 00:06.0,

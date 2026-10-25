@@ -43,6 +43,9 @@
 #include "kernels.hpp"
 #include "int4_smallm.hpp"
 #include "b70/tiered_moe.hpp"
+#ifdef GRIMOIRE_WITH_ONEDNN
+#include "onednn_gemm.hpp"
+#endif
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -2998,6 +3001,15 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
         return e;
     }
+#ifdef GRIMOIRE_WITH_ONEDNN
+    // GRIMOIRE_ONEDNN=1: oneDNN decodes FP8 / BF16 weights inside its GEMM,
+    // so there is no dequantize pass (onednn_gemm.hpp has the measurements).
+    if (EPI != 1 && onednn_gemm_ok(w, M)) {
+        sycl::event e = onednn_gemm(q, w, x, static_cast<float*>(out), M, EPI == 2, deps);
+        if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
+        return e;
+    }
+#endif
     // N not a multiple of NC2 (DeltaNet's a|b gate projection, N = 96): the
     // scratch gets pitch Np with zeroed extra columns and the stores clip at
     // N.  It used to fall back to gemm_flt: 41 ms per Qwen prefill.
@@ -3062,6 +3074,10 @@ size_t gemm_fast_predq_elems(const QuantWeight& w) {
 
 sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_bf16* wdq,
                                      const std::vector<sycl::event>& deps) {
+#ifdef GRIMOIRE_WITH_ONEDNN
+    // oneDNN reads W as stored (launch_gemm_fast_predq below), so nothing to decode.
+    if (onednn_gemm_ok(w, 1)) return q.ext_oneapi_submit_barrier(deps);
+#endif
     const int Np = (w.N + NC2 - 1) / NC2 * NC2;
     if (Np != w.N) {
         const sycl::event e = q.memset(wdq, 0, size_t(Np) * w.K * sizeof(sycl_bf16), deps);
@@ -3073,6 +3089,9 @@ sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_
 sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
                                    const sycl_bf16* x, float* y, int M,
                                    const std::vector<sycl::event>& deps) {
+#ifdef GRIMOIRE_WITH_ONEDNN
+    if (onednn_gemm_ok(w, M)) return onednn_gemm(q, w, x, y, M, false, deps);
+#endif
     const int Np = (w.N + NC2 - 1) / NC2 * NC2;
     return gemm_bf16_vnni<0>(q, x, wdq, y, M, w.N, w.K, deps, Np);
 }

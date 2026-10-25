@@ -16,12 +16,22 @@ for t in "${TLIST[@]}"; do
   GRF+=("-Xsycl-target-backend=$t" "-options \"-cl-intel-256-GRF-per-thread -doubleGRF\"")
   DGRF+=("-Xsycl-target-backend=$t" "-options -doubleGRF")
 done
+# Optional Intel oneDNN for the prompt GEMMs: same rule as
+# tools/build_grimoire_only_b70.sh (both scripts rebuild bin/libgrimoire_gemm.so).
+ONEDNN="${GRIM_ONEDNN:-third_party/onednn}"
+DNNL=()
+if [ -f "$ONEDNN/include/dnnl.hpp" ]; then
+  DNNL=(-DGRIMOIRE_WITH_ONEDNN -I "$ONEDNN/include" src/onednn_gemm.cpp -L "$ONEDNN/lib" -ldnnl)
+  cp -P "$ONEDNN"/lib/libdnnl.so* bin/
+  echo "oneDNN: $ONEDNN"
+fi
 # The large-M prompt GEMM lives in its own library so it alone gets 256
 # registers (see src/gemm_fast.cpp); rebuild it with the engine. Both options
 # are required: cl-256 for joint_matrix, doubleGRF for ESIMD flash prefill.
 icpx -fsycl -fsycl-targets="$TARGETS" "${GRF[@]}" \
   -O3 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
-  -fPIC -shared -I include -I src src/gemm_fast.cpp -o bin/libgrimoire_gemm.so
+  -fPIC -shared -I include -I src src/gemm_fast.cpp "${DNNL[@]}" '-Wl,-rpath,$ORIGIN' \
+  -o bin/libgrimoire_gemm.so
 # Speculative-verify attention: ESIMD kernels get the 256-register file only from
 # -doubleGRF (src/attn_verify_dpas.cpp), so it is its own library as well.
 icpx -fsycl -fsycl-targets="$TARGETS" "${DGRF[@]}" \
