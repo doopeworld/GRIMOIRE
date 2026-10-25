@@ -405,3 +405,60 @@ bench-1022/flash-next.hits.20261010), GRIMOIRE_POWER_LIMIT_W=0. No thread or chu
   top-k, tmoe gate_up/down, shared expert), then DeltaNet (5.2 ms per 18 layers, BF16 weights).
 - Tower idle at the end: no containers, both locks free, book server stopped. dual-1022 = 17c5d1f,
   main = c0aefd0.
+
+
+## 12. 2026-10-25: oneDNN, DFlash2 on two cards, Radiance (branch onednn-1025)
+
+Ian relayed two developer suggestions: (1) add oneDNN, (2) port Radiance (AMD) to Intel.
+
+### 12.1 oneDNN (tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md has every number)
+- oneDNN v3.13.4 built from source with our compiler (tools/bench/onednn/build_onednn.sh ->
+  /mnt/storage/isos/onednn, copied to third_party/onednn, gitignored). No PyTorch, no vLLM.
+- One B70: gemm_fast pays a dequantize pass (FP8 ~200 GB/s, BF16 re-layout ~255 GB/s) as long as
+  the GEMM at 512 rows; oneDNN decodes in the GEMM: FP8 512 x 34816 x 5120 4.09 -> 1.39 ms.
+- src/onednn_gemm.{hpp,cpp} (in libgrimoire_gemm.so), ON by default (GRIMOIRE_ONEDNN=0 off):
+  gemm_fast FP8-row / BF16, TP chunked FFN, the 2..16-row verify GEMMs (GRIMOIRE_SMALLM_ONEDNN=0
+  off), the DFlash2 drafter's projections and head. Kernel creation per new row class is paid by a
+  server warm-up at start (four one-token prompts, GRIMOIRE_SERVER_WARMUP=0 skips); the widest
+  weights (N >= 32768) at 512+ rows run in row pieces (1024/768/512/256 + padded tail). Run-time M
+  = ocl:ref:any, 700x slower: never.
+- regress_all_g0.sh (SUITE_ENV, moved checkpoints found under /models2): 40/44 texts identical to
+  10-10; Agnes / Flash-Next 5987-token prompts change wording (rounding, correct text); Muse x2
+  differ with oneDNN off too.
+
+### 12.2 Two cards, Qwen3.8-27B-FP8 (Megatron TP), code probe / llama-benchy
+| | code tok/s (tokens/step) | tg128 | pp2048 | pp4096 |
+|---|---:|---:|---:|---:|
+| plain, oneDNN off (morning) | 31.5 | 31.5 | 2,448 | 2,542 |
+| plain, oneDNN on | 31.4 | 31.4 | 2,647-2,705 | 2,639-2,667 |
+| MTP (10-24) | 77.4 (4.34) | 48.8 | 2,430 | 2,486 |
+| MTP now | 87.7 (4.46) | 59.2 / 64.2 | 2,728 | 2,637 |
+| DFlash2 now | **120.2 (6.42)** | **69.6** | 2,572 | - |
+DFlash2 under TP: tp_mega_refusal no longer refuses it; the drafter loads whole on BOTH ranks and
+drafts in lockstep (the load code always intended that). Answers identical to plain TP (codecmp).
+Step 52.8 ms: draft 9.0 (was 68: FP8 8-row projections through the batched GEMV, the head as 7
+GEMV over the WHOLE 1.27 GB lm_head -- Megatron does not shard it, tp_enabled() is legacy TP only --,
+16-row context chunks, one-pass block attention), verify 42.8 (was 48.5 before oneDNN small-M).
+
+### 12.3 Radiance (codeberg StillDeadcode/radiance, Apache-2.0; ~/grimoire-work/thirdparty/radiance-src)
+C++/HIP engine for AMD R9700 (RDNA4): core 128K lines, kernels (libr4d) 66K lines HIP gfx12xx only.
+2x R9700 (P2P): Qwen3.8-27B MXFP4 222 tok/s greedy with DFlash2 x7; Flash-Next c1 177 tok/s
+(TP2 + MTP 3, ~15 ms per step). Porting means its DESIGN, not its kernels:
+- done today: DFlash2 x7 under TP (above);
+- next: Flash-Next TP -- router replicated, each rank half of EVERY expert's width (no all-to-all),
+  DeltaNet / attention heads split, hyper-connections + PLE + QSA indexer replicated, one
+  all-reduce after the mixer and one after the MoE. Blockers to solve: NvExpertLayout requires
+  I % 128 == 0 and 640 / 2 = 320 (Radiance: 384 / 256 by expert parity); the PLE table (51 GB) must
+  not be copied twice into one host (rank 0 computes the PLE row and sends the 10240-float update);
+  tiered experts + CPU experts per rank at half width.
+- later: 8-bit trunk for Flash-Next (its BF16 trunk is ~6.6 GB read per token), MTP for Flash-Next.
+
+### 12.4 Next steps
+1. Verify: 42.8 ms per 8-row step vs 32 ms per plain token (all-reduce latency per block, the
+   attention / DeltaNet parts of a verify).
+2. Release image with oneDNN (Dockerfile builder stage builds oneDNN; libdnnl.so + Apache-2.0
+   license in the runtime stage). A test image grimoire-b70:v1.10-dev (v1.9.0 runtime + this
+   branch's binaries) is for Ian's Unraid containers.
+3. Template advice (Ian edits): two-card Qwen3.8 DFlash2 = GRIMOIRE_MTP=0,
+   GRIMOIRE_DFLASH_MODEL=<Qwen3.8-27B-DFlash2 dir>.
+4. Flash-Next TP (12.3).
