@@ -4049,6 +4049,13 @@ void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
         tp_scratch_elems=tp_scratch?local_elems:0;
         if(!tp_scratch) throw std::bad_alloc();
     }
+    // GRIMOIRE_TP_GEMM_TIME=1: fenced local GEMM / exchange / upload times of the first calls.
+    static const bool tg_on=std::getenv("GRIMOIRE_TP_GEMM_TIME")!=nullptr;
+    static int tg_calls=0;
+    const bool tg=tg_on&&tg_calls<48;
+    auto tg_now=[]{ return std::chrono::steady_clock::now(); };
+    std::chrono::steady_clock::time_point tg0,tg1,tg2;
+    if(tg){ q.wait(); tg0=tg_now(); }
     if(N>0) {
         if(w.has_i4())
             launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,tp_scratch,N,K,rows,{});
@@ -4076,6 +4083,7 @@ void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
     }
     float* assembled=pipe_host;                  // [rows][width]
     float* mine=pipe_host+full;                  // [rows][N]
+    if(tg){ q.wait(); tg1=tg_now(); }
     if(N>0) q.memcpy(mine,tp_scratch,size_t(rows)*N*sizeof(float));
     q.wait_and_throw();
     auto place=[&](const float* block,int r) {
@@ -4101,7 +4109,16 @@ void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
            fd_read_all(fd,assembled,full*sizeof(float));
     }
     if(!ok) throw std::runtime_error("TP batched projection all-gather failed");
+    if(tg) tg2=tg_now();
     q.memcpy(y,assembled,full*sizeof(float)).wait();
+    if(tg){
+        const auto tg3=tg_now();
+        auto ms=[](auto a,auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
+        std::fprintf(stderr,"  gemm_tp call %d: rows %d width %d local %d (%s): GEMM %.3f  "
+                     "D2H+exchange %.3f  H2D %.3f ms\n",tg_calls,rows,width,N,
+                     onednn_gemm_ok(w.w,rows)?"oneDNN":"own",ms(tg0,tg1),ms(tg1,tg2),ms(tg2,tg3));
+        ++tg_calls;
+    }
 }
 
 bool Grimoire::tp_allgather(float* dev, int elems, int begin, int count) {
@@ -13100,8 +13117,16 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         // two cards (MEASURED 2026-10-25); gemm_tp does the same with ONE
         // local GEMM over the draft rows and ONE exchange.  Every rank drafts
         // in lockstep, so every rank makes this call.
-        if(lm_head.row_begin==(cfg.vocab*tp_rank)/tp_world &&
-           lm_head.output_rows()==cfg.vocab)
+        const bool batched=lm_head.row_begin==(cfg.vocab*tp_rank)/tp_world &&
+                           lm_head.output_rows()==cfg.vocab;
+        if(time_draft){
+            static bool said=false;
+            if(!said){said=true;std::fprintf(stderr,
+                "  DFlash TP head: %s (row_begin %d, rows %d of %d, vocab %d)\n",
+                batched?"gemm_tp":"per-row gemv_any",lm_head.row_begin,lm_head.w.N,
+                lm_head.output_rows(),cfg.vocab);}
+        }
+        if(batched)
             gemm_tp(lm_head,dflash2.normed+H,dflash2.logits,M-1);
         else for(int r=1;r<M;++r)
             gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
@@ -13114,6 +13139,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else if(lm_head.w.fmt==Fmt::MXFP4&&lm_head.w.payload){
         // Project all draft rows together.  The old per-row GEMV streamed the
         // full vocabulary matrix fifteen times per speculative step.
+        mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
+    }else if(!lm_head.tp_sharded()&&onednn_gemm_ok(lm_head.w,M-1)){
+        // The same for an FP8 / BF16 head (Megatron TP keeps the whole head on
+        // every rank): mm takes oneDNN at these rows, one read of the matrix.
+        // Per-row GEMV read the 1.27 GB FP8 head seven times: 14.9 of a 28 ms
+        // DFlash2 step on two cards (MEASURED 2026-10-25).
         mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
     }else for(int r=1;r<M;++r)
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
