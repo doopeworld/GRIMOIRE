@@ -83,6 +83,7 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire \
     --device "/dev/dri/$NODE" \
     "${MOUNTS[@]}" \
     -v /mnt/storage/Models:/models \
+    -v /mnt/models:/models2:ro \
     "${ENVARGS[@]}" \
     --entrypoint /usr/bin/timeout \
     "$IMAGE" \

@@ -182,17 +182,17 @@ int main(int argc, char** argv) {
         b70::grimoire_pp_worker_loop(*e);
         return 0;
     }
-    // GRIMOIRE_ONEDNN=1 compiles oneDNN kernels the first time a weight meets a
-    // new row class (src/onednn_gemm.cpp): the first request after a start paid
-    // ~0.45 s for it (MEASURED 2026-10-25, Qwen3.8-27B-FP8 on two cards, code
-    // probe TTFT 1.42 vs 0.97 s off).  Pay it here, before any client: a few
-    // prompts of different lengths, one token each, through the same path a
-    // request takes (TP / PP workers follow it like any request).
+    // oneDNN (on unless GRIMOIRE_ONEDNN=0) compiles its kernels the first time a
+    // weight meets a new row class (src/onednn_gemm.cpp): the first request
+    // after a start paid ~0.45 s for it (MEASURED 2026-10-25, Qwen3.8-27B-FP8 on
+    // two cards, code probe TTFT 1.42 vs 0.97 s off).  Pay it here, before any
+    // client: a few prompts of different lengths, one token each, through the
+    // same path a request takes (TP / PP workers follow it like any request).
     // GRIMOIRE_SERVER_WARMUP=0 skips it.
     {
         const char* od = std::getenv("GRIMOIRE_ONEDNN");
         const char* wu = std::getenv("GRIMOIRE_SERVER_WARMUP");
-        if (od && std::atoi(od) != 0 && !(wu && *wu == '0')) {
+        if (!(od && *od && std::atoi(od) == 0) && !(wu && *wu == '0')) {
             const auto t0 = std::chrono::steady_clock::now();
             const std::vector<int32_t> unit =
                 tk.encode("The quick brown fox jumps over the lazy dog while the band plays. ");

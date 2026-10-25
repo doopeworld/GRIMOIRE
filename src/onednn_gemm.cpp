@@ -71,10 +71,13 @@ constexpr int kPieces[] = {1024, 768, 512, 256};
 constexpr int kTails[]  = {64, 128, 256};
 constexpr int kWideN = 32768, kPieceMinM = 512;
 
+// On by default since 2026-10-25 (two cards, Qwen3.8-27B-FP8: prefill +5-26%, decode and
+// answers unchanged; regress_all_g0.sh 40/44 texts identical, the other four a rounding
+// change on 5987-token prompts or not oneDNN's).  GRIMOIRE_ONEDNN=0 turns it off.
 bool enabled() {
     static const bool on = [] {
         const char* v = std::getenv("GRIMOIRE_ONEDNN");
-        return v && std::atoi(v) != 0;
+        return !(v && *v && std::atoi(v) == 0);
     }();
     return on;
 }

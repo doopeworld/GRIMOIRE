@@ -4061,7 +4061,10 @@ void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
                 if(!tp_act) throw std::bad_alloc();
             }
             launch_f32_to_bf16(q,x,tp_act,act_elems,{});
-            launch_gemm_xmx(q,w.w,tp_act,tp_scratch,rows);
+            // oneDNN at any row count for FP8 / BF16 shards: launch_gemm_xmx
+            // falls to gemm_flt below 32 rows (a verify or draft block).
+            if(onednn_gemm_ok(w.w,rows)) onednn_gemm(q,w.w,tp_act,tp_scratch,rows,false);
+            else launch_gemm_xmx(q,w.w,tp_act,tp_scratch,rows);
         } else launch_gemm_batched(q,w.w,x,tp_scratch,rows);
     }
     const size_t full=size_t(rows)*size_t(width);
@@ -4313,9 +4316,12 @@ std::string Grimoire::tp_mega_refusal() const {
     if((cfg.n_heads/W*cfg.head_dim)%128)return "o_proj K slice is not a multiple of 128";
     if(cfg.lin_v_heads>0&&(cfg.lin_v_heads/W*cfg.lin_v_dim)%128)return "DeltaNet out_proj K slice is not a multiple of 128";
     if(cfg.dense_inter<=0||(cfg.dense_inter/W)%128||cfg.dense_inter%W)return "FFN width slice is not a multiple of 128";
-    const char* df=std::getenv("GRIMOIRE_DFLASH_MODEL");
-    const char* df2=std::getenv("GRIMOIRE_DFLASH2_MODEL");
-    if((df&&*df)||(df2&&*df2))return "DFlash drafter";
+    // A DFlash drafter is allowed: it is loaded whole on every rank and every
+    // rank drafts in lockstep (see the DFlash sidecar block in load).  The
+    // residual stream -- and so every tap -- is whole on every rank after each
+    // block's all-reduce, and the one sharded thing the drafter reads, the
+    // target's lm_head, goes through gemv_any's all-gather, which every rank
+    // calls together.
     return "";
 }
 
@@ -7612,13 +7618,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             const int DKV=dflash2.kv_heads*dflash2.head_dim;
             const int DI2=2*dflash2.inter;
             auto dfd=[&](size_t n){db+=n*sizeof(float);return sycl::malloc_device<float>(n,q);};
-            // Muse's context projection is independent of the 16-token draft
-            // query block. A wider batch avoids thousands of tiny launches.
-            // Non-Muse keeps DM because it also uses fixed-size q/k/v scratch.
-            dflash2.ctx_chunk=DM;
-            if(cfg.is_muse){
+            // The context projection is independent of the 16-token draft
+            // query block, so the prompt is ingested a wide chunk at a time.
+            // Non-Muse used to keep DM = 16 rows: a 2153-token prompt was 135
+            // chunks of FP8 GEMV, each re-reading fc (131 MB) and every layer's
+            // k / v -- 1,226 ms of context preparation on two cards, TTFT 2.07 s
+            // against 0.85 plain (MEASURED 2026-10-25, Qwen3.8-27B-FP8 TP +
+            // DFlash2).  512 rows run those GEMMs on the prompt path (gemm_fast,
+            // oneDNN); the q / k / v scratch below is sized for the chunk.
+            {
                 const char* v=std::getenv("GRIMOIRE_DFLASH_CTX_CHUNK");
-                int c=v&&*v?std::atoi(v):256;
+                int c=v&&*v?std::atoi(v):(cfg.is_muse?256:512);
                 if(c<DM)c=DM;
                 if(c>4096)c=4096;
                 dflash2.ctx_chunk=c;
@@ -7642,9 +7652,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             dflash2.h=dfd(size_t(DM)*dflash2.inter);
             dflash2.resid=dfd(size_t(DM)*DH);
             dflash2.normed=dfd(size_t(DMC)*DH);
-            dflash2.q=dfd(size_t(DM)*DQ);
-            dflash2.k=dfd(size_t(DM)*DKV);
-            dflash2.v=dfd(size_t(DM)*DKV);
+            // the context ingest's q / k / v run a whole chunk of rows
+            dflash2.q=dfd(size_t(DMC)*DQ);
+            dflash2.k=dfd(size_t(DMC)*DKV);
+            dflash2.v=dfd(size_t(DMC)*DKV);
             dflash2.attn=dfd(size_t(DM)*DQ);
             dflash2.proj=dfd(size_t(DM)*DH);
             dflash2.gate_up=dfd(size_t(DM)*DI2);
@@ -12724,6 +12735,16 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 return;
             }
         }
+        // FP8 / BF16 weights at draft-block rows: oneDNN reads each weight
+        // once at memory speed (34816 x 5120 FP8 at 8 rows: 0.31 ms).  The
+        // batched GEMV below re-reads it per 4 rows and decodes FP8 slowly:
+        // 33 of a 68 ms DFlash2 step on two cards was gate_up + down
+        // (MEASURED 2026-10-25, Qwen3.8-27B-FP8 TP, GRIMOIRE_DFLASH_TIME=1).
+        if(!dense && rows<=16 && !w.has_i4() && onednn_gemm_ok(w.w,rows)){
+            launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
+            onednn_gemm(q,w.w,dflash2.bf,y,rows,false);
+            return;
+        }
         if(!dense && rows<=16 && w.w.payload && !w.has_i4() &&
            !std::getenv("GRIMOIRE_DFLASH_DRAFT_XMX")){
             launch_gemv_batch(q,w.w,x,y,rows,{});
@@ -13074,10 +13095,15 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         // fraction of the vocabulary -- every rank then drafts a different
         // token, the ranks' KV caches stop describing the same sequence, and
         // nothing reports an error.  gemv_any is the one path that knows to
-        // compute the local rows and all-gather them, so take it.  It costs
-        // M-1 <= 15 row projections per step; correctness first, and the
-        // batched sharded head is a measurement to make on the card.
-        for(int r=1;r<M;++r)
+        // compute the local rows and all-gather them, so take it.  It cost
+        // M-1 GEMV + all-gather round trips, 14.9 of a 68 ms DFlash2 step on
+        // two cards (MEASURED 2026-10-25); gemm_tp does the same with ONE
+        // local GEMM over the draft rows and ONE exchange.  Every rank drafts
+        // in lockstep, so every rank makes this call.
+        if(lm_head.row_begin==(cfg.vocab*tp_rank)/tp_world &&
+           lm_head.output_rows()==cfg.vocab)
+            gemm_tp(lm_head,dflash2.normed+H,dflash2.logits,M-1);
+        else for(int r=1;r<M;++r)
             gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                      dflash2.logits+int64_t(r-1)*cfg.vocab,{});
     }else if(lm_head.has_i4()&&w4){

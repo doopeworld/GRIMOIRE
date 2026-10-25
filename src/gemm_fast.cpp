@@ -3002,8 +3002,8 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
         return e;
     }
 #ifdef GRIMOIRE_WITH_ONEDNN
-    // GRIMOIRE_ONEDNN=1: oneDNN decodes FP8 / BF16 weights inside its GEMM,
-    // so there is no dequantize pass (onednn_gemm.hpp has the measurements).
+    // oneDNN (on unless GRIMOIRE_ONEDNN=0) decodes FP8 / BF16 weights inside
+    // its GEMM, so there is no dequantize pass (onednn_gemm.hpp has the numbers).
     if (EPI != 1 && onednn_gemm_ok(w, M)) {
         sycl::event e = onednn_gemm(q, w, x, static_cast<float*>(out), M, EPI == 2, deps);
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
@@ -3095,6 +3095,15 @@ sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const s
     const int Np = (w.N + NC2 - 1) / NC2 * NC2;
     return gemm_bf16_vnni<0>(q, x, wdq, y, M, w.N, w.K, deps, Np);
 }
+
+#ifndef GRIMOIRE_WITH_ONEDNN
+// Built without third_party/onednn: nothing routes to oneDNN (kernels.hpp).
+bool onednn_gemm_ok(const QuantWeight&, int) { return false; }
+sycl::event onednn_gemm(sycl::queue&, const QuantWeight&, const sycl_bf16*, float*, int, bool,
+                        const std::vector<sycl::event>&) {
+    throw std::runtime_error("onednn_gemm: libgrimoire_gemm.so was built without oneDNN");
+}
+#endif
 
 // One tiered NVFP4 expert's whole FFN for its M rows, the block read only
 // by the first three launches:

@@ -9,9 +9,16 @@ OUT=/mnt/storage/isos/grimoire-runs/regress-$(date +%m%d-%H%M); mkdir -p "$OUT";
 SHORT="Explain in two sentences why the sky is blue."
 STORY="Write a detailed story about a lighthouse keeper."
 LONG="$(cat real4k_ascii.txt)"
+# Checkpoints moved to the new disk (/mnt/models, mounted at /models2 by b70run.sh since
+# 2026-10-22) are found there, by their top directory, in -m and in the env strings.
+MOVED=$(for d in /mnt/models/*/; do b=$(basename "$d"); [ -e "/mnt/storage/Models/$b" ] || echo "$b"; done)
+fixp() { local s=$1 b; for b in $MOVED; do s=$(printf '%s' "$s" | sed -E "s#/models/(${b//./\\.})(/|\$|[[:space:]])#/models2/\\1\\2#g"); done; printf '%s' "$s"; }
+# SUITE_ENV (newline-separated K=V) is added to every run's env, e.g. SUITE_ENV=GRIMOIRE_ONEDNN=1.
 run() { # name model proj n prompt [env]
   local nm=$1 m=$2 pr=$3 n=$4 p=$5 ex=${6:-} r
-  r=$(EXTRA_ENV="$ex" LIM=900 bash tools/g0run.sh rx-$nm -m /models/$m --proj $pr --ctx 8192 -p "$p" -n $n) \
+  ex=$(fixp "$ex${SUITE_ENV:+
+$SUITE_ENV}")
+  r=$(EXTRA_ENV="$ex" LIM=900 bash tools/g0run.sh rx-$nm -m "$(fixp "/models/$m")" --proj $pr --ctx 8192 -p "$p" -n $n) \
     || { echo "STOP: gpu0 guard tripped (or run failed) at $nm: $r"; cp /tmp/grim-rx-$nm.log "$OUT/$nm.log" 2>/dev/null; exit 9; }
   cp /tmp/grim-rx-$nm.log "$OUT/$nm.log"
   echo "  $nm: ${r:-NO RESULT LINE}"

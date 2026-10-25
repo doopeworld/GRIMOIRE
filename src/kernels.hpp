@@ -245,6 +245,12 @@ sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_
 sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
                                    const sycl_bf16* x, float* y, int M,
                                    const std::vector<sycl::event>& deps = {});
+// Intel oneDNN matmul, y = x W^T (or += with accumulate) for FP8 row-scaled and BF16 weights
+// at any row count (src/onednn_gemm.cpp, in libgrimoire_gemm.so).  onednn_gemm_ok is false
+// when the library was built without third_party/onednn or under GRIMOIRE_ONEDNN=0.
+bool onednn_gemm_ok(const QuantWeight& w, int M);
+sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
+                        int M, bool accumulate, const std::vector<sycl::event>& deps = {});
 // Matrix-unit causal prefill attention (src/gemm_fast.cpp);
 // launch_flash_prefill() takes it whenever the geometry fits.
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads);
