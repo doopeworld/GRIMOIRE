@@ -533,3 +533,29 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - Containers: all ten verified (bench-1003/ctest_rest.sh, 10-26), see 12.6.
 - Each B70 exposes 1 compute + 1 copy engine (zeq); CPU -> BAR ~5.5 GB/s on gpu1 = the 64-byte
   TLP efficiency cap of a Gen4 x4 link.
+
+### 12.8 2026-10-26 afternoon: fused passes, chunk 1024, ESIMD flash on the TP rank, image v1.10-dev2
+- Wavefront fused passes (84886bc): pp4096 3,074 -> 3,269 (same session), answers identical.
+- Region budget, compute alone, 768-row chunks (GRIMOIRE_TP_WAVE_TIME=1 + NOAR): FFN gate_up 360
+  ms, down 187, flash 105, DN qkv 90 / out 65 / z 57, SwiGLU 57, norms 50 + 49 (total 1,181).
+- Chunk 1024 from 3,584 rows + ESIMD flash prefill for the 12/2-head TP rank (211f5dc): pp2048 /
+  4096 / 8192 3,418 / 3,233 / 3,078 -> 3,460 / 3,356 / 3,263, answers identical.
+- Image grimoire-b70:v1.10-dev2 (v1.9.0 runtime + 211f5dc binaries); all ten Unraid containers
+  recreated on it and verified (bench-1003/ctest_all.sh, 18:5x): all answer, speeds as before.
+- Speed table, llama-benchy c1 --runs 2, every container's own settings
+  (tools/bench/onednn/speed_table_1026.sh):
+| model | cards | pp2048 | pp4096 | tg128 @2048 | tg128 @4096 |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-27B-FP8 plain (TP) | 2 | 3,464 | 3,538 | 31.9 | 31.4 |
+| Qwen3.8-27B-FP8 + MTP | 2 | 3,432 | 3,540 | 48.7 | 55.0 |
+| Qwen3.8-27B-FP8 + DFlash2 | 2 | 3,417 | 3,492 | 67.5 | 64.8 |
+| Ornith-1.5-FP8 (PP 20/20, 8 slots) | 2 | 6,788 | 9,164 | 107.6 | 103.0 |
+| Flash-Next NVFP4 (PP 24/24, 360/layer) | 2 | 905 | 1,150 | 25.2 | 24.4 |
+| Ornith-1.5 MXFP4 (8 slots) | 1 | 7,983 | 8,842 | 182.6 | 172.1 |
+| Qwen3.8-27B GPTQ int4 + MTP 4 | 1 | 1,999 | 2,018 | 69.8 | 65.3 |
+| Flash-Next NVFP4 (112/layer) | 1 | 478 | 752 | 21.7 | 22.1 |
+  The same two-card plain pp4096 measured 3,356 earlier today: ~5% between sessions.
+- gpu1 link: card->host corrected errors come in bursts while IDLE (+5,297 by 17:24, +256 by
+  18:37), +0 in runs; one guard stop at 17:49 (5 in 10 s). host->card ~1.5/s idle. 0 uncorrectable.
+- Release Dockerfile prepared (scratchpad): oneDNN v3.13.4 built in the builder stage (SYCL GPU
+  only, no graph / tests), libdnnl.so + LICENSE / THIRD-PARTY-PROGRAMS in the runtime stage.
