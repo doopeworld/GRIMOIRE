@@ -511,3 +511,25 @@ xmlToCommand, label net.unraid.docker.managed=dockerman), stopped, image grimoir
 | GRIMOIRE-ORNITH | ready 43 s, Paris, 200.5 tok/s, AER unchanged |
 | GRIMOIRE-QWEN3.8 | ready 73 s, Paris, 73.0 tok/s, AER unchanged |
 | the other eight | NOT tested: Ian stopped the work ("pause") -- test them with bench-1003/ctest2.sh NAME PORT [dual] |
+
+### 12.7 2026-10-26: small all-reduce through the BAR, wavefront TP prompt (lossless)
+Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 tokens):
+| | pp2048 | pp4096 | TTFT | code decode | answers |
+|---|---:|---:|---:|---:|---|
+| per-layer path (GRIMOIRE_TP_WAVE=0 GRIMOIRE_TP_PUMP=0) | 2,695 | 2,671 | 0.84 s | 31.5 | reference |
+| **wavefront (default)** | **3,399** | **3,114** | **0.67 s** | 31.5 | identical |
+| wavefront + int8 payload (GRIMOIRE_TP_AR_INT8=1, LOSSY, opt-in) | 3,516 | 3,239 | 0.63 s | 31.6 | identical |
+| int8 payload, no wavefront | 3,158 | 3,259 | 0.71 s | 31.8 | identical |
+| DFlash2 + wavefront | - | - | 0.69 s | 125.8-128.5 (6.55/step) | identical |
+| MTP + wavefront | 3,276 | 3,172 | 0.69 s | 88.8-88.9 (4.40/step), tg128 57.4 | identical |
+- Small all-reduce (f85bd90): plain round trip at 8 rows = gpu1 d2h 28.3 + CPU copy 9.4 + sum 14.2
+  + h2d 32.9 us; now pieces + CPU sum into own VRAM through the BAR: ~72 us; DFlash2 verify
+  43.0 -> 40.8 ms (code 120 -> 125 tok/s). 1-row decode unchanged (~33 us, latency-bound).
+- Wavefront (why): TIME_LAYER at 4,097 rows = mixer ~6.9 ms per layer with the link idle + FFN
+  phase ~18.4 ms bound by gpu1's x4 link (84 MB each way per layer). Now every layer runs in the
+  FFN's 768-row chunks; layer L+1 chunk c starts when layer L's FFN all-reduce of those rows is in.
+  tp_stream_pump() keeps later pieces leaving while a wait spins. pp4096 is still 21 ms per layer
+  (ideal ~16): next look at the attention chunks and the stream buffering.
+- Containers: all ten verified (bench-1003/ctest_rest.sh, 10-26), see 12.6.
+- Each B70 exposes 1 compute + 1 copy engine (zeq); CPU -> BAR ~5.5 GB/s on gpu1 = the 64-byte
+  TLP efficiency cap of a Gen4 x4 link.

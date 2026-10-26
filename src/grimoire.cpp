@@ -2280,6 +2280,7 @@ struct Grimoire {
     bool tp_stream_reserve(size_t rows);
     uint64_t tp_stream_push(float* dev, size_t elems, int region, size_t row0);
     void tp_stream_issue();
+    void tp_stream_pump();
     bool tp_stream_wait(uint64_t upto);
     bool tp_stream_drain();
     void tm_save_hits();
@@ -5070,6 +5071,35 @@ void Grimoire::tp_stream_issue(){
     }
 }
 
+// Receive-thread mode: send every queued piece whose device->host copy has finished, in
+// order, WITHOUT blocking -- my shared-RAM slot and my flag, the same steps as the send loop
+// of tp_stream_wait -- so the peer's receiver can take pieces queued after the one this
+// rank is waiting for.  Without it a piece leaves only when a wait asks for it.
+void Grimoire::tp_stream_pump(){
+    if(!tshm.s_rxt)return;
+    const int peer=1-tp_rank;
+    const size_t P=tshm.pipe_piece; const uint64_t D=uint64_t(tshm.pipe_slots), RO=uint64_t(tshm.s_rout);
+    const bool q8=tshm.pipe_q8;
+    auto pflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+2048+64*size_t(r));};
+    auto cflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+3072+64*size_t(r));};
+    auto pslot=[&](int r,uint64_t s){return tshm.base+tshm.pipe_off+(size_t(r)*size_t(D)+size_t(s%D))*P*sizeof(float);};
+    while(tshm.s_sent<tshm.s_d2h){
+        const uint64_t g=tshm.s_sent;
+        const auto& j=*std::find_if(tshm.sjobs.begin(),tshm.sjobs.end(),[&](const TpShm::StreamJob& x){
+            return g<x.g0+x.np;});
+        const size_t p=size_t(g-j.g0), n=std::min(P,j.elems-p*P), nb=q8?n+n/8:n*2, o=size_t(g%RO);
+        const uint64_t s=j.s0+p;
+        if(tshm.s_ev_d2h[o].get_info<sycl::info::event::command_execution_status>()!=
+           sycl::info::event_command_status::complete)break;
+        if(s>D&&cflag(peer)->load(std::memory_order_acquire)<s-D)break;
+        tshm.pool.copy(pslot(tp_rank,s),tshm.s_out+o*P*2,nb);
+        pflag(tp_rank)->store(s,std::memory_order_release);
+        tshm.pseq=s;
+        ++tshm.s_sent;
+        tp_stream_issue();
+    }
+}
+
 // Finish every piece with global id below `upto`, in order: my piece to my
 // shared-RAM slot, the peer's into my pinned ring, the add on q -- exactly
 // tp_pipe_allreduce's steps, so the same bits.
@@ -5114,7 +5144,15 @@ bool Grimoire::tp_stream_wait(uint64_t upto){
             ++tshm.s_sent;
             tp_stream_issue();
         }
-        if(!spin([&]{return tshm.s_added.load(std::memory_order_acquire)>=upto;},"its receive thread"))
+        // meanwhile keep later pieces leaving (tp_stream_pump), so the link is not idle
+        // while this rank waits for an earlier one.  GRIMOIRE_TP_PUMP=0 = only on request.
+        static const bool pump=[]{const char* e=std::getenv("GRIMOIRE_TP_PUMP");return !(e&&*e=='0');}();
+        uint32_t pk=0;
+        if(!spin([&]{
+                if(tshm.s_added.load(std::memory_order_acquire)>=upto)return true;
+                if(pump&&(++pk&63)==0)tp_stream_pump();
+                return false;
+            },"its receive thread"))
             return false;
         tshm.s_done=std::max(tshm.s_done,upto);
         while(!tshm.sjobs.empty()&&tshm.sjobs.front().g0+tshm.sjobs.front().np<=tshm.s_done)tshm.sjobs.pop_front();
@@ -16506,7 +16544,163 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // (launch_gemm_fast_residual) and set this, so the next norm does not
     // re-add r0 or rewrite bh -- same fp32 addition, one less pass over bh.
     bool r0_in_h=false;
-    for(int li=prefill_layer_begin;li<prefill_layer_limit;++li){
+    // WAVEFRONT TP PROMPT (two ranks, Megatron, dense FP8 / BF16 FFN, pure mode, one sequence).
+    // The per-layer path below runs a layer's attention / DeltaNet over every row, then waits
+    // for the whole block's all-reduce before the FFN can start, and the next layer waits for
+    // the whole FFN all-reduce.  MEASURED 10-26, Qwen3.8-27B-FP8, 4,097 rows: ~24 ms per layer
+    // = mixer ~6.9 ms with the link idle + FFN phase ~18.4 ms bound by gpu1's x4 link (84 MB
+    // each way per layer).  Here every layer runs in the FFN's row chunks: mixer chunk c
+    // pushes its partials while chunk c+1 computes, FFN chunk c waits only for its own rows,
+    // and layer L+1's chunk c starts as soon as layer L's FFN all-reduce of THOSE rows is in
+    // -- so the link carries one chunk while the card computes the next.  Each chunk is what
+    // a chunked prompt (a second prefill call at pos + a) computes: the same kernels, the
+    // DeltaNet / conv state and the KV cache carried from chunk to chunk.
+    // GRIMOIRE_TP_WAVE=0 = the per-layer path.
+    static const bool tp_wave_env=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE");return !(e&&*e=='0');}();
+    bool tp_wave=tp_wave_env&&tp_mega&&tp_world==2&&tp_ffn_chunk>0&&tshm.s_rxt&&!pp_enabled()&&
+        !seqb&&!spans_mode&&!next_tokens&&!capture_spec&&!capture_rows_hidden&&!exact_verify&&
+        !host_time&&!trace_prefill&&!host_regions&&!prefill_graph&&!prefill_host_progress&&
+        !defer_moe_gather&&!dense_pure&&!norm_bf_only&&!parallel_prefill&&!g_bestla_ready&&
+        !xe2_attention&&!xe2_gdn&&!xe2_gdn_raw&&!xe2_dense_mxfp4&&!xe2_dense_mxfp4_f32&&
+        !std::getenv("GRIMOIRE_BF16_QKV")&&!std::getenv("GRIMOIRE_BF16_DN_QKV")&&
+        prefill_layer_begin==0&&prefill_layer_limit==cfg.n_layers&&M>=2*tp_ffn_chunk+256&&
+        tshm.sjobs.empty();
+    size_t wave_ngu=0, wave_ndn=0;
+    for(int li=0;tp_wave&&li<cfg.n_layers;++li){
+        const LayerDev& d=L[size_t(li)];
+        wave_ngu=std::max(wave_ngu,gemm_fast_predq_elems(d.sh_gu.w));
+        wave_ndn=std::max(wave_ndn,gemm_fast_predq_elems(d.sh_down.w));
+        const int FIc=d.sh_gu.output_rows()/2;
+        const bool ffn_ok=!d.moe_layer&&d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+            !d.sh_gu.has_i4()&&!d.sh_down.has_i4()&&!(a8&&a8s&&xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4)&&
+            d.sh_gu.w.N==2*FIc&&d.sh_down.w.K==FIc&&d.sh_down.w.N==H&&
+            !gemm_fast_swiglu_supported(d.sh_gu.w,M)&&
+            gemm_fast_predq_supported(d.sh_gu.w,M)&&gemm_fast_predq_supported(d.sh_down.w,M);
+        bool mix_ok;
+        if(d.kind==LayerKind::LINEAR_ATTN)
+            mix_ok=!(d.la_all.payload&&d.la_all.w.N==12352)&&!d.la_qkv.has_i4()&&!d.la_ab.has_i4()&&
+                !d.la_z.has_i4()&&!d.la_out.has_i4();
+        else
+            mix_ok=!d.k2_sparse&&!d.rope_proportional&&d.o_gate.output_rows()==0&&
+                (d.q_proj.output_rows()==2*cfg.n_heads*d.head_dim||d.q_proj.output_rows()==cfg.n_heads*d.head_dim)&&
+                !d.q_proj.has_i4()&&!d.k_proj.has_i4()&&!d.v_proj.has_i4()&&!d.o_proj.has_i4();
+        tp_wave=ffn_ok&&mix_ok;
+    }
+    if(tp_wave){
+        const size_t ngu=wave_ngu, ndn=wave_ndn;
+        if(ngu>tp_wq_gu_cap){q.wait();if(tp_wq_gu)sycl::free(tp_wq_gu,q);
+            tp_wq_gu=sycl::malloc_device<sycl_bf16>(ngu,q);tp_wq_gu_cap=tp_wq_gu?ngu:0;}
+        if(ndn>tp_wq_dn_cap){q.wait();if(tp_wq_dn)sycl::free(tp_wq_dn,q);
+            tp_wq_dn=sycl::malloc_device<sycl_bf16>(ndn,q);tp_wq_dn_cap=tp_wq_dn?ndn:0;}
+        tp_wave=tp_wq_gu&&tp_wq_dn&&tp_stream_reserve(size_t(M));
+    }
+    if(tp_wave){
+        static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
+        const auto tw0=std::chrono::steady_clock::now();
+        const size_t Hs=size_t(H), P=tshm.pipe_piece;
+        // the FFN's row chunks ("no short tail", as the per-layer chunked FFN)
+        std::vector<int> c0, cn;
+        for(int a=0;a<M;){
+            int mc=std::min(tp_ffn_chunk,M-a);
+            if(M-a-mc<256)mc=M-a;
+            c0.push_back(a); cn.push_back(mc); a+=mc;
+        }
+        const size_t C=c0.size();
+        std::vector<uint64_t> attn_end(C,0), ffn_end(C,0);
+        auto push=[&](float* y,int a,int mc,int region){
+            const uint64_t g0=tp_stream_push(y,size_t(mc)*Hs,region,size_t(a));
+            tp_stream_pump();
+            return g0+(size_t(mc)*Hs+P-1)/P;
+        };
+        auto gemm=[&](const DevQuant& w,const sycl_bf16* x,float* y,int rows){
+            launch_gemm_xmx(q,w.w,x,y,rows);
+        };
+        auto gemm_f=[&](const DevQuant& w,const float* x,float* y,int rows){
+            launch_f32_to_bf16(q,x,xb,size_t(rows)*w.w.K);
+            launch_gemm_xmx(q,w.w,xb,y,rows);
+        };
+        for(int li=0;li<cfg.n_layers;++li){
+            power_gov_tick();
+            cur_layer=li;
+            LayerDev& d=L[size_t(li)];
+            for(size_t c=0;c<C;++c){
+                const int a=c0[c], mc=cn[c]; const size_t o=size_t(a)*Hs;
+                if(li>0&&!tp_stream_wait(ffn_end[c]))
+                    throw std::runtime_error("TP wavefront prompt: FFN all-reduce failed");
+                launch_rmsnorm_residual_batched(q,bh+o,r0+o,r1+o,d.in_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
+                if(dflash2.target_aux)
+                    for(size_t tap=0;tap<dflash2.target_layers.size();++tap)
+                        if(dflash2.target_layers[tap]+1==li){
+                            launch_dflash_store_tap(q,bh+o,dflash2.target_aux,mc,H,
+                                int(dflash2.target_layers.size()),start_pos+a,int(tap),{},cfg.is_muse);
+                            break;
+                        }
+                const sycl_bf16* xin=bn_bf+o;
+                if(d.kind==LayerKind::LINEAR_ATTN){
+                    const int qs=Hk*Dk, vs=Hv*Dv, ch=d.la_qkv.output_rows();
+                    gemm(d.la_qkv,xin,t0,mc);
+                    ConvParams cp{t0,d.la_conv,d.conv_ring,nullptr,ch,cfg.conv_kernel};
+                    launch_causal_conv1d_split_prefill(q,cp,mc,t1,t2,t3,nullptr,qs,vs);
+                    launch_l2norm_heads(q,t1,mc*Hk,Dk,{});
+                    launch_l2norm_heads(q,t2,mc*Hk,Dk,{});
+                    gemm(d.la_ab,xin,t0,mc);
+                    launch_deltanet_gates_batched(q,t0,d.la_Alog,d.la_dtb,alpha,beta,mc,Hv);
+                    DeltaNetPrefillParams dp{t1,t2,t3,alpha,beta,d.dn_state,t0,Hv,Dk,Dv,mc,Hk};
+                    launch_deltanet_prefill(q,dp);
+                    gemm(d.la_z,xin,t3,mc);
+                    launch_rmsnorm_gate_silu(q,t0,t3,d.la_norm,mc*Hv,Dv,cfg.rms_eps,{});
+                    gemm_f(d.la_out,t0,r0+o,mc);
+                }else{
+                    const bool gated=d.q_proj.output_rows()==2*cfg.n_heads*d.head_dim;
+                    const int pc=pos+a;
+                    gemm(d.q_proj,xin,t0,mc);
+                    float* qv=t0;
+                    if(gated){launch_split_qgate_batched(q,t0,t1,t2,mc,cfg.n_heads,d.head_dim);qv=t1;}
+                    gemm(d.k_proj,xin,t3,mc);
+                    gemm(d.v_proj,xin,t4,mc);
+                    launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,mc,cfg.n_heads,
+                        d.kv_heads,d.head_dim,pc,d.rope_theta,d.partial_rope,cfg.rms_eps);
+                    launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,mc,pc,d.kv_heads,
+                        d.head_dim,max_seq);
+                    launch_flash_prefill(q,qv,d.k_cache,d.v_cache,t3,mc,pc,cfg.n_heads,
+                        d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
+                    if(gated)launch_gate_sigmoid_mul(q,t3,t2,mc*cfg.n_heads*d.head_dim,{});
+                    gemm_f(d.o_proj,t3,r0+o,mc);
+                }
+                attn_end[c]=push(r0+o,a,mc,0);
+            }
+            const int FIc=d.sh_gu.output_rows()/2;
+            const size_t NG=size_t(d.sh_gu.w.N), FIs=size_t(FIc);
+            launch_gemm_fast_dequant(q,d.sh_gu.w,tp_wq_gu);
+            launch_gemm_fast_dequant(q,d.sh_down.w,tp_wq_dn);
+            for(size_t c=0;c<C;++c){
+                const int a=c0[c], mc=cn[c]; const size_t o=size_t(a)*Hs;
+                if(!tp_stream_wait(attn_end[c]))
+                    throw std::runtime_error("TP wavefront prompt: attention all-reduce failed");
+                launch_rmsnorm_residual_batched(q,bh+o,r0+o,nullptr,d.post_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
+                launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o,t0+size_t(a)*NG,mc);
+                launch_swiglu_batched(q,t0+size_t(a)*NG,t1+size_t(a)*FIs,mc,FIc);
+                launch_f32_to_bf16(q,t1+size_t(a)*FIs,xb+size_t(a)*FIs,size_t(mc)*FIs);
+                launch_gemm_fast_predq(q,d.sh_down.w,tp_wq_dn,xb+size_t(a)*FIs,r0+o,mc);
+                ffn_end[c]=push(r0+o,a,mc,1);
+            }
+        }
+        if(!tp_stream_drain())
+            throw std::runtime_error("TP wavefront prompt: FFN all-reduce failed");
+        r0_in_h=false;
+        a8_cached_src=nullptr;
+        a8_cached_bf=nullptr;
+        if(timing){
+            static double w_ms=0; static uint64_t w_n=0;
+            w_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count();
+            ++w_n;
+            std::printf("  TP wavefront prompt rank %d: %d rows in %zu chunks, %.1f ms (mean of %llu prompts %.1f)\n",
+                tp_rank,M,C,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count(),
+                (unsigned long long)w_n,w_ms/double(w_n));
+            std::fflush(stdout);
+        }
+    }
+    for(int li=tp_wave?prefill_layer_limit:prefill_layer_begin;li<prefill_layer_limit;++li){
         power_gov_tick();
         a8_cached_src=nullptr;
         a8_cached_bf=nullptr;

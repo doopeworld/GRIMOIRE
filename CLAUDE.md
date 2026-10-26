@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-26: two cards Qwen3.8-27B-FP8 TP pp2048 2,695 -> 3,399, pp4096 2,671 -> 3,114 (wavefront prompt, lossless, default; GRIMOIRE_TP_WAVE=0 = old), + int8 payload 3,516 / 3,239 (opt-in, lossy); DFlash2 code 125-128 tok/s; small all-reduce through the BAR.** oneDNN is ON by default since 8550947 (the 10-25 paragraph below predates that). All ten Unraid containers verified on grimoire-b70:v1.10-dev (GPUs bound by PCI slot). HANDOFF-2026-10-22-DUAL.md sections 12.5-12.7.
+
 **2026-10-25: oneDNN (Ian: developers asked for it) -- measured, wired in opt-in (branch `onednn-1025`).**
 Read tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md. oneDNN v3.13.4 built from source with our
 compiler (third_party/onednn, gitignored; tools/bench/onednn/build_onednn.sh), no torch, no vLLM.
