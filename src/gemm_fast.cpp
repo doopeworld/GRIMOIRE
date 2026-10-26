@@ -692,9 +692,13 @@ int& flash_esimd_flag() {
     static int f = [] { const char* e = std::getenv("GRIMOIRE_FLASH_ESIMD"); return e ? std::atoi(e) : -1; }();
     return f;
 }
+// 12 / 2 = one tensor-parallel rank of the same model (two cards): MEASURED 10-26, ESIMD vs
+// joint_matrix max|diff| 2-4e-3 of max|ref| 3-9 (GRIMOIRE_FLASH_VERIFY), code-probe answers
+// identical, pp2048 3,383 -> 3,494.
 bool flash_use_esimd(int width, int heads, int kv_heads) {
     const int mode = flash_esimd_flag();
-    return mode < 0 ? width == 256 && heads == 24 && kv_heads == 4 : mode != 0;
+    return mode < 0 ? width == 256 && ((heads == 24 && kv_heads == 4) || (heads == 12 && kv_heads == 2))
+                    : mode != 0;
 }
 
 // ---------------------------------------------------------------------

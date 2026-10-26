@@ -16557,13 +16557,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // DeltaNet / conv state and the KV cache carried from chunk to chunk.
     // GRIMOIRE_TP_WAVE=0 = the per-layer path.
     static const bool tp_wave_env=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE");return !(e&&*e=='0');}();
+    // Row chunk: the FFN chunk (768), or 1024 from 3,584 rows -- MEASURED 10-26 (two cards):
+    // 768 / 1024 / 1536 gave pp4096 3,287 / 3,413 / 3,262, and only 768 keeps pp2048 on the
+    // wavefront (it needs 2 chunks + 256 rows).  GRIMOIRE_TP_WAVE_CHUNK=<rows> fixes it.
+    static const int tp_wave_chunk_env=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE_CHUNK");
+        return e&&*e?std::max(256,std::atoi(e)/256*256):0;}();
+    const int tp_wave_rows=tp_wave_chunk_env>0?tp_wave_chunk_env:
+        (M>=3584?std::max(tp_ffn_chunk,1024):tp_ffn_chunk);
     bool tp_wave=tp_wave_env&&tp_mega&&tp_world==2&&tp_ffn_chunk>0&&tshm.s_rxt&&!pp_enabled()&&
         !seqb&&!spans_mode&&!next_tokens&&!capture_spec&&!capture_rows_hidden&&!exact_verify&&
         !host_time&&!trace_prefill&&!host_regions&&!prefill_graph&&!prefill_host_progress&&
         !defer_moe_gather&&!dense_pure&&!norm_bf_only&&!parallel_prefill&&!g_bestla_ready&&
         !xe2_attention&&!xe2_gdn&&!xe2_gdn_raw&&!xe2_dense_mxfp4&&!xe2_dense_mxfp4_f32&&
         !std::getenv("GRIMOIRE_BF16_QKV")&&!std::getenv("GRIMOIRE_BF16_DN_QKV")&&
-        prefill_layer_begin==0&&prefill_layer_limit==cfg.n_layers&&M>=2*tp_ffn_chunk+256&&
+        prefill_layer_begin==0&&prefill_layer_limit==cfg.n_layers&&M>=2*tp_wave_rows+256&&
         tshm.sjobs.empty();
     size_t wave_ngu=0, wave_ndn=0;
     for(int li=0;tp_wave&&li<cfg.n_layers;++li){
@@ -16602,7 +16609,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // the FFN's row chunks ("no short tail", as the per-layer chunked FFN)
         std::vector<int> c0, cn;
         for(int a=0;a<M;){
-            int mc=std::min(tp_ffn_chunk,M-a);
+            int mc=std::min(tp_wave_rows,M-a);
             if(M-a-mc<256)mc=M-a;
             c0.push_back(a); cn.push_back(mc); a+=mc;
         }
@@ -16614,6 +16621,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // GRIMOIRE_TP_WAVE_FUSE=0: separate fp32 passes (SwiGLU, gates, the norms' unused
         // outputs) as the per-layer path; the fused kernels compute the same values.
         static const bool fuse=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE_FUSE");return !(e&&*e=='0');}();
+        // GRIMOIRE_TP_WAVE_TIME=1 (diagnostic): drain the queue after every region and add up
+        // the host time per region (with GRIMOIRE_TP_WAVE_NOAR=1: the compute per region).
+        static const bool wt=std::getenv("GRIMOIRE_TP_WAVE_TIME")!=nullptr;
+        std::vector<std::pair<const char*,double>> wt_sum;
+        auto wt_prev=std::chrono::steady_clock::now();
+        auto mk=[&](const char* region){
+            if(!wt)return;
+            q.wait();
+            const auto now=std::chrono::steady_clock::now();
+            const double ms=std::chrono::duration<double,std::milli>(now-wt_prev).count();
+            wt_prev=now;
+            for(auto& e:wt_sum)if(e.first==region){e.second+=ms;return;}
+            wt_sum.push_back({region,ms});
+        };
         auto push=[&](float* y,int a,int mc,int region){
             if(noar)return uint64_t(0);
             const uint64_t g0=tp_stream_push(y,size_t(mc)*Hs,region,size_t(a));
@@ -16637,6 +16658,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(li>0&&!tp_stream_wait(ffn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: FFN all-reduce failed");
                 if(timing)wait_mix+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
+                mk("wait: FFN all-reduce of the rows");
                 // r1 is zero in a dense TP layer and bn (fp32) is read by nobody here: with
                 // fuse, neither is touched (the same values; 168 MB less traffic per layer
                 // at 4,096 rows)
@@ -16649,19 +16671,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                                 int(dflash2.target_layers.size()),start_pos+a,int(tap),{},cfg.is_muse);
                             break;
                         }
+                mk("input norm (+ taps)");
                 const sycl_bf16* xin=bn_bf+o;
                 if(d.kind==LayerKind::LINEAR_ATTN){
                     const int qs=Hk*Dk, vs=Hv*Dv, ch=d.la_qkv.output_rows();
-                    gemm(d.la_qkv,xin,t0,mc);
+                    gemm(d.la_qkv,xin,t0,mc); mk("DN qkv projection");
                     ConvParams cp{t0,d.la_conv,d.conv_ring,nullptr,ch,cfg.conv_kernel};
-                    launch_causal_conv1d_split_prefill(q,cp,mc,t1,t2,t3,nullptr,qs,vs);
+                    launch_causal_conv1d_split_prefill(q,cp,mc,t1,t2,t3,nullptr,qs,vs); mk("DN conv + split");
                     launch_l2norm_heads(q,t1,mc*Hk,Dk,{});
-                    launch_l2norm_heads(q,t2,mc*Hk,Dk,{});
+                    launch_l2norm_heads(q,t2,mc*Hk,Dk,{}); mk("DN qk norm");
                     gemm(d.la_ab,xin,t0,mc);
-                    launch_deltanet_gates_batched(q,t0,d.la_Alog,d.la_dtb,alpha,beta,mc,Hv);
+                    launch_deltanet_gates_batched(q,t0,d.la_Alog,d.la_dtb,alpha,beta,mc,Hv); mk("DN gates");
                     DeltaNetPrefillParams dp{t1,t2,t3,alpha,beta,d.dn_state,t0,Hv,Dk,Dv,mc,Hk};
-                    launch_deltanet_prefill(q,dp);
-                    gemm(d.la_z,xin,t3,mc);
+                    launch_deltanet_prefill(q,dp); mk("DN recurrence");
+                    gemm(d.la_z,xin,t3,mc); mk("DN z projection");
                     if(fuse){
                         launch_rmsnorm_gate_silu_bf16_out(q,t0,t3,d.la_norm,xb,mc*Hv,Dv,cfg.rms_eps);
                         gemm(d.la_out,xb,r0+o,mc);
@@ -16669,20 +16692,22 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         launch_rmsnorm_gate_silu(q,t0,t3,d.la_norm,mc*Hv,Dv,cfg.rms_eps,{});
                         gemm_f(d.la_out,t0,r0+o,mc);
                     }
+                    mk("DN norm + output projection");
                 }else{
                     const bool gated=d.q_proj.output_rows()==2*cfg.n_heads*d.head_dim;
                     const int pc=pos+a;
                     gemm(d.q_proj,xin,t0,mc);
                     float* qv=t0;
                     if(gated){launch_split_qgate_batched(q,t0,t1,t2,mc,cfg.n_heads,d.head_dim);qv=t1;}
+                    mk("attn q projection");
                     gemm(d.k_proj,xin,t3,mc);
-                    gemm(d.v_proj,xin,t4,mc);
+                    gemm(d.v_proj,xin,t4,mc); mk("attn k + v projections");
                     launch_qk_norm_rope_batched(q,qv,t3,d.q_norm,d.k_norm,mc,cfg.n_heads,
                         d.kv_heads,d.head_dim,pc,d.rope_theta,d.partial_rope,cfg.rms_eps);
                     launch_kv_append_batched(q,t3,t4,d.k_cache,d.v_cache,mc,pc,d.kv_heads,
-                        d.head_dim,max_seq);
+                        d.head_dim,max_seq); mk("attn qk norm + rope + kv append");
                     launch_flash_prefill(q,qv,d.k_cache,d.v_cache,t3,mc,pc,cfg.n_heads,
-                        d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
+                        d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim)); mk("attn flash");
                     if(gated&&fuse){
                         launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(mc)*cfg.n_heads*d.head_dim);
                         gemm(d.o_proj,xb,r0+o,mc);
@@ -16690,8 +16715,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         if(gated)launch_gate_sigmoid_mul(q,t3,t2,mc*cfg.n_heads*d.head_dim,{});
                         gemm_f(d.o_proj,t3,r0+o,mc);
                     }
+                    mk("attn gate + o projection");
                 }
                 attn_end[c]=push(r0+o,a,mc,0);
+                mk("push (pack + copy out)");
             }
             const int FIc=d.sh_gu.output_rows()/2;
             const size_t NG=size_t(d.sh_gu.w.N), FIs=size_t(FIc);
@@ -16703,16 +16730,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(!tp_stream_wait(attn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: attention all-reduce failed");
                 if(timing)wait_ffn+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
+                mk("wait: attention all-reduce of the rows");
                 launch_rmsnorm_residual_batched(q,bh+o,r0+o,nullptr,d.post_norm,
-                    fuse?nullptr:bn+o,mc,H,cfg.rms_eps,bn_bf+o);
-                launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o,t0+size_t(a)*NG,mc);
+                    fuse?nullptr:bn+o,mc,H,cfg.rms_eps,bn_bf+o); mk("post norm");
+                launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o,t0+size_t(a)*NG,mc); mk("FFN gate_up");
                 if(fuse)launch_swiglu_bf16_out(q,t0+size_t(a)*NG,xb+size_t(a)*FIs,mc,FIc);
                 else{
                     launch_swiglu_batched(q,t0+size_t(a)*NG,t1+size_t(a)*FIs,mc,FIc);
                     launch_f32_to_bf16(q,t1+size_t(a)*FIs,xb+size_t(a)*FIs,size_t(mc)*FIs);
                 }
-                launch_gemm_fast_predq(q,d.sh_down.w,tp_wq_dn,xb+size_t(a)*FIs,r0+o,mc);
+                mk("FFN swiglu");
+                launch_gemm_fast_predq(q,d.sh_down.w,tp_wq_dn,xb+size_t(a)*FIs,r0+o,mc); mk("FFN down");
                 ffn_end[c]=push(r0+o,a,mc,1);
+                mk("push (pack + copy out)");
             }
         }
         if(!tp_stream_drain())
@@ -16720,6 +16750,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         r0_in_h=false;
         a8_cached_src=nullptr;
         a8_cached_bf=nullptr;
+        if(wt&&tp_rank==0){
+            double tot=0; for(auto& e:wt_sum)tot+=e.second;
+            std::printf("  TP wavefront region budget (%d rows, %zu chunks%s), rank 0:\n",M,C,
+                noar?", NO ALL-REDUCE":"");
+            for(auto& e:wt_sum)
+                std::printf("    %-40s %9.3f ms %5.1f%%\n",e.first,e.second,100.0*e.second/std::max(tot,1e-9));
+            std::printf("    %-40s %9.3f ms\n","TOTAL (timed regions)",tot);
+            std::fflush(stdout);
+        }
         if(timing){
             q.wait();
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count();
