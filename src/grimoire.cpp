@@ -16611,6 +16611,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // GRIMOIRE_TP_WAVE_NOAR=1: DEBUG ONLY, WRONG OUTPUT -- no all-reduce at all, so the time
         // is the cards' own compute (the floor the link overlap is measured against).
         static const bool noar=std::getenv("GRIMOIRE_TP_WAVE_NOAR")!=nullptr;
+        // GRIMOIRE_TP_WAVE_FUSE=0: separate fp32 passes (SwiGLU, gates, the norms' unused
+        // outputs) as the per-layer path; the fused kernels compute the same values.
+        static const bool fuse=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE_FUSE");return !(e&&*e=='0');}();
         auto push=[&](float* y,int a,int mc,int region){
             if(noar)return uint64_t(0);
             const uint64_t g0=tp_stream_push(y,size_t(mc)*Hs,region,size_t(a));
@@ -16634,7 +16637,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(li>0&&!tp_stream_wait(ffn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: FFN all-reduce failed");
                 if(timing)wait_mix+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
-                launch_rmsnorm_residual_batched(q,bh+o,r0+o,r1+o,d.in_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
+                // r1 is zero in a dense TP layer and bn (fp32) is read by nobody here: with
+                // fuse, neither is touched (the same values; 168 MB less traffic per layer
+                // at 4,096 rows)
+                launch_rmsnorm_residual_batched(q,bh+o,r0+o,fuse?nullptr:r1+o,d.in_norm,
+                    fuse?nullptr:bn+o,mc,H,cfg.rms_eps,bn_bf+o);
                 if(dflash2.target_aux)
                     for(size_t tap=0;tap<dflash2.target_layers.size();++tap)
                         if(dflash2.target_layers[tap]+1==li){
@@ -16655,8 +16662,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     DeltaNetPrefillParams dp{t1,t2,t3,alpha,beta,d.dn_state,t0,Hv,Dk,Dv,mc,Hk};
                     launch_deltanet_prefill(q,dp);
                     gemm(d.la_z,xin,t3,mc);
-                    launch_rmsnorm_gate_silu(q,t0,t3,d.la_norm,mc*Hv,Dv,cfg.rms_eps,{});
-                    gemm_f(d.la_out,t0,r0+o,mc);
+                    if(fuse){
+                        launch_rmsnorm_gate_silu_bf16_out(q,t0,t3,d.la_norm,xb,mc*Hv,Dv,cfg.rms_eps);
+                        gemm(d.la_out,xb,r0+o,mc);
+                    }else{
+                        launch_rmsnorm_gate_silu(q,t0,t3,d.la_norm,mc*Hv,Dv,cfg.rms_eps,{});
+                        gemm_f(d.la_out,t0,r0+o,mc);
+                    }
                 }else{
                     const bool gated=d.q_proj.output_rows()==2*cfg.n_heads*d.head_dim;
                     const int pc=pos+a;
@@ -16671,8 +16683,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         d.head_dim,max_seq);
                     launch_flash_prefill(q,qv,d.k_cache,d.v_cache,t3,mc,pc,cfg.n_heads,
                         d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
-                    if(gated)launch_gate_sigmoid_mul(q,t3,t2,mc*cfg.n_heads*d.head_dim,{});
-                    gemm_f(d.o_proj,t3,r0+o,mc);
+                    if(gated&&fuse){
+                        launch_gate_sigmoid_mul_bf16_out(q,t3,t2,xb,size_t(mc)*cfg.n_heads*d.head_dim);
+                        gemm(d.o_proj,xb,r0+o,mc);
+                    }else{
+                        if(gated)launch_gate_sigmoid_mul(q,t3,t2,mc*cfg.n_heads*d.head_dim,{});
+                        gemm_f(d.o_proj,t3,r0+o,mc);
+                    }
                 }
                 attn_end[c]=push(r0+o,a,mc,0);
             }
@@ -16686,10 +16703,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(!tp_stream_wait(attn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: attention all-reduce failed");
                 if(timing)wait_ffn+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
-                launch_rmsnorm_residual_batched(q,bh+o,r0+o,nullptr,d.post_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
+                launch_rmsnorm_residual_batched(q,bh+o,r0+o,nullptr,d.post_norm,
+                    fuse?nullptr:bn+o,mc,H,cfg.rms_eps,bn_bf+o);
                 launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o,t0+size_t(a)*NG,mc);
-                launch_swiglu_batched(q,t0+size_t(a)*NG,t1+size_t(a)*FIs,mc,FIc);
-                launch_f32_to_bf16(q,t1+size_t(a)*FIs,xb+size_t(a)*FIs,size_t(mc)*FIs);
+                if(fuse)launch_swiglu_bf16_out(q,t0+size_t(a)*NG,xb+size_t(a)*FIs,mc,FIc);
+                else{
+                    launch_swiglu_batched(q,t0+size_t(a)*NG,t1+size_t(a)*FIs,mc,FIc);
+                    launch_f32_to_bf16(q,t1+size_t(a)*FIs,xb+size_t(a)*FIs,size_t(mc)*FIs);
+                }
                 launch_gemm_fast_predq(q,d.sh_down.w,tp_wq_dn,xb+size_t(a)*FIs,r0+o,mc);
                 ffn_end[c]=push(r0+o,a,mc,1);
             }

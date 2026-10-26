@@ -886,6 +886,8 @@ sycl::event launch_l2norm_heads_pair_bf16_io(sycl::queue& q,sycl_bf16* qv,
     sycl_bf16* kv,int n_heads,int dim,const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     int tokens, int inter, const std::vector<sycl::event>& deps = {});
+sycl::event launch_swiglu_bf16_out(sycl::queue& q, const float* gu, sycl_bf16* out,
+    int tokens, int inter, const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
     float* out, int tokens, int inter,
     const std::vector<sycl::event>& deps = {});

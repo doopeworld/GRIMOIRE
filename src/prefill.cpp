@@ -2317,6 +2317,21 @@ sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     });
 }
 
+// launch_swiglu_batched followed by launch_f32_to_bf16, in one pass, for a result
+// that only feeds the down projection: out = bf16(silu(gate) * up), the same values
+// without the fp32 [tokens][inter] round trip.
+sycl::event launch_swiglu_bf16_out(sycl::queue& q, const float* gu, sycl_bf16* out,
+    int tokens, int inter, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(tokens) * inter), [=](sycl::id<1> id) {
+            const int t = int(id[0] / inter), d = int(id[0] % inter);
+            const int64_t z = int64_t(t) * inter + d;
+            const float g = gu[int64_t(t) * 2 * inter + d];
+            out[z] = sycl_bf16((g / (1.0f + sycl::exp(-g))) * gu[int64_t(t) * 2 * inter + inter + d]);
+        });
+    });
+}
+
 // SwiGLU over SEPARATE gate and up buffers, for the BesTLA prefill path (BesTLA has
 // no fused 2*inter weight, so it produces gate and up as two [M,inter] results).
 sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
