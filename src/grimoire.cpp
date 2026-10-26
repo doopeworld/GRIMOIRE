@@ -2265,9 +2265,17 @@ struct Grimoire {
         static constexpr int kJobs = 64;
         StreamJob s_jt[kJobs]; uint64_t s_njobs = 0;      // the jobs, as the receiver sees them
         uint8_t* s_bar_cpu = nullptr; uint8_t* s_bar_dev = nullptr; int s_bar_fd = -1; size_t s_bar_bytes = 0;
+        // Small all-reduce, two ranks (tp_small_allreduce: decode rows and the verify, up to
+        // small_max floats = GRIMOIRE_TP_SHM_CPU_MAX).  sb = this card's OWN VRAM mapped for the
+        // CPU through the BAR (two parities of small_max floats), the same kind of mapping as the
+        // prefill receive ring; sp_piece floats per piece; sp_cnt = pieces finished, published in
+        // the flag at base+1024+64*rank.  GRIMOIRE_TP_SMALL_BAR=0 = the plain host round trip.
+        size_t small_max = 65536, sp_piece = 0; uint64_t sp_cnt = 0;
+        uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
     } tshm;
     bool tp_shm_setup(std::string& err);
     bool tp_shm_allreduce(float* dev, size_t elems);
+    bool tp_small_allreduce(float* dev, size_t elems);
     bool tp_pipe_allreduce(float* dev, size_t elems);
     bool tp_stream_reserve(size_t rows);
     uint64_t tp_stream_push(float* dev, size_t elems, int region, size_t row0);
@@ -4597,6 +4605,52 @@ bool Grimoire::tp_shm_setup(std::string& err){
     if(!tshm.stage||!tshm.res||!tshm.peer||!tshm.dtmp){err="TP shm staging allocation failed";return false;}
     std::printf("  TP all-reduce: host-staged through shared RAM (own pinned buffers, no P2P), "
                 "%zu rows x %d per piece\n",rows,cfg.hidden);
+    if(const char* e=std::getenv("GRIMOIRE_TP_SHM_CPU_MAX"); e&&*e)tshm.small_max=size_t(std::atoll(e));
+    tshm.small_max=std::min(tshm.small_max,tshm.slot_elems);
+    // Small all-reduces (decode, verify): the CPU sum goes straight into this card's own VRAM
+    // through the BAR -- one GPU driver, nothing shared with the other card, as the prefill
+    // receive (Ian said yes 10-24) -- in pieces, so the copies out overlap the CPU work.
+    if(const char* e=std::getenv("GRIMOIRE_TP_SMALL_BAR"); W==2&&tshm.small_max&&!(e&&*e=='0')){
+        namespace sx=sycl::ext::oneapi::experimental;
+        size_t piece=10240;
+        if(const char* p=std::getenv("GRIMOIRE_TP_SMALL_PIECE"); p&&*p)piece=size_t(std::max(16,std::atoi(p)));
+        piece=std::max((piece+15)/16*16,(tshm.small_max+63)/64);   // <= 64 pieces per call
+        const size_t rb=(2*tshm.small_max*sizeof(float)+65535)/65536*65536;
+        void* dv=nullptr; int fd=-1; void* cpu=MAP_FAILED;
+        try{
+            dv=sx::alloc_exportable_device_mem(65536,rb,sx::external_mem_handle_type::opaque_fd,q);
+            fd=sx::export_device_mem_handle<sx::external_mem_handle_type::opaque_fd>(dv,q);
+            if(fd>=0)cpu=::mmap(nullptr,rb,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+        }catch(const std::exception& ex){
+            std::printf("  TP small all-reduce: BAR buffer failed (%s)\n",ex.what());
+        }
+        if(cpu==MAP_FAILED){
+            if(fd>=0)::close(fd);
+            if(dv)sx::free_exportable_memory(dv,q);
+            std::printf("  TP small all-reduce: no CPU mapping of VRAM -- host->device copies instead\n");
+        }else{
+            tshm.sb_cpu=static_cast<uint8_t*>(cpu); tshm.sb_dev=static_cast<float*>(dv);
+            tshm.sb_fd=fd; tshm.sb_bytes=rb; tshm.sp_piece=piece;
+        }
+    }
+    if(W==2){
+        // Both ranks take the same path with the same pieces, or neither does: the two
+        // protocols use different flags, so a mismatch would wait forever.
+        int lo=int(tshm.sb_cpu?tshm.sp_piece:0), hi=-lo;
+        if(!tp_agree_min(lo)||!tp_agree_min(hi)){err="TP small all-reduce handshake failed";return false;}
+        if(lo<=0||lo!=-hi){
+            if(tshm.sb_cpu){
+                ::munmap(tshm.sb_cpu,tshm.sb_bytes); ::close(tshm.sb_fd);
+                sycl::ext::oneapi::experimental::free_exportable_memory(tshm.sb_dev,q);
+                tshm.sb_cpu=nullptr; tshm.sb_dev=nullptr; tshm.sb_fd=-1; tshm.sb_bytes=0;
+            }
+            tshm.sp_piece=0;
+        }else{
+            std::printf("  TP small all-reduce (<= %zu floats): pieces of %zu floats, sum written by the CPU"
+                        " into this card's VRAM through the BAR (GRIMOIRE_TP_SMALL_BAR=0 = off)\n",
+                        tshm.small_max,tshm.sp_piece);
+        }
+    }
     if(tshm.pipe_piece){
         const size_t rb=tshm.pipe_piece*sizeof(float)*size_t(tshm.pipe_ring);
         tshm.pout=sycl::malloc_host<uint8_t>(rb,q);
@@ -4906,6 +4960,23 @@ static void tp_bar_copy(uint8_t* dst,const uint8_t* src,size_t n){
     if(n>=4)(void)*reinterpret_cast<volatile const uint32_t*>(dst+((n-4)&~size_t(3)));
 }
 
+// The small all-reduce's sum in rank order (a + b, the same fp32 adds as the plain path's
+// CPU sum: identical bits), written into the BAR mapping as 64-byte lines of non-temporal
+// stores.  The caller fences and reads back once after the last piece.
+static void tp_bar_sum(float* dst,const float* a,const float* b,size_t n){
+    size_t i=0;
+    if((reinterpret_cast<uintptr_t>(dst)&15)==0)
+        for(;i+16<=n;i+=16){
+            const __m128 x0=_mm_add_ps(_mm_loadu_ps(a+i),_mm_loadu_ps(b+i));
+            const __m128 x1=_mm_add_ps(_mm_loadu_ps(a+i+4),_mm_loadu_ps(b+i+4));
+            const __m128 x2=_mm_add_ps(_mm_loadu_ps(a+i+8),_mm_loadu_ps(b+i+8));
+            const __m128 x3=_mm_add_ps(_mm_loadu_ps(a+i+12),_mm_loadu_ps(b+i+12));
+            _mm_stream_ps(dst+i,x0); _mm_stream_ps(dst+i+4,x1);
+            _mm_stream_ps(dst+i+8,x2); _mm_stream_ps(dst+i+12,x3);
+        }
+    for(;i<n;++i)dst[i]=a[i]+b[i];
+}
+
 // The receive thread (TpShm): every published piece in order -- the peer's
 // flag, its slot -> my ring (BAR or pinned + copy engine), my consumed flag,
 // the add on q.  Same adds as tp_stream_wait, so the same bits.
@@ -5138,9 +5209,9 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
         return reinterpret_cast<float*>(tshm.base+kTpShmHeader+
             (size_t(2*r)+size_t(s&1))*tshm.slot_elems*sizeof(float));
     };
-    static const size_t cpu_max=[]{const char* e=std::getenv("GRIMOIRE_TP_SHM_CPU_MAX");
-        return e&&*e?size_t(std::atoll(e)):size_t(65536);}();
+    const size_t cpu_max=tshm.small_max;
     if(tshm.pipe_piece&&elems>cpu_max)return tp_pipe_allreduce(dev,elems);
+    if(tshm.sb_cpu&&elems<=cpu_max)return tp_small_allreduce(dev,elems);
     // GRIMOIRE_TP_SMALL_AR_TIME=1 (diagnostic, adds two waits per call): where a
     // small all-reduce's time goes, per row class -- compute still queued when
     // it was called, the device->host copy, the CPU copy into shared RAM, the
@@ -5222,6 +5293,70 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
                 launch_add(q,dev+off,tshm.dtmp,int(n),{});
                 q.wait_and_throw();
             }
+        }
+    }
+    return true;
+}
+
+// Small all-reduce, two ranks (see TpShm): every piece's device->host copy is queued at once,
+// and the CPU works piece by piece as they land -- my piece into my shared-RAM slot, my flag,
+// the peer's flag, then slot 0 + slot 1 (rank order, the plain path's adds) written straight
+// into this card's own VRAM through the BAR -- so the copies out overlap the CPU work.  One
+// on-card copy puts the sum in place.  Measured 10-26 (8 rows, gpu1 on its x4 link): the plain
+// round trip is d2h 28 + CPU copy 9 + sum 14 + h2d 33 us, all serial, with the GPU idle.
+bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
+    const int peer=1-tp_rank;
+    auto sflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+1024+64*size_t(r));};
+    const uint64_t s=++tshm.seq;
+    // slot (rank, parity) as the plain path: a slot is rewritten two calls later, and
+    // nobody starts call s+1 before both have read all of call s
+    auto slot=[&](int r){return reinterpret_cast<float*>(tshm.base+kTpShmHeader+
+        (size_t(2*r)+size_t(s&1))*tshm.slot_elems*sizeof(float));};
+    static const bool st=std::getenv("GRIMOIRE_TP_SMALL_AR_TIME")!=nullptr;
+    using clk=std::chrono::steady_clock;
+    static double st_q[2]={}, st_ar[2]={}; static uint64_t st_n[2]={};
+    clk::time_point t0{},t1{};
+    if(st){t0=clk::now();q.wait();t1=clk::now();}
+    const size_t P=tshm.sp_piece, np=(elems+P-1)/P;
+    sycl::event ev[64];
+    for(size_t k=0;k<np;++k){
+        const size_t o=k*P;
+        ev[k]=q.memcpy(tshm.stage+o,dev+o,std::min(P,elems-o)*sizeof(float));
+    }
+    float* const mine=slot(tp_rank);
+    const float* const s0=slot(0);
+    const float* const s1=slot(1);
+    float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
+    for(size_t k=0;k<np;++k){
+        const size_t o=k*P, n=std::min(P,elems-o);
+        ev[k].wait();
+        std::memcpy(mine+o,tshm.stage+o,n*sizeof(float));
+        const uint64_t c=++tshm.sp_cnt;
+        sflag(tp_rank)->store(c,std::memory_order_release);
+        auto* f=sflag(peer); uint64_t spins=0; const auto tw=clk::now();
+        while(f->load(std::memory_order_acquire)<c){
+            __builtin_ia32_pause();
+            if((++spins&0xFFFFF)==0&&clk::now()-tw>std::chrono::seconds(120)){
+                std::fprintf(stderr,"TP rank %d: small all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                return false;
+            }
+        }
+        tp_bar_sum(bar+o,s0+o,s1+o,n);
+    }
+    _mm_sfence();
+    (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
+    q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
+    if(st){
+        q.wait();
+        const auto t2=clk::now();
+        const int b=elems<=size_t(cfg.hidden)?0:1;
+        st_q[b]+=std::chrono::duration<double,std::micro>(t1-t0).count();
+        st_ar[b]+=std::chrono::duration<double,std::micro>(t2-t1).count();
+        if(++st_n[b]%2048==0){
+            std::printf("  TP small all-reduce (BAR, %zu-float pieces) rank %d, %s rows: %llu calls, us per call:"
+                        " queued compute %.1f, all-reduce %.1f\n",P,tp_rank,b==0?"1":"2-16",
+                        (unsigned long long)st_n[b],st_q[b]/double(st_n[b]),st_ar[b]/double(st_n[b]));
+            std::fflush(stdout);
         }
     }
     return true;
@@ -9541,6 +9676,11 @@ void Grimoire::release() {
         ::munmap(tshm.s_bar_cpu, tshm.s_bar_bytes); ::close(tshm.s_bar_fd);
         sycl::ext::oneapi::experimental::free_exportable_memory(tshm.s_bar_dev, q);
         tshm.s_bar_cpu = nullptr; tshm.s_bar_dev = nullptr; tshm.s_bar_fd = -1;
+    }
+    if (tshm.sb_cpu) {
+        ::munmap(tshm.sb_cpu, tshm.sb_bytes); ::close(tshm.sb_fd);
+        sycl::ext::oneapi::experimental::free_exportable_memory(tshm.sb_dev, q);
+        tshm.sb_cpu = nullptr; tshm.sb_dev = nullptr; tshm.sb_fd = -1;
     }
     if (tp_wq_gu) { sycl::free(tp_wq_gu, q); tp_wq_gu = nullptr; tp_wq_gu_cap = 0; }
     if (tp_wq_dn) { sycl::free(tp_wq_dn, q); tp_wq_dn = nullptr; tp_wq_dn_cap = 0; }
