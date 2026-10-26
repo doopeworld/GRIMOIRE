@@ -16597,6 +16597,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if(tp_wave){
         static const bool timing=std::getenv("GRIMOIRE_TP_AR_TIMING")!=nullptr;
         const auto tw0=std::chrono::steady_clock::now();
+        double wait_mix=0, wait_ffn=0;
         const size_t Hs=size_t(H), P=tshm.pipe_piece;
         // the FFN's row chunks ("no short tail", as the per-layer chunked FFN)
         std::vector<int> c0, cn;
@@ -16607,7 +16608,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         const size_t C=c0.size();
         std::vector<uint64_t> attn_end(C,0), ffn_end(C,0);
+        // GRIMOIRE_TP_WAVE_NOAR=1: DEBUG ONLY, WRONG OUTPUT -- no all-reduce at all, so the time
+        // is the cards' own compute (the floor the link overlap is measured against).
+        static const bool noar=std::getenv("GRIMOIRE_TP_WAVE_NOAR")!=nullptr;
         auto push=[&](float* y,int a,int mc,int region){
+            if(noar)return uint64_t(0);
             const uint64_t g0=tp_stream_push(y,size_t(mc)*Hs,region,size_t(a));
             tp_stream_pump();
             return g0+(size_t(mc)*Hs+P-1)/P;
@@ -16625,8 +16630,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             LayerDev& d=L[size_t(li)];
             for(size_t c=0;c<C;++c){
                 const int a=c0[c], mc=cn[c]; const size_t o=size_t(a)*Hs;
+                const auto tq=std::chrono::steady_clock::now();
                 if(li>0&&!tp_stream_wait(ffn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: FFN all-reduce failed");
+                if(timing)wait_mix+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
                 launch_rmsnorm_residual_batched(q,bh+o,r0+o,r1+o,d.in_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
                 if(dflash2.target_aux)
                     for(size_t tap=0;tap<dflash2.target_layers.size();++tap)
@@ -16675,8 +16682,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             launch_gemm_fast_dequant(q,d.sh_down.w,tp_wq_dn);
             for(size_t c=0;c<C;++c){
                 const int a=c0[c], mc=cn[c]; const size_t o=size_t(a)*Hs;
+                const auto tq=std::chrono::steady_clock::now();
                 if(!tp_stream_wait(attn_end[c]))
                     throw std::runtime_error("TP wavefront prompt: attention all-reduce failed");
+                if(timing)wait_ffn+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tq).count();
                 launch_rmsnorm_residual_batched(q,bh+o,r0+o,nullptr,d.post_norm,bn+o,mc,H,cfg.rms_eps,bn_bf+o);
                 launch_gemm_fast_predq(q,d.sh_gu.w,tp_wq_gu,bn_bf+o,t0+size_t(a)*NG,mc);
                 launch_swiglu_batched(q,t0+size_t(a)*NG,t1+size_t(a)*FIs,mc,FIc);
@@ -16691,12 +16700,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         a8_cached_src=nullptr;
         a8_cached_bf=nullptr;
         if(timing){
+            q.wait();
+            const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count();
             static double w_ms=0; static uint64_t w_n=0;
-            w_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count();
-            ++w_n;
-            std::printf("  TP wavefront prompt rank %d: %d rows in %zu chunks, %.1f ms (mean of %llu prompts %.1f)\n",
-                tp_rank,M,C,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tw0).count(),
-                (unsigned long long)w_n,w_ms/double(w_n));
+            w_ms+=ms; ++w_n;
+            std::printf("  TP wavefront prompt rank %d: %d rows in %zu chunks, %.1f ms to the last kernel"
+                        " (host waits: mixer %.1f, FFN %.1f; mean of %llu prompts %.1f)%s\n",
+                tp_rank,M,C,ms,wait_mix,wait_ffn,(unsigned long long)w_n,w_ms/double(w_n),
+                noar?" -- NO ALL-REDUCE (debug)":"");
             std::fflush(stdout);
         }
     }
