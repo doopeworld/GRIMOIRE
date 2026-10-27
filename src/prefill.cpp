@@ -2522,8 +2522,29 @@ sycl::event launch_moe_unpermute(sycl::queue& q, const float* src,
             const int t=int(id[0]), d=int(id[1]);
             const int64_t z=int64_t(t)*hidden+d;
             float v=0.0f;
+            // inverse -1: a route this rank does not compute (expert parallel)
             for(int s=0;s<top_k;++s){const int64_t r=int64_t(t)*top_k+s;
-                v=sycl::fma(route_weight[r],src[int64_t(inverse[r])*hidden+d],v);}
+                const int32_t p=inverse[r];
+                if(p>=0)v=sycl::fma(route_weight[r],src[int64_t(p)*hidden+d],v);}
+            dst[z]=v;
+        });});
+}
+
+// One route group of a grouped expert pass (tiered_moe_prefill): a route whose
+// sorted position p is in [p0, p1) reads src row p - p0; dst = the sum, or
+// dst += it (accumulate).  One group over every route is launch_moe_unpermute.
+sycl::event launch_moe_unpermute_range(sycl::queue& q, const float* src,
+    const int32_t* inverse, const float* route_weight, float* dst,
+    int tokens, int top_k, int hidden, int p0, int p1, bool accumulate,
+    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+        h.parallel_for(sycl::range<2>(size_t(tokens),size_t(hidden)),[=](sycl::id<2> id){
+            const int t=int(id[0]), d=int(id[1]);
+            const int64_t z=int64_t(t)*hidden+d;
+            float v=accumulate?dst[z]:0.0f;
+            for(int s=0;s<top_k;++s){const int64_t r=int64_t(t)*top_k+s;
+                const int32_t p=inverse[r];
+                if(p>=p0&&p<p1)v=sycl::fma(route_weight[r],src[int64_t(p-p0)*hidden+d],v);}
             dst[z]=v;
         });});
 }

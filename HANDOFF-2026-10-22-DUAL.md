@@ -559,3 +559,37 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   18:37), +0 in runs; one guard stop at 17:49 (5 in 10 s). host->card ~1.5/s idle. 0 uncorrectable.
 - Release Dockerfile prepared (scratchpad): oneDNN v3.13.4 built in the builder stage (SYCL GPU
   only, no graph / tests), libdnnl.so + LICENSE / THIRD-PARTY-PROGRAMS in the runtime stage.
+
+### 12.9 2026-10-26 evening: Flash-Next on two cards with Megatron TP + expert-parallel MoE
+- qwen4_exp (Qwen3.8-Flash-Next-NVFP4) now runs Megatron TP (`multi TP` / dual.sh TP): DeltaNet and
+  attention heads split per rank (heads 24 -> 12, KV 2 -> 1, DN v 48 -> 24, k 16 -> 8), shared
+  expert sliced, routed experts EXPERT-PARALLEL inside TP (ranking position k -> rank k % 2, each
+  rank holds whole experts of its half; tm_tier_h 2 = the other rank's expert), router / HC / QSA
+  indexer / embed / lm_head replicated, PLE (layer 2 only) read on rank 0 from its RAM copy and
+  all-reduced (rank 1 adds zeros). Two all-reduces per layer (mixer output, MoE + shared output).
+- llama-benchy c1 --runs 2, 170 experts per layer per card (tools/bench/onednn/fn_tp_test.sh):
+| measure | PP 24/24 (before) | TP + EP (now) |
+|---|---:|---:|
+| tg128 after pp2048 | 25.2 | 31.7 |
+| tg128 after pp4096 | 24.4 | 30.6 |
+| code probe decode | 17.2 | 26.5 |
+| code probe prefill | 706 | 682 |
+| pp2048 | 905 | 713 |
+| pp4096 | 1,150 | 664 |
+  Answers: capital identical, story identical for 144 chars and code for 514 chars, then other
+  wording, coherent. Load 79 s (PLE RAM copy 51.2 GB in 58 s on rank 0 only). AR ~1.2 ms per call.
+- Decode per token (synced timers): PLE 3, HC 7.8, DN 9.5, attention 6.5, MoE 22, head 2.4 ms.
+- Prompt regression, cause measured (GRIMOIRE_Q4_TIMING): only 2.3 GiB free per card -> 768-row
+  prompt chunks; every chunk re-streams the pinned-RAM experts (MoE ~750 of ~1,050 ms per chunk);
+  HC 224 ms per chunk is replicated on both ranks (~1.5 ms fixed per mix + ~1.1 us per row;
+  GRIMOIRE_ONEDNN=0 is not better: 252 ms). NV=140 per card: pp 793 / 1,040 but tg 22.9 (the PLE
+  then stays on disk: 28.8 GB pinned + 51 GB > RAM) -> keep 170.
+- Fix BUILT (this commit), not run yet: layer-major qwen4_exp prefill. Per layer the mixer runs in
+  sub-chunks (q4_sub_rows, default 768, GRIMOIRE_Q4_SUBCHUNK) and the routed experts run ONCE over
+  all rows of the call (tiered_moe_prefill with route groups, launch_moe_unpermute_range); the call
+  span comes from q4_prefill_split (GRIMOIRE_Q4_SPAN 8192, GRIMOIRE_BUDGET_DEBUG=1 prints it);
+  both ranks agree on the sub-chunk at load; expert ring 64 slots under TP (GRIMOIRE_EXPERT_RING);
+  GRIMOIRE_HC_TIMING=1 splits the hyper-connection mix into its passes.
+- Test: tools/bench/onednn/fn_lm_test.sh (two cards TP, then one card G0 as regression check).
+- Dockerfile: oneDNN v3.13.4 built in the builder stage, libdnnl.so + license files in the runtime
+  stage; image grimoire-b70:v1.10 built (not validated, not released).

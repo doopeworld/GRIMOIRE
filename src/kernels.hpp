@@ -913,6 +913,10 @@ sycl::event launch_moe_unpermute(sycl::queue& q, const float* src,
     const int32_t* inverse, const float* route_weight, float* dst,
     int tokens, int top_k, int hidden,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_moe_unpermute_range(sycl::queue& q, const float* src,
+    const int32_t* inverse, const float* route_weight, float* dst,
+    int tokens, int top_k, int hidden, int p0, int p1, bool accumulate,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_moe_unpermute_bf16(sycl::queue& q, const sycl_bf16* src,
     const int32_t* inverse, const float* route_weight, float* dst,
     int tokens, int top_k, int hidden,

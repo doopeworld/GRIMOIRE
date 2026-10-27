@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-26 evening: Flash-Next NVFP4 on two cards = Megatron TP + expert-parallel MoE: tg128 25.2 -> 31.7, code decode 17.2 -> 26.5, answers correct; prompt regressed 905 / 1,150 -> 713 / 664 (768-row chunks re-stream the RAM experts). Layer-major prefill fix built, test = tools/bench/onednn/fn_lm_test.sh. Handoff 12.9.**
+
 **2026-10-26: two cards Qwen3.8-27B-FP8 TP pp4096 2,671 -> 3,538 (wavefront prompt + fused passes + chunk 1024 + ESIMD flash, lossless, default; GRIMOIRE_TP_WAVE=0 = old; speed table in handoff 12.8), + int8 payload 3,516 / 3,239 (opt-in, lossy); DFlash2 code 125-128 tok/s; small all-reduce through the BAR.** oneDNN is ON by default since 8550947 (the 10-25 paragraph below predates that). All ten Unraid containers verified on grimoire-b70:v1.10-dev (GPUs bound by PCI slot). HANDOFF-2026-10-22-DUAL.md sections 12.5-12.7.
 
 **2026-10-25: oneDNN (Ian: developers asked for it) -- measured, wired in opt-in (branch `onednn-1025`).**

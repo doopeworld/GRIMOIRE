@@ -3,10 +3,11 @@
 # Intel Arc Pro B70 (Battlemage G31).
 #
 # NO vLLM. NO PyTorch. NO Python ML stack, anywhere in this image, at any
-# stage. Every compute kernel is this project's own SYCL/ESIMD source;
-# the only third-party pieces here are Intel's own build toolchain
-# (oneAPI DPC++) and the Intel GPU driver userspace stack (Level Zero /
-# OpenCL / IGC), both pinned to exact versions by package name.
+# stage. Every compute kernel is this project's own SYCL/ESIMD source,
+# except the prompt GEMMs that go through Intel oneDNN (Apache-2.0, built
+# from source below with the same compiler); the other third-party pieces
+# are Intel's own build toolchain (oneAPI DPC++) and the Intel GPU driver
+# userspace stack (Level Zero / OpenCL / IGC), all pinned to exact versions.
 #
 # Build:  docker build -t grimoire-b70 .
 # Run:    see README.md "Docker" section for the full, safe invocation
@@ -16,9 +17,10 @@
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# Stage 1: builder.  Compiles bin/grimoire, bin/grimoire-server and
-# bin/libgrimoire_gemm.so with Intel's oneAPI DPC++ compiler.  Nothing
-# from this stage reaches the final image except those three files.
+# Stage 1: builder.  Compiles Intel oneDNN, then bin/grimoire,
+# bin/grimoire-server, bin/libgrimoire_gemm.so and bin/libgrimoire_attn.so
+# with Intel's oneAPI DPC++ compiler.  Nothing from this stage reaches the
+# final image except those files, libdnnl.so and oneDNN's license files.
 # ---------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
@@ -55,6 +57,26 @@ RUN mkdir -p /tmp/neo && cd /tmp/neo \
     && wget -q "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/libigdgmm12_${GMMLIB_VERSION}_amd64.deb" \
     && dpkg -i *.deb \
     && cd / && rm -rf /tmp/neo
+
+# Intel oneDNN for the prompt GEMMs (src/onednn_gemm.cpp, on by default since
+# 2026-10-25; GRIMOIRE_ONEDNN=0 turns it off): SYCL GPU runtime only -- no CPU
+# primitives, no graph API, no tests -- the configuration measured in
+# tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md.  The build scripts below find
+# it in third_party/onednn and put libdnnl.so next to the binaries (rpath $ORIGIN).
+ARG ONEDNN_VERSION=v3.13.4
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch ${ONEDNN_VERSION} https://github.com/uxlfoundation/oneDNN.git /tmp/onednn \
+    && bash -c 'set -e; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true; \
+        CC=icx CXX=icpx cmake -S /tmp/onednn -B /tmp/onednn/build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/grimoire/third_party/onednn \
+          -DONEDNN_CPU_RUNTIME=NONE -DONEDNN_GPU_RUNTIME=SYCL -DONEDNN_GPU_VENDOR=INTEL \
+          -DONEDNN_BUILD_EXAMPLES=OFF -DONEDNN_BUILD_TESTS=OFF -DONEDNN_BUILD_GRAPH=OFF; \
+        cmake --build /tmp/onednn/build --target dnnl; \
+        cmake --install /tmp/onednn/build >/dev/null' \
+    && mkdir -p /grimoire/licenses/onednn \
+    && cp /tmp/onednn/LICENSE /tmp/onednn/THIRD-PARTY-PROGRAMS /grimoire/licenses/onednn/ \
+    && rm -rf /tmp/onednn
 
 WORKDIR /grimoire
 COPY src/        src/
@@ -142,6 +164,9 @@ COPY --from=builder /grimoire/bin/grimoire           bin/grimoire
 COPY --from=builder /grimoire/bin/grimoire-server     bin/grimoire-server
 COPY --from=builder /grimoire/bin/libgrimoire_gemm.so  bin/libgrimoire_gemm.so
 COPY --from=builder /grimoire/bin/libgrimoire_attn.so  bin/libgrimoire_attn.so
+COPY --from=builder /grimoire/third_party/onednn/lib/libdnnl.so.3.13 bin/libdnnl.so.3.13
+COPY --from=builder /grimoire/licenses/onednn/        /usr/share/doc/onednn/
+RUN cd bin && ln -sf libdnnl.so.3.13 libdnnl.so.3 && ln -sf libdnnl.so.3 libdnnl.so
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh bin/grimoire bin/grimoire-server
 
