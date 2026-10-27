@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-27 evening: decode copies by kernel + pinned flag (ksend): two cards tg128 31.0 / 30.2 -> 34.1 / 32.9; the rest of the all-reduce time is waiting for the rank whose CPU experts run (~0.25 ms a RAM expert). CPU pool pinning built, not tested. Handoff 12.11.**
+
 **2026-10-27: Flash-Next NVFP4 prompt: two cards pp2048 / pp4096 713 / 664 -> 1,263 / 1,463, one card 654 -> 804 at 4096 (layer-major prefill; the HC inject projection had a ~1.5 ms GEMM per call; sub-chunks sized per call); decode unchanged (TP ~31, one card ~22). Ring prefetch and uneven cold-expert split measured slower, off. Handoff 12.10.**
 
 **2026-10-26 evening: Flash-Next NVFP4 on two cards = Megatron TP + expert-parallel MoE: tg128 25.2 -> 31.7, code decode 17.2 -> 26.5, answers correct; prompt regressed 905 / 1,150 -> 713 / 664 (768-row chunks re-stream the RAM experts). Layer-major prefill fix built, test = tools/bench/onednn/fn_lm_test.sh. Handoff 12.9.**

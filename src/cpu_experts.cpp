@@ -28,9 +28,15 @@
 
 #ifndef __SYCL_DEVICE_ONLY__
 #include <immintrin.h>
+#include <pthread.h>
+#include <sched.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 namespace b70 {
 namespace {
@@ -90,11 +96,54 @@ float cpu_nvfp4_dot(const uint8_t* pay, const uint8_t* scl, const float* x, int 
     return hsum8(_mm256_add_ps(acc0, acc1));
 }
 
-void CpuExperts::start(int threads) {
+namespace {
+void pin_self(int cpu) {
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s);
+    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+}
+
+std::vector<int> read_cpu_list(const char* path) {      // "0-5", "6-13,16"
+    std::vector<int> v;
+    std::ifstream f(path);
+    std::string s;
+    if (!(f >> s)) return v;
+    std::stringstream ss(s);
+    for (std::string part; std::getline(ss, part, ',');) {
+        const size_t d = part.find('-');
+        const int a = std::atoi(part.c_str());
+        const int b = d == std::string::npos ? a : std::atoi(part.c_str() + d + 1);
+        for (int c = a; c <= b; ++c) v.push_back(c);
+    }
+    return v;
+}
+} // namespace
+
+std::vector<int> hybrid_pool_cpus(int ranks, int rank) {
+    const std::vector<int> p = read_cpu_list("/sys/devices/cpu_core/cpus");
+    const std::vector<int> e = read_cpu_list("/sys/devices/cpu_atom/cpus");
+    std::vector<int> out;
+    if (p.empty() || e.empty() || ranks < 1 || rank < 0 || rank >= ranks) return out;
+    const std::vector<int> lp = read_cpu_list("/sys/devices/cpu_lowpower/cpus");
+    auto share = [&](const std::vector<int>& all) {
+        std::vector<int> v;
+        for (int c : all) if (std::find(lp.begin(), lp.end(), c) == lp.end()) v.push_back(c);
+        const size_t b = v.size() * size_t(rank) / size_t(ranks), en = v.size() * size_t(rank + 1) / size_t(ranks);
+        for (size_t i = b; i < en; ++i) out.push_back(v[i]);
+    };
+    share(p);
+    share(e);
+    return out;
+}
+
+void CpuExperts::start(int threads, const std::vector<int>& cpus) {
     stop();
     if (threads <= 0) threads = std::max(1, int(std::thread::hardware_concurrency()) - 1);
     nthreads_ = threads;
     quit_ = false;
+    // Only the pool's own threads are pinned: the caller (worker 0) is not,
+    // or every thread it starts later would inherit the one-CPU mask.  cpus[0]
+    // stays free for it.
+    cpus_ = cpus;
     for (int t = 1; t < threads; ++t) workers_.emplace_back(&CpuExperts::worker, this, t);
 }
 
@@ -112,6 +161,7 @@ void CpuExperts::stop() {
 // for a while after the last one, then back off to short sleeps so an idle
 // server does not burn a core per worker.
 void CpuExperts::worker(int tid) {
+    if (tid < int(cpus_.size())) pin_self(cpus_[size_t(tid)]);
     using clk = std::chrono::steady_clock;
     uint64_t seen = gen_.load(std::memory_order_acquire);
     auto last = clk::now();

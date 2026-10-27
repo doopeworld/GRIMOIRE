@@ -636,3 +636,23 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   longer holds the caller's stdout (a `dual.sh | grep` pipeline hung); test "pleready" waits for the
   PLE table's copy into RAM.  gpu1's root port logs RxErr in bursts while idle (~440 in 4 min,
   0 uncorrectable, link up): two-card runs use RP_WIN=1000 RP_RUN=1000000 (Ian 10-25: run anyway).
+
+### 12.11 2026-10-27 evening: decode copies by kernel (ksend), all-reduce time split, CPU pool pinning
+- Two cards, one decode token (GRIMOIRE_TIMELINE): MoE 12.2, DeltaNet 6.5, attention 2.4, HC 4.1,
+  PLE 4.4 (rows still from disk in that run), tail 2.5 ms.  GPU work ~13 ms; the rest is waiting.
+- Small all-reduce split (GRIMOIRE_TP_SMALL_AR_TIME, now four parts): copy out 38-56 us (10 KB,
+  copy-engine memcpy + event wait), peer wait 72-171 us, CPU sum 1.2, copy in 12 us.
+- ksend / kwait: the copy out (and the CPU experts' route + block input) is now one work-group
+  kernel on the compute queue writing pinned RAM, then a tag into a pinned flag the CPU polls.
+  GRIMOIRE_KSEND_CHECK=1 compared 81,920 copies a rank with copy-engine copies: 0 differed.
+  Copy out 38-56 -> 13.9 us.  Two cards tg128 31.0 / 30.2 -> 34.1 / 32.9 (+-0.2), pp unchanged;
+  one card 22.2 / 21.9 -> 23.6 / 22.0.  GRIMOIRE_KSEND=0 = the memcpy.
+- The waits for the peer are the CPU experts: 0.40-0.46 RAM experts a layer call per rank,
+  ~0.25-0.3 ms each (GRIMOIRE_Q4_TIMING), while the GPU part of the MoE is ~30 us -- the rank with a
+  RAM expert arrives late.  Layers with none no longer copy and add a zero partial.
+- Two runs of the same build give different story/code text after 97-141 chars (two cards and
+  one card): decode is not bit-repeatable run to run, so answer identity is no test here.
+- BUILT, NOT TESTED (Ian needed the GPUs): b70::hybrid_pool_cpus pins each rank's CPU-expert pool
+  threads to its share of the P-cores (0-5) and E-cores (6-13), the low-power E-cores 14-15 left
+  out, the calling thread unpinned (GRIMOIRE_CPU_PIN=0 = off).  Test: bench-1022/fn_pin.sh
+  (Q4 timing CPU experts ms per call, then llama-benchy).

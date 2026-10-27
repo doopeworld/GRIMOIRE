@@ -2513,6 +2513,17 @@ struct Grimoire {
     float*    cx_x = nullptr;      float* cx_y = nullptr;
     float*    cx_dy = nullptr;     int32_t* cx_vexp = nullptr;
     double    cx_ms = 0.0;         long cx_calls = 0;   long cx_nexp = 0;   // + RAM experts computed
+    // Small device -> pinned-RAM copies the CPU waits for (decode all-reduce,
+    // CPU experts' route): a kernel on the compute queue copies, then writes an
+    // increasing tag into a pinned flag the CPU polls (ksend / kwait).  10-27:
+    // the copy-engine memcpy + event wait took 38-56 us for 10 KB, ~97 times a
+    // token on two cards.  GRIMOIRE_KSEND=0 = the memcpy.
+    uint64_t* kflag = nullptr;   uint64_t kflag_tag = 0;
+    uint64_t kjob_tag = 0; int kjob_n = 0;           // the last ksend, for GRIMOIRE_KSEND_CHECK
+    const void* kjob_s[4] = {}; void* kjob_d[4] = {}; size_t kjob_b[4] = {};
+    bool ksend_on();
+    uint64_t ksend(int n, const void* const* src, void* const* dst, const size_t* bytes);
+    bool kwait(uint64_t tag, const char* what);
     // the same, M rows at a time (short-prompt prefill), grown on demand
     size_t    px_cap = 0;
     int32_t*  px_route = nullptr;  float* px_wt = nullptr;
@@ -5381,6 +5392,88 @@ bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
 // into this card's own VRAM through the BAR -- so the copies out overlap the CPU work.  One
 // on-card copy puts the sum in place.  Measured 10-26 (8 rows, gpu1 on its x4 link): the plain
 // round trip is d2h 28 + CPU copy 9 + sum 14 + h2d 33 us, all serial, with the GPU idle.
+bool Grimoire::ksend_on() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_KSEND"); return !(e && *e == '0'); }();
+    if (!on) return false;
+    if (!kflag) {
+        kflag = sycl::malloc_host<uint64_t>(8, q);
+        if (kflag) std::memset(kflag, 0, 8 * sizeof(uint64_t));
+    }
+    return kflag != nullptr;
+}
+
+// Up to 4 device arrays into pinned RAM by one work-group on the compute queue,
+// then the next tag into kflag: every lane fences its stores at system scope
+// before the barrier, so the CPU that sees the tag sees the data.  Returns the tag.
+uint64_t Grimoire::ksend(int n, const void* const* src, void* const* dst, const size_t* bytes) {
+    struct Job { const uint8_t* s[4]; uint8_t* d[4]; size_t b[4]; int n; bool v16; } j{};
+    j.n = std::min(n, 4); j.v16 = true;
+    for (int i = 0; i < j.n; ++i) {
+        j.s[i] = static_cast<const uint8_t*>(src[i]); j.d[i] = static_cast<uint8_t*>(dst[i]);
+        j.b[i] = bytes[i];
+        if (((uintptr_t(src[i]) | uintptr_t(dst[i]) | bytes[i]) & 15) != 0) j.v16 = false;
+    }
+    const uint64_t tag = ++kflag_tag;
+    kjob_tag = tag; kjob_n = j.n;                    // for GRIMOIRE_KSEND_CHECK
+    for (int i = 0; i < j.n; ++i) { kjob_s[i] = src[i]; kjob_d[i] = dst[i]; kjob_b[i] = bytes[i]; }
+    uint64_t* fl = kflag;
+    constexpr int WG = 256;
+    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const size_t lid = it.get_local_id(0);
+        for (int k = 0; k < j.n; ++k) {
+            if (j.v16) {
+                const sycl::uint4* s = reinterpret_cast<const sycl::uint4*>(j.s[k]);
+                sycl::uint4* d = reinterpret_cast<sycl::uint4*>(j.d[k]);
+                for (size_t i = lid; i < j.b[k] / 16; i += WG) d[i] = s[i];
+            } else {
+                const uint32_t* s = reinterpret_cast<const uint32_t*>(j.s[k]);
+                uint32_t* d = reinterpret_cast<uint32_t*>(j.d[k]);
+                for (size_t i = lid; i < j.b[k] / 4; i += WG) d[i] = s[i];
+            }
+        }
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group());
+        if (lid == 0) {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *reinterpret_cast<volatile uint64_t*>(fl) = tag;
+        }
+    });
+    return tag;
+}
+
+bool Grimoire::kwait(uint64_t tag, const char* what) {
+    const volatile uint64_t* f = kflag;
+    uint64_t spins = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (*f < tag) {
+        __builtin_ia32_pause();
+        if ((++spins & 0xFFFFF) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(120)) {
+            std::fprintf(stderr, "%s: the device copy did not land in 120 s\n", what);
+            return false;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    // GRIMOIRE_KSEND_CHECK=1: what the CPU read when the tag showed up must equal
+    // a copy-engine copy of the same device bytes made afterwards (the sources
+    // are not written again before the caller is done with the copy)
+    static const bool chk = std::getenv("GRIMOIRE_KSEND_CHECK") != nullptr;
+    static uint64_t n_chk = 0, n_bad = 0;
+    if (chk && tag == kjob_tag) {
+        for (int k = 0; k < kjob_n; ++k) {
+            std::vector<uint8_t> ref(kjob_b[k]);
+            std::vector<uint8_t> got(static_cast<const uint8_t*>(kjob_d[k]),
+                                     static_cast<const uint8_t*>(kjob_d[k]) + kjob_b[k]);
+            q.memcpy(ref.data(), kjob_s[k], kjob_b[k]).wait();
+            ++n_chk;
+            if (std::memcmp(ref.data(), got.data(), kjob_b[k]) != 0) ++n_bad;
+        }
+        if (n_chk % 4096 == 0 || (n_bad && n_bad <= 4))
+            std::fprintf(stderr, "  ksend check: %llu copies compared, %llu differed\n",
+                         (unsigned long long)n_chk, (unsigned long long)n_bad);
+    }
+    return true;
+}
+
 bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
     const int peer=1-tp_rank;
     auto sflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+1024+64*size_t(r));};
@@ -5391,12 +5484,22 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
         (size_t(2*r)+size_t(s&1))*tshm.slot_elems*sizeof(float));};
     static const bool st=std::getenv("GRIMOIRE_TP_SMALL_AR_TIME")!=nullptr;
     using clk=std::chrono::steady_clock;
-    static double st_q[2]={}, st_ar[2]={}; static uint64_t st_n[2]={};
-    clk::time_point t0{},t1{};
+    // timer split (10-27): copy out (submit -> landed in RAM), wait for the peer, CPU sum into
+    // the BAR, copy back in (submit -> done)
+    static double st_q[2]={}, st_ar[2]={}, st_out[2]={}, st_peer[2]={}, st_sum[2]={}, st_in[2]={};
+    static uint64_t st_n[2]={};
+    clk::time_point t0{},t1{},ta{},tb{};
+    double t_peer=0, t_sum=0, t_out=0;
     if(st){t0=clk::now();q.wait();t1=clk::now();}
     const size_t P=tshm.sp_piece, np=(elems+P-1)/P;
     sycl::event ev[64];
-    for(size_t k=0;k<np;++k){
+    // one piece (decode): the copy out is a kernel + pinned flag (ksend)
+    const bool kpath=np==1&&ksend_on();
+    uint64_t ktag=0;
+    if(kpath){
+        const void* sp[1]={dev}; void* dp[1]={tshm.stage}; const size_t nb[1]={elems*sizeof(float)};
+        ktag=ksend(1,sp,dp,nb);
+    }else for(size_t k=0;k<np;++k){
         const size_t o=k*P;
         ev[k]=q.memcpy(tshm.stage+o,dev+o,std::min(P,elems-o)*sizeof(float));
     }
@@ -5406,7 +5509,10 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
     float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
     for(size_t k=0;k<np;++k){
         const size_t o=k*P, n=std::min(P,elems-o);
-        ev[k].wait();
+        if(st)ta=clk::now();
+        if(kpath){ if(!kwait(ktag,"TP small all-reduce"))return false; }
+        else ev[k].wait();
+        if(st){tb=clk::now(); t_out+=std::chrono::duration<double,std::micro>(tb-(k?ta:t1)).count();}
         std::memcpy(mine+o,tshm.stage+o,n*sizeof(float));
         const uint64_t c=++tshm.sp_cnt;
         sflag(tp_rank)->store(c,std::memory_order_release);
@@ -5418,10 +5524,13 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
                 return false;
             }
         }
+        if(st){ta=clk::now(); t_peer+=std::chrono::duration<double,std::micro>(ta-tw).count();}
         tp_bar_sum(bar+o,s0+o,s1+o,n);
+        if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
     }
     _mm_sfence();
     (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
+    if(st)ta=clk::now();
     q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
     if(st){
         q.wait();
@@ -5429,10 +5538,14 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems){
         const int b=elems<=size_t(cfg.hidden)?0:1;
         st_q[b]+=std::chrono::duration<double,std::micro>(t1-t0).count();
         st_ar[b]+=std::chrono::duration<double,std::micro>(t2-t1).count();
+        st_out[b]+=t_out; st_peer[b]+=t_peer; st_sum[b]+=t_sum;
+        st_in[b]+=std::chrono::duration<double,std::micro>(t2-ta).count();
         if(++st_n[b]%2048==0){
+            const double nn=double(st_n[b]);
             std::printf("  TP small all-reduce (BAR, %zu-float pieces) rank %d, %s rows: %llu calls, us per call:"
-                        " queued compute %.1f, all-reduce %.1f\n",P,tp_rank,b==0?"1":"2-16",
-                        (unsigned long long)st_n[b],st_q[b]/double(st_n[b]),st_ar[b]/double(st_n[b]));
+                        " queued compute %.1f, all-reduce %.1f = copy out %.1f + peer wait %.1f + CPU sum %.1f"
+                        " + copy in %.1f\n",P,tp_rank,b==0?"1":"2-16",(unsigned long long)st_n[b],st_q[b]/nn,
+                        st_ar[b]/nn,st_out[b]/nn,st_peer[b]/nn,st_sum[b]/nn,st_in[b]/nn);
             std::fflush(stdout);
         }
     }
@@ -9899,6 +10012,7 @@ void Grimoire::release() {
     }
     if (tp_scratch) { sycl::free(tp_scratch, q); tp_scratch = nullptr; tp_scratch_elems = 0; }
     if (tshm.stage) { sycl::free(tshm.stage, q); tshm.stage = nullptr; }
+    if (kflag) { q.wait(); sycl::free(kflag, q); kflag = nullptr; kflag_tag = 0; }
     if (tshm.res) { sycl::free(tshm.res, q); tshm.res = nullptr; }
     if (tshm.peer) { sycl::free(tshm.peer, q); tshm.peer = nullptr; }
     if (tshm.dtmp) { sycl::free(tshm.dtmp, q); tshm.dtmp = nullptr; }
@@ -11952,11 +12066,20 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             // computes the RAM-resident experts while those run.
             const bool cpu_split = d.tiered && cpu_moe && d.tm_nhost > 0;
             sycl::event cx_ready;
+            uint64_t cx_tag = 0;        // ksend: route, weights and block input in one kernel
             if (cpu_split) {
                 const int K = cfg.top_k;
-                q.memcpy(cx_route, s.d_expert, size_t(K) * sizeof(int32_t));
-                q.memcpy(cx_wt, s.d_weight, size_t(K) * sizeof(float));
-                cx_ready = q.memcpy(cx_x, s.h2, size_t(H) * sizeof(float));
+                if (ksend_on()) {
+                    const void* sp[3] = {s.d_expert, s.d_weight, s.h2};
+                    void* dp[3] = {cx_route, cx_wt, cx_x};
+                    const size_t nb[3] = {size_t(K) * sizeof(int32_t), size_t(K) * sizeof(float),
+                                          size_t(H) * sizeof(float)};
+                    cx_tag = ksend(3, sp, dp, nb);
+                } else {
+                    q.memcpy(cx_route, s.d_expert, size_t(K) * sizeof(int32_t));
+                    q.memcpy(cx_wt, s.d_weight, size_t(K) * sizeof(float));
+                    cx_ready = q.memcpy(cx_x, s.h2, size_t(H) * sizeof(float));
+                }
                 const int32_t* re = s.d_expert; const uint8_t* tier = d.tm_tier_d;
                 int32_t* ve = cx_vexp;
                 q.parallel_for(sycl::range<1>(size_t(K)), [=](sycl::id<1> k) {
@@ -12000,7 +12123,8 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                 launch_add(q, q4_pend, s.sh_out, H, none);
             }
             if (cpu_split) {
-                cx_ready.wait();
+                if (cx_tag) { if (!kwait(cx_tag, "CPU experts route")) return nullptr; }
+                else cx_ready.wait();
                 const auto t0 = std::chrono::steady_clock::now();
                 const uint8_t* blk[64]; float wt[64]; int n = 0;
                 for (int k = 0; k < cfg.top_k && n < 64; ++k) {
@@ -12009,13 +12133,16 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                     if (e < 0 || e >= cfg.n_experts || d.tm_tier_h[size_t(e)] != 1) continue;
                     blk[n] = d.tm_hptr[size_t(e)]; wt[n] = cx_wt[k]; ++n;
                 }
-                cpu_exp.ffn(tm_lay, blk, wt, n, cx_x, cx_y);
+                // no RAM expert routed here (most layers): nothing to add
+                if (n > 0) cpu_exp.ffn(tm_lay, blk, wt, n, cx_x, cx_y);
                 cx_nexp += n;
                 cx_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
                 ++cx_calls;
-                q.memcpy(cx_dy, cx_y, size_t(H) * sizeof(float));
-                launch_add(q, q4_pend, cx_dy, H, none);
+                if (n > 0) {
+                    q.memcpy(cx_dy, cx_y, size_t(H) * sizeof(float));
+                    launch_add(q, q4_pend, cx_dy, H, none);
+                }
             }
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
@@ -14911,7 +15038,21 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
             // 0.33 ms per layer call, 8 + 8 cost 0.07).
             const int ranks = std::max(pp_enabled() ? pp_world : 1, tp_ranked() ? tp_world : 1);
             const int share = std::max(1, int(std::thread::hardware_concurrency()) / ranks);
-            cpu_exp.start(tn ? std::atoi(tn) : ranks > 1 ? share : 0);
+            // A hybrid CPU (the Tower's 285H: P 0-5 at 5.4 GHz, E 6-13 at 4.5, low-power E
+            // 14-15 at 2.5): each rank's pool pinned to its share of the P- and E-cores, the
+            // low-power ones left out -- unpinned, one RAM expert took ~0.25 ms and the other
+            // rank waited at the all-reduce (10-27).  GRIMOIRE_CPU_PIN=0 = unpinned.
+            const char* pin = std::getenv("GRIMOIRE_CPU_PIN");
+            std::vector<int> cpus;
+            if (!(pin && *pin == '0'))
+                cpus = b70::hybrid_pool_cpus(ranks, pp_enabled() ? pp_rank : tp_ranked() ? tp_rank : 0);
+            const int nt = tn ? std::atoi(tn) : !cpus.empty() ? int(cpus.size()) : ranks > 1 ? share : 0;
+            cpu_exp.start(nt, cpus);
+            if (!cpus.empty()) {
+                std::string cl;
+                for (size_t c = 1; c < cpus.size() && int(c) < nt; ++c) cl += (cl.empty() ? "" : ",") + std::to_string(cpus[c]);
+                std::printf("  CPU experts: pool threads pinned to CPUs %s (the calling thread unpinned)\n", cl.c_str());
+            }
             const int K = cfg.top_k;
             cx_route = sycl::malloc_host<int32_t>(size_t(K), lq);
             cx_wt    = sycl::malloc_host<float>(size_t(K), lq);

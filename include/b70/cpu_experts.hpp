@@ -48,7 +48,9 @@ class CpuExperts {
 public:
     ~CpuExperts() { stop(); }
     // threads <= 0: hardware_concurrency - 1.  The calling thread is worker 0.
-    void start(int threads = 0);
+    // cpus: the CPU each pool thread t >= 1 is pinned to (cpus[t]; cpus[0] is
+    // the calling thread's, which is left unpinned); empty = not pinned.
+    void start(int threads = 0, const std::vector<int>& cpus = {});
     void stop();
     bool running() const { return !workers_.empty() || nthreads_ == 1; }
     int  threads() const { return nthreads_; }
@@ -62,6 +64,7 @@ private:
     void run(const std::function<void(int)>& job);   // all threads, then join
     void worker(int tid);
     int nthreads_ = 0;
+    std::vector<int> cpus_;
     std::vector<std::thread> workers_;
     std::atomic<uint64_t> gen_{0};
     std::atomic<int> left_{0};
@@ -72,6 +75,12 @@ private:
 
 // One NVFP4 row (K elements, K % 64 == 0) dotted with x.  Exposed for tests.
 float cpu_nvfp4_dot(const uint8_t* pay, const uint8_t* scl, const float* x, int K);
+
+// The CPUs for rank `rank` of `ranks` processes sharing this host's pool on
+// a hybrid CPU (/sys/devices/cpu_core, cpu_atom): its share of the P-cores,
+// then its share of the E-cores; the low-power E-cores (cpu_lowpower) are
+// left out.  Empty when the CPU is not hybrid or sysfs is not readable.
+std::vector<int> hybrid_pool_cpus(int ranks, int rank);
 
 } // namespace b70
 #endif
