@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -118,6 +119,31 @@ std::vector<int> read_cpu_list(const char* path) {      // "0-5", "6-13,16"
 }
 } // namespace
 
+static_assert(sizeof(cpu_set_t) <= 128, "ScopedCpuPin keeps the old mask in 128 bytes");
+
+ScopedCpuPin::ScopedCpuPin(int cpu) {
+    if (cpu < 0) return;
+    cpu_set_t old;
+    if (pthread_getaffinity_np(pthread_self(), sizeof old, &old) != 0) return;
+    std::memcpy(old_, &old, sizeof old);
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s);
+    on_ = pthread_setaffinity_np(pthread_self(), sizeof s, &s) == 0;
+}
+
+ScopedCpuPin::~ScopedCpuPin() {
+    if (!on_) return;
+    cpu_set_t old;
+    std::memcpy(&old, old_, sizeof old);
+    pthread_setaffinity_np(pthread_self(), sizeof old, &old);
+}
+
+void unpin_self() {
+    cpu_set_t s; CPU_ZERO(&s);
+    const int n = int(std::thread::hardware_concurrency());
+    for (int c = 0; c < n && c < CPU_SETSIZE; ++c) CPU_SET(c, &s);
+    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+}
+
 std::vector<int> hybrid_pool_cpus(int ranks, int rank) {
     const std::vector<int> p = read_cpu_list("/sys/devices/cpu_core/cpus");
     const std::vector<int> e = read_cpu_list("/sys/devices/cpu_atom/cpus");
@@ -144,7 +170,12 @@ void CpuExperts::start(int threads, const std::vector<int>& cpus) {
     // or every thread it starts later would inherit the one-CPU mask.  cpus[0]
     // stays free for it.
     cpus_ = cpus;
-    for (int t = 1; t < threads; ++t) workers_.emplace_back(&CpuExperts::worker, this, t);
+    // The generation every worker starts from is read HERE, not in the new
+    // thread: a worker that only got going after the first run() bumped gen_
+    // took that job's generation as already seen, never ran it, and the
+    // caller waited for it forever (10-27, cpu_expert_bench with 14 threads).
+    const uint64_t g0 = gen_.load(std::memory_order_acquire);
+    for (int t = 1; t < threads; ++t) workers_.emplace_back(&CpuExperts::worker, this, t, g0);
 }
 
 void CpuExperts::stop() {
@@ -160,10 +191,9 @@ void CpuExperts::stop() {
 // Spin while calls arrive every few hundred microseconds (decode), yield
 // for a while after the last one, then back off to short sleeps so an idle
 // server does not burn a core per worker.
-void CpuExperts::worker(int tid) {
+void CpuExperts::worker(int tid, uint64_t seen) {
     if (tid < int(cpus_.size())) pin_self(cpus_[size_t(tid)]);
     using clk = std::chrono::steady_clock;
-    uint64_t seen = gen_.load(std::memory_order_acquire);
     auto last = clk::now();
     for (;;) {
         uint64_t g;
@@ -187,7 +217,9 @@ void CpuExperts::run(const std::function<void(int)>& job) {
     left_.store(nthreads_ - 1, std::memory_order_relaxed);
     gen_.fetch_add(1, std::memory_order_release);
     job(0);
+    const auto t = std::chrono::steady_clock::now();
     while (left_.load(std::memory_order_acquire) > 0) _mm_pause();
+    wait_us_ += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
 }
 
 void CpuExperts::ffn(const NvExpertLayout& L, const uint8_t* const* blocks, const float* w,

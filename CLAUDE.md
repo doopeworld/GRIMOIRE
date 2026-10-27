@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-27 late evening: Flash-Next two cards tg128 34.1 / 32.9 -> 38.4-38.7 / 36.3-36.7: CPU pool and decode thread pinned, the CPU experts' partial added on the host inside the MoE all-reduce (bit-exact).  CPU experts still stall in 1-2% of calls.  Handoff 12.12.**
+
 **2026-10-27 evening: decode copies by kernel + pinned flag (ksend): two cards tg128 31.0 / 30.2 -> 34.1 / 32.9; the rest of the all-reduce time is waiting for the rank whose CPU experts run (~0.25 ms a RAM expert). CPU pool pinning built, not tested. Handoff 12.11.**
 
 **2026-10-27: Flash-Next NVFP4 prompt: two cards pp2048 / pp4096 713 / 664 -> 1,263 / 1,463, one card 654 -> 804 at 4096 (layer-major prefill; the HC inject projection had a ~1.5 ms GEMM per call; sub-chunks sized per call); decode unchanged (TP ~31, one card ~22). Ring prefetch and uneven cold-expert split measured slower, off. Handoff 12.10.**

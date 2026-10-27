@@ -656,3 +656,50 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   threads to its share of the P-cores (0-5) and E-cores (6-13), the low-power E-cores 14-15 left
   out, the calling thread unpinned (GRIMOIRE_CPU_PIN=0 = off).  Test: bench-1022/fn_pin.sh
   (Q4 timing CPU experts ms per call, then llama-benchy).
+
+### 12.12 2026-10-27 evening: CPU pool pinning measured, CPU-expert bench, pool start race, CPU partial folded into the MoE all-reduce
+- Pinning (b70::hybrid_pool_cpus, default on), same session, two cards, llama-benchy tg128:
+  pinned 37.59 / 35.63 and 37.69 / 35.91 (repeat), unpinned (GRIMOIRE_CPU_PIN=0) 31.80 / 32.68;
+  prompts unchanged (pp2048 1,256-1,320, pp4096 1,436-1,461).  CPU experts per layer call
+  (GRIMOIRE_Q4_TIMING): 0.069-0.088 ms pinned vs 0.115-0.139 ms unpinned; MoE region per token
+  16.7-17.6 vs 21.8-23.0 ms (synced timing).
+- tools/cpu_expert_bench.cpp (CPU only, no GPU): Flash-Next-sized experts (H 2560, I 640, 2.77 MB)
+  in a 1 GB pool, one random expert per call at the decode cadence.
+  - One thread: P-core 21.6 GMAC/s with the row in L1, 11.7 streamed from RAM (6.6 GB/s);
+    E-core 9.6 / 9.5; low-power E-core 4.5 / 3.9.  Streaming, not arithmetic, is the limit.
+  - Pool: one rank, 7 pinned threads: median 65 us (42 GB/s); both ranks at once: 80 us each
+    (34 GB/s each, the DRAM limit); unpinned: medians 75-102 us but p99 1.2-1.7 ms and max 5-9 ms
+    (descheduled workers); 3 P-core threads 125 us; two experts a call 132 us.
+  - In the engine one RAM expert looked like ~170-200 us pinned, but that figure is unreliable:
+    cx_ms / cx_calls also counts the short-prompt rows (tiered_moe_cpu_rows: M calls each) while
+    cx_nexp counts decode experts only.  GRIMOIRE_CX_STATS=1 now times decode calls alone.
+  - The pool reads the GPU's pinned memory (sycl::malloc_host, 4 KB pages, no huge pages) as fast
+    as plain memory: 67.5 vs 65.9 us; plain memory on 4 KB pages 66.8 us.  Software prefetch 2/4/8
+    rows ahead: 75-85 us (slower) in the bench, no change in the engine (37.54 / 36.22 tg) --
+    removed.
+- CPU experts' partial folded into the MoE all-reduce (GRIMOIRE_CX_FOLD, default on; =0 old way):
+  the GPU partial's copy out (ksend) is queued before the CPU experts run, and the CPU adds its
+  partial on the host (same fp32 add as the device's, same order) instead of host->device copy +
+  device add + copy out after the CPU.  GRIMOIRE_CX_FOLD_CHECK=1: 12,288 all-reduces a rank
+  compared with the old device add, 0 differed.  tg128 fold 38.01 / 36.11 and 37.99 / 35.38,
+  no fold 37.63 / 35.78: about +1%.
+- Busy threads during decode (tsample.sh / tsample2.sh, per-thread CPU over 1-2 s): each rank's
+  decode thread (rank 0's scheduler thread, rank 1's main thread) is busy all the time and was
+  NOT pinned: it ran on the low-power cores 14-15 (2.5 GHz) or on a pinned worker's CPU (rank 1's
+  on its own worker's CPU 5, or on rank 0's CPU 8), and the PLE table copy thread (about 60 s at
+  100% kernel time) on CPU 3.
+- Decode thread pinned (b70::ScopedCpuPin around forward_qwen4_exp, cpus[0] of the rank's list:
+  rank 0 CPU 0, rank 1 CPU 3; GRIMOIRE_CPU_PIN_CALLER=0 = off); the PLE copy thread and the
+  ple_fetch_rows workers unpin themselves.  llama-benchy tg128 pinned 38.39 / 36.69 and 38.74 /
+  36.31, unpinned 37.94 / 36.23.  GRIMOIRE_CX_STATS (decode calls only), pinned vs unpinned:
+  one-expert calls 0.121-0.147 vs 0.201-0.208 ms, all calls 0.161-0.202 vs 0.236-0.271 ms, the
+  caller's wait for the last worker 33-58 vs 114-139 us; calls over 1.6 ms 179-324 vs 309-786 of
+  ~15-16K.  14-16 calls with RAM experts a token a rank, 1.42-1.48 experts a call.
+- Remaining CPU-expert loss: 55% of calls are under 100 us (the bench's speed) but ~1-2% stall
+  1.6 ms or more (a worker descheduled while it holds an item); the spinning workers are always
+  runnable, so any other task that wakes on their CPU takes a slice.  The caller's wait for the
+  last worker: 4.6-6.8 us a call in the bench, 33-58 us in the engine.
+- Pool start race, FIXED: a worker read its starting generation inside its own new thread; one
+  that started only after the first run() took that job as already seen, never ran it, and the
+  caller waited forever (the bench with 14 threads hung).  start() now hands every worker the
+  generation it starts from.  The engine's first call comes long after load, so it never hit it.

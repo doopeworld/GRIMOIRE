@@ -54,6 +54,8 @@ public:
     void stop();
     bool running() const { return !workers_.empty() || nthreads_ == 1; }
     int  threads() const { return nthreads_; }
+    // microseconds the caller has spent waiting for the last worker after its own share
+    double wait_us() const { return wait_us_; }
 
     // y[H] = sum_j w[j] * down_j(silu(gate_j x) * up_j x) for the n experts
     // in blocks[] (host memory).  x is H floats.  Overwrites y.
@@ -62,7 +64,7 @@ public:
 
 private:
     void run(const std::function<void(int)>& job);   // all threads, then join
-    void worker(int tid);
+    void worker(int tid, uint64_t seen);   // seen = the generation it starts from
     int nthreads_ = 0;
     std::vector<int> cpus_;
     std::vector<std::thread> workers_;
@@ -70,8 +72,27 @@ private:
     std::atomic<int> left_{0};
     std::atomic<bool> quit_{false};
     const std::function<void(int)>* job_ = nullptr;
+    double wait_us_ = 0.0;
     std::vector<float> gu_, h_;          // per-call scratch
 };
+
+// Keeps the calling thread on one CPU while it lives (a decode step), then
+// gives it back the CPUs it had.  A thread started meanwhile inherits the
+// one-CPU mask, so it goes only around code that starts none (and the few
+// threads the engine starts call unpin_self).  cpu < 0 = does nothing.
+class ScopedCpuPin {
+public:
+    explicit ScopedCpuPin(int cpu);
+    ~ScopedCpuPin();
+    ScopedCpuPin(const ScopedCpuPin&) = delete;
+    ScopedCpuPin& operator=(const ScopedCpuPin&) = delete;
+private:
+    bool on_ = false;
+    unsigned char old_[128] = {};        // the cpu_set_t it had
+};
+
+// The calling thread may run on every CPU again (a thread started by a pinned one).
+void unpin_self();
 
 // One NVFP4 row (K elements, K % 64 == 0) dotted with x.  Exposed for tests.
 float cpu_nvfp4_dot(const uint8_t* pay, const uint8_t* scl, const float* x, int K);
