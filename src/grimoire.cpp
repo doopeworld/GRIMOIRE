@@ -2331,7 +2331,16 @@ struct Grimoire {
     int  q4_sub_rows = 0;
     size_t tm_group_routes = 0;
     int  q4_prefill_split();
+    // the budget behind q4_sub_rows (bytes; TP ranks agree on the smallest)
+    // and the bytes a full row / sub-chunk row / route costs: q4_sub_for(M)
+    // picks a call's own sub-chunk from them
+    double q4_split_free = 0, q4_per_full = 0, q4_per_sub = 0, q4_per_route = 0;
+    int  q4_sub_for(int M) const;
     int  tm_ring_want() const;
+    // Megatron TP expert ownership: the rank of hit-ranking position k when
+    // every rank keeps nv experts a layer in VRAM, and how many this rank owns
+    int  tm_owner(int k, int nv) const;
+    int  tm_owned(int E, int nv) const;
     bool tp_budget_live = false;
     int comm_rank() const { return pp_enabled()?pp_rank:tp_rank; }
     static bool fd_write_all(int fd,const void* data,size_t bytes) {
@@ -2486,6 +2495,14 @@ struct Grimoire {
     // their own copy queue while the compute queue works on earlier ones.
     uint8_t*  tm_ring = nullptr;  int tm_ring_slots = 0;
     std::unique_ptr<sycl::queue> tm_cq;
+    // The ring runs on across layers (tiered_moe_prefill): the next ring
+    // position, each slot's last copy or read, and the next MoE layer's first
+    // positions already copied while that layer's mixer runs.
+    size_t tm_gpos = 0;
+    std::vector<sycl::event> tm_slot_ev, tm_pref_ev;
+    std::vector<char> tm_slot_has;
+    const void* tm_pref_d = nullptr;      // the LayerDev those positions belong to
+    int tm_pref_n = 0;
     int32_t   *tm_ptoken = nullptr, *tm_pinv = nullptr;
     // Decode: RAM-resident experts computed on the host CPU (b70/cpu_experts.hpp)
     // while the GPU runs the VRAM-resident ones.  Pinned staging for the
@@ -3579,6 +3596,7 @@ struct Grimoire {
                                LayerDev& d, int layer, std::string& err);
     bool tiered_moe_prefill(const LayerDev& d, const float* x, const int32_t* rex,
                             const float* rwt, float* out, int M);
+    void tm_prefetch(const LayerDev& next, int M);
     bool tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int32_t* rex,
                              const float* rwt, float* mh, float* out, int M);
     // PLE from the file: rows for positions [p0, p0+M) into ple_stage.
@@ -8358,6 +8376,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             int sub = q4_sub_rows > 0 ? q4_sub_rows : (1 << 30);
             if (!tp_agree_min(sub)) { err = "TP prefill sub-chunk agreement failed"; return false; }
             q4_sub_rows = sub >= cap ? 0 : sub;
+            // q4_sub_for() sizes each call's sub-chunk from these: the same
+            // figures on every rank (MiB, the smallest budget)
+            int free_mib = int(std::clamp(q4_split_free / 1048576.0, 0.0, 1.0e9));
+            if (!tp_agree_min(free_mib)) { err = "TP prefill budget agreement failed"; return false; }
+            q4_split_free = double(free_mib) * 1048576.0;
+            if (q4_sub_rows > 0 && tm_group_routes == 0) tm_group_routes = 8192;
             std::printf("  layer-major prefill: %s\n", q4_sub_rows > 0
                 ? ("sub-chunks of " + std::to_string(q4_sub_rows) + " rows, experts once per call").c_str()
                 : "every call in one piece");
@@ -8981,6 +9005,7 @@ int Grimoire::q4_prefill_split() {
     static const int sub_want = [] { const char* v = std::getenv("GRIMOIRE_Q4_SUBCHUNK");
         return v && *v ? std::max(128, std::atoi(v)) / 128 * 128 : 768; }();
     const double whole = per_full + per_sub + TK * per_route;
+    q4_split_free = F; q4_per_full = per_full; q4_per_sub = per_sub; q4_per_route = per_route;
     long n;
     if (F >= whole * span_max) {
         n = long(F / whole);                  // one piece, every route at once
@@ -9004,6 +9029,52 @@ int Grimoire::q4_prefill_split() {
                      free_b / 1073741824.0, margin / 1073741824.0, per_full / 1024.0, per_sub / 1024.0,
                      per_route / 1024.0, n, q4_sub_rows);
     return int(n);
+}
+
+// The sub-chunk of a call of M rows: the largest multiple of 128 (at least
+// q4_sub_rows) that q4_prefill_split()'s budget still holds next to the
+// call's full-width rows and one route group -- M itself when the call fits
+// in one piece.  10-27: a fixed 768 cut a 4,096-token prompt on one card into
+// six pieces where one fits (pp4096 752 -> 654).  TP ranks compute it from
+// the figures they agreed on at load, so they cut the same sub-chunks.
+int Grimoire::q4_sub_for(int M) const {
+    static const bool fixed = [] { const char* v = std::getenv("GRIMOIRE_Q4_SUBGROW");
+        return v && *v == '0'; }();
+    if (q4_sub_rows <= 0 || M <= q4_sub_rows) return M;
+    if (fixed) return q4_sub_rows;
+    // only figures every rank shares (not tm_cap: each rank's routes differ)
+    const double routes = double(M) * std::max(1, cfg.top_k);
+    const double G = tm_group_routes > 0 ? std::min(double(tm_group_routes), routes) : routes;
+    const double left = q4_split_free - double(M) * q4_per_full - G * q4_per_route;
+    const long s = left > 0 && q4_per_sub > 0 ? long(left / q4_per_sub) / 128 * 128 : 0;
+    if (s >= M) return M;
+    return int(std::max<long>(s, q4_sub_rows));
+}
+
+// Megatron TP expert ownership.  The first world * nv positions of the hit
+// ranking (the hot experts, which stay in VRAM) alternate: position k goes to
+// rank k % world.  The cold ones after them stream over PCIe in every prompt;
+// GRIMOIRE_EP_COLD_SHARE=<f> (two ranks) gives rank 0 the fraction f of them,
+// spread evenly down the ranking -- 10-27: gpu1's x4 link moves half what
+// gpu0's x8 one does, and with an even split gpu0 waited for it (MoE 1.56 s
+// of a 4,096-token prompt).  Unset = k % world for every position.  Every
+// rank must see the same nv (GRIMOIRE_EXPERT_VRAM_PER_LAYER, or the same
+// card), or the ranks would disagree on who owns what.
+int Grimoire::tm_owner(int k, int nv) const {
+    if (!tp_mega) return 0;
+    static const double s0 = [] { const char* v = std::getenv("GRIMOIRE_EP_COLD_SHARE");
+        return v && *v ? std::clamp(std::atof(v), 0.0, 1.0) : -1.0; }();
+    const long hot = long(tp_world) * nv;
+    if (s0 < 0 || tp_world != 2 || k < hot) return k % tp_world;
+    const double c = double(k - hot);
+    return std::floor((c + 1.0) * s0) > std::floor(c * s0) ? 0 : 1;
+}
+
+int Grimoire::tm_owned(int E, int nv) const {
+    if (!tp_mega) return E;
+    int n = 0;
+    for (int k = 0; k < E; ++k) n += tm_owner(k, nv) == tp_rank;
+    return n;
 }
 
 // GRIMOIRE_EXPERT_RING slots of one expert block each (default 128, ~350 MB
@@ -9989,6 +10060,8 @@ void Grimoire::release() {
     tm_cap = tm_icap = 0; tm_any = false; tm_vram_per_layer = -1; tm_vram_bytes = tm_host_bytes = 0;
     if (tm_cq) { tm_cq->wait(); tm_cq.reset(); }
     tm_ring_slots = 0;
+    tm_gpos = 0; tm_slot_ev.clear(); tm_slot_has.clear(); tm_pref_ev.clear();
+    tm_pref_d = nullptr; tm_pref_n = 0;
     {
         LayerDev& d = mtp.L;
         mtp.fc.release(q);
@@ -11574,6 +11647,34 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                 q4_normed, q4_lora, inj_out, LR, HC, WIDE, none);
             launch_hc_up_mean1(q, reinterpret_cast<const bf16_t*>(hc.up.w.payload), q4_lora,
                                q4_normed, block_out, HC, H, LR, none);
+            // GRIMOIRE_HC_CHECK=1: the first 8 mixes also run the kernels
+            // before 10-27 into q4_gate and print the largest differences
+            static const bool hc_check = std::getenv("GRIMOIRE_HC_CHECK") != nullptr;
+            static int hc_checked = 0;
+            if (hc_check && hc_checked < 8) {
+                ++hc_checked;
+                float* rl = q4_gate; float* ri = q4_gate + LR; float* rb = q4_gate + LR + HC;
+                launch_hc_down_inject1_sg(q, reinterpret_cast<const bf16_t*>(hc.down.w.payload),
+                    want_inj ? reinterpret_cast<const bf16_t*>(hc.inject.w.payload) : nullptr,
+                    q4_normed, rl, ri, LR, HC, WIDE, none);
+                launch_hc_up_mean1_sg(q, reinterpret_cast<const bf16_t*>(hc.up.w.payload), rl,
+                                      q4_normed, rb, HC, H, LR, none);
+                const int n = LR + HC + H;
+                std::vector<float> a(size_t(n), 0.0f), b(size_t(n), 0.0f);
+                q.memcpy(a.data(), q4_lora, size_t(LR) * sizeof(float));
+                if (want_inj) q.memcpy(a.data() + LR, inj_out, size_t(HC) * sizeof(float));
+                q.memcpy(a.data() + LR + HC, block_out, size_t(H) * sizeof(float));
+                q.memcpy(b.data(), q4_gate, size_t(n) * sizeof(float)).wait();
+                if (!want_inj) std::fill(b.begin() + LR, b.begin() + LR + HC, 0.0f);
+                double dm[3] = {0, 0, 0}, rm[3] = {0, 0, 0};
+                for (int i = 0; i < n; ++i) {
+                    const int s = i < LR ? 0 : i < LR + HC ? 1 : 2;
+                    dm[s] = std::max(dm[s], double(std::fabs(a[size_t(i)] - b[size_t(i)])));
+                    rm[s] = std::max(rm[s], double(std::fabs(b[size_t(i)])));
+                }
+                std::fprintf(stderr, "  HC check %d: lora max diff %.3g (max %.3g)  inject %.3g (%.3g)  "
+                             "block %.3g (%.3g)\n", hc_checked, dm[0], rm[0], dm[1], rm[1], dm[2], rm[2]);
+            }
             return;
         }
         if (pend) launch_hc_combine(q, q4_hyper, pinj, pend, q4_hyper,
@@ -14677,26 +14778,27 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         for (int l = 0; l < int(ck.layers.size()); ++l)
             if ((!pp_enabled() || (l >= pp_begin && l < pp_end)) &&
                 !ck.layers[size_t(l)].e_gate_p.empty()) ++moe_layers;
-        // Megatron TP: this rank holds whole experts of its half only (owners alternate down
-        // the hit ranking, so the hot ones are split evenly).
-        const int Eown = tp_mega ? E / tp_world : E;
-        const size_t all = size_t(Eown) * lay.bytes * size_t(moe_layers);
+        // Megatron TP: this rank holds whole experts of its share only (tm_owner: the
+        // hot ones alternate down the hit ranking).
+        const int Ehalf = tp_mega ? E / tp_world : E;
+        const size_t all = size_t(Ehalf) * lay.bytes * size_t(moe_layers);
         const size_t dev = lq.get_device().get_info<sycl::info::device::global_mem_size>();
-        int nv = Eown;
+        int nv = Ehalf;
         if (const char* v = std::getenv("GRIMOIRE_EXPERT_VRAM_PER_LAYER")) {
-            nv = std::max(0, std::min(Eown, std::atoi(v)));
+            nv = std::max(0, std::min(Ehalf, std::atoi(v)));
         } else {
             const char* g = std::getenv("GRIMOIRE_EXPERT_VRAM_GB");
             const size_t budget = g ? size_t(std::max(0.0, std::atof(g)) * 1073741824.0)
                                 : (all <= dev / 10 * 6 ? all : size_t(16) << 30);
-            nv = int(std::min<size_t>(size_t(Eown), budget / (lay.bytes * size_t(moe_layers))));
+            nv = int(std::min<size_t>(size_t(Ehalf), budget / (lay.bytes * size_t(moe_layers))));
         }
         tm_vram_per_layer = nv;
+        const int Eown = tm_owned(E, nv);
         const size_t host_need = size_t(Eown - nv) * lay.bytes * size_t(moe_layers);
         const size_t avail = mem_available_bytes();
         std::printf("  tiered experts: %d layers x %d%s, %.2f MB each -- %d/layer in VRAM "
                     "(%.1f GB), %d/layer in pinned RAM (%.1f GB of %.1f GB available)\n",
-                    moe_layers, Eown, tp_mega ? " (this rank's half of every layer)" : "",
+                    moe_layers, Eown, tp_mega ? " (this rank's share of every layer)" : "",
                     lay.bytes / 1048576.0, nv,
                     double(nv) * lay.bytes * moe_layers / 1073741824.0, Eown - nv,
                     host_need / 1073741824.0, avail / 1073741824.0);
@@ -14716,14 +14818,14 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         }
     }
     const int nv = tm_vram_per_layer;
-    const int Eown = tp_mega ? E / tp_world : E;
+    const int Eown = tm_owned(E, nv);
     d.tm_nvram = nv;
     d.tm_nhost = Eown - nv;
     d.tm_ep = tp_mega;
     // Which experts go to VRAM: the nv most-routed ones when a hits file
     // from earlier runs exists (GRIMOIRE_EXPERT_HITS, [moe layer][expert]
     // uint64), else the first nv.  Slot = rank within its tier.  Megatron TP:
-    // position k of that ranking belongs to rank k % world (tier 2 elsewhere).
+    // position k of that ranking belongs to rank tm_owner(k) (tier 2 elsewhere).
     d.tm_tier_h.assign(size_t(E), 1);
     {
         std::vector<int> order(static_cast<size_t>(E));
@@ -14744,7 +14846,7 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         if (tp_mega) {
             std::vector<int> mine;
             for (int k = 0; k < E; ++k) {
-                if (k % tp_world == tp_rank) mine.push_back(order[size_t(k)]);
+                if (tm_owner(k, nv) == tp_rank) mine.push_back(order[size_t(k)]);
                 else d.tm_tier_h[size_t(order[size_t(k)])] = 2;
             }
             order.swap(mine);
@@ -14859,10 +14961,10 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
     // gives the copy engine a head start on the ring), then the RAM-resident
     // ones in ring order.  Megatron TP: the other rank's experts (tier 2) take
     // no rows here; their routes unpermute as -1, which adds nothing.
-    std::vector<int> ord, host;
+    std::vector<int> ord;
     for (int e = 0; e < E; ++e) if (count[size_t(e)] && d.tm_tier_h[size_t(e)] == 0) ord.push_back(e);
     for (int e = 0; e < E; ++e)
-        if (count[size_t(e)] && d.tm_tier_h[size_t(e)] == 1) { ord.push_back(e); host.push_back(e); }
+        if (count[size_t(e)] && d.tm_tier_h[size_t(e)] == 1) ord.push_back(e);
     size_t Rown = 0;
     for (const int e : ord) { off[size_t(e)] = int(Rown); Rown += size_t(count[size_t(e)]); }
     {
@@ -14904,6 +15006,32 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
     }
     if (Rown) q.memcpy(tm_ptoken, hp.data(), Rown * sizeof(int32_t));
     q.memcpy(tm_pinv, hi.data(), R * sizeof(int32_t)).wait();
+    // The ring runs on across layers: this rank's RAM-resident experts of a
+    // layer (index order, hl) take ring positions tm_gpos, tm_gpos + 1, ...
+    // (slot = position % S), and tm_slot_ev holds each slot's last copy or
+    // read.  The previous MoE layer may already have copied this layer's
+    // first tm_pref_n positions while its mixer ran (10-27: the copies started
+    // only here, after the router -- on two cards gpu1's x4 link then spent
+    // ~32 ms a layer with the card waiting: 1.56 s of a 4,096-token prompt).
+    const int S = tm_ring_slots;
+    if (tm_slot_ev.size() != size_t(S)) { tm_slot_ev.assign(size_t(S), {}); tm_slot_has.assign(size_t(S), 0); }
+    const size_t G = tm_gpos;
+    auto slot = [&](size_t gp) { return tm_ring + (gp % size_t(S)) * tm_lay.bytes; };
+    std::vector<int> hl;
+    for (int e = 0; e < E; ++e) if (d.tm_tier_h[size_t(e)] == 1) hl.push_back(e);
+    const int nh = int(hl.size());
+    std::vector<sycl::event> copied(static_cast<size_t>(nh));
+    auto copy = [&](const LayerDev& dl, int e, size_t gp, sycl::event& ev) {
+        const size_t s = gp % size_t(S);
+        std::vector<sycl::event> dep;
+        if (tm_slot_has[s]) dep.push_back(tm_slot_ev[s]);
+        ev = tm_cq->memcpy(slot(gp), dl.tm_hptr[size_t(e)], tm_lay.bytes, dep);
+        tm_slot_ev[s] = ev; tm_slot_has[s] = 1;
+    };
+    const int P = tm_pref_d == &d ? std::min(tm_pref_n, nh) : 0;
+    for (int j = 0; j < P; ++j) copied[size_t(j)] = tm_pref_ev[size_t(j)];
+    tm_pref_d = nullptr; tm_pref_n = 0;
+    tm_gpos = G + size_t(nh);           // the next layer's first ring position
     if (!Rown) {            // no route to this rank's experts
         q.memset(out, 0, size_t(M) * H * sizeof(float));
         return true;
@@ -14925,12 +15053,14 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
             tm_xperm + o * H, tm_hbf + o * I, tm_yperm + o * H,
             count[size_t(e)], tm_scratch, deps, done);
     };
-    const int nh = int(host.size()), S = tm_ring_slots;
-    std::vector<sycl::event> copied(static_cast<size_t>(nh)), done(static_cast<size_t>(nh));
-    auto slot = [&](int j) { return tm_ring + size_t(j % S) * tm_lay.bytes; };
-    for (int j = 0; j < std::min(S, nh); ++j)
-        copied[size_t(j)] = tm_cq->memcpy(slot(j), d.tm_hptr[size_t(host[size_t(j)])], tm_lay.bytes);
-    int hj = 0;             // RAM-resident experts started so far, in ring order
+    for (int j = P; j < std::min(S, nh); ++j)
+        if (count[size_t(hl[size_t(j)])]) copy(d, hl[size_t(j)], G + size_t(j), copied[size_t(j)]);
+    // after position j's last read: refill its slot with position j + S
+    auto advance = [&](int j) {
+        if (j + S < nh && count[size_t(hl[size_t(j + S)])])
+            copy(d, hl[size_t(j + S)], G + size_t(j + S), copied[size_t(j + S)]);
+    };
+    int hj = 0;             // next ring position, in hl order
     for (size_t gi = 0; gi < grp.size(); ++gi) {
         const Group& g = grp[gi];
         launch_permute_rows_bf16(q, x, tm_ptoken + g.p0, tm_xperm, int(g.p1 - g.p0), H);
@@ -14938,16 +15068,49 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
             const int e = ord[j];
             const size_t o = size_t(off[size_t(e)]) - g.p0;
             if (d.tm_tier_h[size_t(e)] == 0) { ffn(e, o, d.tm_hptr[size_t(e)], {}, nullptr); continue; }
-            ffn(e, o, slot(hj), {copied[size_t(hj)]}, &done[size_t(hj)]);
-            if (hj + S < nh)      // refill the slot once its block is no longer read
-                copied[size_t(hj + S)] = tm_cq->memcpy(slot(hj + S),
-                    d.tm_hptr[size_t(host[size_t(hj + S)])], tm_lay.bytes, done[size_t(hj)]);
-            ++hj;
+            while (hj < nh && hl[size_t(hj)] != e) advance(hj++);      // positions without rows
+            if (hj >= nh) { std::fprintf(stderr, "tiered MoE: RAM expert %d not in the ring order\n", e); return false; }
+            sycl::event fin;
+            const size_t gp = G + size_t(hj);
+            ffn(e, o, slot(gp), {copied[size_t(hj)]}, &fin);
+            tm_slot_ev[gp % size_t(S)] = fin; tm_slot_has[gp % size_t(S)] = 1;
+            advance(hj++);
         }
         launch_moe_unpermute_range(q, tm_yperm, tm_pinv, rwt, out, M, K, H,
                                    int(g.p0), int(g.p1), gi > 0);
     }
     return true;
+}
+
+// The next MoE layer's first S ring positions (its RAM-resident experts in
+// index order), each after the last read of its slot -- in the order the
+// slots free up -- so they cross PCIe while that layer's mixer runs.  The
+// caller issues it AFTER this layer's MoE all-reduce: 10-27, issued before
+// it, the copies took gpu1's x4 link from the all-reduce on the critical
+// path (two cards, pp4096 MoE 1.6 -> 2.5 s).  Only for calls of
+// GRIMOIRE_EXPERT_PREFETCH rows or more (unset / 0 = off), where all of a
+// layer's experts have rows: a 73-row call wasted most copies (MoE 339 ->
+// 1,381 ms).
+void Grimoire::tm_prefetch(const LayerDev& next, int M) {
+    static const int pref_min = [] { const char* v = std::getenv("GRIMOIRE_EXPERT_PREFETCH");
+        return v && *v ? std::max(0, std::atoi(v)) : 0; }();
+    tm_pref_d = nullptr; tm_pref_n = 0;
+    if (pref_min <= 0 || M < pref_min || !tm_ring || !tm_cq || !next.tiered || next.tm_nhost <= 0) return;
+    const int S = tm_ring_slots, E = cfg.n_experts;
+    if (tm_slot_ev.size() != size_t(S)) { tm_slot_ev.assign(size_t(S), {}); tm_slot_has.assign(size_t(S), 0); }
+    std::vector<int> nl;
+    for (int e = 0; e < E; ++e) if (next.tm_tier_h[size_t(e)] == 1) nl.push_back(e);
+    const int P = std::min(S, int(nl.size()));
+    tm_pref_ev.assign(size_t(P), {});
+    for (int j = 0; j < P; ++j) {
+        const size_t s = (tm_gpos + size_t(j)) % size_t(S);
+        std::vector<sycl::event> dep;
+        if (tm_slot_has[s]) dep.push_back(tm_slot_ev[s]);
+        tm_pref_ev[size_t(j)] = tm_cq->memcpy(tm_ring + s * tm_lay.bytes,
+            next.tm_hptr[size_t(nl[size_t(j)])], tm_lay.bytes, dep);
+        tm_slot_ev[s] = tm_pref_ev[size_t(j)]; tm_slot_has[s] = 1;
+    }
+    tm_pref_d = &next; tm_pref_n = P;
 }
 
 // Short prompts: the GPU runs the VRAM-resident experts for all M rows
@@ -15019,6 +15182,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     const bool pp_later = pp_enabled() && pp_rank > 0;
     const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
     const int start_pos = pos;
+    tm_pref_d = nullptr; tm_pref_n = 0;     // ring prefetches never cross calls
 
     const int H = cfg.hidden, QH = cfg.n_heads;
     const int HC = cfg.hc_count, WIDE = HC * H, LR = cfg.hc_lowrank;
@@ -15058,8 +15222,9 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     // Layer-major sub-chunks (the layer loop): the rows of the whole call live in
     // hyper/inj/pinj/pend/blk_in/dtok/rex/rwt, everything else holds one
     // sub-chunk of SUB rows.  q4_sub_rows comes from prefill_token_budget()
-    // (agreed by the TP ranks at load); 0 = the whole call in one piece.
-    const int SUB = (seqb || q4_sub_rows <= 0) ? M : std::min(M, q4_sub_rows);
+    // (agreed by the TP ranks at load); 0 = the whole call in one piece; a call
+    // that has room for bigger sub-chunks takes them (q4_sub_for).
+    const int SUB = (seqb || q4_sub_rows <= 0) ? M : q4_sub_for(M);
     auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
     float* hyper  = df(size_t(M) * WIDE);
     float* normed = df(size_t(SUB) * WIDE);
@@ -15217,7 +15382,15 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         hclap(4, ht);
         launch_hc_gated_mean(q, gate, normed, block_out, MR, HC, H, none);
         hclap(5, ht);
-        if (inj_out && hc.inject.w.N) mm(hc.inject, normed, inj_out);
+        if (inj_out && hc.inject.w.N) {
+            // the general GEMM is ~1.5 ms a call at N = hc_count (10-27)
+            if (hc.inject.w.fmt == Fmt::BF16 && hc.inject.w.payload && hc.inject.w.N == HC &&
+                HC <= 8 && WIDE % 8 == 0 && !std::getenv("GRIMOIRE_HC_INJECT_GEMM"))
+                launch_hc_inject_rows(q, reinterpret_cast<const bf16_t*>(hc.inject.w.payload),
+                                      normed, inj_out, MR, HC, WIDE, none);
+            else
+                mm(hc.inject, normed, inj_out);
+        }
         hclap(6, ht);
     };
     // the shared expert of a MoE layer, added into pe (MR rows from bi)
@@ -15573,6 +15746,9 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         }
         // Megatron TP: this rank's experts and half of the shared expert
         if (tp_mega && !tp_block_reduce(pend, size_t(M) * H)) { ok = false; break; }
+        // the next layer's first RAM experts cross PCIe while its mixer runs
+        if (moe_full && i + 1 < (pp_enabled() ? pp_end : cfg.n_layers))
+            tm_prefetch(L[size_t(i + 1)], M);
         pending = true;
         q4lap(4);
     }
@@ -15589,6 +15765,17 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         std::fprintf(stderr, "  QSA prefill: prep %.1f  dense flash %.1f  logits %.1f  topk %.1f  "
                      "expand %.1f  sparse attn %.1f ms\n", qsams[0], qsams[1], qsams[2],
                      qsams[3], qsams[4], qsams[5]);
+    // GRIMOIRE_BUDGET_DEBUG: what the card has left with every buffer of the
+    // call (and the expert route scratch, the ring) still allocated
+    static const bool bdbg = std::getenv("GRIMOIRE_BUDGET_DEBUG") != nullptr;
+    if (bdbg && q.get_device().has(sycl::aspect::ext_intel_free_memory)) {
+        q.wait();
+        try {
+            std::fprintf(stderr, "    qwen4_exp prefill M=%d, sub-chunks of %d: %.2f GiB of the card free at "
+                         "the end of the call\n", M, SUB, double(q.get_device().get_info<
+                         sycl::ext::intel::info::device::free_memory>()) / 1073741824.0);
+        } catch (...) {}
+    }
 
     if (!ok) { q.wait(); cleanup(); return false; }
 

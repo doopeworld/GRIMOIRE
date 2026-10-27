@@ -586,6 +586,19 @@ sycl::event launch_hc_down_inject1(sycl::queue& q, const bf16_t* down, const bf1
 sycl::event launch_hc_up_mean1(sycl::queue& q, const bf16_t* up, const float* lora,
     const float* normed, float* block, int hc_count, int hidden, int lowrank,
     const std::vector<sycl::event>& deps = {});
+// The kernels B and C were before 10-27 (one sub-group per output row, one
+// dot at a time): GRIMOIRE_HC_SGROW=1 selects them, GRIMOIRE_HC_CHECK=1
+// compares the two.
+sycl::event launch_hc_down_inject1_sg(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+    const float* normed, float* lora, float* inj, int lowrank, int hc_count, int wide,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_up_mean1_sg(sycl::queue& q, const bf16_t* up, const float* lora,
+    const float* normed, float* block, int hc_count, int hidden, int lowrank,
+    const std::vector<sycl::event>& deps = {});
+// A prompt's injection projection, inj[r][c] = inject[c] . normed[r], for
+// hc_count <= 8 BF16 rows (wide % 8 == 0).
+sycl::event launch_hc_inject_rows(sycl::queue& q, const bf16_t* inj_w, const float* normed,
+    float* inj, int rows, int hc_count, int wide, const std::vector<sycl::event>& deps = {});
 sycl::event launch_hc_norm(sycl::queue& q, const float* x, const bf16_t* w,
     float* out, int rows, int hc_count, int hidden, float eps,
     const std::vector<sycl::event>& deps = {});

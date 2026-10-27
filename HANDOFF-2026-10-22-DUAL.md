@@ -593,3 +593,46 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - Test: tools/bench/onednn/fn_lm_test.sh (two cards TP, then one card G0 as regression check).
 - Dockerfile: oneDNN v3.13.4 built in the builder stage, libdnnl.so + license files in the runtime
   stage; image grimoire-b70:v1.10 built (not validated, not released).
+
+### 12.10 2026-10-27: Flash-Next prompt -- layer-major tested, the HC inject GEMM, sub-chunks per call
+- Layer-major prefill (12.9) tested: two cards pp2048 / pp4096 713 / 664 -> 974 / 1,183 (above the old
+  PP 24/24 905 / 1,150); one card 464 / 654 (regressed from 752: a fixed 768-row cut, see below).
+- The hyper-connection "fixed cost" (~1.5 ms a mix) was the injection projection: hc.inject is
+  [4 x 10240] BF16 and the general GEMM (f32->bf16 + launch_gemm_xmx) took ~1.5 ms a call at N = 4
+  whatever M (GRIMOIRE_HC_TIMING, two cards, 4,097 rows: inject 898 of 1,293 ms HC).  New kernel
+  launch_hc_inject_rows (one work-group per row, the 4 weight rows from cache): 40 ms.
+  GRIMOIRE_HC_INJECT_GEMM=1 = the old GEMM.
+- q4_sub_for(M): a call's sub-chunk is the largest multiple of 128 that q4_prefill_split's budget
+  still holds next to the call's full-width rows and one route group (TP ranks agree on the budget
+  at load); M itself when the call fits.  One card is one piece again; two cards 4,096 rows run in
+  sub-chunks of 1,024 (1.94 GiB of gpu1 free at the end of a call).  GRIMOIRE_Q4_SUBGROW=0 = the
+  fixed q4_sub_rows.
+- Decode HC kernels: B (down + inject) one work-group per output row with K split over its
+  sub-groups (was one sub-group walking a 20 KB row: ~85% of the card idle), C (up + mean) the 4
+  stream dots in one walk.  GRIMOIRE_HC_CHECK=1 compares with the old ones (kept as *_sg,
+  GRIMOIRE_HC_SGROW=1): max diff ~1e-6 at magnitudes 2-70.  tg unchanged within noise (+-2 tok/s).
+- Final, llama-benchy c1 --runs 2 (tools/bench/onednn/fn_final.sh):
+| Flash-Next NVFP4 | pp2048 | pp4096 | tg128 @2048 | tg128 @4096 | code probe prefill |
+|---|---:|---:|---:|---:|---:|
+| two cards TP, 10-26 evening | 713 | 664 | 31.7 | 30.6 | 682 |
+| two cards TP, 10-27 morning (layer-major) | 974 | 1,183 | 31.2 | 30.1 | 883 |
+| two cards TP, 10-27 final | 1,263 | 1,463 | 31.0 | 30.2 | 1,182 |
+| one card, 10-27 morning | 464 | 654 | 21.95 | 21.75 | 485 |
+| one card, 10-27 final | 526 | 804 | 22.2 | 21.9 | 580 |
+  Answers: capital identical, story / code coherent (other wording after 97-460 chars: float order).
+- Two cards, 4,097 rows, where the time goes now (GRIMOIRE_Q4_TIMING, prefetch off): MoE 1,622 ms
+  (gpu1 streams its 86 RAM experts a layer, 227 MB, over the x4 link: ~32 ms a layer), HC 534,
+  DeltaNet 421, attention 281, PLE 17.
+- Tried, OFF by default:
+  - GRIMOIRE_EXPERT_PREFETCH=<min rows>: the next layer's first 64 RAM experts copied while its
+    mixer runs (ring positions run on across layers, tm_slot_ev per slot).  Slower in every form:
+    issued before the MoE all-reduce pp4096 1,094, after it 1,073 (base 1,439); a 73-row call wasted
+    the copies (MoE 339 -> 1,381 ms).  Likely the expert copies and the all-reduce copies share the
+    copy engine, and the all-reduce is on the critical path.
+  - GRIMOIRE_EP_COLD_SHARE=0.67: rank 0 (gpu0, x8) owns 2/3 of the cold experts (115 vs 57 RAM
+    experts a layer): pp4096 1,648 but pp2048 1,002 and decode after pp4096 27.6 (rank 0's CPU
+    experts do more per token).  --runs 1 numbers; worth a cleaner A/B before any default.
+- dual.sh: a G0 run takes only gpu0.lock and ignores gpu1's own link rules; the book server no
+  longer holds the caller's stdout (a `dual.sh | grep` pipeline hung); test "pleready" waits for the
+  PLE table's copy into RAM.  gpu1's root port logs RxErr in bursts while idle (~440 in 4 min,
+  0 uncorrectable, link up): two-card runs use RP_WIN=1000 RP_RUN=1000000 (Ian 10-25: run anyway).
