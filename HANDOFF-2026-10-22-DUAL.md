@@ -703,3 +703,19 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   that started only after the first run() took that job as already seen, never ran it, and the
   caller waited forever (the bench with 14 threads hung).  start() now hands every worker the
   generation it starts from.  The engine's first call comes long after load, so it never hit it.
+
+### 12.13 2026-10-27 night: Qwen3.8-27B-FP8 table for Ian (1 / 4 / 8 users, pp 4K / 8K / 16K); PAUSED
+- Ian asked for Qwen3.8 at pp 4096 / 8192 / 16K, tg 128, 1 / 4 / 8 users: tools/bench/onednn/
+  q38_conc.sh (TP, plain decode, GRIMOIRE_SEQ_SLOTS=8, ctx 18432) and q38_spec.sh (one user, MTP
+  and DFlash2).  Full table: tools/bench/onednn/RESULTS-2026-10-27.md.
+- Plain: pp4096 3,530 (c1) / 3,375 (c4) / 3,381 (c8); tg128 total 29.5 / 97.0 / 165.0.  pp16384
+  ~3,000 at every concurrency; tg total 27.4 / 59.5 / 41.9 -- 16K x 8 users is the weak row
+  (long prompts admitted between the other users' decode steps).  Batched decode under Megatron TP
+  works (first time measured).
+- One user: MTP tg128 56.2 / 52.9 / 51.0, DFlash2 59.3 / 67.1 / 50.5 (pp 4K / 8K / 16K); code
+  probe MTP 88.8-89.2 (4.40 tok/step), DFlash2 126.0-128.4 (6.55 tok/step), tests PASS.
+- Ian on VRAM ("25g ... now 30g per gpu"): 8 slots x 18,432 tokens of KV + the prompt scratch
+  sized from the free VRAM at load (prefill chunk cap 18,176 tokens); no errors, no eviction.
+- PAUSED by Ian ("save everything and push to git we will resume tomorrow"): no containers, no
+  test scripts, GPUs idle.  Resume with: CPU-expert stalls (workers block when idle instead of
+  spin-yield), timeline (bench-1022/fn_tl.sh), then Flash-Next MTP + a qwen4_exp verify path.
