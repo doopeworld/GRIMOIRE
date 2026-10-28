@@ -166,6 +166,14 @@ sycl::event rmsnorm_split(sycl::queue& q, float* h, const float* r0,
             });
     });
 
+    // 10-28: every partial loaded up front (registers), then added in the same order
+    // (bit-identical).  The loop below left each lane 20 dependent loads deep at n = 5120:
+    // ~10 us a norm in the Qwen3.8 two-card decode timeline, 128 norms a token.
+    // B70_NORM_PREG=1 turns it on -- opt-in until it is measured on the cards (built 10-28,
+    // the test was stopped by gpu1's drop).
+    constexpr int PMAX = 32;
+    static const bool preg = [] { const char* e = std::getenv("B70_NORM_PREG"); return e && *e == '1'; }();
+    const bool regs = preg && G <= PMAX;
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(e1);
         hd.parallel_for(
@@ -174,6 +182,13 @@ sycl::event rmsnorm_split(sycl::queue& q, float* h, const float* r0,
                 const int lid = int(it.get_local_id(0));
                 const int g   = int(it.get_group(0));
                 float total = 0.0f;
+                if (regs) {
+                    float pv[PMAX];
+                    #pragma unroll
+                    for (int j = 0; j < PMAX; ++j) if (j < G) pv[j] = part[j];
+                    #pragma unroll
+                    for (int j = 0; j < PMAX; ++j) if (j < G) total += pv[j];
+                } else
                 for (int j = 0; j < G; ++j) total += part[j];
                 const float scale = sycl::rsqrt(total / float(n) + eps);
                 const int i = g * WG + lid;
@@ -2367,7 +2382,9 @@ sycl::event launch_hc_combine_norm1(sycl::queue& q, float* hyper, const float* p
                 const int c = int(it.get_group(0)), lane = int(it.get_local_id(0));
                 float* x = hyper + int64_t(c) * hidden;
                 float z = 0.0f;
-                if (pend) z = 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count))));
+                // pinj == nullptr with a pend: unit weight on every stream (the reference's
+                // combine with no injection -- the Flash-Next MTP head's first combine)
+                if (pend) z = pinj ? 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count)))) : 1.0f;
                 float v[MAXE];
                 #pragma unroll
                 for (int j = 0; j < MAXE; ++j) if (j < per) v[j] = x[lane + j * WG];
@@ -2399,7 +2416,7 @@ sycl::event launch_hc_combine_norm1(sycl::queue& q, float* hyper, const float* p
             const int c = int(it.get_group(0)), lane = int(it.get_local_id(0));
             float* x = hyper + int64_t(c) * hidden;
             float z = 0.0f;
-            if (pend) z = 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count))));
+            if (pend) z = pinj ? 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count)))) : 1.0f;
             float acc = 0.0f;
             for (int i = lane; i < hidden; i += WG) {
                 float v = x[i];
