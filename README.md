@@ -8,9 +8,9 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.9.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and go into the next release image. Still on branches: **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage) and the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. Still on branches: **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage) and the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -83,12 +83,13 @@ UD-Q4_K_XL, UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correct
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.9.0/grimoire-b70-v1.9.0.tar.gz
-docker load < grimoire-b70-v1.9.0.tar.gz        # -> grimoire-b70:latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.0/grimoire-b70-v1.10.0.tar.gz
+docker load < grimoire-b70-v1.10.0.tar.gz              # -> grimoire-b70:v1.10.0
+docker tag grimoire-b70:v1.10.0 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.9.0 note: when you use MTP, keep `GRIMOIRE_SEQ_SLOTS` at 2 or more (the commands here use 8);
-with one slot this binary can skip or repeat parts of an answer. Fixed in the source after v1.9.0.
+v1.10.0 runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
+two GPUs, and ships oneAPI 2026.2, GPU driver 26.35 and oneDNN 3.14 (see its release notes).
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
 build the image yourself: `docker build -t grimoire-b70 .`
@@ -129,11 +130,9 @@ docker run -d --name grimoire --init --stop-timeout 300 \
 Only three things change from one model to another: the `--model` folder, `--proj`, and the extra
 flags in the table. The server is OpenAI-compatible at `http://<host>:8000/v1`.
 
-**v1.9.0 correctness warning:** MTP with `GRIMOIRE_SEQ_SLOTS=1` can skip or repeat chunks
-of an answer, including at the default `GRIMOIRE_MTP_K=4`. This was reproduced on Qwen3.8
-and Ornith. When serving with that release, set `GRIMOIRE_SEQ_SLOTS` to at least 2
-(the command above uses 8), or disable MTP. The fix is in the source on `longctx-attn-wip`;
-the published v1.9.0 binary still contains the bug.
+**v1.9.0 only:** MTP with `GRIMOIRE_SEQ_SLOTS=1` can skip or repeat chunks of an answer
+(reproduced on Qwen3.8 and Ornith). Fixed in v1.10.0; with v1.9.0, keep `GRIMOIRE_SEQ_SLOTS`
+at 2 or more, or disable MTP.
 
 - `--init` and `--stop-timeout 300` are required: killing a container with GPU work in flight can
   drop the card off the PCI bus until a power cycle.
