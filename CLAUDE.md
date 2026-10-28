@@ -2,7 +2,7 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-28: Flash-Next two cards decode +11% (tg128 38.5 -> 42.7 at 2K, 36.4 -> 40.3 at 4K), exact (same answers): router top-k register kernel for 512 experts, head split over the vocabulary, lean tiered-expert kernels, HC norm in registers -- each has a =0 switch.  Tables: tools/bench/onednn/RESULTS-2026-10-28.md.  Handoff 12.14.**
+**2026-10-28: Flash-Next two cards decode +16% (tg128 38.5 -> 44.6 at 2K, 36.4 -> 42.2 at 4K), exact; expert kernels read activations from L1 (GRIMOIRE_TMOE_GX=0 = SLM); earlier today +11%: exact (same answers): router top-k register kernel for 512 experts, head split over the vocabulary, lean tiered-expert kernels, HC norm in registers -- each has a =0 switch.  Tables: tools/bench/onednn/RESULTS-2026-10-28.md.  Handoff 12.14.**
 
 **2026-10-27 night: PAUSED by Ian (resume 10-28).  Qwen3.8-27B-FP8 two cards: pp4096 3,530 (1 user), tg128 total 29.5 / 97 / 165 at 1 / 4 / 8 users; one user MTP code 89, DFlash2 code 128 tok/s.  Tables: tools/bench/onednn/RESULTS-2026-10-27.md.  Handoff 12.13.**
 

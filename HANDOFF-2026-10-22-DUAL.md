@@ -765,3 +765,9 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - dual.sh: CLIENT_CPUS=14,15 (opt-in) keeps llama-benchy off the CPU-expert pool cores;
   old code with it: tg128 38.47 / 36.36 = 10-27's best (38.39-38.74 / 36.31-36.69), so the
   client was not what cost decode.
+- 5. GX (GRIMOIRE_TMOE_GX=0 = old): the lean kernels alone left gate_up / down at ~35 us each --
+  the real cost was the SLM copy of the activations, read with lanes 128 bytes apart (all 16
+  lanes on one SLM bank).  Reading them from L1 as float4: gate_up 22-26 us, down 19-27 us, MoE
+  region 7.27 -> 6.18 ms a token, one token 19.4 ms.  Same three answers as the old code
+  (frozen placement).  llama-benchy tg128 44.60 (2K) / 42.18 (4K), pp 1,292 / 1,474.
+  DAY TOTAL, Flash-Next two cards: tg128 38.47 -> 44.60 and 36.36 -> 42.18 (+16%), exact.
