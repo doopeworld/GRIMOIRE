@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-29 late morning: MTP batched drafting on main (answers identical, +5-16% at 2-8 users); prompt-attention kernel named in the log; two cards pp32768 = 2,570 tok/s.  TWO-CARD WORK PAUSED: 10:43 gpu1 root-port receive-error burst during a load (guard STOP), switch RxErr ~2,170/s idle -- gpu0 only until Ian says.  Handoff 12.16.**
+
 **2026-10-29: accuracy vs the BF16 original (tools/bench/accuracy): the official FP8 checkpoint as --proj fp8 = top-1 94.9% (double rounding of its block scales), as --proj int8 = 98.0%; INT8 now has FP8's fast paths (oneDNN s8 prompts, ESIMD INT8 decode, INT8 small-M) -- two cards + MTP pp4096 3,566 / tg128 53.6 / 4 users 96.2 = FP8's 3,522 / 53.5 / 96.6.  README recommends --proj int8 for that checkpoint (main; v1.10.0 image still slow at INT8).  g0run EXTRA_ENV = one K=V per line.  Handoff 12.15 (10-28: main, B60 fixes, multi-user MTP, v1.10.0) and 12.16.**
 
 **2026-10-28: Flash-Next two cards decode +16% (tg128 38.5 -> 44.6 at 2K, 36.4 -> 42.2 at 4K), exact; expert kernels read activations from L1 (GRIMOIRE_TMOE_GX=0 = SLM); earlier today +11%: exact (same answers): router top-k register kernel for 512 experts, head split over the vocabulary, lean tiered-expert kernels, HC norm in registers -- each has a =0 switch.  Tables: tools/bench/onednn/RESULTS-2026-10-28.md.  Handoff 12.14.**

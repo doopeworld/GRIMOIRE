@@ -835,3 +835,13 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - Next: image with INT8 -> DUAL-QWEN3.8 container on --proj int8; pp32768 on two cards (tester:
   ~900 at 32K on B60s); MTP multi-user items from 12.15; W8A8 prompts (INT8 DPAS = 2x bf16, lossy,
   accuracy check decides); native block-scaled FP8; native NVFP4.
+- Batched MTP drafting merged (bd-main -> main): one card GPTQ + MTP K=6, 4 / 8 users at once
+  (bench-1022 conc_code.py, new dual.sh test concN): 8/8 and 16/16 answers pass, 24/24 texts
+  identical ON vs OFF, 126.2 -> 132.6 and 130.4 -> 136.3 tok/s; benchy 4 users 144.1 -> 164.3.
+  Two cards (SPEC_MAX_SEQS=8, benchy): 2 / 4 / 8 users 65.3 / 92.1 / 122.9 -> 71.5 / 93.6 / 142.3.
+- 10:43 two-card load bd2-def: dual.sh guard STOP, gpu1 root port receive errors +1,655 in 10 s
+  (0 all morning), switch 05:00.0 RxErr ~2,170/s even idle (10-28 before its drop: ~45/s).
+  Server stopped gracefully once idle; gpu1 still on the bus.  Two-card work paused.
+- /mnt/user vs /mnt/storage: a NEW file scp'd to /mnt/user/isos/... can land on another disk than
+  the storage pool, and /mnt/storage/isos/... (dual.sh's $B) does not see it -- copy new bench
+  files to /mnt/storage/isos/grimoire-runs/bench-1022 directly.

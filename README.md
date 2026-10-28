@@ -54,7 +54,10 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 
 On two cards, MTP serves several users at once since 2026-10-28 (it drafts for up to 2 of them;
 with more, the step is a plain batched one): 1 / 2 / 4 / 8 users = 56.5 / 62.9 / 95.0 / 161.9
-tok/s in total.  DFlash2 still serves one request at a time on two cards.
+tok/s in total.  DFlash2 still serves one request at a time on two cards.  Since 2026-10-29 the
+MTP head drafts for all users in one pass (main): with 2 / 4 / 8 users speculating, +10% / +2% /
++16% on two cards and +14% at 4 users on one card (llama-benchy), answers identical to drafting
+one user at a time (`GRIMOIRE_MTP_BATCH_DRAFT=0`).
 
 **Run the official FP8 checkpoint with `--proj int8`** (main since 2026-10-29; the v1.10.0 image
 still runs INT8 slower, use `--proj fp8` with it): it is closer to

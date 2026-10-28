@@ -3748,6 +3748,29 @@ struct Grimoire {
     // from_mtp_hidden: chained drafts feed the head its OWN previous hidden
     // state instead of the main model's h_t, which is how depth > 1 works.
     int  mtp_draft(int next_token, int position, bool from_mtp_hidden = false);
+    // Batched drafting (2026-10-28): one draft for each of n conversations in ONE pass of
+    // the head -- the head's weights read once and, under TP, three collectives for all
+    // rows instead of three per row.  Rows are different sequence slots; `position` is what
+    // mtp_draft takes.  chained: start from each row's previous draft output (mtpr.out,
+    // row order of the previous call after mtp_rows_keep).  False = not usable (MoE head,
+    // a buffer missing): the caller drafts row by row.
+    struct MtpRows {
+        float *hid = nullptr, *emb = nullptr, *cat = nullptr, *x = nullptr, *h2 = nullptr,
+              *qkv = nullptr, *qs = nullptr, *gs = nullptr, *k = nullptr, *v = nullptr,
+              *att = nullptr, *y = nullptr, *f = nullptr, *ff = nullptr, *out = nullptr,
+              *lg = nullptr, *val = nullptr;
+        int32_t *tok = nullptr, *dtok = nullptr;
+        sycl_bf16* bf = nullptr;
+        size_t bf_cap = 0;
+        int dv = 0;
+        bool tried = false, ok = false;
+    } mtpr;
+    bool mtp_rows_ready();
+    void mtpr_mm(const QuantWeight& w, const float* x, float* y, int M);
+    bool mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, const int* position,
+                        bool chained, int32_t* tok_out);
+    // keep[i] = the previous call's row that becomes row i (rows that still draft)
+    void mtp_rows_keep(const std::vector<int>& keep);
     // Populate the MTP head's KV cache over prompt positions so the drafter
     // does not start each request blind. Writes K/V only -- no attention,
     // no FFN, no lm_head. See mtp_warm() for why this matters.
@@ -9527,6 +9550,47 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     const int requested=dflash2.ok?dflash_block_rows()-1:
         std::clamp(configured?std::atoi(configured):kMtpDefaultDepth,0,15);
     const int max_depth=std::max(0,std::min(requested,kSpecBatch/n-1));
+    // Batched drafting (mtp_draft_rows): every row's depth first, then ONE pass of the head
+    // per depth over the rows that still draft.  The row loop below drafts only when the
+    // head cannot be batched (an MoE head, DFlash, GRIMOIRE_MTP_BATCH_DRAFT=0) or n == 1.
+    std::vector<std::vector<int32_t>> drafted;
+    bool batched=false;
+    if(!dflash2.ok && n>1 && mtp_rows_ready()) {
+        std::vector<int> depth(static_cast<size_t>(n));
+        int dmax=0;
+        for(int row=0;row<n;++row) {
+            const int p=positions[size_t(row)];
+            depth[size_t(row)]=std::max(0,std::min({max_depth,max_seq-p-1,remaining[size_t(row)]-1}));
+            dmax=std::max(dmax,depth[size_t(row)]);
+        }
+        drafted.assign(size_t(n),{});
+        batched=true;
+        std::vector<int> act, prev, sl, ps;
+        std::vector<int32_t> tin, tout;
+        for(int k=0;k<dmax && batched;++k) {
+            act.clear(); tin.clear(); sl.clear(); ps.clear();
+            for(int row=0;row<n;++row) if(depth[size_t(row)]>k) {
+                act.push_back(row);
+                tin.push_back(k==0?tokens[size_t(row)]:drafted[size_t(row)].back());
+                sl.push_back(slots[size_t(row)]); ps.push_back(positions[size_t(row)]+k);
+            }
+            if(k>0) {   // rows whose depth is reached drop out: move the others' head outputs up
+                std::vector<int> keep;
+                for(int row:act) keep.push_back(int(std::find(prev.begin(),prev.end(),row)-prev.begin()));
+                mtp_rows_keep(keep);
+            }
+            tout.assign(act.size(),0);
+            if(!mtp_draft_rows(int(act.size()),tin.data(),sl.data(),ps.data(),k>0,tout.data())) {
+                batched=false;   // declined before any work: draft row by row instead
+                break;
+            }
+            for(size_t i=0;i<act.size();++i) {
+                if(tout[i]<0 || tout[i]>=cfg.vocab) throw std::runtime_error("batched MTP proposal failed");
+                drafted[size_t(act[i])].push_back(tout[i]);
+            }
+            prev=act;
+        }
+    }
     for(int row=0;row<n;++row) {
         sync(); bind_seq_slot(slots[size_t(row)]);
         pos=positions[size_t(row)]; set_cursor(pos);
@@ -9542,6 +9606,8 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
                 if(!dflash_draft(block[0],pos,draft) || draft.empty())
                     throw std::runtime_error("batched DFlash proposal failed");
                 block.insert(block.end(),draft.begin(),draft.begin()+std::min(depth,int(draft.size())));
+            } else if(batched) {
+                block.insert(block.end(),drafted[size_t(row)].begin(),drafted[size_t(row)].end());
             } else {
                 int token=block[0];
                 for(int k=0;k<depth;++k) {
@@ -13420,6 +13486,226 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
     return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
+}
+
+// ---------------------------------------------------------------------------
+// Batched drafting (2026-10-28).  decode_spec_batch drafted row by row: at 4 users and
+// 3 drafts each, 12 passes of the head per step, each reading the head's weights and,
+// under Megatron TP, three collectives (attention, FFN, the token).  MEASURED
+// 2026-10-28, Qwen3.8-27B-FP8 + MTP on two B70s: 4 users speculating 88.9 tok/s in
+// total against 95.0 with plain batched steps.  Here a depth is one pass over all rows:
+// the projections and the head as small-M GEMMs (weights read once), the attention row
+// by row against each conversation's own head cache, the collectives once.  Dense FFN
+// heads (Qwen3.8); an MoE head (Ornith, Qwen3.6) keeps mtp_draft row by row.
+// GRIMOIRE_MTP_BATCH_DRAFT=0 = row by row everywhere.
+bool Grimoire::mtp_rows_ready() {
+    if (mtpr.tried) return mtpr.ok;
+    mtpr.tried = true;
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_MTP_BATCH_DRAFT");
+        return !(e && *e == '0'); }();
+    const LayerDev& d = mtp.L;
+    // Every weight read here through its plain payload (mtpr_mm): none converted to the int4
+    // companion -- a W4A8 conversion frees the payload, and reading a freed weight is a
+    // device fault, not an error -- and none legacy-TP sharded.
+    auto plain = [](const DevQuant& w) { return w.w.payload && w.w.N > 0 && !w.has_i4() && !w.tp_sharded(); };
+    int ok = on && mtp.ok && !dflash2.ok && !pp_enabled() && !tp_enabled() && !d.k2_sparse &&
+             !(cfg.is_moe() && d.moe.cfg.num_experts > 0) && plain(mtp.fc) && plain(d.q_proj) &&
+             plain(d.k_proj) && plain(d.v_proj) && plain(d.o_proj) && plain(d.sh_gu) &&
+             plain(d.sh_down) && !lm_head.tp_sharded() &&
+             !std::getenv("GRIMOIRE_MTP_POS_OLD") && !std::getenv("GRIMOIRE_MTP_HID_FIRST") &&
+             !std::getenv("GRIMOIRE_MTP_CHAIN_OLD");
+    if (ok) {
+        const int H = cfg.hidden, R = kSpecBatch;
+        const int QD = d.q_proj.w.N, KD = d.k_proj.w.N, VD = d.v_proj.w.N;
+        const int AD = cfg.n_heads * d.head_dim, FI2 = d.sh_gu.w.N;
+        static const int dv_env = [] { const char* v = std::getenv("GRIMOIRE_MTP_DRAFT_VOCAB");
+            return v && *v ? std::atoi(v) : 0; }();
+        mtpr.dv = dv_env > 0 ? std::min(dv_env, cfg.vocab) : cfg.vocab;
+        auto f = [&](size_t n) { return sycl::malloc_device<float>(std::max<size_t>(1, n), q); };
+        mtpr.hid = f(size_t(R) * H);  mtpr.emb = f(size_t(R) * H);   mtpr.cat = f(size_t(R) * 2 * H);
+        mtpr.x = f(size_t(R) * H);    mtpr.h2 = f(size_t(R) * H);    mtpr.qkv = f(size_t(R) * QD);
+        mtpr.qs = f(size_t(R) * AD);  mtpr.gs = f(size_t(R) * AD);   mtpr.k = f(size_t(R) * KD);
+        mtpr.v = f(size_t(R) * VD);   mtpr.att = f(size_t(R) * AD);  mtpr.y = f(size_t(R) * H);
+        mtpr.f = f(size_t(R) * FI2);  mtpr.ff = f(size_t(R) * (FI2 / 2));
+        mtpr.out = f(size_t(R) * H);  mtpr.lg = f(size_t(R) * mtpr.dv); mtpr.val = f(R);
+        mtpr.dtok = sycl::malloc_device<int32_t>(R, q);
+        mtpr.tok = sycl::malloc_host<int32_t>(R, q);
+        ok = mtpr.hid && mtpr.emb && mtpr.cat && mtpr.x && mtpr.h2 && mtpr.qkv && mtpr.qs &&
+             mtpr.gs && mtpr.k && mtpr.v && mtpr.att && mtpr.y && mtpr.f && mtpr.ff && mtpr.out &&
+             mtpr.lg && mtpr.val && mtpr.dtok && mtpr.tok;
+    }
+    // every rank drafts the same way, or the collectives below do not line up
+    if (tp_ranked() && !tp_agree_min(ok)) ok = 0;
+    mtpr.ok = ok != 0;
+    std::fprintf(stderr, "  MTP batched drafting: %s (up to %d rows, draft vocabulary %d)\n",
+                 mtpr.ok ? "on" : "off (row by row)", int(kSpecBatch), mtpr.dv);
+    return mtpr.ok;
+}
+
+// y[M][N] = x[M][K] (fp32) through the small-M engines the batched verify uses (oneDNN for
+// FP8 / BF16, the DPAS small-M kernels otherwise), the weight read once for all rows;
+// row by row through the decode GEMV when none takes the shape.
+void Grimoire::mtpr_mm(const QuantWeight& w, const float* x, float* y, int M) {
+    const std::vector<sycl::event> none{};
+    auto rows = [&] {
+        for (int r = 0; r < M; ++r)
+            launch_gemv(q, w, x + size_t(r) * w.K, y + size_t(r) * w.N, none);
+    };
+    if (M <= 1) { rows(); return; }
+    const size_t need = size_t(M) * size_t(w.K);
+    if (need > mtpr.bf_cap) {
+        if (mtpr.bf) { q.wait(); sycl::free(mtpr.bf, q); }
+        mtpr.bf = sycl::malloc_device<sycl_bf16>(need, q);
+        mtpr.bf_cap = mtpr.bf ? need : 0;
+    }
+    if (!mtpr.bf) { rows(); return; }
+    const bool dnnl = onednn_gemm_ok(w, M);
+    const bool f8 = !dnnl && M <= 8 && fp8_smallm_ok(w, M, nullptr, y);
+    const bool mx = !dnnl && !f8 && mxfp4_smallm_ok(w, M, nullptr, y);
+    const bool i4 = !dnnl && !f8 && !mx && int4_smallm_ok(w, M, nullptr, y);
+    const bool bf = !dnnl && !f8 && !mx && !i4 && bf16_smallm_ok(w, M, nullptr, y);
+    if (!(dnnl || f8 || mx || i4 || bf)) { rows(); return; }
+    launch_f32_to_bf16(q, x, mtpr.bf, need);
+    if (dnnl) onednn_gemm(q, w, mtpr.bf, y, M, false);
+    else if (f8) launch_fp8_smallm(q, w, mtpr.bf, y, M);
+    else if (mx) launch_mxfp4_smallm(q, w, mtpr.bf, y, M);
+    else if (i4) launch_int4_smallm(q, w, mtpr.bf, y, M);
+    else launch_bf16_smallm(q, w, mtpr.bf, y, M);
+}
+
+void Grimoire::mtp_rows_keep(const std::vector<int>& keep) {
+    const int H = cfg.hidden;
+    // keep is increasing and keep[i] >= i: copying in order never overwrites a later source
+    for (size_t i = 0; i < keep.size(); ++i)
+        if (keep[i] != int(i))
+            q.memcpy(mtpr.out + i * size_t(H), mtpr.out + size_t(keep[i]) * H, size_t(H) * sizeof(float));
+}
+
+bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, const int* position,
+                              bool chained, int32_t* tok_out) {
+    if (n <= 0 || n > kSpecBatch || !mtp_rows_ready()) return false;
+    for (int r = 0; r < n; ++r)
+        if (slot[r] < 0 || slot[r] >= int(draft_slots.size()) || position[r] < 0 ||
+            position[r] >= max_seq || tok_in[r] < 0 || tok_in[r] >= cfg.vocab)
+            return false;
+    const int H = cfg.hidden, H2 = 2 * H;
+    const float eps = cfg.rms_eps;
+    const std::vector<sycl::event> none{};
+    LayerDev& d = mtp.L;
+    const int QD = d.q_proj.w.N, KD = d.k_proj.w.N, VD = d.v_proj.w.N;
+    const int QH = cfg.n_heads, HD = d.head_dim, AD = QH * HD;
+    const bool gated = (QD == 2 * AD);
+    const int FI2 = d.sh_gu.w.N, FI = FI2 / 2;
+    auto row = [](float* base, int r, int width) { return base + size_t(r) * size_t(width); };
+
+    // ---- the head's input: [norm(embedding) ; norm(hidden)], embedding first (mtp_draft) ----
+    for (int r = 0; r < n; ++r) {
+        const float* src = chained ? row(mtpr.out, r, H) : draft_slots[size_t(slot[r])].hidden;
+        if (!chained && !mtp_prenorm() && fnorm) {   // mtp_target_hidden, per row
+            launch_rmsnorm_residual(q, const_cast<float*>(src), nullptr, fnorm, row(mtpr.hid, r, H),
+                                    H, eps, none);
+            src = row(mtpr.hid, r, H);
+        }
+        launch_rmsnorm_residual(q, const_cast<float*>(src), nullptr, mtp.pre_h,
+                                row(mtpr.cat, r, H2) + H, H, eps, none);
+        if (!embed_one(int(tok_in[r]), row(mtpr.emb, r, H)))
+            throw std::runtime_error("MTP batched draft: embedding failed");
+        launch_rmsnorm_residual(q, row(mtpr.emb, r, H), nullptr, mtp.pre_e, row(mtpr.cat, r, H2),
+                                H, eps, none);
+    }
+    mtpr_mm(mtp.fc.w, mtpr.cat, mtpr.x, n);                 // [n][H] = [n][2H] fc^T
+
+    // ---- one full-attention decoder layer; attention per row on its own head cache ----
+    for (int r = 0; r < n; ++r)
+        launch_rmsnorm_residual(q, row(mtpr.x, r, H), nullptr, d.in_norm, row(mtpr.h2, r, H), H, eps, none);
+    mtpr_mm(d.q_proj.w, mtpr.h2, mtpr.qkv, n);
+    mtpr_mm(d.k_proj.w, mtpr.h2, mtpr.k, n);
+    mtpr_mm(d.v_proj.w, mtpr.h2, mtpr.v, n);
+    static const bool draft_dpas = [] {
+        const char* e = std::getenv("GRIMOIRE_VERIFY_DPAS"); return !(e && *e == '0'); }();
+    for (int r = 0; r < n; ++r) {
+        const int p = position[r] > 0 ? position[r] - 1 : 0;   // the pair sits at token t
+        set_cursor(p);
+        const DraftSlot& ds = draft_slots[size_t(slot[r])];
+        uint8_t* kc = ds.mk;
+        uint8_t* vc = ds.mv;
+        float* qrow = row(mtpr.qkv, r, QD);
+        float* qvec = gated ? row(mtpr.qs, r, AD) : qrow;
+        float* gvec = row(mtpr.gs, r, AD);
+        float* krow = row(mtpr.k, r, KD);
+        float* vrow = row(mtpr.v, r, VD);
+        if (gated) launch_split_qgate(q, qrow, qvec, gvec, QH, HD, none);
+        if ((fusion_mask & 2) && d.q_norm && d.k_norm) {
+            launch_qk_norm_rope(q, qvec, krow, d.q_norm, d.k_norm, QH, d.kv_heads, HD, s.d_pos,
+                                d.rope_theta, d.partial_rope, eps, none);
+        } else {
+            if (d.q_norm) launch_rmsnorm_heads(q, qvec, d.q_norm, QH, HD, eps, true, none);
+            if (d.k_norm) launch_rmsnorm_heads(q, krow, d.k_norm, d.kv_heads, HD, eps, true, none);
+            launch_rope_dev(q, qvec, QH, HD, s.d_pos, d.rope_theta, d.partial_rope, none);
+            launch_rope_dev(q, krow, d.kv_heads, HD, s.d_pos, d.rope_theta, d.partial_rope, none);
+        }
+        launch_kv_append_dev(q, krow, vrow, kc, vc, s.d_pos, d.kv_heads, HD, max_seq, none);
+        AttnParams ap{};
+        ap.q = qvec; ap.k_cache = kc; ap.v_cache = vc;
+        ap.out = row(mtpr.att, r, AD);
+        ap.seq_len = p + 1; ap.seq_cap = max_seq;
+        ap.head_dim = HD; ap.num_heads = QH; ap.num_kv_heads = d.kv_heads;
+        ap.softmax_scale = cfg.attn_softmax_scale(HD);
+        ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
+        ap.splits = GRAPH_SPLITS; ap.d_seq_len = s.d_seq_len;
+        if (draft_dpas && verify_dpas_ok(ap)) {
+            VerifyGroups vg{};
+            vg.n = 1; vg.row0[0] = 0; vg.nrows[0] = 1; vg.slot[0] = 0;
+            const int smax = verify_dpas_splits(ap, vg, p + 1);
+            launch_verify_attn_dpas(q, ap, vg, 0, s.d_seq_len, smax);
+            launch_verify_merge(q, ap, 1, smax);
+        } else {
+            launch_flash_decode(q, ap, none);
+            launch_flash_merge(q, ap, none);
+        }
+        if (gated) launch_gate_sigmoid_mul(q, row(mtpr.att, r, AD), gvec, AD, none);
+    }
+    mtpr_mm(d.o_proj.w, mtpr.att, mtpr.y, n);
+    if (!tp_block_reduce(mtpr.y, size_t(n) * H))
+        throw std::runtime_error("MTP batched draft: TP block all-reduce failed");
+
+    // ---- dense FFN ----
+    for (int r = 0; r < n; ++r)
+        launch_rmsnorm_residual(q, row(mtpr.x, r, H), row(mtpr.y, r, H), d.post_norm, row(mtpr.h2, r, H),
+                                H, eps, none);
+    mtpr_mm(d.sh_gu.w, mtpr.h2, mtpr.f, n);
+    for (int r = 0; r < n; ++r)
+        launch_swiglu(q, row(mtpr.f, r, FI2), row(mtpr.f, r, FI2) + FI, row(mtpr.ff, r, FI), FI, none);
+    mtpr_mm(d.sh_down.w, mtpr.ff, mtpr.y, n);
+    if (!tp_block_reduce(mtpr.y, size_t(n) * H))
+        throw std::runtime_error("MTP batched draft: TP block all-reduce failed");
+
+    // ---- final norm (the lm_head input and the next chained draft's hidden) + the head ----
+    for (int r = 0; r < n; ++r)
+        launch_rmsnorm_residual(q, row(mtpr.x, r, H), row(mtpr.y, r, H), mtp.norm, row(mtpr.out, r, H),
+                                H, eps, none);
+    const int dv = mtpr.dv;
+    if (!lm_head.has_i4() && !lm_head.tp_sharded() && lm_head.w.payload) {
+        QuantWeight hw = lm_head.w;       // whole rows together (b70/weights.hpp): first dv rows
+        hw.N = dv;
+        mtpr_mm(hw, mtpr.out, mtpr.lg, n);
+    } else {
+        for (int r = 0; r < n; ++r) {     // the int4-sym companion: mtp_draft's way, row by row
+            if (dv < cfg.vocab && lm_head.has_i4())
+                launch_gemv_int4sym(q, lm_head.i4, lm_head.i4s, row(mtpr.out, r, H), row(mtpr.lg, r, dv),
+                                    dv, H, none);
+            else
+                gemv_any(lm_head, row(mtpr.out, r, H), row(mtpr.lg, r, dv), none);
+        }
+    }
+    for (int r = 0; r < n; ++r)
+        launch_argmax(q, row(mtpr.lg, r, dv), dv, mtpr.dtok + r, mtpr.val + r, none);
+    q.memcpy(mtpr.tok, mtpr.dtok, size_t(n) * sizeof(int32_t)).wait();
+    std::vector<int32_t> t(mtpr.tok, mtpr.tok + n);
+    if (tp_ranked() && !tp_sync_tokens(t))
+        throw std::runtime_error("MTP batched draft: token sync failed");
+    for (int r = 0; r < n; ++r) tok_out[r] = t[size_t(r)];
+    return true;
 }
 
 int Grimoire::argmax_token() {
