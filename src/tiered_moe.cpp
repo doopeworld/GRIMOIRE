@@ -35,6 +35,8 @@
 #include "b70/formats.hpp"
 #include "b70/tiered_moe.hpp"
 
+#include <cstdlib>
+
 namespace b70 {
 namespace {
 
@@ -66,7 +68,12 @@ inline uint32_t load_s2(const uint8_t* p) {       // 2-byte aligned
 // gate + up.  One sub-group owns R (gate row, up row) pairs of one
 // (token, slot); a work-group is WG_SUBGROUPS sub-groups of one token.
 // ---------------------------------------------------------------------
-template <int R>
+// LEAN (10-28): a work-group's rows all lie in one slot when rows_per_wg divides I (Flash-Next:
+// 16 | 640).  A slot routed to no expert of this table (-1: another rank's, or a RAM-resident
+// one the CPU computes) writes its zeros and leaves before it stages the activation and builds
+// the decode tables -- ~55% of the work-groups in a two-card decode step.  Same arithmetic for
+// every row that is computed.
+template <int R, bool LEAN>
 sycl::event tmoe_gate_up_r(sycl::queue& q, const TieredMoeView& v,
                            const int32_t* d_expert, const float* x, float* h,
                            int M, const std::vector<sycl::event>& deps) {
@@ -76,6 +83,7 @@ sycl::event tmoe_gate_up_r(sycl::queue& q, const TieredMoeView& v,
     const int gpt = (K * I + rows_per_wg - 1) / rows_per_wg;
     const size_t n_groups = size_t(M) * gpt;
     const uint8_t* const* eptr = v.eptr;
+    const bool one_slot = LEAN && I % rows_per_wg == 0;
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
         sycl::local_accessor<float, 1> slmx(size_t(H), hc);
@@ -86,12 +94,20 @@ sycl::event tmoe_gate_up_r(sycl::queue& q, const TieredMoeView& v,
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const int lid = int(it.get_local_id(0));
                 const int lsz = WG_SUBGROUPS * SG_SIZE;
+                const int token = int(it.get_group(0)) / gpt;
+                const int lg    = int(it.get_group(0)) % gpt;
+                if (one_slot) {
+                    const int wrow = lg * rows_per_wg;
+                    if (wrow < K * I && d_expert[int64_t(token) * K + wrow / I] < 0) {
+                        if (lid < rows_per_wg && wrow + lid < K * I)
+                            h[int64_t(token) * K * I + wrow + lid] = 0.0f;
+                        return;
+                    }
+                }
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* e2 = e2s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 for (int b = lid; b < 256; b += lsz) e4[b] = e4m3_to_f32(uint8_t(b));
                 if (lid < 16) e2[lid] = e2m1_to_f32(uint8_t(lid));
-                const int token = int(it.get_group(0)) / gpt;
-                const int lg    = int(it.get_group(0)) % gpt;
                 const float* xt = x + int64_t(token) * H;
                 for (int c = lid; c < H; c += lsz) slmx[c] = xt[c];
                 sycl::group_barrier(it.get_group());
@@ -149,7 +165,11 @@ sycl::event tmoe_gate_up_r(sycl::queue& q, const TieredMoeView& v,
 // down + router-weighted sum over the k slots.  One sub-group owns R
 // output rows of one token and walks all k experts.
 // ---------------------------------------------------------------------
-template <int R>
+// LEAN (10-28): only the slots this table computes (expert >= 0, weight != 0 -- the ones the
+// loop below reads) are staged, not all K * I values, and a work-group with none writes its
+// zeros and leaves.  Used with R = 4: half the work-groups, so half the staging again.  Each
+// row's arithmetic is unchanged.
+template <int R, bool LEAN>
 sycl::event tmoe_down_r(sycl::queue& q, const TieredMoeView& v,
                         const int32_t* d_expert, const float* d_weight,
                         const float* h, float* y, int M,
@@ -170,13 +190,29 @@ sycl::event tmoe_down_r(sycl::queue& q, const TieredMoeView& v,
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const int lid = int(it.get_local_id(0));
                 const int lsz = WG_SUBGROUPS * SG_SIZE;
+                const int token = int(it.get_group(0)) / gpt;
+                const int lg    = int(it.get_group(0)) % gpt;
+                const float* ht = h + int64_t(token) * K * I;
+                uint32_t act = 0;                  // LEAN: the slots the loop below reads
+                if (LEAN) {
+                    for (int s = 0; s < K; ++s) {
+                        const int64_t rt = int64_t(token) * K + s;
+                        if (d_expert[rt] >= 0 && d_weight[rt] != 0.0f) act |= 1u << s;
+                    }
+                    if (!act) {
+                        const int o = lg * rows_per_wg + lid;
+                        if (lid < rows_per_wg && o < H) y[int64_t(token) * H + o] = 0.0f;
+                        return;
+                    }
+                }
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* e2 = e2s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 for (int b = lid; b < 256; b += lsz) e4[b] = e4m3_to_f32(uint8_t(b));
                 if (lid < 16) e2[lid] = e2m1_to_f32(uint8_t(lid));
-                const int token = int(it.get_group(0)) / gpt;
-                const int lg    = int(it.get_group(0)) % gpt;
-                const float* ht = h + int64_t(token) * K * I;
+                if (LEAN) {
+                    for (int c = lid; c < K * I; c += lsz)
+                        if ((act >> (c / I)) & 1u) slmh[c] = ht[c];
+                } else
                 for (int c = lid; c < K * I; c += lsz) slmh[c] = ht[c];
                 sycl::group_barrier(it.get_group());
                 const float* hs = slmh.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -223,17 +259,25 @@ sycl::event tmoe_down_r(sycl::queue& q, const TieredMoeView& v,
 
 } // namespace
 
+// GRIMOIRE_TMOE_LEAN=0: the kernels as they were before 10-28 (every slot staged and walked)
+static bool tmoe_lean() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_TMOE_LEAN"); return !(e && *e == '0'); }();
+    return on;
+}
+
 sycl::event launch_tmoe_gate_up(sycl::queue& q, const TieredMoeView& v,
                                 const int32_t* d_expert, const float* x, float* h,
                                 int M, const std::vector<sycl::event>& deps) {
-    return tmoe_gate_up_r<2>(q, v, d_expert, x, h, M, deps);
+    if (tmoe_lean()) return tmoe_gate_up_r<2, true>(q, v, d_expert, x, h, M, deps);
+    return tmoe_gate_up_r<2, false>(q, v, d_expert, x, h, M, deps);
 }
 
 sycl::event launch_tmoe_down(sycl::queue& q, const TieredMoeView& v,
                              const int32_t* d_expert, const float* d_weight,
                              const float* h, float* y, int M,
                              const std::vector<sycl::event>& deps) {
-    return tmoe_down_r<2>(q, v, d_expert, d_weight, h, y, M, deps);
+    if (tmoe_lean() && v.top_k <= 32) return tmoe_down_r<4, true>(q, v, d_expert, d_weight, h, y, M, deps);
+    return tmoe_down_r<2, false>(q, v, d_expert, d_weight, h, y, M, deps);
 }
 
 } // namespace b70

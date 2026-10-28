@@ -719,3 +719,49 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - PAUSED by Ian ("save everything and push to git we will resume tomorrow"): no containers, no
   test scripts, GPUs idle.  Resume with: CPU-expert stalls (workers block when idle instead of
   spin-yield), timeline (bench-1022/fn_tl.sh), then Flash-Next MTP + a qwen4_exp verify path.
+
+### 12.14 2026-10-28: Flash-Next two-card decode -- steady-state timeline, per-kernel marks, four kernel fixes
+- Tower rebooted 06:41 (same GPU layout; gpu1 switch RxErr ~45/s idle, corrected, root port
+  clean).  GitHub checked first: every branch pushed; 3 old probe tools committed (763e869).
+- Steady state (bench-1022/fn_tl2.sh, answers only after the PLE table is in RAM): one token
+  23.6 ms (42 tok/s, short context); small all-reduce 28 us a call (copy out 5.4 + peer 10 +
+  sum 1 + copy in 8); CPU experts 12-13 calls a token a rank, 0.127 ms a call, no call over
+  1.6 ms.  fn_tl.sh (10-27 and today) dumped a token read while the 51 GB PLE copy was still
+  running (L01 ple 9.6 ms, 3 ms deltanet spikes, AR 75-240 us): not representative.
+- tools/kgap_probe.cpp (gpu0, no model): a kernel slot costs the GPU 0.6-1.0 us when the host is
+  ahead (empty / 64 WG / 512 WG / 1 WG x 1024 / 10 KB copy).  Fusion is NOT the lever: ~1,440
+  kernels a token = ~1.4 ms; the time is inside slow kernels.
+- Per-kernel marks (GRIMOIRE_TIMELINE_LAYER=4 / _LAYER2=3, "Lnn .step"; fn_tl3.sh), us, rank 0:
+  HC mix: combine+norm 10.6-13, down+inject 14.2-14.8, up+mean 14.2-14.7 (x 96 a token).
+  DeltaNet L04: qkv 55.2 (26.2 MB, 475 GB/s), conv 8.8, ab 2.5, gates 2.3, step 5.8, z 28.8
+  (547 GB/s), norm 3.4, out 31.5 (500 GB/s), all-reduce 20.
+  Attention L03: q 64.7 (487 GB/s), k 4.4, v 4.2, rope 5.6, kv 2.8, attn (indexer + flash) 47.5,
+  gate 1.1, o 28.5, all-reduce 19.7.
+  MoE: router 6.4, top-k 42.9 (!), ksend 2.8, vexp 1.7, VRAM experts gate_up 35-39 + down 33-38
+  (~12 MB, ~180 GB/s), shared gu 7.4, swiglu 1.1, shared down 10.3, gate 2.4, scale 1.1, add 1.0,
+  AR send 1.8-2.3, all-reduce 14-46 (rank 1 waits for rank 0's slower experts).  head 2.4 ms.
+- Fixes, each with a switch back to the old code:
+  1. Router top-k for 512 experts on the ESIMD register kernel (GRIMOIRE_TOPK_ESIMD=0; 512 fell
+     to the generic sub-group SLM path).  GRIMOIRE_TOPK_CHECK=1 runs both on the same logits:
+     0 of 8,192 calls a rank differed (experts and weights bit for bit).
+     llama-benchy (client on CPUs 14-15 both sides): tg128 38.47 -> 40.81 (2K), 36.36 -> 39.14
+     (4K); pp2048 1,235 -> 1,268, pp4096 1,453 -> 1,513.
+  2. Head split over the vocabulary under Megatron TP for Qwen4-Exp (GRIMOIRE_TP_HEAD_SPLIT=0):
+     each rank its rows, local argmax, (value, index) pairs exchanged over the TP sockets
+     (tp_head_pick: highest value, lowest index on a tie = launch_argmax's rule).  The first
+     build skipped it: tp_peer_fd is empty during build() (pp_connect runs at its end).
+  3. Lean tiered-expert kernels (GRIMOIRE_TMOE_LEAN=0): gate_up work-groups of a slot routed to
+     no VRAM expert of this rank leave before staging; down stages only the slots it reads, R=4.
+  4. HC combine+norm with the lane's values in registers (GRIMOIRE_HC_NORM_REGS=0).
+- Greedy text moved between runs of the SAME build: every served run adds its routes to
+  GRIMOIRE_EXPERT_HITS, so the next load splits VRAM / RAM experts differently (CPU vs GPU
+  summation order).  Exactness runs use a frozen copy (fn_ex4.sh: flash-next.hits.frozen-1028
+  copied to flash-next.hits.ab before every run).
+- RESULT (fn_ex4.sh, all four on vs all four off, frozen placement, client on CPUs 14-15):
+  old twice: the three answers identical; new twice: identical to old, all three (capital,
+  160-token story, 160-token code).  llama-benchy new: pp2048 1,348, tg128 42.71; pp4096
+  1,477, tg128 40.33 -- against old (fn_ab3.sh) 1,235 / 38.47 and 1,453 / 36.36: decode +11%.
+  Top-k alone gave 40.81 / 39.14, so head split + lean experts + HC norm add 3-5% on top.
+- dual.sh: CLIENT_CPUS=14,15 (opt-in) keeps llama-benchy off the CPU-expert pool cores;
+  old code with it: tg128 38.47 / 36.36 = 10-27's best (38.39-38.74 / 36.31-36.69), so the
+  client was not what cost decode.

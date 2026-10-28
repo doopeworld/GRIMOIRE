@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-28: Flash-Next two cards decode +11% (tg128 38.5 -> 42.7 at 2K, 36.4 -> 40.3 at 4K), exact (same answers): router top-k register kernel for 512 experts, head split over the vocabulary, lean tiered-expert kernels, HC norm in registers -- each has a =0 switch.  Tables: tools/bench/onednn/RESULTS-2026-10-28.md.  Handoff 12.14.**
+
 **2026-10-27 night: PAUSED by Ian (resume 10-28).  Qwen3.8-27B-FP8 two cards: pp4096 3,530 (1 user), tg128 total 29.5 / 97 / 165 at 1 / 4 / 8 users; one user MTP code 89, DFlash2 code 128 tok/s.  Tables: tools/bench/onednn/RESULTS-2026-10-27.md.  Handoff 12.13.**
 
 **2026-10-27 late evening: Flash-Next two cards tg128 34.1 / 32.9 -> 38.4-38.7 / 36.3-36.7: CPU pool and decode thread pinned, the CPU experts' partial added on the host inside the MoE all-reduce (bit-exact).  CPU experts still stall in 1-2% of calls.  Handoff 12.12.**

@@ -33,6 +33,8 @@
 #include "b70/int8_embedding.hpp"
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace b70 {
@@ -1083,7 +1085,14 @@ sycl::event router_topk_esimd(sycl::queue& q, const float* logits, int top_k,
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(1, 1), [=](sycl::nd_item<1>) SYCL_ESIMD_KERNEL {
-            es::simd<float, E> v = es::block_load<float, E>(logits);
+            // more than 256 logits (Flash-Next: 512) arrive as 256-float blocks
+            es::simd<float, E> v;
+            if constexpr (E <= 256) v = es::block_load<float, E>(logits);
+            else {
+                #pragma unroll
+                for (int c = 0; c < E / 256; ++c)
+                    v.template select<256, 1>(c * 256) = es::block_load<float, 256>(logits + c * 256);
+            }
             es::simd<int, E> idx(0, 1);
             es::simd_mask<E> live = 1;
             es::simd<float, 16> sv = 0.0f;
@@ -1164,6 +1173,8 @@ sycl::event router_topk_esimd_rows(sycl::queue& q, const float* logits, int toke
 }
 } // namespace
 
+namespace { bool g_topk_subgroup_only = false; }   // GRIMOIRE_TOPK_CHECK's reference run (host only)
+
 sycl::event launch_router_topk(sycl::queue& q, const float* logits,
                                int n_experts, int top_k,
                                int32_t* out_expert, float* out_weight,
@@ -1192,6 +1203,37 @@ sycl::event launch_router_topk(sycl::queue& q, const float* logits,
         return !(e && *e == '0'); }();
     if (topk_es && n_experts == 256 && top_k >= 1 && top_k <= 16)
         return router_topk_esimd<256>(q, logits, top_k, out_expert, out_weight, normalize, deps);
+    // Qwen4-Exp (Flash-Next) routes 512: the same register kernel.  MEASURED 2026-10-28 in
+    // the two-card decode timeline: the sub-group kernel below took 43 us a layer for 512
+    // logits, 2 ms of a 23 ms token.  GRIMOIRE_TOPK_CHECK=1 also runs the sub-group kernel on
+    // the same logits and compares picks and weights bit for bit (it waits: a check only).
+    if (topk_es && !g_topk_subgroup_only && n_experts == 512 && top_k >= 1 && top_k <= 16) {
+        const sycl::event ev = router_topk_esimd<512>(q, logits, top_k, out_expert, out_weight,
+                                                      normalize, deps);
+        static const bool chk = std::getenv("GRIMOIRE_TOPK_CHECK") != nullptr;
+        if (chk) {
+            static int32_t* ce = nullptr; static float* cw = nullptr;
+            static uint64_t n_chk = 0, n_bad = 0;
+            if (!ce) { ce = sycl::malloc_device<int32_t>(16, q); cw = sycl::malloc_device<float>(16, q); }
+            g_topk_subgroup_only = true;
+            launch_router_topk(q, logits, n_experts, top_k, ce, cw, normalize, {ev});
+            g_topk_subgroup_only = false;
+            int32_t e0[16], e1[16]; float w0[16], w1[16];
+            q.memcpy(e0, out_expert, size_t(top_k) * sizeof(int32_t));
+            q.memcpy(w0, out_weight, size_t(top_k) * sizeof(float));
+            q.memcpy(e1, ce, size_t(top_k) * sizeof(int32_t));
+            q.memcpy(w1, cw, size_t(top_k) * sizeof(float)).wait();
+            ++n_chk;
+            const bool bad = std::memcmp(e0, e1, size_t(top_k) * sizeof(int32_t)) != 0 ||
+                             std::memcmp(w0, w1, size_t(top_k) * sizeof(float)) != 0;
+            if (bad) ++n_bad;
+            if (n_chk % 4096 == 0 || (bad && n_bad <= 4))
+                std::fprintf(stderr, "  top-k check (512 experts): %llu calls compared, %llu differed%s\n",
+                             (unsigned long long)n_chk, (unsigned long long)n_bad,
+                             bad ? " (this one did)" : "");
+        }
+        return ev;
+    }
     if (n_experts == SG_SIZE * 16)
         return router_topk_fixed<16>(q, logits, top_k, out_expert, out_weight,
                                      normalize, deps);
@@ -2310,6 +2352,47 @@ sycl::event launch_hc_combine_norm1(sycl::queue& q, float* hyper, const float* p
                                     int hc_count, int hidden, float eps,
                                     const std::vector<sycl::event>& deps) {
     constexpr int WG = 256;
+    // 10-28: a lane's values are loaded into registers up front, then the same operations
+    // in the same order (bit-identical).  The loop below stores hyper[i] between its loads,
+    // so the compiler, unable to rule out aliasing, waited out every load in turn: 11-13 us
+    // a call for 40 KB, 96 calls a Flash-Next token.  GRIMOIRE_HC_NORM_REGS=0 = the loop.
+    constexpr int MAXE = 16;
+    static const bool regs_env = [] { const char* e = std::getenv("GRIMOIRE_HC_NORM_REGS");
+        return !(e && *e == '0'); }();
+    if (regs_env && hidden % WG == 0 && hidden / WG <= MAXE) {
+        const int per = hidden / WG;
+        return q.submit([&](sycl::handler& h) {
+            h.depends_on(deps);
+            h.parallel_for(sycl::nd_range<1>(size_t(hc_count) * WG, WG), [=](sycl::nd_item<1> it) {
+                const int c = int(it.get_group(0)), lane = int(it.get_local_id(0));
+                float* x = hyper + int64_t(c) * hidden;
+                float z = 0.0f;
+                if (pend) z = 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count))));
+                float v[MAXE];
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) v[j] = x[lane + j * WG];
+                if (pend) {
+                    float p[MAXE];
+                    #pragma unroll
+                    for (int j = 0; j < MAXE; ++j) if (j < per) p[j] = pend[lane + j * WG];
+                    #pragma unroll
+                    for (int j = 0; j < MAXE; ++j) if (j < per) { v[j] += p[j] * z; x[lane + j * WG] = v[j]; }
+                }
+                float acc = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) acc += v[j] * v[j];
+                acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                const float inv = sycl::rsqrt(acc / float(hidden) + eps);
+                const bf16_t* ws = w + int64_t(c) * hidden;
+                float* o = normed + int64_t(c) * hidden;
+                float wv[MAXE];
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) wv[j] = bf16_to_f32(ws[lane + j * WG]);
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) o[lane + j * WG] = v[j] * inv * (1.0f + wv[j]);
+            });
+        });
+    }
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(hc_count) * WG, WG), [=](sycl::nd_item<1> it) {

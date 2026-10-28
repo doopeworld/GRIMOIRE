@@ -2322,6 +2322,13 @@ struct Grimoire {
     }
     int  tp_sync_token(int token);
     bool tp_sync_tokens(std::vector<int32_t>& toks);
+    // Megatron TP, Qwen4-Exp (10-28): the head split over the vocabulary.  This rank keeps
+    // rows [head_v0, head_v0 + lm_head.w.N), of which head_valid are real vocabulary, and
+    // tp_head_pick turns every rank's best (value, index) per row into the same token on
+    // all of them.  GRIMOIRE_TP_HEAD_SPLIT=0 keeps the whole head on every rank.
+    bool tp_head_split = false;
+    int  head_v0 = 0, head_valid = 0;
+    bool tp_head_pick(const float* val, const int32_t* idx, int n, int32_t* out);
     // Megatron TP prefill chunk cap: every rank's LIVE budget (real free
     // VRAM after load), agreed to the smallest once at load, so no rank ever
     // sizes a chunk past what its own card actually has, and all ranks cut
@@ -4560,6 +4567,39 @@ int Grimoire::tp_sync_token(int token){
     }else if(!fd_read_all(tp_peer_fd[0],&wire,sizeof wire))return -1;
     return int(wire);
 }
+// The split head's token (see tp_head_split): every rank sends its rows' best (value, local
+// index) to the others and takes the same decision -- the highest value, and on a tie the
+// lowest vocabulary index, which is launch_argmax's own rule over the whole vocabulary.  An
+// index of INT_MAX (no candidate: every logit -inf or NaN) stays INT_MAX, as it would whole.
+bool Grimoire::tp_head_pick(const float* val, const int32_t* idx, int n, int32_t* out){
+    if(n<=0)return true;
+    if(int(tp_peer_fd.size())!=tp_world){
+        std::fprintf(stderr,"TP: split-head token exchange before the ranks connected\n");return false;
+    }
+    struct Cand { float v; int32_t i; };
+    std::vector<Cand> mine(static_cast<size_t>(n)), all(static_cast<size_t>(n)*size_t(tp_world));
+    const int32_t none=0x7fffffff;   // launch_argmax's INT_MAX
+    for(int r=0;r<n;++r)
+        mine[size_t(r)]={val[r],idx[r]==none?none:idx[r]+head_v0};
+    const size_t nb=size_t(n)*sizeof(Cand);
+    std::memcpy(all.data()+size_t(tp_rank)*size_t(n),mine.data(),nb);
+    if(tp_rank==0){
+        for(int p=1;p<tp_world;++p)
+            if(!fd_read_all(tp_peer_fd[size_t(p)],all.data()+size_t(p)*size_t(n),nb))return false;
+        for(int p=1;p<tp_world;++p)
+            if(!fd_write_all(tp_peer_fd[size_t(p)],all.data(),size_t(tp_world)*nb))return false;
+    }else if(!fd_write_all(tp_peer_fd[0],mine.data(),nb)||
+             !fd_read_all(tp_peer_fd[0],all.data(),size_t(tp_world)*nb))return false;
+    for(int r=0;r<n;++r){
+        Cand b=all[size_t(r)];
+        for(int p=1;p<tp_world;++p){
+            const Cand c=all[size_t(p)*size_t(n)+size_t(r)];
+            if(c.v>b.v||(c.v==b.v&&c.i<b.i))b=c;
+        }
+        out[r]=b.i;
+    }
+    return true;
+}
 bool Grimoire::tp_sync_tokens(std::vector<int32_t>& toks){
     if(!tp_mega||tp_peer_fd.empty())return true;
     uint32_t n=uint32_t(toks.size());
@@ -6152,6 +6192,25 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         }
         shard(lm_head,q);
         if(!ok){if(err.empty())err="lm_head TP sharding failed";return false;}
+        // Megatron TP, Qwen4-Exp (10-28): each rank keeps its share of the vocabulary rows
+        // (tp_head_split): 0.64 GB less per card and half the head read every token (2.4 ms
+        // of a 23 ms Flash-Next token on two cards).  Qwen4-Exp has no MTP / DFlash path,
+        // which would need the whole head.  GRIMOIRE_TP_HEAD_SPLIT=0 keeps it whole.
+        static const bool head_split_env = [] { const char* e = std::getenv("GRIMOIRE_TP_HEAD_SPLIT");
+            return !(e && *e == '0'); }();
+        // (the ranks' sockets connect after the load; tp_head_pick needs them only in decode)
+        if (tp_mega && cfg.is_qwen4_exp && head_split_env && tp_world > 1 &&
+            !lm_head.has_i4() && !lm_head.fp16 && !lm_head.tp_sharded()) {
+            const int V = lm_head.w.N;
+            const int b = int(int64_t(V) * tp_rank / tp_world), e = int(int64_t(V) * (tp_rank + 1) / tp_world);
+            if (e > b) {
+                mrows(lm_head, q, Blocks{{b, e - b}});
+                if (!ok) { if (err.empty()) err = "lm_head vocabulary split failed"; return false; }
+                tp_head_split = true; head_v0 = b;
+                head_valid = std::max(0, std::min(e - b, cfg.vocab - b));
+                std::printf("(rows [%d,%d) of %d on this rank, GRIMOIRE_TP_HEAD_SPLIT=0 = whole) ", b, e, V);
+            }
+        }
         acct(size_t(lm_head.w.bytes()));
     }
     // tie_word_embeddings.  cfg.tie_embeddings was PARSED and never used:
@@ -11789,6 +11848,15 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         char tag[40]; std::snprintf(tag, sizeof tag, "L%02d %s", li, kind);
         mark(tag);
     };
+    // GRIMOIRE_TIMELINE_LAYER / GRIMOIRE_TIMELINE_LAYER2 (default 4 and 3: a DeltaNet and a
+    // full-attention layer): marks between the kernels of those two layers too ("Lnn .step";
+    // each step's region is its kernel plus any idle time the host left before the next mark)
+    static const int tl_l1 = [] { const char* e = std::getenv("GRIMOIRE_TIMELINE_LAYER"); return e ? std::atoi(e) : 4; }();
+    static const int tl_l2 = [] { const char* e = std::getenv("GRIMOIRE_TIMELINE_LAYER2"); return e ? std::atoi(e) : 3; }();
+    int tl_cur = -1;                   // the layer hc_mix is working for
+    auto tld = [&](int li, const char* step) {
+        if (li == tl_l1 || li == tl_l2) tlm(li, step);
+    };
     auto tl_end = [&]() {
         if (!timeline) return;
         q.wait();
@@ -11809,9 +11877,11 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             (!want_inj || (hc.inject.w.fmt == Fmt::BF16 && hc.inject.w.payload))) {
             launch_hc_combine_norm1(q, q4_hyper, pend, pinj, hc.norm, q4_normed,
                                     HC, H, cfg.rms_eps, none);
+            tld(tl_cur, ".hc-norm");
             launch_hc_down_inject1(q, reinterpret_cast<const bf16_t*>(hc.down.w.payload),
                 want_inj ? reinterpret_cast<const bf16_t*>(hc.inject.w.payload) : nullptr,
                 q4_normed, q4_lora, inj_out, LR, HC, WIDE, none);
+            tld(tl_cur, ".hc-down");
             launch_hc_up_mean1(q, reinterpret_cast<const bf16_t*>(hc.up.w.payload), q4_lora,
                                q4_normed, block_out, HC, H, LR, none);
             // GRIMOIRE_HC_CHECK=1: the first 8 mixes also run the kernels
@@ -11921,6 +11991,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
 
         q4lap(0);
         tlm(i, "ple");
+        tl_cur = i;
         // ---- attention hyper-connection -------------------------------
         hc_mix(d.hc_attn, pending ? q4_pend : nullptr,
                pending ? q4_pinj : nullptr, q4_inj, s.h2);
@@ -11931,16 +12002,20 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         if (d.kind == LayerKind::LINEAR_ATTN) {
             const int qkv_ch = d.la_qkv.output_rows();
             gemv_any(d.la_qkv, s.h2, s.qkv, none);
+            tld(i, ".qkv");
             ConvParams cp{};
             cp.x = s.qkv; cp.weight = d.la_conv; cp.ring = d.conv_ring;
             cp.out = s.qkv; cp.channels = qkv_ch; cp.kernel = cfg.conv_kernel;
             launch_causal_conv1d_l2norm(q, cp, 2 * Hk, Dk, none);
+            tld(i, ".conv");
             float* qv = s.qkv;
             float* kv = s.qkv + int64_t(Hk) * Dk;
             float* vv = s.qkv + int64_t(2) * Hk * Dk;
             gemv_any(d.la_ab, s.h2, s.abuf, none);
+            tld(i, ".ab");
             launch_deltanet_gates(q, s.abuf, s.abuf + Hv, d.la_Alog, d.la_dtb,
                                   s.alpha, s.beta, Hv, none);
+            tld(i, ".gates");
             DeltaNetParams dp{};
             dp.q = qv; dp.k = kv; dp.v = vv;
             dp.a = s.alpha; dp.beta = s.beta;
@@ -11948,30 +12023,40 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             dp.n_heads = Hv; dp.k_dim = Dk; dp.v_dim = Dv;
             dp.n_k_heads = Hk;
             launch_deltanet_step(q, dp, none);
+            tld(i, ".step");
             gemv_any(d.la_z, s.h2, s.zbuf, none);
+            tld(i, ".z");
             if (cfg.dn_gate_sigmoid)
                 launch_rmsnorm_gate_sigmoid(q, s.attn_out, s.zbuf, d.la_norm,
                                             Hv, Dv, cfg.rms_eps, none);
             else
             launch_rmsnorm_gate_silu(q, s.attn_out, s.zbuf, d.la_norm,
                                      Hv, Dv, cfg.rms_eps, none);
+            tld(i, ".norm");
             gemv_any(d.la_out, s.attn_out, s.moe_y, none);
+            tld(i, ".out");
         } else {
             const int QD = d.q_proj.output_rows();
             const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
             gemv_any(d.q_proj, s.h2, s.qkv, none);
+            tld(i, ".q");
             if (gated)
                 launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
                                    cfg.n_heads, d.head_dim, none);
+            tld(i, ".qsplit");
             float* qvec = gated ? s.qsplit : s.qkv;
             gemv_any(d.k_proj, s.h2, s.zbuf, none);
+            tld(i, ".k");
             gemv_any(d.v_proj, s.h2, s.bbuf, none);
+            tld(i, ".v");
             const int qheads = cfg.n_heads;
             launch_qk_norm_rope(q, qvec, s.zbuf, d.q_norm, d.k_norm,
                 qheads, d.kv_heads, d.head_dim, s.d_pos,
                 d.rope_theta, d.partial_rope, cfg.rms_eps, none);
+            tld(i, ".rope");
             launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
                                  s.d_pos, d.kv_heads, d.head_dim, max_seq, none);
+            tld(i, ".kv");
 
             if (d.qsa) {
                 // ---- the indexer --------------------------------------
@@ -12087,11 +12172,14 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                 launch_flash_decode(q, ap, none);
                 launch_flash_merge(q, ap, none);
             }
+            tld(i, ".attn");
             if (gated) {
                 const int gn = cfg.n_heads * d.head_dim;
                 launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, gn, none);
             }
+            tld(i, ".gate");
             gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+            tld(i, ".o");
         }
         // Megatron TP: out_proj / o_proj ran on this rank's heads only
         if (tp_mega && !tp_block_reduce(s.moe_y, size_t(H))) {
@@ -12113,8 +12201,10 @@ const float* Grimoire::forward_qwen4_exp(int token) {
         if (d.moe_layer) {
             const int I = cfg.moe_inter;
             gemv_any(d.router, s.h2, s.rlogits, none);
+            tld(i, ".router");
             launch_router_topk(q, s.rlogits, cfg.n_experts, cfg.top_k,
                                s.d_expert, s.d_weight, true, none);
+            tld(i, ".topk");
             // CPU split: route + block input to the host FIRST (they are
             // ready as soon as topk is), then the GPU kernels for the
             // VRAM-resident experts only, then the shared expert -- the host
@@ -12135,15 +12225,19 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                     q.memcpy(cx_wt, s.d_weight, size_t(K) * sizeof(float));
                     cx_ready = q.memcpy(cx_x, s.h2, size_t(H) * sizeof(float));
                 }
+                tld(i, ".ksend");
                 const int32_t* re = s.d_expert; const uint8_t* tier = d.tm_tier_d;
                 int32_t* ve = cx_vexp;
                 q.parallel_for(sycl::range<1>(size_t(K)), [=](sycl::id<1> k) {
                     const int e = re[k];
                     ve[k] = (e >= 0 && tier[e] == 0) ? e : -1;
                 });
+                tld(i, ".vexp");
                 launch_tmoe_gate_up(q, tm_view(d), cx_vexp, s.h2, s.moe_h, 1, none);
+                tld(i, ".gu");
                 launch_tmoe_down(q, tm_view(d), cx_vexp, s.d_weight, s.moe_h,
                                  q4_pend, 1, none);
+                tld(i, ".dn");
             } else if (d.tiered && d.tm_ep) {
                 // this rank's experts only (VRAM, or RAM read over PCIe)
                 const int K = cfg.top_k;
@@ -12169,18 +12263,25 @@ const float* Grimoire::forward_qwen4_exp(int token) {
             if (d.sh_gu.w.N) {
                 const int SI = d.sh_gu.output_rows() / 2;
                 ffn_gemv(d, true, s.h2, s.sh_g, none);
+                tld(i, ".sh-gu");
                 launch_swiglu(q, s.sh_g, s.sh_g + SI, s.sh_g, SI, none);
+                tld(i, ".sh-swiglu");
                 ffn_gemv(d, false, s.sh_g, s.sh_out, none);
+                tld(i, ".sh-dn");
                 if (d.has_sh_gate) {
                     gemv_any(d.sh_gate_q, s.h2, s.sh_gate_val, none);
+                    tld(i, ".sh-gate");
                     launch_scale_by_sigmoid(q, s.sh_out, s.sh_gate_val, H, none);
+                    tld(i, ".sh-scale");
                 }
                 launch_add(q, q4_pend, s.sh_out, H, none);
+                tld(i, ".sh-add");
             }
             if (cpu_split) {
                 // Megatron TP: the GPU partial (VRAM experts + shared expert) leaves for the
                 // all-reduce now; the CPU experts' partial joins it on the host
                 ar_tag = tp_small_ar_send(q4_pend, size_t(H));
+                tld(i, ".arsend");
                 if (cx_tag) { if (!kwait(cx_tag, "CPU experts route")) return nullptr; }
                 else cx_ready.wait();
                 const auto t0 = std::chrono::steady_clock::now();
@@ -12212,6 +12313,9 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                     q.memcpy(cx_dy, cx_y, size_t(H) * sizeof(float));
                     launch_add(q, q4_pend, cx_dy, H, none);
                 }
+                // submitted after the host's route wait and CPU experts: the gap since
+                // .arsend is GPU idle time when those took longer than the GPU's work
+                tld(i, n > 0 ? ".cpu-experts" : ".no-cpu");
             }
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
@@ -13150,6 +13254,17 @@ int Grimoire::argmax_token() {
             std::printf("    argmax -> id %d  logit %.4f\n", tok, val);
         }
         return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
+    }
+    if (tp_head_split) {
+        // this rank's rows only; the ranks then agree on the best of all (tp_head_pick)
+        launch_argmax(q, s.logits, head_valid, s.d_tok, s.d_val, none);
+        int32_t tok = 0; float val = 0.0f;
+        q.memcpy(&val, s.d_val, sizeof(float));
+        q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
+        int32_t out = -1;
+        if (!tp_head_pick(&val, &tok, 1, &out)) return -1;
+        if (debug) { std::printf("    argmax -> id %d (split head)\n", int(out)); std::fflush(stdout); }
+        return int(out);
     }
     launch_argmax(q, s.logits, cfg.vocab, s.d_tok, s.d_val, none);
     // ONE blocking round trip per token, not two. The logit value is only
@@ -16020,12 +16135,18 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         hc_mix(hc_final,pending?pend:nullptr,pending?pinj:nullptr,nullptr,blk_in);
         if(!ok) { q.wait(); cleanup(); return false; }
         next_tokens->resize(size_t(M));
+        std::vector<float> hv(tp_head_split?size_t(M):0);   // the split head's row values
         for(int r=0;r<M;++r) {
             gemv_any(lm_head,blk_in+int64_t(r)*H,s.logits,none);
-            launch_argmax(q,s.logits,cfg.vocab,s.d_tok,s.d_val,none);
+            launch_argmax(q,s.logits,tp_head_split?head_valid:cfg.vocab,s.d_tok,s.d_val,none);
             q.memcpy(next_tokens->data()+r,s.d_tok,sizeof(int32_t));
+            if(tp_head_split)q.memcpy(hv.data()+r,s.d_val,sizeof(float));
         }
         q.wait_and_throw();
+        if(tp_head_split&&!tp_head_pick(hv.data(),next_tokens->data(),M,next_tokens->data())){
+            std::fprintf(stderr,"TP: split-head token exchange failed\n");
+            cleanup(); return false;
+        }
         cleanup();
         ++g_batch_decode_steps; g_batch_decode_rows+=M;
         return true;
