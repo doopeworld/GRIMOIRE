@@ -13,4 +13,9 @@ case "${1:-all}" in
   *) echo "usage: dev_build.sh [grimoire|server|all]" >&2; exit 2 ;;
 esac
 docker image inspect "$IMG" >/dev/null 2>&1 || docker build --target builder -t "$IMG" -f "$REPO/Dockerfile" "$REPO"
-exec docker run --rm -e GRIM_TARGETS="${GRIM_TARGETS:-}" -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"
+# CPUs the compile may use: the eight E-cores 6-13 by default, so a build never takes the
+# whole Tower (P-cores 0-5 and low-power cores 14-15 stay free); GRIM_BUILD_CPUS=all lifts it.
+CPUS="${GRIM_BUILD_CPUS:-6-13}"
+CPUSET=()
+[ "$CPUS" = all ] || CPUSET=(--cpuset-cpus "$CPUS")
+exec docker run --rm ${CPUSET[@]+"${CPUSET[@]}"} -e GRIM_TARGETS="${GRIM_TARGETS:-}" -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"

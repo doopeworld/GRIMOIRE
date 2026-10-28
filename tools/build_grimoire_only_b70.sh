@@ -5,10 +5,11 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
 set -u
 cd "${1:-/grimoire}"
-# GPU targets for the AOT kernels.  Default: the Arc Pro B70 (BMG G31) only.
-# GRIM_TARGETS=intel_gpu_bmg_g31,intel_gpu_bmg_g21 adds the Arc B580 (BMG G21),
-# e.g. for a pipeline stage on a B580 (twice the device-compile time).
-TARGETS="${GRIM_TARGETS:-intel_gpu_bmg_g31}"
+# GPU targets for the AOT kernels.  Default: the Arc Pro B70 (BMG G31) AND the Arc Pro
+# B60 / Arc B580 (BMG G21), so one build runs on both (2026-10-28: a B60 owner had to
+# rebuild before anything ran).  GRIM_TARGETS=intel_gpu_bmg_g31 builds the B70 only,
+# at half the device-compile time (development builds).
+TARGETS="${GRIM_TARGETS:-intel_gpu_bmg_g31,intel_gpu_bmg_g21}"
 GRF=()
 DGRF=()
 IFS=',' read -r -a TLIST <<< "$TARGETS"

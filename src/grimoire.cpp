@@ -103,6 +103,15 @@ static void* open_bridge(const char* path,int flags) {
 #endif
 }
 
+// The loaders below look for optional outside libraries that GRIMOIRE does not ship.
+// Not finding one is the normal case -- GRIMOIRE's own kernels run -- so it is reported
+// only with GRIMOIRE_BRIDGE_DEBUG=1.  2026-10-28: an outside tester read the old
+// "... unavailable; using fallback" start-up lines as "the fast code is missing".
+static bool bridge_debug() {
+    static const bool on = std::getenv("GRIMOIRE_BRIDGE_DEBUG") != nullptr;
+    return on;
+}
+
 using Xe2GroupedW4A16 = void (*)(sycl::queue*, const void*, const unsigned char*,
     const void*, void*, int, int, const int*, const int*, int, int, int*);
 
@@ -125,7 +134,7 @@ static Xe2GroupedW4A16 load_xe2_grouped() {
         if (fn) break;
         dlclose(handle); handle = nullptr;
     }
-    if (!fn) std::fprintf(stderr,
+    if (!fn && bridge_debug()) std::fprintf(stderr,
         "  Xe2 grouped GEMM unavailable; using exact fallback (%s)\n", dlerror());
     return fn;
 }
@@ -154,7 +163,7 @@ static Xe2DenseMXFP4 load_xe2_dense_mxfp4() {
         if (fn) break;
         dlclose(handle); handle = nullptr;
     }
-    if (!fn) std::fprintf(stderr,
+    if (!fn && bridge_debug()) std::fprintf(stderr,
         "  Xe2 native MXFP4 GEMM unavailable; using internal XMX fallback\n");
     return fn;
 }
@@ -304,7 +313,7 @@ static Xe2DFlashPagedF16 load_xe2_dflash_paged_f16() {
         dlclose(handle);
         handle=nullptr;
     }
-    if(!fn)std::fprintf(stderr,
+    if(!fn&&bridge_debug())std::fprintf(stderr,
         "  Muse DFlash: raw Xe2 FP16 paged FA2 bridge unavailable\n");
     return fn;
 }
@@ -390,7 +399,7 @@ static Xe2ChunkPrefill load_xe2_chunk_prefill() {
             dlsym(handle,"grimoire_xe2_chunk_prefill_bf16"));
         if(fn)break;dlclose(handle);handle=nullptr;
     }
-    if(!fn)std::fprintf(stderr,"  Xe2 chunk prefill unavailable; using fallback\n");
+    if(!fn&&bridge_debug())std::fprintf(stderr,"  Xe2 chunk prefill unavailable; using fallback\n");
     return fn;
 }
 
@@ -407,7 +416,7 @@ static Xe2ChunkGdn load_xe2_chunk_gdn() {
     for(const char* path:paths){if(!path||!*path)continue;handle=open_bridge(path,RTLD_NOW|RTLD_LOCAL);
         if(!handle)continue;fn=reinterpret_cast<Xe2ChunkGdn>(dlsym(handle,"grimoire_xe2_chunk_gdn_bf16"));
         if(fn)break;dlclose(handle);handle=nullptr;}
-    if(!fn)std::fprintf(stderr,"  Xe2 chunk GDN unavailable; using fallback\n");
+    if(!fn&&bridge_debug())std::fprintf(stderr,"  Xe2 chunk GDN unavailable; using fallback\n");
     return fn;
 }
 
@@ -501,7 +510,7 @@ static OneDnnF16Api load_onednn_f16() {
         if(api)break;
         api={};dlclose(handle);handle=nullptr;
     }
-    if(!api)std::fprintf(stderr,"  Muse DFlash: oneDNN FP16 linear unavailable\n");
+    if(!api&&bridge_debug())std::fprintf(stderr,"  Muse DFlash: oneDNN FP16 linear unavailable\n");
     return api;
 }
 
@@ -536,7 +545,7 @@ static OneDnnMXApi load_onednn_mx() {
         api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_mxfp4_w4a16_destroy"));
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
-    if(!api)std::fprintf(stderr,"  oneDNN MXFP4 W4A16 unavailable\n");
+    if(!api&&bridge_debug())std::fprintf(stderr,"  oneDNN MXFP4 W4A16 unavailable\n");
     return api;
 }
 
@@ -554,7 +563,7 @@ static OneDnnW4A8Api load_onednn_w4a8() {
         api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_w4a8_destroy"));
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
-    if(!api)std::fprintf(stderr,"  oneDNN W4A8 unavailable\n");
+    if(!api&&bridge_debug())std::fprintf(stderr,"  oneDNN W4A8 unavailable\n");
     return api;
 }
 
@@ -572,7 +581,7 @@ static OneDnnS4Api load_onednn_s4() {
         api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_s4a16_destroy"));
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
-    if(!api)std::fprintf(stderr,"  oneDNN s4 W4A16 unavailable\n");
+    if(!api&&bridge_debug())std::fprintf(stderr,"  oneDNN s4 W4A16 unavailable\n");
     return api;
 }
 
@@ -590,7 +599,7 @@ static OneDnnW4Api load_onednn_w4() {
         api.destroy=reinterpret_cast<decltype(api.destroy)>(dlsym(handle,"grimoire_onednn_w4a16_destroy"));
         if(api)break; api={}; dlclose(handle); handle=nullptr;
     }
-    if(!api)std::fprintf(stderr,"  raw oneDNN W4A16 unavailable; using XMX fallback\n");
+    if(!api&&bridge_debug())std::fprintf(stderr,"  raw oneDNN W4A16 unavailable; using XMX fallback\n");
     return api;
 }
 
@@ -6359,7 +6368,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
                 if (!d.ix_kraw || !d.ix_kcmp) {
                     err = "QSA indexer key cache allocation failed"; return false;
                 }
-                acct(size_t(max_seq + nb) * IHD * 4);
+                acct(size_t(n_seq_slots) * size_t(max_seq + nb) * IHD * 4);
             }
 
             d.ple = src.ple;
@@ -6782,12 +6791,11 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             // at once and switching between them is a pointer move rather
             // than a copy of the whole cache.  At the default of one slot
             // this allocates exactly what it always did.
+            //
+            // Allocated after the last weight ("KV caches, fitted to the
+            // card" below), when it is known how many slots fit.
             d.kv_slot = kv_elems;
-            d.k_base = sycl::malloc_device<uint8_t>(kv_elems * size_t(n_seq_slots), lq);
-            d.v_base = sycl::malloc_device<uint8_t>(kv_elems * size_t(n_seq_slots), lq);
-            d.k_cache = d.k_base;
-            d.v_cache = d.v_base;
-            acct(2 * kv_elems * size_t(n_seq_slots));
+            d.k_base = d.v_base = d.k_cache = d.v_cache = nullptr;
             if(cfg.is_muse){
                 // Match Fusion's XPU FlashAttention KV-cache group.
                 constexpr int block_size=64;
@@ -8558,8 +8566,107 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         if (!tp_shm_setup(err)) return false;
     }
 
+    // ---- KV caches, fitted to the card ----------------------------------
+    // Allocated HERE, after every weight, the drafter and the scratch, not in the
+    // layer loop: only now is it known how much of the card is left, so the number
+    // of conversations that fit (GRIMOIRE_SEQ_SLOTS at --ctx) is checked BEFORE the
+    // memory is taken.  The driver does not refuse an allocation past the card's
+    // memory; it moves buffers to system RAM, and every step then crawls over PCIe.
+    // MEASURED by an outside tester 2026-10-28: Qwen3.8-27B-FP8 on two 24 GB Arc Pro
+    // B60s, 4 slots x 200K context (~3.4 GiB of caches a slot next to ~14 GiB of
+    // weights a card) -- no request finished in 85 minutes.  Fewer slots only means
+    // a request waits for a free one.
+    //   GRIMOIRE_SLOTS_FIT=0        keep the requested slots anyway (a warning only)
+    //   GRIMOIRE_VRAM_RESERVE_GB=x  room kept for prompt chunks, oneDNN and the driver
+    //                               (default 2, 3 with several ranks)
+    //   GRIMOIRE_VRAM_GB=x          fit for a card of x GiB (check a smaller card's
+    //                               fit on a bigger one)
+    std::printf("ok\n");                    // closes the "scratch buffers ..." line
+    {
+        const double gib = 1073741824.0;
+        size_t kv_slot_bytes = 0;            // this rank's attention layers, one slot
+        for (const auto& d : L) kv_slot_bytes += 2 * d.kv_slot;
+        // what the closing reset() adds for every slot past the first
+        // (init_draft_slots): the MTP head's KV, a DFlash drafter's caches and taps
+        size_t draft_slot_bytes = size_t(cfg.hidden) * sizeof(float);
+        if (mtp.ok) draft_slot_bytes += 2 * size_t(mtp.L.kv_heads) * mtp.L.head_dim * max_seq;
+        if (dflash2.target_aux)
+            draft_slot_bytes += size_t(max_seq) * dflash2.target_layers.size() * cfg.hidden * sizeof(float);
+        for (const auto& dl : dflash2.layers) {
+            const size_t dk = size_t(dflash2.kv_heads) * dflash2.head_dim * max_seq;
+            const size_t dh = size_t(dflash2.num_blocks) * dflash2.block_size * dflash2.kv_heads *
+                              dflash2.head_dim * sizeof(sycl::half);
+            draft_slot_bytes += (dl.k_cache ? dk : 0) + (dl.v_cache ? dk : 0) +
+                                (dl.k_cache_f16 ? dh : 0) + (dl.v_cache_f16 ? dh : 0);
+        }
+        const auto dev = q.get_device();
+        const double card = double(dev.get_info<sycl::info::device::global_mem_size>());
+        double used = double(bytes) + 1.0 * gib;   // + kernels, runtime, scratch not counted
+        if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+            try { used = card - double(dev.get_info<sycl::ext::intel::info::device::free_memory>()); }
+            catch (...) {}
+        }
+        double cap = card;
+        if (const char* v = std::getenv("GRIMOIRE_VRAM_GB"); v && *v && std::atof(v) > 0)
+            cap = std::atof(v) * gib;
+        const char* rv = std::getenv("GRIMOIRE_VRAM_RESERVE_GB");
+        const double reserve = (rv && *rv ? std::max(0.0, std::atof(rv))
+                                          : (tp_ranked() || pp_enabled() ? 3.0 : 2.0)) * gib;
+        const double room = cap - used - reserve;
+        const double first = double(kv_slot_bytes);
+        const double more = std::max(1.0, double(kv_slot_bytes + draft_slot_bytes));
+        const int want = n_seq_slots;
+        int fit = room < first ? 0 : int(std::min(double(want), 1.0 + (room - first) / more));
+        // Every rank must hold the same slots: a batched request names slot numbers.
+        if (tp_ranked() && !tp_agree_min(fit)) { err = "TP slot-count agreement failed"; return false; }
+        const char* fv = std::getenv("GRIMOIRE_SLOTS_FIT");
+        const bool shrink = !(fv && *fv == '0') && !pp_enabled();   // PP stages do not agree on it
+        if (fit < want) {
+            if (fit >= 1 && shrink) {
+                std::printf("  memory: %d conversations at --ctx %d do not fit this card (%.2f GiB of "
+                            "caches each; %.2f GiB free after the model, %.1f GiB of it kept in "
+                            "reserve) -> %d slot%s; more requests wait for a free one "
+                            "(GRIMOIRE_SLOTS_FIT=0 keeps %d)\n",
+                            want, max_seq, more / gib, (cap - used) / gib, reserve / gib, fit,
+                            fit == 1 ? "" : "s", want);
+                n_seq_slots = fit;
+            } else {
+                // the context at which the requested slots would fit
+                const double per_tok = (first + double(want - 1) * more) / double(max_seq);
+                const long ctx_fit = per_tok > 0 ? long(std::max(0.0, room) / per_tok) / 1024 * 1024 : 0;
+                std::printf("  WARNING: %d conversation%s at --ctx %d need %.2f GiB of caches; %.2f GiB "
+                            "are free after the model, %.1f GiB of it kept in reserve.  The driver will "
+                            "move memory to system RAM and every step will be VERY slow.  Lower --ctx "
+                            "to about %ld%s.\n",
+                            want, want == 1 ? "" : "s", max_seq,
+                            (first + double(want - 1) * more) / gib, (cap - used) / gib, reserve / gib,
+                            ctx_fit, want > 1 ? " (or fewer GRIMOIRE_SEQ_SLOTS)" : "");
+            }
+        }
+        size_t kv_total = 0;
+        for (int i = 0; i < cfg.n_layers; ++i) {
+            LayerDev& d = L[size_t(i)];
+            if (!d.kv_slot) continue;
+            sycl::queue& lq = qL(i);
+            d.k_base = sycl::malloc_device<uint8_t>(d.kv_slot * size_t(n_seq_slots), lq);
+            d.v_base = sycl::malloc_device<uint8_t>(d.kv_slot * size_t(n_seq_slots), lq);
+            if (!d.k_base || !d.v_base) { err = "KV cache allocation failed"; return false; }
+            // Zeroed.  Allocated after the load, the cache can be memory the runtime's
+            // pool recycled from freed upload buffers, where an allocation fresh from the
+            // driver was zeros -- and an answer must not depend on which it got.
+            lq.memset(d.k_base, 0, d.kv_slot * size_t(n_seq_slots));
+            lq.memset(d.v_base, 0, d.kv_slot * size_t(n_seq_slots));
+            d.k_cache = d.k_base;
+            d.v_cache = d.v_base;
+            kv_total += 2 * d.kv_slot * size_t(n_seq_slots);
+        }
+        acct(kv_total);
+        std::printf("  KV cache: %d slot%s x --ctx %d, %.2f GiB on this card\n",
+                    n_seq_slots, n_seq_slots == 1 ? "" : "s", max_seq, double(kv_total) / gib);
+    }
+
     power_gov_init();
-    std::printf("ok\n  zeroing recurrent state ... ");
+    std::printf("  zeroing recurrent state ... ");
     std::fflush(stdout);
     // EVERY slot, not just the bound one.  reset() clears the sequence
     // that is live; a slot nobody has used yet holds whatever the

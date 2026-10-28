@@ -1,6 +1,7 @@
 # =====================================================================
 # GRIMOIRE -- bare-metal SYCL/Level-Zero/C++ inference engine for the
-# Intel Arc Pro B70 (Battlemage G31).
+# Intel Arc Pro B70 (Battlemage G31); the same build runs on the Arc Pro B60
+# and Arc B580 (Battlemage G21).
 #
 # NO vLLM. NO PyTorch. NO Python ML stack, anywhere in this image, at any
 # stage. Every compute kernel is this project's own SYCL/ESIMD source,
@@ -87,10 +88,11 @@ COPY tools/grimoire_main.cpp           tools/
 COPY tools/grimoire_server.cpp         tools/
 RUN mkdir -p bin
 
-# GPU targets for the AOT kernels (tools/build_*_only_b70.sh read it): the Arc Pro B70 by
-# default; --build-arg GRIM_TARGETS=intel_gpu_bmg_g31,intel_gpu_bmg_g21 adds the Arc B580
-# (e.g. a pipeline stage on a B580), at twice the device-compile time.
-ARG GRIM_TARGETS=intel_gpu_bmg_g31
+# GPU targets for the AOT kernels (tools/build_*_only_b70.sh read it): the Arc Pro B70
+# (BMG G31) and the Arc Pro B60 / Arc B580 (BMG G21), so the same image runs on both;
+# --build-arg GRIM_TARGETS=intel_gpu_bmg_g31 builds the B70 only, at half the
+# device-compile time.
+ARG GRIM_TARGETS=intel_gpu_bmg_g31,intel_gpu_bmg_g21
 
 RUN bash tools/build_grimoire_only_b70.sh /grimoire \
     && bash tools/build_server_only_b70.sh /grimoire \
