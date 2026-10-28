@@ -2388,8 +2388,10 @@ struct Grimoire {
         std::vector<int32_t> prompt;
         int budget = 0, eos = -1, eot = -1;
         bool shutdown = false;      // the last message a worker gets
-        int kind = 0; // 0: generate, 1: shutdown, 2: admit slot, 3: batch step
+        int kind = 0; // 0: generate, 1: shutdown, 2: admit slot, 3: batch step,
+                      // 4: cache a sequence, 5: speculative batch step (TP + MTP)
         std::vector<int32_t> slots, positions;
+        std::vector<int32_t> remaining;   // kind 5: each row's token budget left
     };
     bool serving_control = false; // rank 0 scheduler owns the control stream
     bool following_control = false; // a worker inside grimoire_pp_worker_loop
@@ -3092,8 +3094,18 @@ struct Grimoire {
     std::vector<DraftSlot> draft_slots;
     float* batch_conv_steps=nullptr;
     void init_draft_slots();
+    // Megatron TP + the MTP head (2026-10-28): rank 0's scheduler sends every speculative
+    // step to the workers (PPRequest kind 5), so all ranks draft, verify and commit the same
+    // rows and their collectives line up.  Before, TP served drafting one request at a time:
+    // an outside tester's 8 users on two B60s got 69 tok/s in total against 72 for one user.
+    // GRIMOIRE_TP_SPEC_BATCH=0 = one at a time again.  DFlash2 and PP stay one at a time.
+    bool tp_spec_batch() const {
+        static const bool on = [] { const char* e = std::getenv("GRIMOIRE_TP_SPEC_BATCH");
+            return !(e && *e == '0'); }();
+        return on && tp_mega && !pp_enabled() && mtp.ok && !dflash2.ok && !pp_spec && !pp_dflash;
+    }
     bool speculative_batch() const {
-        return !pp_enabled() && !tp_ranked() && (mtp.ok || dflash2.ok);
+        return !pp_enabled() && (!tp_ranked() || tp_spec_batch()) && (mtp.ok || dflash2.ok);
     }
     bool decode_spec_batch(const std::vector<int32_t>& tokens,
         const std::vector<int>& slots, const std::vector<int>& positions,
@@ -3916,16 +3928,19 @@ bool Grimoire::pp_send_request(const PPRequest& r) {
         if(tp_rank!=0) return true;
         for(int i=1;i<tp_world;++i) peers.push_back(tp_peer_fd[size_t(i)]);
     } else if(pp_next_fd>=0) { pp_send_wait(); peers.push_back(pp_next_fd); }
-    if(r.kind==3 && (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size()))
+    const bool rows=r.kind==3 || r.kind==5;
+    if(rows && (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size()))
         return false;
+    if(r.kind==5 && r.remaining.size()!=r.prompt.size()) return false;
     const int32_t head[5]={r.shutdown?1:r.kind,int32_t(r.prompt.size()),
                           int32_t(r.budget),int32_t(r.eos),int32_t(r.eot)};
     const size_t bytes=r.prompt.size()*sizeof(int32_t);
     for(int fd:peers) {
         if(!fd_write_all(fd,head,sizeof head)) return false;
         if(bytes && !fd_write_all(fd,r.prompt.data(),bytes)) return false;
-        if(r.kind==3 && (!fd_write_all(fd,r.slots.data(),bytes) ||
-                       !fd_write_all(fd,r.positions.data(),bytes))) return false;
+        if(rows && (!fd_write_all(fd,r.slots.data(),bytes) ||
+                    !fd_write_all(fd,r.positions.data(),bytes))) return false;
+        if(r.kind==5 && !fd_write_all(fd,r.remaining.data(),bytes)) return false;
     }
     return true;
 }
@@ -3935,22 +3950,23 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
     if (upstream < 0) return false;             // rank 0 has no upstream
     int32_t head[5] = {0,0,0,0,0};
     if (!fd_read_all(upstream, head, sizeof head)) return false;
-    if (head[0]<0 || head[0]>4) return false;
+    if (head[0]<0 || head[0]>5) return false;
     r.kind=head[0];
     r.shutdown = r.kind == 1;
     const int32_t n = head[1];
+    const bool rows = r.kind==3 || r.kind==5;
     // A length off the wire sizes an allocation, so it is checked before
     // it is trusted: a desynchronised pipe would otherwise turn into a
     // multi-gigabyte resize rather than a clean failure.
-    if (n < 0 || n > (r.kind==3?kMaxBatchRows:max_seq)) return false;
-    if ((r.kind==2 || r.kind==3) && n==0) return false;
+    if (n < 0 || n > (r.kind==5?kSpecBatch:r.kind==3?kMaxBatchRows:max_seq)) return false;
+    if ((r.kind==2 || rows) && n==0) return false;
     if (r.kind==2 && (head[2]<0 || head[2]>=n_seq_slots)) return false;
     if(r.kind==4 && (head[2]<0 || head[2]>=n_seq_slots || head[3]!=n)) return false;
     r.budget = head[2]; r.eos = head[3]; r.eot = head[4];
     r.prompt.assign(size_t(n), 0);
     if (n && !fd_read_all(upstream, r.prompt.data(),
                           size_t(n) * sizeof(int32_t))) return false;
-    if (r.kind==3) {
+    if (rows) {
         r.slots.resize(size_t(n)); r.positions.resize(size_t(n));
         if (!fd_read_all(upstream,r.slots.data(),size_t(n)*sizeof(int32_t)) ||
             !fd_read_all(upstream,r.positions.data(),size_t(n)*sizeof(int32_t)))
@@ -3961,6 +3977,11 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
                 return false;
             for(int j=0;j<i;++j) if(r.slots[size_t(i)]==r.slots[size_t(j)]) return false;
         }
+    }
+    if (r.kind==5) {
+        r.remaining.resize(size_t(n));
+        if (!fd_read_all(upstream,r.remaining.data(),size_t(n)*sizeof(int32_t))) return false;
+        for (int32_t v : r.remaining) if (v < 0) return false;
     }
     // Pass it on BEFORE running it, so every stage downstream starts its
     // own prefill while this one is still working.  Forwarding after
@@ -9157,8 +9178,9 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
 //  * a drafter and a batch both want the verify path; combining them is
 //    a scheduling question nobody has answered yet.
 std::string Grimoire::batch_unsupported_reason() const {
-    if ((pp_enabled() || tp_ranked()) && (pp_spec || pp_dflash || mtp.ok || dflash2.ok))
-        return "distributed speculative batching is not implemented";
+    if ((pp_enabled() || tp_ranked()) && (pp_spec || pp_dflash || mtp.ok || dflash2.ok) &&
+        !tp_spec_batch())
+        return "distributed speculative batching is not implemented for this drafter / layout";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
     // A file-backed per-layer-embedding table (GRIMOIRE_PLE_FILE) keeps ONE
@@ -20279,14 +20301,6 @@ void GrimoireScheduler::run() {
         bool failed = false; std::string err;
         if (!toks.empty()) {
             try {
-                if (e.pp_enabled() || e.tp_ranked()) {
-                    Grimoire::PPRequest request;
-                    request.kind=3; request.prompt=toks;
-                    request.slots.assign(slots.begin(),slots.end());
-                    request.positions.assign(poss.begin(),poss.end());
-                    if (!e.pp_send_request(request))
-                        throw std::runtime_error("pipeline batch broadcast failed");
-                }
                 // Speculate only while few sequences are live: at 8 users each
                 // gets one draft and the verify rows cost more than plain
                 // batching.  MEASURED 2026-10-06, Qwen3.8-27B GPTQ + MTP K=4
@@ -20294,19 +20308,36 @@ void GrimoireScheduler::run() {
                 // 2 / 4 / 8 users: limit 2 -> 80.2 / 104.2 / 187.1, limit 8 ->
                 // 90.4 / 118.7 / 153.7, limit 4 -> 93.7 / 118.2 / 187.0
                 // (vLLM 0.30.1 MTP-4 on the same card: 85.2 / 130.4 / 122.3).
-                // GRIMOIRE_SPEC_MAX_SEQS.
-                static const int spec_max_seqs = [] {
+                // GRIMOIRE_SPEC_MAX_SEQS.  Megatron TP: 2.  MEASURED 2026-10-28,
+                // Qwen3.8-27B-FP8 + MTP on two B70s, llama-benchy pp4096/tg128 total
+                // tok/s: 4 users speculating 88.9, plain steps 95.0 (plain without MTP
+                // 97.0); 2 users speculating 62.9 -- there every draft is a pass with
+                // two all-reduces.
+                static const int spec_max_seqs = [this] {
                     const char* v = std::getenv("GRIMOIRE_SPEC_MAX_SEQS");
-                    return v && *v ? std::max(1, std::atoi(v)) : 4; }();
+                    return v && *v ? std::max(1, std::atoi(v)) : (e.tp_ranked() ? 2 : 4); }();
                 const bool spec_now = e.speculative_batch() &&
                     (e.dflash2.ok || int(toks.size()) <= spec_max_seqs);
-                if(spec_now) {
-                    std::vector<int> remaining;
+                std::vector<int> remaining;
+                if(spec_now)
                     for(size_t k:which) {
                         const auto& job=active[k];
                         std::lock_guard<std::mutex> lock(job->mu);
                         remaining.push_back(job->budget-int(job->ready.size()));
                     }
+                if (e.pp_enabled() || e.tp_ranked()) {
+                    // Decided above, sent here: a worker runs the same kind of step
+                    // (5 = speculative under Megatron TP + MTP, 3 = plain), or the
+                    // ranks' collectives would not line up.
+                    Grimoire::PPRequest request;
+                    request.kind=spec_now?5:3; request.prompt=toks;
+                    request.slots.assign(slots.begin(),slots.end());
+                    request.positions.assign(poss.begin(),poss.end());
+                    if(spec_now) request.remaining.assign(remaining.begin(),remaining.end());
+                    if (!e.pp_send_request(request))
+                        throw std::runtime_error("pipeline batch broadcast failed");
+                }
+                if(spec_now) {
                     e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
                 } else if(toks.size()==1 && e.solo_ok()) {
                     const int t=e.decode_solo(toks[0],slots[0],poss[0]);
@@ -20527,6 +20558,21 @@ void grimoire_pp_worker_loop(Grimoire& e) {
                 const std::vector<int> positions(req.positions.begin(),req.positions.end());
                 if(!e.decode_batch(req.prompt,slots,positions,out))
                     throw std::runtime_error("pipeline batch step failed");
+                // rank 0 feeds a plain step's tokens to the MTP head (too many rows to
+                // draft); the head's collectives need every rank there too
+                if(e.speculative_batch()) e.mtp_follow_batch(out,slots,positions);
+                continue;
+            }
+            if (req.kind==5) {
+                // the same speculative step as rank 0's scheduler (Megatron TP + MTP)
+                const std::vector<int> slots(req.slots.begin(),req.slots.end());
+                const std::vector<int> positions(req.positions.begin(),req.positions.end());
+                const std::vector<int> remaining(req.remaining.begin(),req.remaining.end());
+                if(!e.speculative_batch())
+                    throw std::runtime_error("speculative batch step on a rank without speculation");
+                std::vector<std::vector<int32_t>> blocks;
+                std::vector<int> consumed;
+                e.decode_spec_batch(req.prompt,slots,positions,remaining,blocks,consumed);
                 continue;
             }
             grimoire_serve_generate(e, req.prompt, req.budget, req.eos, out,

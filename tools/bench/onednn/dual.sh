@@ -11,7 +11,8 @@
 #            pleready (wait for the PLE table's copy into RAM)
 #
 # Holds /mnt/user/isos/grimoire-runs/gpu0.lock then gpu1.lock for the whole run (the other
-# agents use the same locks).  Server = host bin/ of grimoire-fuse in grimoire-b70:latest.
+# agents use the same locks).  Server = host bin/ of grimoire-fuse in grimoire-b70:latest;
+# IMG=<image> HOSTBIN=0 runs an image's OWN binaries instead (a release image as shipped).
 # Link guard, sampled every 2 s from container start to stop:
 #   STOP on any non-fatal/fatal AER on either card's path; gpu1 root-port receive errors
 #        (card->host direction, where every old drop started) >= RP_WIN (5) in one 10-s window or
@@ -128,11 +129,16 @@ echo "== $NAME  $MODE  $MODEL --proj $PROJ --ctx $CTX  [$EXTRA]  gpu0=$P0/$N0 gp
 echo "   link before: $(linkstat)"
 watch_link &
 docker rm -f $NAME > /dev/null 2>&1
+IMG=${IMG:-grimoire-b70:latest}
+if [ "${HOSTBIN:-1}" = 1 ]; then
+  BINM=(-v $R/bin:/grimoire/bin:ro -v $R/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib
+        -v $R/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro)
+else BINM=(); fi
+echo "   image $IMG, $([ "${HOSTBIN:-1}" = 1 ] && echo "host bin/" || echo "the image's own binaries")"
 docker run -d --name $NAME --init --stop-timeout 300 --network host --ipc=host "${DEVS[@]}" \
-  -v /dev/dri/by-path:/dev/dri/by-path:ro -v $R/bin:/grimoire/bin:ro -v $R/tools:/grimoire/tools:ro \
-  --tmpfs /opt/grimoire/lib -v $R/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro \
+  -v /dev/dri/by-path:/dev/dri/by-path:ro ${BINM[@]+"${BINM[@]}"} \
   -v /mnt/storage/Models:/models -v /mnt/models:/models2 -v /mnt/storage/isos/grimoire-cache:/cache "${envs[@]}" \
-  grimoire-b70:latest "${ENTRY[@]}" --model $MODEL --proj $PROJ --ctx $CTX --host 0.0.0.0 --port $PORT > /dev/null || exit 9
+  $IMG "${ENTRY[@]}" --model $MODEL --proj $PROJ --ctx $CTX --host 0.0.0.0 --port $PORT > /dev/null || exit 9
 started=1; t0=$(date +%s); ok=0
 while [ $(( $(date +%s) - t0 )) -lt $LOAD_MAX ]; do
   sleep 3

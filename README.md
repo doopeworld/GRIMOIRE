@@ -47,13 +47,14 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 | Model | Weights | Mode | pp2048 | pp4096 | pp8192 | Decode, 1 user |
 |---|---|---|---:|---:|---:|---:|
 | **Qwen3.8-27B** | FP8 | tensor parallel | -- | **3,530** | 3,315 | **29.5** (8 users: **165** total) |
-| **Qwen3.8-27B + MTP** | FP8 | tensor parallel, `GRIMOIRE_MTP=1` | -- | 3,531 | 3,319 | **56.2** (88.8 on code) |
+| **Qwen3.8-27B + MTP** | FP8 | tensor parallel, `GRIMOIRE_MTP=1` | -- | 3,528 | 3,319 | **56.5** (88.2 on code; 4 users: **95.0** total, 8 users: **161.9**) |
 | **Qwen3.8-27B + DFlash2** | FP8 + [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | tensor parallel | -- | 3,334 | 3,232 | **59.3** (126 on code) |
 | **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
 | **Qwen3.8-Flash-Next** | NVFP4; 170 of 512 experts per layer in VRAM on each card | tensor + expert parallel | 1,292 | 1,474 | -- | **44.6** (42.2 after a 4K prompt) |
 
-On two cards, drafting (MTP / DFlash2) serves **one request at a time** for now; for several users
-at once, leave it off -- plain decoding batches them (165 tok/s total at 8 users above).
+On two cards, MTP serves several users at once since 2026-10-28 (it drafts for up to 2 of them;
+with more, the step is a plain batched one): 1 / 2 / 4 / 8 users = 56.5 / 62.9 / 95.0 / 161.9
+tok/s in total.  DFlash2 still serves one request at a time on two cards.
 
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
 1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 3,530 and 29.5
@@ -91,6 +92,11 @@ with one slot this binary can skip or repeat parts of an answer. Fixed in the so
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
 build the image yourself: `docker build -t grimoire-b70 .`
+
+Built from main, the same image runs on the Arc Pro B70 and on the **Arc Pro B60 / Arc B580**
+(Battlemage G21; the kernels are tuned on the B70, and we have not measured a B60 ourselves). At start
+it prints `KV cache: N slots x --ctx M, X GiB on this card`: when `GRIMOIRE_SEQ_SLOTS` conversations
+at `--ctx` do not fit the card, it holds fewer at once (the others wait for a free one) and says why.
 
 ### 2. Download a model
 
@@ -212,8 +218,8 @@ on boards without GPU-to-GPU P2P. Two layouts:
 
 - `multi TP` (tensor parallel): both cards work on every token, each holding half of every layer.
   Use it for dense models such as Qwen3.8-27B-FP8 (~3,500 tok/s prompt, 29.5 decode for one user,
-  165 total for 8 users; with `GRIMOIRE_MTP=1` 56 for one user and 89 on code, one request at a
-  time) and for Qwen3.8-Flash-Next (tensor + expert parallel, see below).
+  165 total for 8 users; with `GRIMOIRE_MTP=1` 56.5 for one user, 88 on code, 162 total for 8
+  users) and for Qwen3.8-Flash-Next (tensor + expert parallel, see below).
 - `multi PP` (pipeline parallel): each card holds a block of layers. Use it for MoE models such as
   Ornith-1.5-35B-A3B-FP8.
 

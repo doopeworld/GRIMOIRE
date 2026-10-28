@@ -77,6 +77,8 @@ fi
 MOUNTS=(-v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro
         -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro
         --tmpfs /opt/grimoire/lib)
+# HOSTBIN=0 (with GRIM_IMAGE=<release image>): run the image's OWN binaries, as shipped.
+[ "${HOSTBIN:-1}" = 0 ] && MOUNTS=(--tmpfs /opt/grimoire/lib)
 CID=$(docker run -d --name "$CNAME" -w /grimoire \
     --init \
     --stop-timeout 300 \
