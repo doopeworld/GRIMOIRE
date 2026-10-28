@@ -2419,6 +2419,12 @@ struct Grimoire {
     int  pp_dflash = 0;
     bool spec_active() const {
         if (pp_enabled()) return pp_spec != 0;
+        // the Qwen4-Exp head speculates unless only its shadow drafts are asked for
+        // (GRIMOIRE_MTP4_SHADOW=1 keeps the target decoding token by token)
+        if (mtp4.ok) {
+            const char* e = std::getenv("GRIMOIRE_MTP4_SHADOW");
+            return mtp_enabled() && !(e && *e == '1');
+        }
         return mtp_enabled() && mtp.ok;
     }
     // Does a rejected draft have recurrent state to restore?  Keyed on
@@ -3142,6 +3148,12 @@ struct Grimoire {
     size_t spec_dn_row_floats = 0;
     bool dn_verify_fused = false;
     float* spec_conv_inputs = nullptr;
+    // Qwen4-Exp MTP (mtp4): every PLE layer's conv window over the verify rows ([history |
+    // rows], the commit keeps its accepted end), and every verify row's multi-stream state
+    // after the last combine (the next round's first draft reads the accepted one)
+    float* spec_ple_rows = nullptr;
+    float* spec_multi = nullptr;
+    bool   spec_multi_valid = false;
     float* spec_hidden_steps = nullptr;
     // Whether spec_hidden_steps actually HOLDS this round's hidden states.
     // Only the BATCHED verify writes it.  The pointer is allocated as soon
@@ -8539,7 +8551,20 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     // mtp.ok, because mtp.ok is false on the early stages by design -- and
     // pp_connect, which publishes the pipeline's answer, has not run yet.
     // If the last stage then fails to load a head, these go unused.
-    if (mtp.ok || dflash2.ok || (pp_enabled() && mtp_enabled())) {
+    if (mtp.ok || dflash2.ok || mtp4.ok || (pp_enabled() && mtp_enabled())) {
+        if (mtp4.ok) {
+            const int slen = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+            const size_t wide = size_t(cfg.hc_count) * cfg.hidden;
+            size_t npl = 0;
+            for (const auto& d : L) if (d.ple) ++npl;
+            if (npl && slen > 0)
+                spec_ple_rows = sycl::malloc_device<float>(npl * size_t(slen + kSpecBatch) * wide, q);
+            spec_multi = sycl::malloc_device<float>(size_t(kSpecBatch) * wide, q);
+            if ((npl && slen > 0 && !spec_ple_rows) || !spec_multi) {
+                err = "MTP4 rollback-state allocation failed"; return false;
+            }
+            acct((npl * size_t(std::max(0, slen) + kSpecBatch) + kSpecBatch) * wide * sizeof(float));
+        }
         // One exact rollback image for the hybrid recurrent state. This is
         // about 157 MiB on Qwen3.8-27B and is copied device-to-device.
         for (const auto& d : L) {
@@ -10190,6 +10215,7 @@ void Grimoire::snapshot_recurrent() {
     // capture is invalidated: whatever the last round left in the buffer
     // does not describe this one, and only a batched verify will refill it.
     spec_hidden_valid = false;
+    spec_multi_valid = false;
     const size_t dn_n = size_t(cfg.lin_v_heads) * cfg.lin_v_dim * cfg.lin_k_dim;
     const size_t cv_n = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
                                cfg.lin_v_heads * cfg.lin_v_dim) *
@@ -10283,6 +10309,23 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
     if (spec_hidden_steps && spec_hidden_valid)
         q.memcpy(s.h, spec_hidden_steps + size_t(step) * cfg.hidden,
                  size_t(cfg.hidden) * sizeof(float));
+    // Qwen4-Exp MTP (mtp4): each PLE layer's history = the window after the accepted rows of
+    // the verify's [history | rows] (prefill_qwen4_exp, the same walk over L), and the head's
+    // next backbone input = the last accepted row's multi-stream state
+    if (cfg.is_qwen4_exp && mtp4.ok && spec_multi_valid) {
+        const int slen = (cfg.ple_conv_kernel - 1) * cfg.ngram_size;
+        const size_t wide = size_t(cfg.hc_count) * cfg.hidden;
+        size_t poff = 0;
+        for (auto& d : L) {
+            if (!d.ple) continue;
+            if (slen > 0 && spec_ple_rows && d.ple_hist)
+                q.memcpy(d.ple_hist, spec_ple_rows + poff + size_t(accepted) * wide,
+                         size_t(slen) * wide * sizeof(float));
+            poff += size_t(std::max(0, slen) + kSpecBatch) * wide;
+        }
+        q.memcpy(mtp4.back, spec_multi + size_t(step) * wide, wide * sizeof(float));
+        spec_multi_valid = false;
+    }
     pos = saved_pos + accepted;
     set_cursor(pos);
 }
@@ -13276,6 +13319,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     // which is what makes the acceptance count agree without a second
     // round trip.
     if (pp_enabled() && pp_rank < pp_world - 1) return pp_sync_token(-1);
+    if (mtp4.ok) return mtp4_draft(next_token, position, from_mtp_hidden);
     if (!mtp.ok) return -1;
     if(position<0||position>=max_seq||next_token<0||next_token>=cfg.vocab)throw std::out_of_range("invalid MTP draft position/token");
     const int H = cfg.hidden;
@@ -15945,7 +15989,14 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                                  std::vector<int32_t>* next_tokens, const SeqBatch* seqb) {
     const int M = int(tokens.size());
     if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
-    if (next_tokens && !seqb) return false;              // no speculative verify path
+    // verify (10-28): one conversation's candidate rows, the MTP4 speculative round -- every
+    // row's token, the DeltaNet state left as it is and the recurrent inputs kept for
+    // commit_spec_prefix (which replays the accepted rows and rebuilds conv ring and PLE
+    // history).  Declines -- before any work -- when that state was not allocated.
+    const bool verify = next_tokens && !seqb;
+    if (verify && !(mtp4.ok && dn_verify_fused && spec_dn_inputs && spec_conv_inputs &&
+                    spec_multi && M <= kSpecBatch && !pp_enabled()))
+        return false;
     // Pipeline: prompts are batched across stages (the multi-stream residual
     // crosses each boundary, every pending combine landed first); batched
     // DECODE steps are not, so a pipeline runs one sequence at a time.
@@ -16006,7 +16057,20 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     // sub-chunk of SUB rows.  q4_sub_rows comes from prefill_token_budget()
     // (agreed by the TP ranks at load); 0 = the whole call in one piece; a call
     // that has room for bigger sub-chunks takes them (q4_sub_for).
-    const int SUB = (seqb || q4_sub_rows <= 0) ? M : q4_sub_for(M);
+    const int SUB = (seqb || verify || q4_sub_rows <= 0) ? M : q4_sub_for(M);
+    // verify: where each layer's saved inputs go -- the same walk over L as
+    // commit_spec_prefix, so both find a layer's slice at the same offset
+    std::vector<size_t> vx_doff(L.size(), size_t(-1)), vx_xoff(L.size(), size_t(-1)),
+                        vx_poff(L.size(), size_t(-1));
+    if (verify) {
+        size_t ds = 0, xs = 0, ps = 0;
+        const size_t dn_n = size_t(Hv) * Dv * Dk;
+        for (size_t li = 0; li < L.size(); ++li) {
+            if (L[li].dn_state) { vx_doff[li] = ds; ds += dn_n; }
+            if (L[li].conv_ring) { vx_xoff[li] = xs; xs += size_t(kSpecBatch) * qkv_ch; }
+            if (L[li].ple) { vx_poff[li] = ps; ps += size_t(std::max(0, SLEN) + kSpecBatch) * WIDE; }
+        }
+    }
     auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
     float* hyper  = df(size_t(M) * WIDE);
     float* normed = df(size_t(SUB) * WIDE);
@@ -16284,6 +16348,10 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                 launch_ple_conv(q,pcnv,pgat,HY+int64_t(r)*WIDE,d.ple_cw,
                     HY+int64_t(r)*WIDE,SLEN,count,WIDE,cfg.ple_conv_kernel,
                     cfg.ngram_size,none);
+                // verify: [history | rows]; the commit keeps the window after the accepted ones
+                if(verify&&SLEN>0&&spec_ple_rows&&vx_poff[size_t(i)]!=size_t(-1))
+                    q.memcpy(spec_ple_rows+vx_poff[size_t(i)],pcnv,
+                             size_t(SLEN+count)*WIDE*sizeof(float));
                 if(SLEN>0) q.memcpy(history,pcnv+int64_t(count)*WIDE,
                                     size_t(SLEN)*WIDE*sizeof(float));
             }
@@ -16299,6 +16367,10 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         if (d.kind == LayerKind::LINEAR_ATTN) {
             mm(d.la_qkv, ain, t0);
             if (!ok) break;
+            // verify: the conv inputs, from which the commit rebuilds the ring
+            if (verify && vx_xoff[size_t(i)] != size_t(-1))
+                q.memcpy(spec_conv_inputs + vx_xoff[size_t(i)], t0,
+                         size_t(MR) * qkv_ch * sizeof(float));
             for(int r=0;r<(seqb?MR:1);++r) {
                 ConvParams cp{t0+int64_t(r)*qkv_ch,d.la_conv,
                     seqb?d.conv_base+size_t(seqb->slot[r])*d.conv_slot:d.conv_ring,
@@ -16313,6 +16385,19 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             if (!ok) break;
             launch_deltanet_gates_batched(q, t0, d.la_Alog, d.la_dtb,
                                           alpha, beta, MR, Hv);
+            if (verify) {
+                // every row's output from the live state, which stays as it is; the inputs
+                // are kept for the commit's replay of the accepted rows
+                DeltaNetParams sp{};
+                sp.q = t1; sp.k = t2; sp.v = t3; sp.a = alpha; sp.beta = beta; sp.out = attn;
+                sp.n_heads = Hv; sp.k_dim = Dk; sp.v_dim = Dv; sp.n_k_heads = Hk;
+                sp.state = d.dn_state;
+                DnGroups g{};
+                g.row0[0] = 0; g.nrows[0] = MR; g.slot[0] = 0; g.n = 1;
+                const size_t dn_n = size_t(Hv) * Dv * Dk;
+                float* saved = spec_dn_inputs + (vx_doff[size_t(i)] / dn_n) * kSpecBatch * spec_dn_row_floats;
+                launch_deltanet_verify_rows(q, sp, g, 0, saved, {});
+            } else
             if (MR <= 16) {
                 for (int t = 0; t < MR; ++t) {
                     DeltaNetParams sp{};
@@ -16577,9 +16662,15 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         return true;
     }
 
-    if(seqb) {
+    if(seqb || verify) {
         hc_mix(hc_final,pending?pend:nullptr,pending?pinj:nullptr,nullptr,blk_in);
         if(!ok) { q.wait(); cleanup(); return false; }
+        // verify: every row's multi-stream state after its last combine (hc_mix combines in
+        // place) -- the next round's first draft starts from the accepted one
+        if(verify) {
+            q.memcpy(spec_multi,hyper,size_t(M)*WIDE*sizeof(float));
+            spec_multi_valid=true;
+        }
         next_tokens->resize(size_t(M));
         std::vector<float> hv(tp_head_split?size_t(M):0);   // the split head's row values
         for(int r=0;r<M;++r) {
@@ -16592,6 +16683,21 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         if(tp_head_split&&!tp_head_pick(hv.data(),next_tokens->data(),M,next_tokens->data())){
             std::fprintf(stderr,"TP: split-head token exchange failed\n");
             cleanup(); return false;
+        }
+        if(verify) {
+            // every rank judges the drafts with the same tokens (rank 0's, if the head is whole)
+            if(tp_mega&&!tp_head_split&&!tp_sync_tokens(*next_tokens)){
+                std::fprintf(stderr,"TP: verify token sync failed\n");
+                cleanup(); return false;
+            }
+            // the head's caches for the candidate rows, each with the candidate after it; a
+            // rejected row's entries are rewritten when that position is decoded for real
+            for(int r=0;r+1<M;++r)
+                mtp4_warm_row(spec_multi+int64_t(r)*WIDE,tokens[size_t(r+1)],start_pos+r);
+            set_cursor(start_pos);
+            q.wait_and_throw();
+            cleanup();
+            return true;
         }
         cleanup();
         ++g_batch_decode_steps; g_batch_decode_rows+=M;

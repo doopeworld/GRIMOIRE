@@ -794,3 +794,7 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   (tensor map and plan: memory grimoire-flashnext-mtp-plan), decode / prefill warming of the
   head's caches, shadow mode GRIMOIRE_MTP4_SHADOW=1 (drafts at every step, counts hits, no
   speculation).  Test after the restart: tools/bench/onednn/fn_mtp1.sh.
+- Flash-Next MTP step 2 (written, syntax-checked, not run -- gpu1 still down at 11:4x): a
+  prefill_qwen4_exp verify mode (DeltaNet verify + replay, conv inputs, PLE windows, per-row
+  multi-stream) and the commit / speculation hooks.  Order after the restart: fn_mtp1.sh (shadow),
+  fn_mtp2.sh (base vs K=3 / 4, answers + llama-benchy).
