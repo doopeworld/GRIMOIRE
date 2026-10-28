@@ -75,6 +75,10 @@ static std::string tool_calls_json(const std::vector<b70::ParsedToolCall>& calls
 }
 
 int main(int argc, char** argv) {
+    // Line-buffered stdout: a served process writes to a pipe (docker logs), where
+    // full buffering held the engine's printf lines (GRIMOIRE_SPEC_TIME, spec
+    // stats) until exit -- and a stopped container never flushed them.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     // Level Zero sysman reports the card's free VRAM, which sizes prefill
     // chunks (Grimoire::prefill_token_budget); it must be on before SYCL starts.
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
@@ -181,6 +185,36 @@ int main(int argc, char** argv) {
                      std::atoi(pp ? pp : (tp ? tp : "0")));
         b70::grimoire_pp_worker_loop(*e);
         return 0;
+    }
+    // oneDNN (on unless GRIMOIRE_ONEDNN=0) compiles its kernels the first time a
+    // weight meets a new row class (src/onednn_gemm.cpp): the first request
+    // after a start paid ~0.45 s for it (MEASURED 2026-10-25, Qwen3.8-27B-FP8 on
+    // two cards, code probe TTFT 1.42 vs 0.97 s off).  Pay it here, before any
+    // client: a few prompts of different lengths, one token each, through the
+    // same path a request takes (TP / PP workers follow it like any request).
+    // GRIMOIRE_SERVER_WARMUP=0 skips it.
+    {
+        const char* od = std::getenv("GRIMOIRE_ONEDNN");
+        const char* wu = std::getenv("GRIMOIRE_SERVER_WARMUP");
+        if (!(od && *od && std::atoi(od) == 0) && !(wu && *wu == '0')) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::vector<int32_t> unit =
+                tk.encode("The quick brown fox jumps over the lazy dog while the band plays. ");
+            int done = 0;
+            for (const int len : {73, 333, 777, 2153}) {
+                if (unit.empty() || len + 2 >= max_seq) break;
+                std::vector<int32_t> ids;
+                while (int(ids.size()) < len) ids.insert(ids.end(), unit.begin(), unit.end());
+                ids.resize(size_t(len));
+                const int eot = tk.special_id("<|eot|>");
+                if (!b70::grimoire_pp_broadcast_request(*e, ids, 1, tk.eos(), eot)) break;
+                std::vector<int32_t> out;
+                b70::grimoire_serve_generate(*e, ids, 1, tk.eos(), out, eot);
+                ++done;
+            }
+            std::fprintf(stderr, "oneDNN warm-up: %d prompts in %.1f s\n", done,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
     }
     // How many requests may be in flight together.  The engine caps it at
     // what the KV cache was allocated for (GRIMOIRE_SEQ_SLOTS) and at its

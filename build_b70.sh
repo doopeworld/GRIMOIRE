@@ -94,8 +94,12 @@ OUT="${B70_OUT:-b70_native_inference}"
 # that silently has the option on NEITHER.
 IFS=',' read -r -a TARGET_LIST <<< "$TARGET"
 BACKEND_OPTS=()
+GEMM_OPTS=()
+ATTN_OPTS=()
 for _t in "${TARGET_LIST[@]}"; do
     BACKEND_OPTS+=( -Xsycl-target-backend="$_t" "-options -cl-intel-256-GRF-per-thread" )
+    GEMM_OPTS+=( -Xsycl-target-backend="$_t" "-options \"-cl-intel-256-GRF-per-thread -doubleGRF\"" )
+    ATTN_OPTS+=( -Xsycl-target-backend="$_t" "-options -doubleGRF" )
 done
 
 if command -v ocloc >/dev/null; then
@@ -178,12 +182,20 @@ icpx -O2 -std=c++17 -I include \
 #  work-groups elsewhere).  Linked, not dlopen'd: bin/grimoire refuses to
 #  start without it rather than falling back silently.
 # ---------------------------------------------------------------------
-icpx -fsycl -fsycl-targets="$TARGET" "${BACKEND_OPTS[@]}" -O3 -std=c++20 \
+icpx -fsycl -fsycl-targets="$TARGET" "${GEMM_OPTS[@]}" -O3 -std=c++20 \
      -fno-fast-math -ffp-contract=fast -fno-math-errno \
      -fPIC -shared -I include -I src \
      src/gemm_fast.cpp -o bin/libgrimoire_gemm.so \
   && echo "built  : bin/libgrimoire_gemm.so" \
   || { echo "=== LIBGRIMOIRE_GEMM BUILD FAILED ==="; REQUIRED_FAILED=1; }
+
+# Speculative verify attention also requires a separate ESIMD 256-GRF image.
+icpx -fsycl -fsycl-targets="$TARGET" "${ATTN_OPTS[@]}" -O3 -std=c++20 \
+     -fno-fast-math -ffp-contract=fast -fno-math-errno \
+     -fPIC -shared -I include -I src \
+     src/attn_verify_dpas.cpp -o bin/libgrimoire_attn.so \
+  && echo "built  : bin/libgrimoire_attn.so" \
+  || { echo "=== LIBGRIMOIRE_ATTN BUILD FAILED ==="; REQUIRED_FAILED=1; }
 
 # ---------------------------------------------------------------------
 #  grimoire -- the inference CLI
@@ -197,7 +209,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
-     -Lbin -lgrimoire_gemm '-Wl,-rpath,$ORIGIN' \
+     -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire \
   && echo "built  : bin/grimoire" \
   || { echo "=== GRIMOIRE BUILD FAILED ==="; REQUIRED_FAILED=1; }
@@ -217,7 +229,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
-     -lpthread -Lbin -lgrimoire_gemm '-Wl,-rpath,$ORIGIN' \
+     -lpthread -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire-server \
   && echo "built  : bin/grimoire-server" \
   || { echo "=== GRIMOIRE-SERVER BUILD FAILED ==="; REQUIRED_FAILED=1; }

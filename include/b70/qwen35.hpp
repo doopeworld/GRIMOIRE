@@ -301,6 +301,9 @@ struct TensorRef {
     // can be passed directly to oneDNN after exposing the logical [N,K].
     bool     compressed_int4 = false;
     bool     row_scaled = false; // FP8 payload with separate [N,1] scale
+    // Embedding recipe: signed INT8 rows, with scales rounded to BF16
+    // before lookup multiplication and a BF16 result (Swift bake).
+    bool     int8_embedding = false;
     // NVFP4 (NVIDIA Blackwell): the SAME [N,K/2] E2M1 payload as MXFP4,
     // with E4M3 scales per 16 instead of E8M0 per 32, plus one FP32
     // scale for the whole tensor.  A .weight_packed name says nothing

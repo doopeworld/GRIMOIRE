@@ -235,6 +235,22 @@ bool gemm_fast_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
                              const std::vector<sycl::event>& deps = {});
+// launch_gemm_fast in two halves: dequantize W once into wdq
+// (gemm_fast_predq_elems(w) bf16), then the GEMM over any block of rows --
+// bit-identical rows (TP prefill's chunked FFN).
+bool gemm_fast_predq_supported(const QuantWeight& w, int M);
+size_t gemm_fast_predq_elems(const QuantWeight& w);
+sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_bf16* wdq,
+                                     const std::vector<sycl::event>& deps = {});
+sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
+                                   const sycl_bf16* x, float* y, int M,
+                                   const std::vector<sycl::event>& deps = {});
+// Intel oneDNN matmul, y = x W^T (or += with accumulate) for FP8 row-scaled and BF16 weights
+// at any row count (src/onednn_gemm.cpp, in libgrimoire_gemm.so).  onednn_gemm_ok is false
+// when the library was built without third_party/onednn or under GRIMOIRE_ONEDNN=0.
+bool onednn_gemm_ok(const QuantWeight& w, int M);
+sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
+                        int M, bool accumulate, const std::vector<sycl::event>& deps = {});
 // Matrix-unit causal prefill attention (src/gemm_fast.cpp);
 // launch_flash_prefill() takes it whenever the geometry fits.
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads);
@@ -570,6 +586,19 @@ sycl::event launch_hc_down_inject1(sycl::queue& q, const bf16_t* down, const bf1
 sycl::event launch_hc_up_mean1(sycl::queue& q, const bf16_t* up, const float* lora,
     const float* normed, float* block, int hc_count, int hidden, int lowrank,
     const std::vector<sycl::event>& deps = {});
+// The kernels B and C were before 10-27 (one sub-group per output row, one
+// dot at a time): GRIMOIRE_HC_SGROW=1 selects them, GRIMOIRE_HC_CHECK=1
+// compares the two.
+sycl::event launch_hc_down_inject1_sg(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+    const float* normed, float* lora, float* inj, int lowrank, int hc_count, int wide,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_up_mean1_sg(sycl::queue& q, const bf16_t* up, const float* lora,
+    const float* normed, float* block, int hc_count, int hidden, int lowrank,
+    const std::vector<sycl::event>& deps = {});
+// A prompt's injection projection, inj[r][c] = inject[c] . normed[r], for
+// hc_count <= 8 BF16 rows (wide % 8 == 0).
+sycl::event launch_hc_inject_rows(sycl::queue& q, const bf16_t* inj_w, const float* normed,
+    float* inj, int rows, int hc_count, int wide, const std::vector<sycl::event>& deps = {});
 sycl::event launch_hc_norm(sycl::queue& q, const float* x, const bf16_t* w,
     float* out, int rows, int hc_count, int hidden, float eps,
     const std::vector<sycl::event>& deps = {});
@@ -772,12 +801,14 @@ sycl::event launch_flash_prefill(
 // DFlash query attention. Query K/V rows have already been appended at
 // [context_len, context_len + tokens). Some trained heads use a non-causal
 // block while sliding-attention heads such as Muse are causal.
+// split_keys: a draft block (<= 16 queries) over a long key range runs the
+// range in slices on separate work-groups plus a merge (prefill.cpp).
 sycl::event launch_dflash2_block_attention(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
     int sliding_window, bool causal, float softmax_scale,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, bool split_keys = false);
 
 // DFlash2-only elementwise and selector kernels.  Activations remain f32 in
 // Grimoire; the explicit bf16 round points mirror the reference model.
@@ -818,6 +849,12 @@ sycl::event launch_dflash2_path_walk(
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_embed_int8(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, int token, float* out, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_embed_int8_batched(sycl::queue& q, const int8_t* table,
+    const bf16_t* scales, const int32_t* tokens, float* out, int count,
+    int hidden, int begin, int rows, const std::vector<sycl::event>& deps = {});
 // Row-sharded counterpart of launch_embed_batched, for tensor parallel.
 // Each rank holds vocabulary rows [begin, begin+rows) of the table; a token
 // outside that range contributes ZERO from this rank, and the caller sums
@@ -862,6 +899,8 @@ sycl::event launch_l2norm_heads_pair_bf16_io(sycl::queue& q,sycl_bf16* qv,
     sycl_bf16* kv,int n_heads,int dim,const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     int tokens, int inter, const std::vector<sycl::event>& deps = {});
+sycl::event launch_swiglu_bf16_out(sycl::queue& q, const float* gu, sycl_bf16* out,
+    int tokens, int inter, const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
     float* out, int tokens, int inter,
     const std::vector<sycl::event>& deps = {});
@@ -886,6 +925,10 @@ sycl::event launch_permute_rows_bf16(sycl::queue& q, const float* src,
 sycl::event launch_moe_unpermute(sycl::queue& q, const float* src,
     const int32_t* inverse, const float* route_weight, float* dst,
     int tokens, int top_k, int hidden,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_moe_unpermute_range(sycl::queue& q, const float* src,
+    const int32_t* inverse, const float* route_weight, float* dst,
+    int tokens, int top_k, int hidden, int p0, int p1, bool accumulate,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_moe_unpermute_bf16(sycl::queue& q, const sycl_bf16* src,
     const int32_t* inverse, const float* route_weight, float* dst,
@@ -915,6 +958,28 @@ struct RowSlots { int32_t slot[kMaxRowSlots]; int32_t pos[kMaxRowSlots]; };
 sycl::event launch_deltanet_step_rows(sycl::queue& q, const DeltaNetParams& p, int rows,
                                       const RowSlots& rs, int64_t state_stride,
                                       const std::vector<sycl::event>& deps = {});
+// Speculative verify: every row of every conversation in ONE launch.  Group g is rows
+// row0[g] .. row0[g]+nrows[g]-1 of one conversation (consecutive positions), state
+// p.state + slot[g] * state_stride.  Each sub-group keeps its state row in registers
+// across the group's rows with dn_step_sg's arithmetic, so row t's output is
+// bit-identical to the per-row launch_deltanet_step loop -- but the state is only READ:
+// each row's k / v / a / beta go to saved + row * deltanet_saved_row_floats(p), and the
+// commit applies the accepted prefix with launch_deltanet_replay.
+struct DnGroups {
+    int32_t n = 0;
+    int32_t row0[kMaxRowSlots];
+    int32_t nrows[kMaxRowSlots];
+    int32_t slot[kMaxRowSlots];
+};
+bool deltanet_verify_ok(const DeltaNetParams& p);
+int64_t deltanet_saved_row_floats(const DeltaNetParams& p);
+sycl::event launch_deltanet_verify_rows(sycl::queue& q, const DeltaNetParams& p, const DnGroups& g,
+                                        int64_t state_stride, float* saved,
+                                        const std::vector<sycl::event>& deps = {});
+// p.state (in place) advanced by the n rows saved at `saved` (consecutive rows), in order:
+// the same arithmetic again, so the state equals the per-row loop's after those n rows.
+sycl::event launch_deltanet_replay(sycl::queue& q, const DeltaNetParams& p, const float* saved, int n,
+                                   const std::vector<sycl::event>& deps = {});
 // launch_causal_conv1d_split_prefill(tokens = 1) for `rows` rows in one
 // launch, kernel width 4 only: row r convolves x[r] over its own ring
 // (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.

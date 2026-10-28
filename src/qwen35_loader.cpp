@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <unistd.h>
 
 namespace b70 {
@@ -747,6 +748,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     // ---- shards ------------------------------------------------------
     shards.clear();
     index.clear();
+    TensorRef selected_embedding;
     native_model.reset();
     std::string native_path=dir+"/model-v3.b70";
     if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
@@ -767,10 +769,31 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     } else {
         HFModel hf;
         if (!hf.discover(dir, err)) return false;
+        const bool embed_recipe = hf.config.count("embed_tokens_quant") != 0;
+        const std::string side = hf.cfg_str("embed_tokens_quant.side_file", "");
+        const std::string key_weight = hf.cfg_str("embed_tokens_quant.key_weight", "");
+        const std::string key_scale = hf.cfg_str("embed_tokens_quant.key_scale", "");
+        if (embed_recipe && (hf.cfg_int("embed_tokens_quant.bits", 0) != 8 ||
+            hf.cfg_int("embed_tokens_quant.packed", 0) != 0 || side.empty() ||
+            side == "." || side == ".." || side.find('/') != std::string::npos ||
+            side.find('\\') != std::string::npos || key_weight.empty() || key_scale.empty())) {
+            err = "unsupported INT8 embedding recipe (bits, packing, side file or tensor keys)";
+            return false;
+        }
+        const std::string scheme = hf.cfg_str("embed_tokens_quant.scheme", "per_row_absmax_symmetric");
+        if (embed_recipe && scheme != "per_row_absmax_symmetric") {
+            err = "unsupported embedding quantization scheme: " + scheme; return false;
+        }
+        int side_shard = -1;
         for (size_t i = 0; i < hf.shards.size(); ++i) {
             auto st = std::make_unique<SafeTensors>();
             if (!st->open(hf.shards[i], err)) return false;
+            const bool is_side = embed_recipe && hf.shards[i] == dir + "/" + side;
+            if (is_side) side_shard = int(i);
             for (const auto& kv : st->tensors()) {
+                // Select the recipe below, not by lexicographic duplicate order.
+                // The original dense embedding remains in the ordinary index.
+                if (is_side) continue;
                 if (skip_vision && (kv.first.find(".visual.")!=std::string::npos||kv.first.find("vision")!=std::string::npos)) continue;
                 TensorRef r;
                 r.shard = int(i);
@@ -779,14 +802,40 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             }
             shards.push_back(std::move(st));
         }
+        if (embed_recipe) {
+            if (side_shard < 0) { err = "embedding side file not found: " + side; return false; }
+            const auto* weight = shards[size_t(side_shard)]->find(key_weight);
+            const auto* scale = shards[size_t(side_shard)]->find(key_scale);
+            if (!weight || !scale || weight->dtype != STDtype::I8 ||
+                weight->shape.size() != 2 || weight->shape[0] < cfg.vocab ||
+                weight->shape[1] != cfg.hidden || scale->dtype != STDtype::F16 ||
+                scale->shape != std::vector<int64_t>{weight->shape[0], 1}) {
+                err = "INT8 embedding requires I8[vocab,hidden] and F16[vocab,1] scales";
+                return false;
+            }
+            // Validate all rows before any GPU allocation or upload. Zero scales
+            // are valid padding, as in the reference's vocabulary shards.
+            std::vector<float> scales(size_t(scale->shape[0]));
+            if (!shards[size_t(side_shard)]->read_f32(*scale, scales.data(), err)) return false;
+            for (float v : scales) if (!std::isfinite(v) || v < 0) {
+                err = "INT8 embedding scales must be finite and nonnegative"; return false;
+            }
+            selected_embedding.shard = side_shard;
+            selected_embedding.t = *weight;
+            selected_embedding.int8_embedding = true;
+            selected_embedding.scales_shard = side_shard;
+            selected_embedding.scales_t = *scale;
+        }
     }
     if (index.empty()) { err = "no tensors found in " + dir; return false; }
 
     // ---- prefix ------------------------------------------------------
     // Multimodal checkpoints nest the text model one level deeper. The
     // MoE 35B uses model.language_model.*, plain text models use model.*
-    prefix = index.count("model.language_model.embed_tokens.weight")
+    prefix = (index.count("model.language_model.embed_tokens.weight") ||
+              index.count("model.language_model.norm.weight"))
            ? "model.language_model." : "model.";
+    if (selected_embedding.ok()) index[prefix + "embed_tokens.weight"] = selected_embedding;
 
     // Offline format compilers operate over the checkpoint index directly.
     // Some BF16 releases store all experts in fused 3-D tensors rather than
@@ -856,6 +905,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     };
 
     embed      = get(prefix + "embed_tokens.weight");
+    if (embed.ok() && embed.t.dtype == STDtype::I8 && !embed.int8_embedding && !embed.native) {
+        err = "INT8 embedding has no declared row-scale recipe; refusing unscaled codes";
+        return false;
+    }
     final_norm = get(prefix + "norm.weight");
     if (cfg.is_qwen4_exp) {
         // Qwen4-Exp has no model.norm: the tail hyper-connection mixer's

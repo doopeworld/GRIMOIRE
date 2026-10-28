@@ -419,7 +419,28 @@ bool HFModel::discover(const std::string& d, std::string& err) {
                 const std::string k = j.str();
                 if (!j.ok || !j.eat(':')) break;
                 const char c = j.peek();
-                if (c == '"') {
+                if (k == "embed_tokens_quant") {
+                    config[k] = "1";
+                    if (!j.eat('{')) { err = "embed_tokens_quant must be an object"; return false; }
+                    if (j.peek() != '}') for (;;) {
+                        const std::string ek = j.str();
+                        if (!j.ok || !j.eat(':')) { err = "invalid embed_tokens_quant"; return false; }
+                        const std::string name = "embed_tokens_quant." + ek;
+                        const char ec = j.peek();
+                        if (ec == '"') config[name] = j.str();
+                        else if ((ec >= '0' && ec <= '9') || ec == '-') {
+                            const double value = j.num();
+                            char text[64]; std::snprintf(text, sizeof text, "%.17g", value);
+                            config[name] = text;
+                        } else if (ec == 't' || ec == 'f') {
+                            config[name] = ec == 't' ? "1" : "0";
+                            j.skip();
+                        } else { err = "unsupported embed_tokens_quant value"; return false; }
+                        if (!j.ok) { err = "invalid embed_tokens_quant value"; return false; }
+                        if (!j.eat(',')) break;
+                    }
+                    if (!j.eat('}')) { err = "invalid embed_tokens_quant object"; return false; }
+                } else if (c == '"') {
                     config[k] = j.str();
                 } else if ((c >= '0' && c <= '9') || c == '-') {
                     const double v = j.num();
@@ -438,8 +459,8 @@ bool HFModel::discover(const std::string& d, std::string& err) {
     }
 
     // ---- shards ------------------------------------------------------
-    // Prefer the index if present; otherwise take every .safetensors in
-    // the directory, sorted, so shard order is deterministic.
+    // Include compatibility side files as well as ordinary shards.
+    // The model loader selects a declared embedding side file explicitly.
     DIR* dp = ::opendir(dir.c_str());
     if (!dp) { err = "cannot list " + dir; return false; }
     std::vector<std::string> found;

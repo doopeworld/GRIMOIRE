@@ -2,6 +2,207 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-28: Flash-Next two cards decode +16% (tg128 38.5 -> 44.6 at 2K, 36.4 -> 42.2 at 4K), exact; expert kernels read activations from L1 (GRIMOIRE_TMOE_GX=0 = SLM); earlier today +11%: exact (same answers): router top-k register kernel for 512 experts, head split over the vocabulary, lean tiered-expert kernels, HC norm in registers -- each has a =0 switch.  Tables: tools/bench/onednn/RESULTS-2026-10-28.md.  Handoff 12.14.**
+
+**2026-10-27 night: PAUSED by Ian (resume 10-28).  Qwen3.8-27B-FP8 two cards: pp4096 3,530 (1 user), tg128 total 29.5 / 97 / 165 at 1 / 4 / 8 users; one user MTP code 89, DFlash2 code 128 tok/s.  Tables: tools/bench/onednn/RESULTS-2026-10-27.md.  Handoff 12.13.**
+
+**2026-10-27 late evening: Flash-Next two cards tg128 34.1 / 32.9 -> 38.4-38.7 / 36.3-36.7: CPU pool and decode thread pinned, the CPU experts' partial added on the host inside the MoE all-reduce (bit-exact).  CPU experts still stall in 1-2% of calls.  Handoff 12.12.**
+
+**2026-10-27 evening: decode copies by kernel + pinned flag (ksend): two cards tg128 31.0 / 30.2 -> 34.1 / 32.9; the rest of the all-reduce time is waiting for the rank whose CPU experts run (~0.25 ms a RAM expert). CPU pool pinning built, not tested. Handoff 12.11.**
+
+**2026-10-27: Flash-Next NVFP4 prompt: two cards pp2048 / pp4096 713 / 664 -> 1,263 / 1,463, one card 654 -> 804 at 4096 (layer-major prefill; the HC inject projection had a ~1.5 ms GEMM per call; sub-chunks sized per call); decode unchanged (TP ~31, one card ~22). Ring prefetch and uneven cold-expert split measured slower, off. Handoff 12.10.**
+
+**2026-10-26 evening: Flash-Next NVFP4 on two cards = Megatron TP + expert-parallel MoE: tg128 25.2 -> 31.7, code decode 17.2 -> 26.5, answers correct; prompt regressed 905 / 1,150 -> 713 / 664 (768-row chunks re-stream the RAM experts). Layer-major prefill fix built, test = tools/bench/onednn/fn_lm_test.sh. Handoff 12.9.**
+
+**2026-10-26: two cards Qwen3.8-27B-FP8 TP pp4096 2,671 -> 3,538 (wavefront prompt + fused passes + chunk 1024 + ESIMD flash, lossless, default; GRIMOIRE_TP_WAVE=0 = old; speed table in handoff 12.8), + int8 payload 3,516 / 3,239 (opt-in, lossy); DFlash2 code 125-128 tok/s; small all-reduce through the BAR.** oneDNN is ON by default since 8550947 (the 10-25 paragraph below predates that). All ten Unraid containers verified on grimoire-b70:v1.10-dev (GPUs bound by PCI slot). HANDOFF-2026-10-22-DUAL.md sections 12.5-12.7.
+
+**2026-10-25: oneDNN (Ian: developers asked for it) -- measured, wired in opt-in (branch `onednn-1025`).**
+Read tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md. oneDNN v3.13.4 built from source with our
+compiler (third_party/onednn, gitignored; tools/bench/onednn/build_onednn.sh), no torch, no vLLM.
+- One B70, weights cold: GRIMOIRE's prompt GEMM pays a dequantize pass first (FP8 -> bf16 at ~200
+  GB/s, BF16 re-layout ~255 GB/s) that costs as much as the GEMM at 512 rows. oneDNN decodes inside
+  the GEMM: FP8 512 x 34816 x 5120 4.09 -> 1.39 ms, BF16 4.23 -> 1.42, 64 rows 3.38 -> 0.37, TP-rank
+  4096 rows 7.22 -> 5.30. Our bf16 GEMM alone equals oneDNN's. Decode (1 row): oneDNN 586 GB/s,
+  no gain over our ESIMD decode kernels (near the 602 GB/s roofline; not re-measured at this shape).
+- oneDNN also serves FP8 with 128x128 block scales (the official Qwen checkpoint) at the same speed;
+  GRIMOIRE today re-rounds that checkpoint to one scale per row at load (a second quantization).
+- int8 x int8 (W8A8, lossy) runs 273 TOPS = 2x bf16: the lever for Ian's pp ~3,500 target.
+- GRIMOIRE_ONEDNN=1 routes gemm_fast (+ TP chunked FFN) FP8-row/BF16 weights to src/onednn_gemm.cpp:
+  host-checked PASS, same times as benchdnn. **Two cards, Qwen3.8-27B-FP8 TP: pp2048 2,460 -> 2,717
+  (+10.5%), pp4096 2,537 -> 2,667 (+5%), new lengths 1024-2500 +2-26%, tg128 31.5 unchanged, code
+  probe PASS.** First-request cost (one-time kernel variants, TTFT 1.42 s) is paid by a server warm-up
+  at start (2.2 s): cold TTFT 0.83 s (off 0.97). Widest weights (N >= 32768) run in row pieces; run-time
+  M = ocl:ref:any, 700x slower, rejected. NOT default yet: regress_all_g0.sh with it on comes first.
+- gpu1's root port 00:06.0 logs card->host errors ~1.3/s since 10-25 07:40 even idle (clean on
+  10-24); under the A/B load +11K corrected in 2 min, 0 uncorrectable, no drop. Ian chose to run.
+- Radiance (AMD R9700 engine, Apache-2.0, codeberg StillDeadcode/radiance): 2x R9700 Qwen3.8-27B
+  decode 222 tok/s greedy with DFlash2 x7, Flash-Next c1 177 tok/s (TP2 + MTP 3, half of every
+  expert per rank, int8 trunk, 4-bit codebook experts). Its 66K lines of kernels are HIP/RDNA4-only;
+  porting its design to GRIMOIRE (Flash-Next TP with half-width experts, 8-bit trunk, MTP) is the plan.
+
+**2026-10-24: Qwen3.8-27B-FP8 TP=2 vs Ian's vLLM (pp4096 / tg128): vLLM 1,400 / 21, 56 GB VRAM;
+GRIMOIRE default (BAR receive, on since 10-24) 2,494 / 30.9, with MTP 2,486 / 48.8 (77 on code), 43 GB peak.** Read
+HANDOFF-2026-10-22-DUAL.md section 8 first (Tower rebooted: gpu1 = 07:00.0 on root port 00:06.0,
+render nodes gpu0 renderD129, gpu1 renderD130). BAR receive is the default (Ian said yes 10-24).
+**Qwen3.8-Flash-Next two cards (PP 24/24, tiered experts): tg128 16.1 -> 25.6, pp2048 652 -> 904, pp8192
+1,269** after real routing statistics, CPU expert threads = cores / ranks, PP chunks <= 2048 rows, PLE table in RAM
+(section 9). Next: per-layer host sync of the CPU-expert path, then expert-parallel TP.
+
+**2026-10-22: two B70s on Ian's new redriver M.2-OCuLink adapter -- all three dual targets run.**
+Branch `dual-1022`. Read HANDOFF-2026-10-22-DUAL.md (hardware, harness, every run, numbers; sec. 7 = afternoon).
+
+### Findings
+- gpu1 is now 0000:08:00.0 = renderD130 behind root port 00:06.2 (Gen4 x4). gpu0 03:00.0 =
+  renderD128. No drop in ~30 two-card runs. Correctable AER only: host->card RxErr ~5/s even idle;
+  card->host 0-8 per heavy TP-prefill run (replayed, no retrain, 0 uncorrectable).
+- Qwen3.8 checkpoints moved to /mnt/models (new disk). Unraid DUAL templates still map
+  /mnt/storage/Models and the old render nodes -- Ian edits his templates himself.
+- Two cards, c1, llama-benchy: Qwen3.8-27B-FP8 PP 825 / 1,436 / 20.5; Ornith-1.5-FP8 PP plain
+  3,880 / 6,886 / 111 (MTP under PP is SLOWER); Flash-Next-NVFP4 PP tiered 273 / 652 / 16.1.
+- Qwen3.8-27B-FP8 TP prefill (pp512 / pp2048): 510 -> 1,483 (pipelined bf16 all-reduce) ->
+  **1,039 / 1,805 lossless** (chunked FFN, streamed all-reduces, copy-engine receive; default;
+  bit-identical answers). int8 payload (GRIMOIRE_TP_AR_INT8=1, LOSSY, opt-in) 1,240 / 2,269.
+  TP plain tg 32; TP+MTP tg 50-78.
+- gpu1's x4 link moves ~7 GB/s TOTAL when the GPU pulls data (read requests queue behind its
+  writes). CPU writes into gpu1's VRAM through its BAR run FULL DUPLEX with its D2H (probe,
+  tools/bar_write_probe.cpp) -- not in the server yet: Ian's OK needed (changes one step of his
+  10-07 transport chain; still no P2P).
+- P2P is impossible on the Tower: Linux 6.18 P2PDMA allows root-port-to-root-port P2P only for
+  AMD Zen or whitelisted Xeon host bridges; the Core Ultra 285H (8086:7d06) is neither. (The
+  2x B70 P2P all-reduce in vllm-xpu-kernels #570 runs on a different platform.)
+- Power governor default OFF everywhere (Ian: the cards run 280 W fine).
+- FAILED: tools/tp_devar_probe.cpp (device-side poll) hung -> gpu0 engine reset; the duplex probe's
+  narrow host stores -> gpu1 engine reset. Both recovered. Probes need internal time budgets.
+
+### Next steps
+1. With Ian's OK: BAR receive + a receiver thread (CPU copies in/out run in parallel) -> the
+   copy engine only does D2H; estimate pp2048 bf16 ~2,100-2,300.
+2. Hide the attention block too: chunk QKV / o_proj so the next layer starts on early rows
+   (full wavefront). Ian's target pp ~3,500 needs this AND faster GEMMs (85-93 TFLOP/s now).
+3. TP plain decode 32 -> 40: the 128 CPU-staged decode all-reduces cost ~6.5 ms per token.
+
+**The 2026-10-10 pause below is historical.**
+
+**2026-10-10 evening: PAUSED by Ian after Swift validation and backup.**
+
+All agent GPU jobs ended normally. No GPU containers, queued jobs or automatic
+restart. GPU1 untouched. Preserve ComfyUI. Resume only when Ian asks.
+
+### Findings
+- Swift loader fixed: select declared INT8 embedding side file and apply scales;
+  match BF16 scale rounding BEFORE multiplication, then BF16 output. Resident
+  INT8 + 16-bit scales uses1.18GiB versus2.37GiB dense, no framework dependency.
+- Decode/prefill/graph/MTP/shared-draft lookups route through resident format.
+  Saved HF INT4 MTP weights are preserved by default; explicit overrides remain.
+- CPU independent oracle51200 values PASS, meaningful negative controls fail;
+  loader malformed cases reject, real Swift resolves all nine baked projections.
+  Existing safetensors tests PASS. GPU single/batch/shard/dynamic graph lookup
+  is bit-exact atH256/H5120. Ten actual Swift coded answers PASS, natural EOS.
+- Matched Swift table: PP1967/2000/1853/1265/827, decode113.9/111.0/107.2/82.1/61.3
+  at4K/8K/16K/64K/128K. One B70; published Wrap two B60s, latest128K1255/78.0.
+  Model matches now; remaining hardware/config/sample differences are explicit.
+- Native INT4 drafting/65536 fastest tested: BF16 and full-vocab pilots slower,
+  all answers PASS. Do not claim Swift closed the performance gap.
+- Targeted legacy checks: GPTQ ordinary/exact/legacy96 IDs IDENTICAL; MXFP4
+  Sherlock n24 IDENTICAL. Earlier44-run sweep predates this Swift patch; no new
+  full44-run sweep or multi-GPU/release-image validation is claimed.
+- Validated bins installed while idle, oldfiles bench-swift-1010/main-before-swift.
+  Handoff HANDOFF-2026-10-10-SWIFT.md; report RESULTS-2026-10-10-SWIFT.md.
+  Mac backup results-20261010-swift; source backup via longctx-attn-wip GitHub push.
+  v1.9.0 release image unchanged, warning remains. Intel cloud review still pending28h.
+
+### Next steps after Ian resumes
+1. Read Swift handoff, verify GPU0 mapping after reboot, preserve GPU1/ComfyUI.
+2. Profile retained Swift128K costs with TIME_LAYER=all; choose measured target.
+3. Full post-Swift regression before release work; require oracle/real answers for
+   new changes. Commit bodies must include Findings and Next steps.
+
+**Completed earlier checkpoints below are historical; this pause takes priority.**
+
+**2026-10-10: validation complete; GPU resources released to Ian.**
+
+### Findings
+- Source7250ac3 on longctx-attn-wip. gpu0 only03:00.0[8086:e223]/renderD128;
+  checked after reboot. All agent GPU containers exited normally. Ian's comfyui
+  container is running: preserve it. No agent GPU work or queued jobs remain.
+- Combined cl256GRF+doubleGRF removes prefill ESIMD spill, preserves joint_matrix
+  register allocation. Eight query rows/128 keys: controlled two-slot/chunk2048
+  PP gain+16.6%at64K,+21.5%at128K, all coded answers PASS.
+- New prefill default limited to validated H24/KVH4/D256. Ornith H16/KVH2 keeps
+  its original prompt kernel; broader ESIMD caused a real empty-list test failure.
+- Single-slot verify now uses fast DPAS. Corrected old inclusive cache lengths
+  (self key). GPTQ96-token exact/legacy-exact fixture matches plain, accepted
+  speculation exercised; old-binary negative control fails. No universal parity claim.
+- Qwen one-slot K6/vocab65536/ctx135168/auto-chunks: ten coded answers PASS.
+  4K/8K/16K/64K/128K fresh PP:1975/2011/1868/1267/834;
+  repeat decode:119.4/116.1/114.2/88.6/65.8. RESULTS-2026-10-10-CONTEXT.md.
+  Wrap latest128K1255/78.0 still ahead; hardware/checkpoint/sample methods differ.
+- Scoped default K4 Qwen+Ornith4K/8K:8/8 behavior PASS. Production fp64 library
+  checks pass on one-token, ragged/resumed/long shapes; retained Qwen hashes match
+  winning prototype and Ornith default equals explicit joint_matrix.
+- Full regress_all_g0.sh:44/44 completed, ALL DONE, no GPU0 guard trip. Sherlock
+  reference and hot-expert text IDENTICAL. Existing speculative prose comparisons
+  still differ from plain; this is not44 behavioral passes or universal parity.
+  Logs: regress-1010-1536, bench-1010/regress-final.out. Checked AER totals0/0/0.
+- Main bin installed; originals bench-1010/main-before-install. No release image
+  changed; v1.9.0 warning remains. Full multi-target release-image build unrun.
+- Rejected four-row flash, packed keys, interleaved output and blocked BF16 panels.
+  More details HANDOFF-2026-10-10-PREFILL.md. Intel cloud still in review after28h.
+
+### Next steps
+1. When GPU0 is available, profile retained128K costs with TIME_LAYER=all before
+   choosing another kernel target. Oct9 FFN46.4% applies only to its16K diagnostic.
+2. Continue verified attention/FFN work; require production oracle and real answers.
+3. Cloud inspection awaits approval/SSH details; key exists, no cloud work done.
+
+**The 2026-10-09 pause below is historical; Ian resumed on 10-10.**
+
+**2026-10-09: PAUSED by Ian after the final diagnostic; resume tomorrow only when asked.**
+No GPU containers, gpu0 idle (0.02 GiB), AER totals zero. GPU1 untouched; no queued jobs.
+Full checkpoint: `HANDOFF-2026-10-09-PAUSED.md`.
+
+### Findings
+- One-slot MTP state commit fixed in dd286b3. Full regression 44/44 completed without a guard trip.
+- Selected attention 031a87b preserves short-context performance and improves isolated 64K/128K
+  verify attention 26%/22%. This did not improve prompt processing.
+- Validated table 10/10 PASS: prompt/decode at 4K/8K/16K/64K/128K = 1928/120.0, 1872/121.2,
+  1691/115.0, 1052/77.1, 678/66.8. Wrap latest published 128K = 1255/78.0; table corrected.
+- Earlier saved win was 2K/8K on one B70 per stack. It never established wins at every length.
+  Current published Wrap numbers use two B60s and Swift; distinguish those comparisons.
+- Final 16K diagnostic: FFN 4.490 s (46.4%), flash attention 2.315 s (23.9%) of 9.686 s timed
+  regions. Flash time grows 225/657/1084 ms across three equal 5120-token chunks.
+- gemm_fast.cpp defaults to joint_matrix prefill; its ESIMD alternative is not enabled.
+  Check actual GRF allocation before testing it. No new performance change adopted.
+- v1.9.0 release warning published; image unchanged. Intel key present, SSH line pending.
+
+### Next steps
+1. When Ian resumes, profile/optimize feed-forward GEMMs and prefill attention on gpu0 only,
+   preserving pure SYCL/Level Zero. Read the paused handoff before running anything.
+2. Evaluate existing ESIMD flash prefill with proper register allocation, in an isolated library,
+   at matching cache and chunk sizes. Keep only measured wins with passing text/behavior checks.
+3. Revalidate all five context lengths; claim wins only for controlled matching comparisons.
+4. Intel cloud: obtain How to Connect SSH line; inspect only, no heavy work.
+
+**2026-10-09 evening: PAUSED until 10-10 (Ian: "stop and pause everything ... resume tomorrow").**
+Historical state at the pause: no containers and gpu0 idle. Superseded by the resume above.
+- v1.9.0 is PUBLISHED (tag = 78274a5).  The Ornith pp512 "regression" is a llama-benchy artifact (its time
+  to first response is +5 ms from v1.8.2 on; direct requests are identical v1.8 -> v1.9.0).
+- NEW BUG, from `bench-1003/ab_lc.sh` (4K coding answer, Qwen3.8 GPTQ-Int4-MTP, MTP K=6, DRAFT_VOCAB 65536):
+  with GRIMOIRE_SEQ_SLOTS=1 the answer is CORRUPTED (chunks skipped / repeated, 4.7-4.8 tokens per step,
+  ~90 tok/s); with 8 slots it passes (5.23 tokens per step, 120.7 tok/s).  The committed attention library
+  (v1.9.0) fails exactly like the new one and the context (16K or 135K) does not matter.  FIRST TASK
+  tomorrow: find why the one-slot MTP path breaks (bisect 97b56da / 1aa80fd / 78274a5; bin-prev holds an
+  older build; is the default K=4 affected?).  The README tells users to set SEQ_SLOTS=8.
+- Branch `longctx-attn-wip` (NOT merged): src/attn_verify_dpas.cpp, one work-group per KV head x split,
+  <= 1024 keys per split.  Passes at 4K with 8 slots; not yet measured against the committed kernel at the
+  same cache size.
+- Then Ian's table, GRIMOIRE vs the third-party k8v4-xpu stack at 4K / 8K / 16K / 64K / 131K
+  (`bench-1003/lc_table.sh`; 8 slots do not fit 135K context, 1 slot is broken until the bug is fixed).
+- Intel cloud GPU instance: Ian's is "in review"; I need the SSH line from its "How to Connect".
+- Rules unchanged: gpu0 only, never gpu1; stop every GPU container as soon as its test ends; run
+  benchmarks in the foreground (a queued watcher started the A/B behind my back today).
+- Full details: HANDOFF-2026-10-03-SERVED.md section 11.
+
 **2026-10-06 evening: PAUSED until 10-07 (Ian).**  Nothing runs on the Tower.
 - Image v1.8.3 (`grimoire-b70:v1.8.3`, 5e01d55a9c00, code 2840755: ESIMD FP8
   decode GEMV, FP8 small-M DPAS, one card per rank in `multi`) passed validation

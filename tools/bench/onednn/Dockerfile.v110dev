@@ -1,0 +1,11 @@
+# GRIMOIRE test image grimoire-b70:v1.10-dev -- the v1.9.0 runtime (Level Zero / compute-runtime /
+# oneAPI runtime, docker-entrypoint.sh unchanged since v1.9.0) with branch onednn-1025's binaries:
+# oneDNN prompt GEMMs (Intel oneDNN v3.13.4 built from source with the same compiler; no PyTorch,
+# no vLLM), DFlash2 under two-card tensor parallel, faster MTP / DFlash2 verify.  For trying in an
+# Unraid container before a release; not a published image.
+FROM grimoire-b70:v1.9.0
+COPY grimoire grimoire-server libgrimoire_gemm.so libgrimoire_attn.so libdnnl.so.3.13 /grimoire/bin/
+RUN cd /grimoire/bin && ln -sf libdnnl.so.3.13 libdnnl.so.3 && ln -sf libdnnl.so.3 libdnnl.so \
+    && chmod +x grimoire grimoire-server
+COPY onednn-LICENSE onednn-THIRD-PARTY-PROGRAMS /usr/share/doc/onednn/
+LABEL org.opencontainers.image.description="GRIMOIRE v1.10-dev (onednn-1025): oneDNN prompt GEMMs, DFlash2 on two cards"

@@ -32,7 +32,8 @@
 //  110 TFLOP/s, max relative error 1.6e-6 against an fp64 reference.
 //
 //  bin/grimoire and bin/grimoire-server link this file as
-//  bin/libgrimoire_gemm.so, built with -cl-intel-256-GRF-per-thread.  The
+//  bin/libgrimoire_gemm.so, built with -cl-intel-256-GRF-per-thread and
+//  -doubleGRF (also needed by ESIMD flash prefill). The
 //  flag is what makes it fast: the same kernel with the per-kernel
 //  grf_size<256> property measured 70 TFLOP/s, and the flag cannot go on the
 //  whole engine because gemm_flt and others launch 1024-thread work-groups,
@@ -42,6 +43,9 @@
 #include "kernels.hpp"
 #include "int4_smallm.hpp"
 #include "b70/tiered_moe.hpp"
+#ifdef GRIMOIRE_WITH_ONEDNN
+#include "onednn_gemm.hpp"
+#endif
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -680,12 +684,22 @@ FlashScratch& flash_scratch_for(sycl::queue& q) {
     return s;
 }
 
-// GRIMOIRE_FLASH_ESIMD=1|0 selects the ESIMD flash prefill kernel.
+// ESIMD defaults on for the validated Qwen3.8 geometry (24 query heads,
+// 4 KV heads, width 256). Other shapes, QSA and sliding-window attention
+// keep joint_matrix. GRIMOIRE_FLASH_ESIMD=1|0 overrides the shape choice;
+// GRIMOIRE_FLASH_BLOCK=32|64|128 tunes its keys.
 int& flash_esimd_flag() {
-    static int f = [] { const char* e = std::getenv("GRIMOIRE_FLASH_ESIMD"); return e ? std::atoi(e) : 0; }();
+    static int f = [] { const char* e = std::getenv("GRIMOIRE_FLASH_ESIMD"); return e ? std::atoi(e) : -1; }();
     return f;
 }
-bool flash_use_esimd() { return flash_esimd_flag() != 0; }
+// 12 / 2 = one tensor-parallel rank of the same model (two cards): MEASURED 10-26, ESIMD vs
+// joint_matrix max|diff| 2-4e-3 of max|ref| 3-9 (GRIMOIRE_FLASH_VERIFY), code-probe answers
+// identical, pp2048 3,383 -> 3,494.
+bool flash_use_esimd(int width, int heads, int kv_heads) {
+    const int mode = flash_esimd_flag();
+    return mode < 0 ? width == 256 && ((heads == 24 && kv_heads == 4) || (heads == 12 && kv_heads == 2))
+                    : mode != 0;
+}
 
 // ---------------------------------------------------------------------
 // Flash prefill, ESIMD: one hardware thread owns 8 query rows of a head.
@@ -698,13 +712,13 @@ bool flash_use_esimd() { return flash_esimd_flag() != 0; }
 // round-tripped S and P through SLM and kept corr[] in private memory (IGC
 // ISA dump).  All building blocks checked on the B70 by tools/esimd_probe.cpp.
 // ---------------------------------------------------------------------
-template <int D>
+template <int D, int BK>
 sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, int Tp,
                         const sycl_bf16* Kp, const sycl_bf16* Vp, int Sp, float* out,
                         int tokens, int start, int H, int KVH) {
     namespace es = sycl::ext::intel::esimd;
     namespace xmx = sycl::ext::intel::esimd::xmx;
-    constexpr int RB = 8, BK = 32, DT = D / 16, TPW = 8;
+    constexpr int RB = 8, DT = D / 16, TPW = 8, NB = BK / 16;
     const int qtiles = (tokens + RB * TPW - 1) / (RB * TPW);
     const size_t nthreads = size_t(qtiles) * H * TPW;
     return q.submit([&](sycl::handler& h) {
@@ -720,61 +734,62 @@ sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, in
             const sycl_bf16* qh = Qb + size_t(hq) * Tp * D;
             const uint32_t* kh = reinterpret_cast<const uint32_t*>(Kp + size_t(kvh) * (D / 2) * Sp * 2);
             const uint32_t* vh = reinterpret_cast<const uint32_t*>(Vp + size_t(kvh) * (Sp / 2) * D * 2);
-            es::simd<float, RB * D> o = 0.0f;            // DT tiles of [RB][16], row-major
+            es::simd<float, RB * D> o = 0.0f;
             es::simd<float, RB> m = NINF, l = 0.0f;
             const es::simd<int, 16> col(0, 1);
             for (int s0 = 0; s0 < kmax; s0 += BK) {
-                es::simd<float, RB * 16> slo = 0.0f, shi = 0.0f;
-                // partial unroll: fully unrolled, all 16 steps' tiles were
-                // hoisted at once and the kernel spilled 8 KB
-                #pragma unroll 4
+                // Key tiles stay block-major: each 16-key chunk is an 8x16
+                // DPAS accumulator, so every register offset is constant.
+                es::simd<float, NB * RB * 16> scores = 0.0f;
+                #pragma unroll 2
                 for (int dt = 0; dt < DT; ++dt) {
                     es::simd<sycl_bf16, RB * 16> a = es::load_2d<sycl_bf16, 16, RB>(
                         qh, D * 2 - 1, Tp - 1, D * 2 - 1, dt * 16, r0);
-                    // 2-D blocks are at most 64 bytes wide: one per 16 keys
-                    es::simd<uint32_t, 128> b0 = es::load_2d<uint32_t, 16, 8>(
-                        kh, Sp * 4 - 1, D / 2 - 1, Sp * 4 - 1, s0, dt * 8);
-                    es::simd<uint32_t, 128> b1 = es::load_2d<uint32_t, 16, 8>(
-                        kh, Sp * 4 - 1, D / 2 - 1, Sp * 4 - 1, s0 + 16, dt * 8);
-                    slo = xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
-                        slo, b0.template bit_cast_view<sycl_bf16>().read(), a);
-                    shi = xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
-                        shi, b1.template bit_cast_view<sycl_bf16>().read(), a);
+                    #pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        es::simd<uint32_t, 128> keys = es::load_2d<uint32_t, 16, 8>(
+                            kh, Sp * 4 - 1, D / 2 - 1, Sp * 4 - 1, s0 + b * 16, dt * 8);
+                        scores.template select<RB * 16, 1>(b * RB * 16) =
+                            xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                                es::simd<float, RB * 16>(scores.template select<RB * 16, 1>(b * RB * 16)),
+                                keys.template bit_cast_view<sycl_bf16>().read(), a);
+                    }
                 }
-                // causal mask (and rows past the prompt): only blocks that reach
-                // past the first row's position need it -- a uniform branch.
                 if (s0 + BK - 1 > start + r0) {
                     #pragma unroll
-                    for (int r = 0; r < RB; ++r) {
-                        const int lim = r0 + r < tokens ? start + r0 + r : -1;
-                        es::simd<float, 16> v0 = slo.template select<16, 1>(16 * r);
-                        es::simd<float, 16> v1 = shi.template select<16, 1>(16 * r);
-                        v0.merge(es::simd<float, 16>(NINF), col + s0 > lim);
-                        v1.merge(es::simd<float, 16>(NINF), col + (s0 + 16) > lim);
-                        slo.template select<16, 1>(16 * r) = v0;
-                        shi.template select<16, 1>(16 * r) = v1;
-                    }
+                    for (int b = 0; b < NB; ++b)
+                        #pragma unroll
+                        for (int r = 0; r < RB; ++r) {
+                            const int lim = r0 + r < tokens ? start + r0 + r : -1;
+                            es::simd<float, 16> v = scores.template select<16, 1>((b * RB + r) * 16);
+                            v.merge(es::simd<float, 16>(NINF), col + s0 + b * 16 > lim);
+                            scores.template select<16, 1>((b * RB + r) * 16) = v;
+                        }
                 }
                 es::simd<float, RB> bm;
                 #pragma unroll
                 for (int r = 0; r < RB; ++r) {
-                    es::simd<float, 16> v = es::max(es::simd<float, 16>(slo.template select<16, 1>(16 * r)),
-                                                    es::simd<float, 16>(shi.template select<16, 1>(16 * r)));
+                    es::simd<float, 16> v = scores.template select<16, 1>(r * 16);
+                    #pragma unroll
+                    for (int b = 1; b < NB; ++b)
+                        v = es::max(v, es::simd<float, 16>(scores.template select<16, 1>((b * RB + r) * 16)));
                     bm[r] = es::hmax<float>(v);
                 }
-                es::simd<float, RB> mn = es::max(m, bm);
-                es::simd<float, RB> ms = mn;
+                es::simd<float, RB> mn = es::max(m, bm), ms = mn;
                 ms.merge(es::simd<float, RB>(0.0f), mn == NINF);
-                es::simd<float, RB> corr = es::exp2(m - ms);   // m = -inf -> 0
-                es::simd<float, RB> rs;
+                es::simd<float, RB> corr = es::exp2(m - ms), rs;
                 #pragma unroll
                 for (int r = 0; r < RB; ++r) {
                     const float msr = ms[r];
-                    es::simd<float, 16> p0 = es::exp2(es::simd<float, 16>(slo.template select<16, 1>(16 * r)) - msr);
-                    es::simd<float, 16> p1 = es::exp2(es::simd<float, 16>(shi.template select<16, 1>(16 * r)) - msr);
-                    slo.template select<16, 1>(16 * r) = p0;
-                    shi.template select<16, 1>(16 * r) = p1;
-                    rs[r] = es::reduce<float>(p0 + p1, std::plus<>());
+                    es::simd<float, 16> sum = 0.0f;
+                    #pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        es::simd<float, 16> prob = es::exp2(
+                            es::simd<float, 16>(scores.template select<16, 1>((b * RB + r) * 16)) - msr);
+                        scores.template select<16, 1>((b * RB + r) * 16) = prob;
+                        sum += prob;
+                    }
+                    rs[r] = es::reduce<float>(sum, std::plus<>());
                 }
                 l = l * corr + rs;
                 m = mn;
@@ -786,23 +801,19 @@ sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, in
                     #pragma unroll
                     for (int r = 0; r < RB; ++r)
                         o.template select<16, 1>((dt * RB + r) * 16) *= cr[r];
-                const es::simd<sycl_bf16, RB * 16> plo = slo, phi = shi;
-                // full unroll: O is indexed by dt and must see constant
-                // offsets (a runtime offset into the 8 KB O is rejected by RA)
+                es::simd<sycl_bf16, NB * RB * 16> probabilities = scores;
                 #pragma unroll
                 for (int dt = 0; dt < DT; ++dt) {
-                    // 16 key-pairs (32 keys) x 16 d, VNNI over keys: rows 0-7 are
-                    // keys s0..s0+15, rows 8-15 keys s0+16..s0+31
-                    es::simd<uint32_t, 16 * 16> v = es::load_2d<uint32_t, 16, 16>(
-                        vh, D * 4 - 1, Sp / 2 - 1, D * 4 - 1, dt * 16, s0 / 2);
-                    es::simd<uint32_t, 128> v0 = v.template select<128, 1>(0);
-                    es::simd<uint32_t, 128> v1 = v.template select<128, 1>(128);
-                    o.template select<RB * 16, 1>(dt * RB * 16) =
-                        xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
+                    #pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        es::simd<uint32_t, 128> values = es::load_2d<uint32_t, 16, 8>(
+                            vh, D * 4 - 1, Sp / 2 - 1, D * 4 - 1, dt * 16, (s0 + b * 16) / 2);
+                        o.template select<RB * 16, 1>(dt * RB * 16) =
                             xmx::dpas<8, RB, float, float, sycl_bf16, sycl_bf16>(
                                 es::simd<float, RB * 16>(o.template select<RB * 16, 1>(dt * RB * 16)),
-                                v0.template bit_cast_view<sycl_bf16>().read(), plo),
-                            v1.template bit_cast_view<sycl_bf16>().read(), phi);
+                                values.template bit_cast_view<sycl_bf16>().read(),
+                                es::simd<sycl_bf16, RB * 16>(probabilities.template select<RB * 16, 1>(b * RB * 16)));
+                    }
                 }
             }
             es::simd<float, RB> inv = 1.0f / l;
@@ -816,11 +827,19 @@ sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, in
                 for (int r = 0; r < RB; ++r)
                     o.template select<16, 1>((dt * RB + r) * 16) *= iv[r];
                 es::store_2d<float, 16, RB>(out, H * D * 4 - 1, tokens - 1, H * D * 4 - 1,
-                                            hq * D + dt * 16, r0,
-                                            es::simd<float, RB * 16>(o.template select<RB * 16, 1>(dt * RB * 16)));
+                    hq * D + dt * 16, r0, es::simd<float, RB * 16>(o.template select<RB * 16, 1>(dt * RB * 16)));
             }
         });
     });
+}
+
+int flash_key_block() {
+    static const int block = [] {
+        const char* e = std::getenv("GRIMOIRE_FLASH_BLOCK");
+        const int n = e ? std::atoi(e) : 128;
+        return n == 64 || n == 128 ? n : 32;
+    }();
+    return block;
 }
 
 template <int D>
@@ -838,7 +857,10 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                             int window = 0) {
     constexpr int NF = D / TN, WG = FA_NSG * SG_SIZE;
     FlashScratch& fs = flash_scratch_for(q);
-    const int kend = start + tokens, Sp = (kend + FA_BK - 1) / FA_BK * FA_BK;
+    const int kend = start + tokens;
+    const bool use_esimd = flash_use_esimd(D, H, KVH) && !qbits && window <= 0;
+    const int block = use_esimd ? flash_key_block() : FA_BK;
+    const int Sp = (kend + block - 1) / block * block;
     const size_t elems = size_t(KVH) * Sp * D;
     if (!grow(q, fs.kp, fs.kp_cap, elems) || !grow(q, fs.vp, fs.vp_cap, elems))
         throw std::runtime_error("flash_fast: K/V scratch allocation failed");
@@ -880,8 +902,11 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 bf16_rne(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
         });
     });
-    if (flash_use_esimd() && !qbits && window <= 0)
-        return flash_esimd<D>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
+    if (use_esimd) {
+        if (block == 128) return flash_esimd<D, 128>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
+        if (block == 64) return flash_esimd<D, 64>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
+        return flash_esimd<D, 32>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
+    }
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
         sycl::local_accessor<float, 1> Ss(FA_NSG * FA_RB * FA_BK, h);
@@ -2980,6 +3005,15 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
         return e;
     }
+#ifdef GRIMOIRE_WITH_ONEDNN
+    // oneDNN (on unless GRIMOIRE_ONEDNN=0) decodes FP8 / BF16 weights inside
+    // its GEMM, so there is no dequantize pass (onednn_gemm.hpp has the numbers).
+    if (EPI != 1 && onednn_gemm_ok(w, M)) {
+        sycl::event e = onednn_gemm(q, w, x, static_cast<float*>(out), M, EPI == 2, deps);
+        if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
+        return e;
+    }
+#endif
     // N not a multiple of NC2 (DeltaNet's a|b gate projection, N = 96): the
     // scratch gets pitch Np with zeroed extra columns and the stores clip at
     // N.  It used to fall back to gemm_flt: 41 ms per Qwen prefill.
@@ -3029,6 +3063,51 @@ sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const 
                                     sycl_bf16* h, int M, const std::vector<sycl::event>& deps) {
     return gemm_fast_run<1>(q, w, x, h, M, deps);
 }
+
+// The two halves of launch_gemm_fast for a weight that serves several row
+// blocks (TP prefill's chunked FFN, grimoire.cpp): dequantize W ONCE into the
+// caller's buffer, then run the GEMM over any block of rows.  Same scratch
+// layout and kernels as gemm_fast_run<0>, so each output row is bit-identical.
+bool gemm_fast_predq_supported(const QuantWeight& w, int M) {
+    return gemm_fast_supported(w, M) && !fused_mxfp4_ok(w);
+}
+
+size_t gemm_fast_predq_elems(const QuantWeight& w) {
+    return size_t((w.N + NC2 - 1) / NC2 * NC2) * size_t(w.K);
+}
+
+sycl::event launch_gemm_fast_dequant(sycl::queue& q, const QuantWeight& w, sycl_bf16* wdq,
+                                     const std::vector<sycl::event>& deps) {
+#ifdef GRIMOIRE_WITH_ONEDNN
+    // oneDNN reads W as stored (launch_gemm_fast_predq below), so nothing to decode.
+    if (onednn_gemm_ok(w, 1)) return q.ext_oneapi_submit_barrier(deps);
+#endif
+    const int Np = (w.N + NC2 - 1) / NC2 * NC2;
+    if (Np != w.N) {
+        const sycl::event e = q.memset(wdq, 0, size_t(Np) * w.K * sizeof(sycl_bf16), deps);
+        return dequant_any(q, w, wdq, {e}, Np);
+    }
+    return dequant_any(q, w, wdq, deps);
+}
+
+sycl::event launch_gemm_fast_predq(sycl::queue& q, const QuantWeight& w, const sycl_bf16* wdq,
+                                   const sycl_bf16* x, float* y, int M,
+                                   const std::vector<sycl::event>& deps) {
+#ifdef GRIMOIRE_WITH_ONEDNN
+    if (onednn_gemm_ok(w, M)) return onednn_gemm(q, w, x, y, M, false, deps);
+#endif
+    const int Np = (w.N + NC2 - 1) / NC2 * NC2;
+    return gemm_bf16_vnni<0>(q, x, wdq, y, M, w.N, w.K, deps, Np);
+}
+
+#ifndef GRIMOIRE_WITH_ONEDNN
+// Built without third_party/onednn: nothing routes to oneDNN (kernels.hpp).
+bool onednn_gemm_ok(const QuantWeight&, int) { return false; }
+sycl::event onednn_gemm(sycl::queue&, const QuantWeight&, const sycl_bf16*, float*, int, bool,
+                        const std::vector<sycl::event>&) {
+    throw std::runtime_error("onednn_gemm: libgrimoire_gemm.so was built without oneDNN");
+}
+#endif
 
 // One tiered NVFP4 expert's whole FFN for its M rows, the block read only
 // by the first three launches:

@@ -580,3 +580,218 @@ and spans rows, which are consecutive tokens of one sequence.
 - A decode-graph path for M rows; the batched step still pays the prefill machinery's extra
   kernels.
 - Dedupe of routed experts shared by two tokens at M=8.
+
+
+## 11. 2026-10-09: v1.9.0 published, Ornith "regression" closed, ONE-SLOT MTP BUG found, PAUSED ~17:10 CEST
+
+Ian: "stop and pause everything" / "make a backup, send github push and we will resume tomorrow".
+State at the pause: no containers, gpu0 idle (0.02 GiB), gpu0's AER chain 0/0/0 before and after every run.
+Clocks: the Tower is CEST; Ian's Mac is IDT (+1 h).
+
+**v1.9.0 is PUBLISHED** -- https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.9.0 (tag = 78274a5,
+grimoire-b70-v1.9.0.tar.gz, 641,226,938 B).
+
+**Ornith pp512 "regression" = llama-benchy artifact, closed.**
+- Same-session llama-benchy pp512, 1 / 8 users (tok/s): v1.8 7,234 / 9,761; v1.8.1 7,123 / 9,771;
+  v1.8.2 6,792 / 9,236 (decode identical, 194.4 / 468 tok/s). Its time to first response rises 5 ms
+  (= one Ornith decode step) from v1.8.2 on: 113.1 / 113.6 / 118.2 ms; its latency probe stays ~42 ms.
+- Direct requests do not show it: the same 541-token prompt (the server counts 541 tokens on all four
+  images) takes 119.0 ms on v1.8, 120.2 v1.8.1, 119.1 v1.8.2, 120.4 v1.9.0 (median of 5); llama-benchy's
+  own random-slice prompts with its exact payload stream the first chunk after ~112 ms on v1.8.1 and v1.8.2.
+- Ruled out: chat template (1 token more, which llama-benchy compensates), reasoning_content split,
+  decoder hold-back, scheduler lone-burst hold (GRIMOIRE_ADMIT_HOLD_MS=0: v1.8.2 6,786 and v1.9.0 6,423 at
+  c1). Users see no difference; why llama-benchy's run sequence does is unknown.
+
+**BUG: MTP with ONE sequence slot corrupts the answer (committed code = v1.9.0).**
+- Found while running Ian's long-context table with GRIMOIRE_SEQ_SLOTS=1 (ctx 135,168, MTP K=6,
+  DRAFT_VOCAB 65536, Qwen3.8-27B-GPTQ-Int4-MTP-BF16): EVERY coding answer fails the syntax / test check at
+  4K, 8K, 16K, 64K and 130K -- chunks of the answer are skipped or repeated mid-line, 4.3-4.9 tokens per
+  step (5.2-5.5 when healthy). The same task passed this morning with 8 slots.
+- A/B (bench-1003/ab_lc.sh, 4K coding answer, one launch each, 17:02-17:05 CEST):
+
+  | run | attention library | ctx | slots | answer | decode | tokens/step |
+  |---|---|---:|---:|---|---:|---:|
+  | A | committed (78274a5) | 135,168 | 1 | FAIL, corrupted | 90.7 tok/s | 4.78 |
+  | B | new (longctx-attn-wip) | 16,384 | 8 | PASS | 120.7 tok/s | 5.23 |
+  | C | new | 16,384 | 1 | FAIL, corrupted | 89.4 tok/s | 4.71 |
+
+  So the trigger is the single slot. NOT the new attention kernel, NOT the long context.
+- Exposure: GRIMOIRE_SEQ_SLOTS defaults to 1 (README line 58); the README run command sets 8 and the
+  Unraid templates use 8. Unknown yet: whether the default K=4 also fails at 1 slot, whether Ornith /
+  other MTP models do, and which commit introduced it (candidates: 97b56da DPAS verify attention,
+  1aa80fd fused DN/conv/norm, 78274a5 cheap int4 dequant; bin-prev/ holds an older server build).
+  Whether v1.9.0's release notes need a warning is Ian's call (public surface).
+
+**Long-context verify attention -- branch `longctx-attn-wip`, passes at 4K / 8 slots, not yet proven faster.**
+- Change (src/attn_verify_dpas.cpp): one work-group per (KV head, split) holding the `tiles` threads
+  (local id = tile), so the ~6 GQA tiles read the same K/V blocks together (DRAM once, L1 for the rest);
+  at most kMaxKeysPerSplit = 1024 keys per split. The 10-08 kernel gave every tile its own work-group.
+- Kernel bench (tools/bench_verify_attn.cpp, gpu0, cache sized for the longest length, 131,072; exact
+  against fp64 up to 16K with error 3e-4 as before; longer lengths timing only). old = the per-row decode
+  kernel + merge, new = the DPAS kernel with this change. 7 rows, us: 2K 658 -> 60; 8K 2,229 -> 252;
+  16K 9,140 -> 511; 32K 23,556 -> 875; 64K 50,686 -> 839; 131K 105,546 -> 1,529 (10.9x - 69x).
+  1 row: 83 -> 52, 306 -> 122, 1,192 -> 304, 3,135 -> 1,111, 6,075 -> 2,108, 11,437 -> 2,551 (1.6x - 4.5x).
+- NOT measured: this change against the COMMITTED DPAS kernel at the same cache size. The 10-08 figures
+  (7 rows: 2K 57, 8K 128, 16K 231 us) used a 16K cache. Suspected: with a 131K cache every kernel is
+  ~2x slower even at 2K-16K (the per-row kernel: 2K 283 -> 658 us) because K is laid out
+  [256 dims][seq_cap], 128 KB apart per dimension -- address translation; a blocked K layout would fix it.
+- Prefill is unaffected by the change (other kernels); with ctx 135,168 and 1 slot, time to first token was
+  2.21 / 4.19 / 9.29 / 59.3 / 194.0 s = 1,895 / 1,955 / 1,741 / 1,082 / 671 tok/s at 4K / 8K / 16K / 64K /
+  130K (prompts 4,180 / 8,184 / 16,180 / 64,189 / 130,191 tokens). Their decode numbers (82.0 / 67.5 / 53.8 /
+  21.8 / 10.8 tok/s) are INVALID: corrupted answers.
+
+**Test kit** (Tower /mnt/storage/isos/grimoire-runs/bench-1003/, copy on Ian's Mac in
+~/grimoire-work/bench-1003-scripts-20261009/): cmp_g0.sh (grim|k8v4; new variables GRIM_CTX, K8V4_MAXLEN,
+K8V4_SEQS, PROBE_ARGS, NO_BENCHY, GRIM_ENV), coding_probe.py, lc_table.sh (GRIMOIRE, then the third-party
+k8v4 stack, 4K-130K), ab_lc.sh, bisect_ornith.sh, bisect_hold.sh, tmplcount.sh, streamfirst*.sh. bin-oldattn/
+(Tower checkout) = today's server + the committed attention library, for A/B runs.
+
+**Other**
+- Ian's Mac runs Mullvad VPN; with "Local network sharing: block" the Mac loses the whole 192.168.8.x LAN
+  (it looked like a dead Tower for ~10 min). Ian turned LAN sharing on.
+- Intel cloud GPU: Ian has an instance "in review"; his JupyterLab page has no SSH. Key: ~/.ssh/id_ed25519_intel_cloud
+  on his Mac (comment intel-cloud-gpu). Need the SSH line from the console's "How to Connect"; read-only first.
+  GRIMOIRE builds for BMG G31 only (GRIM_TARGETS adds other chips).
+- A real power cut at ~15:00 CEST took down the Mac and the Tower; the Tower was back at 16:22 CEST with the
+  array started and gpu0 healthy (03:00.0 = renderD128).
+- A watcher I queued to start the A/B "later" started it anyway (two queue attempts, one invisible to ps);
+  the 3 runs were short and each stopped its server gracefully. Next time: run it in the foreground.
+
+**Next, in order**
+1. Find the one-slot MTP corruption: reproduce with ab_lc.sh run C, then bisect 97b56da / 1aa80fd /
+   78274a5 (bin-prev), compare the single-slot verify path with the batched one, test K=4 and Ornith at
+   1 slot. Fix, run tools/regress_all_g0.sh, tell Ian whether v1.9.0 needs a warning.
+2. Bench the work-group change against the committed kernel at the same cache size; keep it only if it wins.
+3. Ian's table: GRIMOIRE vs the third-party k8v4 stack at 4K / 8K / 16K / 64K / 131K (bench-1003/lc_table.sh).
+   8 slots do not fit 135K (4.1 GiB of KV per slot); use 2 slots if they fit, or fix item 1 first.
+4. Intel cloud instance once it is approved.
+
+
+## 12. 2026-10-09 resumed: one-slot speculative state commit
+
+Ian explicitly resumed work after the pause in section 11. Tower is still on
+`longctx-attn-wip`, starting from `2299a03`; gpu0 is PCI `03:00.0`, `[8086:e223]`,
+`renderD128`. No reboot or work on gpu1 occurred.
+
+### Findings
+
+- Reproduced run C: one-slot Qwen3.8 GPTQ/MTP K=6 at ctx 16384, 4K coding prompt,
+  syntax FAIL (unterminated string). Default K=4 and Ornith K=4 also fail.
+- Fresh builds with pinned oneAPI 2026.1.1: `97b56da` PASS, `1aa80fd` FAIL;
+  committed `78274a5` server/library FAIL. `bin-prev` contains the fused DeltaNet
+  code too, so it cannot serve as a pre-fusion baseline. Current build with
+  `GRIMOIRE_DN_VERIFY_FUSED=0` PASS.
+- Root cause: `launch_deltanet_verify_rows` reads live state without advancing it;
+  `generation.hpp` committed only after a rejection. Full acceptance silently lost
+  the block's recurrent state. The scheduler's `decode_spec_batch` already replayed
+  every accepted prefix, explaining the slot-dependent failure. Fix: commit every
+  successful batched recurrent verify, including full acceptance; declined verify
+  continues with a plain step and never commits unfilled buffers.
+- Host test makes recurrent state influence output and covers MTP/DFlash, K=4/6,
+  every rejection prefix, full acceptance and declined verify. It passes on Mac and
+  Linux; restoring only the old condition fails greedy parity. The pre-existing host
+  fake lacked PP stubs after the generation header changed; these are restored, and
+  `<cstdio>` is included explicitly.
+- Repaired served Qwen3.8 GPTQ/MTP one slot: K=6 4K fresh/repeat PASS (105.0/105.2
+  tok/s); 8K fresh/repeat PASS (79.3/79.3). K=4 4K/8K PASS (86.1/70.1). 8-slot K=6
+  control PASS (120.7 at 4K). These use ctx 16384; they are not the long-context table.
+- Ornith's repaired 4K answer used `bool` to reject boolean endpoints. The probe's
+  builtin allowlist omitted that harmless type, producing NameError on otherwise
+  valid code. Added `bool`, preserving all functional assertions; all four saved
+  repaired Ornith answers pass on recheck and the old corrupted one still fails.
+- Scripts remain outside git in `grimoire-runs/bench-1003`; the Mac copy of
+  `coding_probe.py` also includes the builtin fix. Original saved as
+  `coding_probe.py.before-bool-resume`. Raw JSONL evidence: `cmp-k8v4/grim-resume-*.jsonl`.
+- Server and CLI rebuilt in isolated worktrees, with no GPU mapped to build containers.
+  Repaired binaries and libraries installed into the main Tower checkout's `bin/`.
+  Original files preserved in `bench-1003/resume-original-bin/` (no archive).
+- v1.9.0's published image remains affected; README now warns to use >=2 slots for
+  serving with MTP, or disable MTP. No image or release asset was replaced.
+
+### Next steps
+
+1. Run `tools/regress_all_g0.sh`, and inspect its parity checks and generated text.
+2. Compare committed and work-group DPAS attention with identical cache capacity.
+   Committed library is preserved at `bin/attn-committed/libgrimoire_attn.so`.
+3. Run both sides of Ian's table via `bench-1003/lc_table.sh`; use ctx 135168 and
+   preferably 2 slots to exercise the faster scheduler verify path. Only PASS decode
+   numbers are valid. Record actual prompt token counts for both checkpoints.
+4. Ask Ian for Intel cloud's How to Connect SSH line; inspect with his cloud key,
+   run no heavy workload.
+
+
+### Resume checkpoint: full sweep and selected attention (table running)
+
+- `tools/regress_all_g0.sh`: 44/44 completed, ALL DONE, no gpu0 guard trip. Logs:
+  `/mnt/storage/isos/grimoire-runs/regress-1009-1730`, wrapper output
+  `bench-1003/regress-resume.out`. Sherlock matches its reference; hot-expert text
+  IDENTICAL. The printed MTP/DFlash prose comparisons differ from plain, as they
+  already did in the pre-fix `regress-1009-1315`; do not describe this as exact
+  speculative token parity across all real checkpoints.
+- A new Ornith launch passed both 4K answers but failed both 8K answers with a real
+  IndexError: interval endpoints were indexed before checking tuple length. The
+  source is coherent, unlike the pre-fix corruption. These two decode rates are
+  excluded; the preceding repaired launch's 4K/8K answers pass the corrected checker.
+- v1.9.0 release notes now include the published warning and link to `dd286b3`.
+  The image and asset are unchanged.
+- Same executable, random inputs, cache capacities 16384 and 131072, pinned toolchain,
+  gpu0: unconditional grouping LOSES at short context. 7 rows, 16K cache, committed
+  vs grouped at 4K/8K/16K: 66/131/233 -> 118/178/330 us. At 131K cache: 4K/8K/16K
+  67/230/451 -> 98/251/512; 64K/128K 1051/1850 -> 837/1525 us.
+- Equal split counts at 64K/128K (committed library with KEYS_PER_SPLIT=1024):
+  1552/3166 us vs grouped 837/1525. Thus grouping itself helps long context, whereas
+  the original 32-split policy is better than merely raising the split count.
+- Selected library: use committed tile layout until the long-context split floor
+  exceeds the ordinary thread target, then group the tiles. 16K cache, 7 rows:
+  4K/8K/16K = 66.8/127.5/231.0 us. 131K cache: 4K/8K/16K = 67.0/229.3/450.0,
+  64K/128K = 831.9/1510.8 (26.4%/22.4% faster than committed). One-row timings
+  preserved. Errors vs fp64 up to 16K unchanged; longer lengths timing only.
+- Files in bench-1003: `attn-committed-16k.out`, `attn-committed-131k.out`,
+  `attn-candidate-16k.out`, `attn-candidate-131k.out`,
+  `attn-committed-equalsplits.out`, `attn-adaptive-16k.out`, `attn-adaptive-131k.out`.
+- The selected library was rebuilt separately and installed without an active GPU
+  container. Only the library changed; the verified server/CLI ABI is unchanged.
+- Table is now RUNNING in foreground: `LENGTHS=4096,8192,16384,65536,131072
+  GRIM_SLOTS=2 bash lc_table.sh`, output `bench-1003/lc-table-resume.out`.
+  Both servers reserve 135168 context. Probe summary medians now exclude failed
+  answers. Removed outer timeouts from the table wrapper; k8v4 starts with --init.
+  Script updates also live in the Mac copy of bench-1003.
+
+Next: deliver the complete GRIMOIRE/k8v4 table (PASS decode only), then ask for
+Intel cloud's How to Connect SSH line and inspect only.
+
+
+### Table completed; Ian changed comparison source to published GitHub results
+
+GRIMOIRE all 10/10 answers PASS, ctx 135168 and 2 slots. Prompt/decode tok/s at
+4K/8K/16K/64K/128K: 1928/120.0, 1872/121.2, 1691/115.0, 1052/77.1, 678/66.8.
+Fresh TTFT: 2.22/4.48/9.80/62.47/193.68 s. Actual counts and sources are in
+`RESULTS-2026-10-09-CONTEXT.md`; raw JSONL is `cmp-k8v4/grim-lc-1009-1818.jsonl`.
+
+The attempted local k8v4 launch exited itself: its image's native library expects
+TP2 local heads 12/2, not TP1 24/4. No local numbers were generated. Ian then said
+"take wrapzii results from his page on github". Use his October 2 published coding
+sweep for comparable 8K/64K/128K data; mark 4K/16K unreported in that sweep. His
+subsequent 128K W4A8 confirmation is also documented, with its different sample
+method. Do not combine historical forced-EOS fox rows with current coding rows.
+
+All GPU containers stopped, gpu0 0.02 GiB, all monitored correctable/nonfatal/fatal
+AER totals zero. Intel cloud key exists; asked Ian for How to Connect SSH line.
+Next: inspect cloud hardware only when the line arrives. Run nothing heavy there.
+
+
+### Table correction requested by Ian
+
+Ian pointed out that the table used the older 128K Wrapzii row despite mentioning
+his newer fix separately. Corrected `RESULTS-2026-10-09-CONTEXT.md`: Wrapzii 128K is
+now 1254.9 prompt / 78.02 decode (display 1255/78.0), from the W4A8 wiring confirmation.
+8K/64K remain the earlier published sweep because the wiring report does not provide
+fresh prompt throughput for those lengths. The report explicitly records these
+runtime/sampling differences. Do not present 1111/74.48 as his latest 128K result.
+
+
+### Final pause requested by Ian — 2026-10-09
+
+The final 16K kernel diagnostic completed. Findings and tomorrow's order are in
+HANDOFF-2026-10-09-PAUSED.md. Tower idle, no GPU containers, gpu0 0.02 GiB and AER
+totals zero. No jobs queued; gpu1 untouched. Resume only when Ian asks.
