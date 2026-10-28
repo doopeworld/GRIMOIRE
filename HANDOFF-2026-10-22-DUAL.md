@@ -771,3 +771,26 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   region 7.27 -> 6.18 ms a token, one token 19.4 ms.  Same three answers as the old code
   (frozen placement).  llama-benchy tg128 44.60 (2K) / 42.18 (4K), pp 1,292 / 1,474.
   DAY TOTAL, Flash-Next two cards: tg128 38.47 -> 44.60 and 36.36 -> 42.18 (+16%), exact.
+
+### 12.15 2026-10-28 morning: Qwen3.8 two-card timeline; gpu1 dropped idle; Flash-Next MTP step 1 written
+- Qwen3.8-27B-FP8 two cards, plain decode (q38_tl1.sh, GRIMOIRE_SEQ_SLOTS=1 -- with 8 slots the
+  one-user decode takes the batched path, no timeline marks): 33.6 ms a token.  First DeltaNet
+  layer, rank 0, us: in_norm 9.8, qkv 51.5 (26 MB, 509 GB/s), conv 2.2, l2norm 2.0, ab+gates
+  5.0, step 5.3, z 29.7, norm+gate 3.4, out + all-reduce (+ the token-boundary wait in layer 0)
+  274, post_norm 9.9, gate_up 158.9 (89 MB, 560 GB/s), swiglu 1.3, down + all-reduce 126.8.
+  Typical DeltaNet layer ~465 us, full-attention ~441 us; head FP8 2.13 ms (597 GB/s, replicated).
+  GEMVs ~523 GB/s = 87% of 602: plain decode is near the bandwidth limit; the cheap wins are the
+  norms (~10 us x 128), the head split (~1 ms), small all-reduce copies (128 x 30 us).
+- Split RMSNorm (rmsnorm_split, the default for n >= 1024): kernel 2 summed the 20 partials one
+  dependent load at a time.  Partials into registers first (B70_NORM_PREG=1, opt-in, same adds in
+  the same order).  Built; the test (q38_norm.sh) was refused by the guard -- see below.
+- **gpu1 dropped off the bus at 08:12:17 while idle** (only a CPU-only compile was running):
+  root port 00:06.0 Uncorrectable (Fatal) Transaction Layer, MalfTLP+, "xe 0000:07:00.0: AER: can't
+  recover", link reset -> device recovery failed, config space ffff ffff, root port at 8 GT/s.  The
+  first drop since the redriver adapter (10-22).  No log flood, no D-state process, gpu0 clean.
+  dual.sh refused every later run ("uncorrectable link errors already logged").  Needs a Tower
+  restart (Ian's call).
+- Flash-Next MTP, step 1 (written, syntax-checked, not run): MtpHead4 loaded with GRIMOIRE_MTP=1
+  (tensor map and plan: memory grimoire-flashnext-mtp-plan), decode / prefill warming of the
+  head's caches, shadow mode GRIMOIRE_MTP4_SHADOW=1 (drafts at every step, counts hits, no
+  speculation).  Test after the restart: tools/bench/onednn/fn_mtp1.sh.
