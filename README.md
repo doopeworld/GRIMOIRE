@@ -23,7 +23,7 @@ Every number on this page was measured on one machine:
 | GPU 1 | Intel Arc Pro B70, 32 GB, on an **M.2-to-OCuLink adapter with a PCIe redriver**: **PCIe Gen4 x4** (a passive adapter made the card drop off the bus under load; the redriver fixed it) |
 | Power | each GPU on its own 550 W supply; GRIMOIRE runs the cards at their own firmware limit (no governor) |
 | GPU-to-GPU | **no peer-to-peer**: Linux does not allow PCIe P2P between these two root ports on this CPU, so every byte between the cards goes through host memory |
-| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs (built into the image), one GRIMOIRE process per GPU |
+| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs, one GRIMOIRE process per GPU; the v1.10.0 image ships oneAPI 2026.2, driver 26.35 and oneDNN 3.14 (checked 2026-10-28: same answers, same speed) |
 | Benchmark | [llama-benchy](https://github.com/eugr/llama-benchy) 0.4.0 through GRIMOIRE's OpenAI-compatible server, one user unless noted, greedy decoding |
 
 This is a small desktop with one card on a x4 link, not a workstation with two x16 slots. Two-GPU

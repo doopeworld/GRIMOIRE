@@ -25,15 +25,17 @@
 # ---------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
-# Pinned to the exact compiler build every kernel in this project has
-# been measured against (icpx 2026.1.1.20260724).  A different version
-# is not guaranteed to generate the same ESIMD/DPAS code; if you need a
-# newer oneAPI, re-run tools/regress_all_g0.sh against it before trusting
-# the numbers in any commit message.
-ARG ONEAPI_VERSION=2026.1
-ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
-ARG IGC_VERSION=2.38.2
-ARG IGC_BUILD=22051
+# Pinned to the exact compiler build the kernels were checked against: icpx 2026.2.0 with
+# compute-runtime 26.35 / IGC 2.41.5 and oneDNN 3.14 since v1.10.0 (2026-10-28: against
+# icpx 2026.1.1 / 26.27 / IGC 2.38.2 / oneDNN 3.13.4, tools/regress_all_g0.sh gave 43 of 44
+# answers identical, the 44th a one-word rounding flip, at the same speed on one and two
+# B70s).  A different version is not guaranteed to generate the same ESIMD/DPAS code; if you
+# need a newer oneAPI, re-run tools/regress_all_g0.sh against it before trusting the
+# numbers in any commit message.
+ARG ONEAPI_VERSION=2026.2
+ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
+ARG IGC_VERSION=2.41.5
+ARG IGC_BUILD=22716
 ARG GMMLIB_VERSION=22.10.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -64,7 +66,9 @@ RUN mkdir -p /tmp/neo && cd /tmp/neo \
 # primitives, no graph API, no tests -- the configuration measured in
 # tools/bench/onednn/RESULTS-2026-10-25-ONEDNN.md.  The build scripts below find
 # it in third_party/onednn and put libdnnl.so next to the binaries (rpath $ORIGIN).
-ARG ONEDNN_VERSION=v3.13.4
+ARG ONEDNN_VERSION=v3.14
+# parallel compile jobs for oneDNN (the build host keeps the rest of its cores)
+ARG BUILD_JOBS=8
 RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build git \
     && rm -rf /var/lib/apt/lists/* \
     && git clone --depth 1 --branch ${ONEDNN_VERSION} https://github.com/uxlfoundation/oneDNN.git /tmp/onednn \
@@ -73,7 +77,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-bui
           -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/grimoire/third_party/onednn \
           -DONEDNN_CPU_RUNTIME=NONE -DONEDNN_GPU_RUNTIME=SYCL -DONEDNN_GPU_VENDOR=INTEL \
           -DONEDNN_BUILD_EXAMPLES=OFF -DONEDNN_BUILD_TESTS=OFF -DONEDNN_BUILD_GRAPH=OFF; \
-        cmake --build /tmp/onednn/build --target dnnl; \
+        cmake --build /tmp/onednn/build --target dnnl -j ${BUILD_JOBS}; \
         cmake --install /tmp/onednn/build >/dev/null' \
     && mkdir -p /grimoire/licenses/onednn \
     && cp /tmp/onednn/LICENSE /tmp/onednn/THIRD-PARTY-PROGRAMS /grimoire/licenses/onednn/ \
@@ -94,9 +98,12 @@ RUN mkdir -p bin
 # device-compile time.
 ARG GRIM_TARGETS=intel_gpu_bmg_g31,intel_gpu_bmg_g21
 
+# libdnnl.so.3 (the soname the binaries load) is copied out as a plain file, so the runtime
+# stage below does not name a oneDNN version.
 RUN bash tools/build_grimoire_only_b70.sh /grimoire \
     && bash tools/build_server_only_b70.sh /grimoire \
-    && strip --strip-unneeded bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so bin/libgrimoire_attn.so
+    && strip --strip-unneeded bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so bin/libgrimoire_attn.so \
+    && cp -L bin/libdnnl.so.3 /grimoire/libdnnl.so.3
 
 # ---------------------------------------------------------------------
 # Stage 2: runtime.  Only what the three binaries actually need (checked
@@ -108,10 +115,10 @@ RUN bash tools/build_grimoire_only_b70.sh /grimoire \
 # ---------------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 
-ARG ONEAPI_VERSION=2026.1
-ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
-ARG IGC_VERSION=2.38.2
-ARG IGC_BUILD=22051
+ARG ONEAPI_VERSION=2026.2
+ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
+ARG IGC_VERSION=2.41.5
+ARG IGC_BUILD=22716
 ARG GMMLIB_VERSION=22.10.0
 ARG LEVEL_ZERO_VERSION=1.32.0
 
@@ -166,9 +173,9 @@ COPY --from=builder /grimoire/bin/grimoire           bin/grimoire
 COPY --from=builder /grimoire/bin/grimoire-server     bin/grimoire-server
 COPY --from=builder /grimoire/bin/libgrimoire_gemm.so  bin/libgrimoire_gemm.so
 COPY --from=builder /grimoire/bin/libgrimoire_attn.so  bin/libgrimoire_attn.so
-COPY --from=builder /grimoire/third_party/onednn/lib/libdnnl.so.3.13 bin/libdnnl.so.3.13
+COPY --from=builder /grimoire/libdnnl.so.3 bin/libdnnl.so.3
 COPY --from=builder /grimoire/licenses/onednn/        /usr/share/doc/onednn/
-RUN cd bin && ln -sf libdnnl.so.3.13 libdnnl.so.3 && ln -sf libdnnl.so.3 libdnnl.so
+RUN cd bin && ln -sf libdnnl.so.3 libdnnl.so
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh bin/grimoire bin/grimoire-server
 
