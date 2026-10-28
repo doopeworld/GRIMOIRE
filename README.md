@@ -10,7 +10,7 @@ The aim is straightforward: make high-performance local LLM inference possible o
 
 > **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.9.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> Work in progress on branches (not in a release image yet): **two-GPU speed** on [`dual-1022`](https://github.com/doopeworld/GRIMOIRE/tree/dual-1022) and **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage). Their results are in [Results at a glance](#results-at-a-glance), marked by branch.
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and go into the next release image. Still on branches: **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage) and the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -23,7 +23,7 @@ Every number on this page was measured on one machine:
 | GPU 1 | Intel Arc Pro B70, 32 GB, on an **M.2-to-OCuLink adapter with a PCIe redriver**: **PCIe Gen4 x4** (a passive adapter made the card drop off the bus under load; the redriver fixed it) |
 | Power | each GPU on its own 550 W supply; GRIMOIRE runs the cards at their own firmware limit (no governor) |
 | GPU-to-GPU | **no peer-to-peer**: Linux does not allow PCIe P2P between these two root ports on this CPU, so every byte between the cards goes through host memory |
-| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), one GRIMOIRE process per GPU |
+| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs (built into the image), one GRIMOIRE process per GPU |
 | Benchmark | [llama-benchy](https://github.com/eugr/llama-benchy) 0.4.0 through GRIMOIRE's OpenAI-compatible server, one user unless noted, greedy decoding |
 
 This is a small desktop with one card on a x4 link, not a workstation with two x16 slots. Two-GPU
@@ -42,18 +42,22 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 | **Ornith-1.5-35B-A3B** | BF16 / FP8 / NVFP4 release, MXFP4 at load | 6,529 (pp512), 9,430 (pp4096) | **193.7** | **461.3** |
 | Qwen3.8-Flash-Next | NVFP4; 112 of 512 experts per layer in VRAM, the rest in pinned RAM | -- | 22 (v1.8.x, one 128-token request) | -- |
 
-### Two Arc Pro B70s (branch `dual-1022`, 2026-10-22 / 24)
+### Two Arc Pro B70s (main, measured 2026-10-27 / 28; Ornith 2026-10-22)
 
 | Model | Weights | Mode | pp2048 | pp4096 | pp8192 | Decode, 1 user |
 |---|---|---|---:|---:|---:|---:|
-| **Qwen3.8-27B** | FP8 | tensor parallel | 2,494 | **2,494** | -- | **31.5** |
-| **Qwen3.8-27B + MTP** | FP8 | tensor parallel, `GRIMOIRE_MTP=1` | 2,430 | 2,486 | -- | **48.7** (77.4 on code) |
+| **Qwen3.8-27B** | FP8 | tensor parallel | -- | **3,530** | 3,315 | **29.5** (8 users: **165** total) |
+| **Qwen3.8-27B + MTP** | FP8 | tensor parallel, `GRIMOIRE_MTP=1` | -- | 3,531 | 3,319 | **56.2** (88.8 on code) |
+| **Qwen3.8-27B + DFlash2** | FP8 + [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | tensor parallel | -- | 3,334 | 3,232 | **59.3** (126 on code) |
 | **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
-| **Qwen3.8-Flash-Next** | NVFP4; 360 of 512 experts per layer in VRAM on each card | pipeline 24 / 24 | 904 | 1,081 | **1,269** | **25.6** |
+| **Qwen3.8-Flash-Next** | NVFP4; 170 of 512 experts per layer in VRAM on each card | tensor + expert parallel | 1,292 | 1,474 | -- | **44.6** (42.2 after a 4K prompt) |
+
+On two cards, drafting (MTP / DFlash2) serves **one request at a time** for now; for several users
+at once, leave it off -- plain decoding batches them (165 tok/s total at 8 users above).
 
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
-1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 2,494 and 30.9
-(48.8 with MTP), peaking at 43 GB.** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
+1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 3,530 and 29.5
+(56.2 with MTP).** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
 above gives exactly the same answer, character for character, as the code before it, and every
 two-GPU answer to that prompt passes its unit tests.
 
@@ -207,10 +211,11 @@ serves HTTP. Each GPU stays in its own process and exchanges data through host m
 on boards without GPU-to-GPU P2P. Two layouts:
 
 - `multi TP` (tensor parallel): both cards work on every token, each holding half of every layer.
-  Use it for dense models such as Qwen3.8-27B-FP8 (on `dual-1022`: ~2,490 tok/s prompt, 31
-  decode, 49 with MTP and 77 on code).
+  Use it for dense models such as Qwen3.8-27B-FP8 (~3,500 tok/s prompt, 29.5 decode for one user,
+  165 total for 8 users; with `GRIMOIRE_MTP=1` 56 for one user and 89 on code, one request at a
+  time) and for Qwen3.8-Flash-Next (tensor + expert parallel, see below).
 - `multi PP` (pipeline parallel): each card holds a block of layers. Use it for MoE models such as
-  Ornith-1.5-35B-A3B-FP8 and Qwen3.8-Flash-Next.
+  Ornith-1.5-35B-A3B-FP8.
 
 Map exactly the render nodes you want, in order, and set `ZE_AFFINITY_MASK` to match:
 
@@ -230,8 +235,8 @@ docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-si
 --proj fp8 ...` and leave out `GRIMOIRE_PP_SPLIT`. Use two GPUs only for checkpoints that do not fit
 one card -- a model that fits runs faster on one GPU.
 
-Qwen3.8-Flash-Next on two cards (branch `dual-1022`): `multi` with `--proj bf16`,
-`GRIMOIRE_PP_SPLIT=24`, `GRIMOIRE_EXPERT_VRAM_PER_LAYER=360`, `GRIMOIRE_PLE_FILE=` (the flattened
+Qwen3.8-Flash-Next on two cards: `multi TP` with `--proj bf16 --ctx 65536`,
+`GRIMOIRE_EXPERT_VRAM_PER_LAYER=170` (experts per layer kept in each card's VRAM), `GRIMOIRE_PLE_FILE=` (the flattened
 n-gram table, made by `tools/ple_flatten.py`) and `GRIMOIRE_EXPERT_HITS=` (routing counts: GRIMOIRE
 updates this file as it serves, and the most-used experts go to VRAM at the next start). The experts
 that stay outside VRAM take ~20 GB of pinned host RAM; the n-gram table (51 GB) is copied into RAM in
