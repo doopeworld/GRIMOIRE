@@ -79,7 +79,7 @@ Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP:
 above gives exactly the same answer, character for character, as the code before it, and every
 two-GPU answer to that prompt passes its unit tests.
 
-### GGUF files, one Arc Pro B70 (measured 2026-10-15 / 21 on the GGUF branch, on main since 10-29)
+### GGUF files, one Arc Pro B70 (Ornith measured 2026-10-15 / 21, Qwen3.8-27B 2026-10-29, on main)
 
 Ornith-1.5-35B-A3B, the official `Q4_K_M` GGUF; accuracy = mean KL divergence against the BF16
 model on WikiText-2 (lower is better).
@@ -91,9 +91,22 @@ model on WikiText-2 (lower is better).
 | llama.cpp SYCL, same file | 1,959 | 104 | 0.061 |
 | llama.cpp Vulkan, same file | 1,833 | 50 | -- |
 
-Qwen3.8-27B: the BF16 GGUF gives **token-identical** output to the safetensors release; Unsloth's
-UD-Q4_K_XL, UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (native decode
-~10 tok/s so far, being worked on). Qwen3.8-Flash-Next GGUF: not supported yet.
+Qwen3.8-27B, Unsloth's `UD-Q4_K_XL` GGUF (measured 2026-10-29 on main, one B70; decode = CLI, 128
+tokens after a short coding prompt; accuracy = top-1 agreement with the BF16 model's next token over
+256 positions of text, `tools/bench/accuracy`):
+
+| Engine and mode | Prompt (pp4096) | Decode | Top-1 vs BF16 |
+|---|---:|---:|---:|
+| **GRIMOIRE native + MTP** (`--proj native`, `GRIMOIRE_MTP=1`, K=6, draft vocabulary 65,536) | 2,015 | **71.6** | **94.5%** (same tokens as without MTP) |
+| GRIMOIRE native (`--proj native`) | 2,015 | 28.0 | **94.5%** |
+| GRIMOIRE, converted to MXFP4 at load (`--proj mxfp4`) | **2,097** | 33.3 | 87.5% |
+
+The same day's steps on this file: native decode 9.0 -> 28.0 tok/s (vector kernels for every K-quant
+and IQ4 block type), prompts 1,701 -> 2,015 tok/s (streaming dequant + the fused SwiGLU GEMM), MTP from
+the file's own `nextn` head 28.0 -> 71.6 tok/s (a DPAS kernel that checks up to 16 drafted tokens for
+about the cost of one).  The BF16 GGUF gives **token-identical** output to the safetensors release;
+UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (Q8_0 as `--proj int8`: 99.2%
+top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 
 ## Run a model
 
@@ -289,11 +302,13 @@ release (4 of 4 prompts), and the Q4_K_M / UD-Q4_K_XL files answer correctly.
   at load (fastest, less accurate).
 - Validated on real Hugging Face files: Ornith-1.5-35B-A3B (official GGUF, BF16 and Q4_K_M),
   Qwen3.8-27B (Unsloth BF16 and five quants, from Q8_0 down to IQ2_XXS), gemma-4-12B.
-- Qwen3.8-Flash-Next GGUF needs the RAM expert tiering and is not supported yet. MTP / DFlash on GGUF
-  files is not measured yet (the Qwen3.8-27B and Ornith GGUFs do carry the MTP head, the `nextn`
-  block).
+- MTP works from the file's own MTP head (the `nextn` block; `GRIMOIRE_MTP=1`): Qwen3.8-27B
+  UD-Q4_K_XL 28.0 -> 71.6 tok/s on one B70 with exactly the same tokens.  Files without the head
+  (Unsloth's UD-IQ1_S / UD-IQ2_XXS) refuse `GRIMOIRE_MTP`.  Ornith's MoE MTP head on GGUF and DFlash
+  on GGUF are not tested yet.
+- Qwen3.8-Flash-Next GGUF needs the RAM expert tiering and is not supported yet.
 
-Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-measured-2026-10-15--21-on-the-gguf-branch-on-main-since-10-29).
+Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-ornith-measured-2026-10-15--21-qwen38-27b-2026-10-29-on-main).
 
 ## Why GRIMOIRE was created
 

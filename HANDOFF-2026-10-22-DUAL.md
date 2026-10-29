@@ -890,3 +890,34 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   GRIMOIRE_GGUF_ESGEMV_Q5K / _IQ4XS / _B32 (IQ4_NL + Q8_0) =0.  Floor for this file ~30 ms (bytes);
   Q5_K layers 575 us vs MXFP4 430.  Build CLI only while iterating: tower_build.sh grimoire (19 min;
   the server part adds 20+ min since the GGUF merge).
+- 1c62a4d IQ4_NL + Q8_0 ESIMD (52.0 -> 46.9 ms).  f91470d: the IQ4 table read by a register-table
+  iselect cost ~3x the rest of the kernel (IQ4_XS 142 GB/s vs Q4_K 575; with no table at all 550).
+  nq_iq4_value = degree-4 minimax polynomial of the index, rounded to nearest = exactly the 16 table
+  values (largest error 0.433; fp16 evaluation is NOT exact -- checked); IQ4_XS scales as one
+  vector; IQ4_NL / Q8_0 lanes = 16 consecutive values of a block (stride-18/34 byte selects were
+  slow).  Kernels: IQ4_XS gate_up 664 -> 212 us (447 GB/s), down 352 -> 107, IQ4_NL down 365 -> 109,
+  Q8_0 ssm_out 133 -> 57 (589 GB/s).  UD-Q4_K_XL one token 46.9 -> 34.8 ms (morning 79.9), every
+  layer kind 476-569 us, texts identical, top-1 94.5%.  tools/bench_native_esgemv.cpp = one-kernel
+  bench + check at Qwen3.8 shapes (bench-1022/nq5.sh builds it in grimoire-dev in ~10 s; needs
+  `source /opt/intel/oneapi/setvars.sh` inside bash -lc).  Still re-rounded to MXFP4 at load:
+  mixed-type gate/up pairs (47 tensors, 2.5 GiB) and Q3_K / IQ3_S (4 tensors).
+- 2049abf GGUF native prompts: src/native_dequant.hpp streams Q4_K .. IQ4_NL to bf16 VNNI
+  (dequant_mxfp4_stream's walk, decode_elem's arithmetic: bit-identical, 0 mismatches in 446 M
+  values, tools/bench_native_dequant.cpp) and native gate_up now takes the fused SwiGLU GEMM.
+  pp4096 1,701 -> 2,015 tok/s (MXFP4 2,097); a 1,456-token prompt's answer identical.  Note:
+  GRIMOIRE_NO_FUSED_SWIGLU=1 also moves the MXFP4 (mixed gate/up) layers, so it is no clean A/B.
+  --ppl is teacher-forced per-token DECODE, it does not exercise the prompt path.
+- GGUF native small-M DPAS GEMM (src/native_smallm.hpp, M 2..8, lane = weight row, LSC gathers,
+  exact bf16 codes 128+q / IQ4 values / Q8_0 nibbles, ones-DPAS for sum x): all six formats
+  correct (maxrel <= 7e-8 vs double), 8 rows = 0.97-1.13x one decode GEMV
+  (tools/bench_native_smallm.cpp).  Wired into the verify mm() (dpas_nq) and mtpr_mm; GGUF MTP
+  head mapped (gguf_qwen35.cpp: blk.<n_layers>.* -> mtp.layers.0.*, nextn.eh_proj -> mtp.fc,
+  enorm / hnorm / shared_head_norm -> the three mtp norms with norm_inv).
+- 8c7a33f GGUF MTP (Qwen3.8-27B UD-Q4_K_XL, CLI, code prompt): no MTP 28.0 tok/s; K=4 with the
+  verify head row by row 56.0; K=4 63.1 (3.27 accepted, 83%; fenced step draft 9.1 + verify 44.7
+  ms); K=6 + GRIMOIRE_MTP_DRAFT_VOCAB=65536 71.6 (3.50 accepted; draft 6.1, verify 45.4 ms).  All
+  MTP texts identical to plain greedy.  In-model GRIMOIRE_SMALLM_VERIFY=1: rel 2.6e-4 .. 1.9e-3.
+- 10-29 ~20:32 PAUSED by Ian.  bin/grimoire = 20:27 build (everything above); bin/grimoire-server is
+  the 17:09 build (OLD: the server build was stopped at the pause) -> `tower_build.sh server` first
+  tomorrow, then served llama-benchy on GGUF (dual.sh needs a directory + HF tokenizer: patch it for
+  a .gguf path), a GGUF container template, Ornith GGUF + MTP (MoE head), release v1.10.1 (Ian's yes).
