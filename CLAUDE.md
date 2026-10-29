@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-29 afternoon: GGUF (feature/gguf-battlemage) MERGED INTO MAIN -- one branch for everything; gate A 4/4 identical, regression 41/44 identical to pre-merge (3 Muse near-tie flips, deterministic).  INT4 small-M past 8 rows on the fast dequant (MTP 2 / 4 users +9 / +8%).  Adaptive MTP depth tried, slower (branch mtp-adapt).  Correction: tp_enabled() = LEGACY TP only; Megatron runs the small-M kernels like one card.  gpu1 still paused; dual.sh T0 = both TP ranks on gpu0.  Handoff 12.17.**
+
 **2026-10-29 late morning: MTP batched drafting on main (answers identical, +5-16% at 2-8 users); prompt-attention kernel named in the log; two cards pp32768 = 2,570 tok/s.  TWO-CARD WORK PAUSED: 10:43 gpu1 root-port receive-error burst during a load (guard STOP), switch RxErr ~2,170/s idle -- gpu0 only until Ian says.  Handoff 12.16.**
 
 **2026-10-29: accuracy vs the BF16 original (tools/bench/accuracy): the official FP8 checkpoint as --proj fp8 = top-1 94.9% (double rounding of its block scales), as --proj int8 = 98.0%; INT8 now has FP8's fast paths (oneDNN s8 prompts, ESIMD INT8 decode, INT8 small-M) -- two cards + MTP pp4096 3,566 / tg128 53.6 / 4 users 96.2 = FP8's 3,522 / 53.5 / 96.6.  README recommends --proj int8 for that checkpoint (main; v1.10.0 image still slow at INT8).  g0run EXTRA_ENV = one K=V per line.  Handoff 12.15 (10-28: main, B60 fixes, multi-user MTP, v1.10.0) and 12.16.**

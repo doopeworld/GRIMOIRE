@@ -854,3 +854,20 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   (texts identical); 1 user unchanged.  GRIMOIRE_I4_WIDE_FDQ=0 = old.  K=8 / K=10 still slower than
   K=6 on one user (9+ verify rows cost more than they return).  Adaptive depth (branch mtp-adapt)
   slower than K=6, not merged.  New dual.sh mode T0 = multi TP with both ranks on gpu0.
+
+### 12.17 2026-10-29 afternoon: GGUF branch merged into main; image rc2; regression
+- feature/gguf-battlemage (911d6d4, 80 commits since 74c7aa9) merged into main in a worktree
+  (/mnt/storage/isos/gguf-merge-wt, branch gguf-merge): 16 conflict blocks in 5 files, all "keep
+  both sides" (commit message lists them).  Worktree needed bin/ and third_party/onednn (copied,
+  18 MB) before tower_build.sh would build it (GRIM_REPO=<worktree>).
+- GGUF on the merged build: gate A (Ornith BF16 GGUF vs safetensors, mxfp4) 4/4 identical; Ornith
+  Q4_K_M mxfp4 2/2 + native 2/2; Qwen3.8 UD-Q4_K_XL mxfp4 2/2 (validate_models.sh prints the
+  text after the id line for that file, so its summary shows an empty line -- the text is fine).
+- Safetensors regression (tools/regress_all_g0.sh, 44 runs, gpu0) on main 1418bea before the merge:
+  pass, 41/44 texts identical to 10-28 (fn-h hits file, 2x Muse near-tie).  On the merge build:
+  41/44 identical to pre-merge main; 3 Muse near-tie flips
+  (the merge reproduces 10-28's Muse texts; deterministic per build, 3/3 runs identical); timings equal.
+- Image grimoire-b70:v1.10.1-rc2 built from 1418bea (before the merge); not tested.
+- Unraid path trap again: tower_build.sh lives only under /mnt/user/isos/grimoire-runs/bench-1022
+  (not /mnt/storage/...).  New files: write them under /mnt/storage, call tower_build.sh by its
+  /mnt/user path.

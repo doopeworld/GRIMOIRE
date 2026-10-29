@@ -10,7 +10,7 @@ The aim is straightforward: make high-performance local LLM inference possible o
 
 > **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. Still on branches: **GGUF support** on [`feature/gguf-battlemage`](https://github.com/doopeworld/GRIMOIRE/tree/feature/gguf-battlemage) and the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`). Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -79,7 +79,7 @@ Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP:
 above gives exactly the same answer, character for character, as the code before it, and every
 two-GPU answer to that prompt passes its unit tests.
 
-### GGUF files, one Arc Pro B70 (branch `feature/gguf-battlemage`, 2026-10-15 / 21)
+### GGUF files, one Arc Pro B70 (measured 2026-10-15 / 21 on the GGUF branch, on main since 10-29)
 
 Ornith-1.5-35B-A3B, the official `Q4_K_M` GGUF; accuracy = mean KL divergence against the BF16
 model on WikiText-2 (lower is better).
@@ -276,9 +276,11 @@ BF16 (or FP8 / NVFP4) release with `--proj mxfp4` quantizes to the same MXFP4 fo
 and runs at the same speed (measured: 193 tok/s on Ornith from the FP8 and NVFP4 releases and
 from the converted copy). The converted copy only starts faster.
 
-## GGUF support (branch `feature/gguf-battlemage`)
+## GGUF support (main since 2026-10-29)
 
-GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp inside.
+GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp inside.  Merged into
+main on 2026-10-29: the BF16 Ornith GGUF still gives exactly the same tokens as the safetensors
+release (4 of 4 prompts), and the Q4_K_M / UD-Q4_K_XL files answer correctly.
 
 - Load a bare `.gguf` path (split files too): the tokenizer and chat template come from the file.
 - All 35 ggml tensor types are decoded, bit-exact against the reference implementation.
@@ -291,7 +293,7 @@ GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp insi
   files is not measured yet (the Qwen3.8-27B and Ornith GGUFs do carry the MTP head, the `nextn`
   block).
 
-Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-branch-featuregguf-battlemage-2026-10-15--21).
+Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-measured-2026-10-15--21-on-the-gguf-branch-on-main-since-10-29).
 
 ## Why GRIMOIRE was created
 
@@ -366,8 +368,8 @@ Tensor-parallel and pipeline-parallel both run correctly across two B70s. They e
 checkpoints whose own footprint doesn't fit one card's VRAM (Qwen3.8-27B in FP8, Ornith in FP8,
 Qwen3.8-Flash-Next); a model that fits a single B70 runs fastest there.
 
-GGUF files of Ornith-1.5-35B-A3B and Qwen3.8-27B load directly on the `feature/gguf-battlemage`
-branch (see [GGUF support](#gguf-support-branch-featuregguf-battlemage)).
+GGUF files of Ornith-1.5-35B-A3B and Qwen3.8-27B load directly (see
+[GGUF support](#gguf-support-main-since-2026-10-29)).
 
 Speculative decoding is faster than plain decoding on Qwen3.8-27B since v1.7 (MTP ~1.5x,
 DFlash2 ~1.7x for one user). On the other models it is not faster yet, so leave it off there.
