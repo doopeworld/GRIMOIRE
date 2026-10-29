@@ -12,6 +12,15 @@ namespace nqes = sycl::ext::intel::esimd;
 // Accumulator lanes: Q4_K has 32-value groups, Q6_K 16-value groups. A row
 // keeps ONE vector accumulator over all its blocks and reduces it once.
 template <Fmt F> constexpr int nq_acc_lanes() { return F == Fmt::Q4_K || F == Fmt::Q5_K ? 32 : 16; }
+// The IQ4_NL / IQ4_XS value table (formats.hpp iq4nl_value) as a register vector, for iselect.
+SYCL_ESIMD_FUNCTION inline nqes::simd<float, 16> nq_iq4_table() {
+    constexpr float v[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                             1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f};
+    nqes::simd<float, 16> t;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) t[i] = v[i];
+    return t;
+}
 template <Fmt F> using nq_acc_t = nqes::simd<float, nq_acc_lanes<F>()>;
 
 // acc += (decoded 256 values of the block at p) * x[xoff .. xoff+255].
@@ -22,8 +31,31 @@ template <Fmt F> using nq_acc_t = nqes::simd<float, nq_acc_lanes<F>()>;
 template <Fmt F, bool ODD, int NX>
 SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
         const uint8_t* p, nqes::simd<float, NX>& x, int xoff, nq_acc_t<F>& acc) {
-    static_assert(F == Fmt::Q4_K || F == Fmt::Q5_K || F == Fmt::Q6_K);
-    if constexpr (F == Fmt::Q5_K) {
+    static_assert(F == Fmt::Q4_K || F == Fmt::Q5_K || F == Fmt::Q6_K || F == Fmt::IQ4_XS);
+    if constexpr (F == Fmt::IQ4_XS) {
+        // IQ4_XS (2026-10-29): 136-byte blocks of 256 -- d (fp16), scales_h (2 bits a sub-block),
+        // scales_l (4 bits a sub-block), then 8 sub-blocks of 32 as 16 bytes each: low nibbles =
+        // values 0..15, high nibbles = 16..31, each an index into the IQ4_NL table (iselect).
+        // Blocks are 8-byte aligned; every load here starts on one.
+        nqes::simd<uint8_t, 8> hdr = nqes::block_load<uint8_t, 8>(p);
+        nqes::simd<uint8_t, 128> qs = nqes::block_load<uint8_t, 128>(p + 8);
+        const float d = float(sycl::bit_cast<sycl::half>(
+            uint16_t(uint32_t(hdr[0]) | (uint32_t(hdr[1]) << 8))));
+        const uint32_t h = uint32_t(hdr[2]) | (uint32_t(hdr[3]) << 8);
+        nqes::simd<float, 16> tab = nq_iq4_table();
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const uint32_t low = (uint32_t(hdr[4 + l / 2]) >> (4 * (l % 2))) & 15;
+            const float sc = d * float(int(low | (((h >> (2 * l)) & 3) << 4)) - 32);
+            nqes::simd<uint16_t, 16> b = qs.template select<16, 1>(16 * l);
+            nqes::simd<uint16_t, 16> i0 = b & 15;
+            nqes::simd<uint16_t, 16> i1 = b >> 4;
+            nqes::simd<float, 16> v0 = tab.iselect(i0);
+            nqes::simd<float, 16> v1 = tab.iselect(i1);
+            acc += (v0 * sc) * x.template select<16, 1>(xoff + 32 * l);
+            acc += (v1 * sc) * x.template select<16, 1>(xoff + 32 * l + 16);
+        }
+    } else if constexpr (F == Fmt::Q5_K) {
         // Q5_K (2026-10-29): Q4_K's header (d, dmin, 12 scale/min bytes), then qh (32 B: bit g of
         // byte l = the fifth bit of value l of sub-block g) and qs (128 B, sub-block 2j in the low
         // nibbles of bytes 32j..32j+31, 2j+1 in the high ones) -- 176-byte blocks, 16-byte aligned.
@@ -201,7 +233,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
 template <Fmt F>
 inline bool native_qk_es_layout_ok(const QuantWeight& w) {
     constexpr int BB = NativeGGUFBlock<F>::bytes;
-    constexpr uintptr_t AL = F == Fmt::Q4_K || F == Fmt::Q5_K ? 16 : 4;
+    constexpr uintptr_t AL = F == Fmt::Q4_K || F == Fmt::Q5_K ? 16 : F == Fmt::IQ4_XS ? 8 : 4;
     return native_qk_fast_weight<F>(w) && w.K % 512 == 0 &&
            w.row_bytes == int64_t(w.K / 256) * BB && w.row_bytes % int64_t(AL) == 0 &&
            reinterpret_cast<uintptr_t>(w.payload) % AL == 0;
@@ -230,6 +262,12 @@ inline bool native_qk_esgemv_try(sycl::queue& q, const QuantWeight& w,
         return !(e && *e == '0'); }();
     if (q5 && w.fmt == Fmt::Q5_K && native_qk_es_layout_ok<Fmt::Q5_K>(w)) {
         out = native_qk_esgemv<Fmt::Q5_K>(q, w, x, y, deps);
+        return true;
+    }
+    static const bool iq4xs = [] { const char* e = std::getenv("GRIMOIRE_GGUF_ESGEMV_IQ4XS");
+        return !(e && *e == '0'); }();
+    if (iq4xs && w.fmt == Fmt::IQ4_XS && native_qk_es_layout_ok<Fmt::IQ4_XS>(w)) {
+        out = native_qk_esgemv<Fmt::IQ4_XS>(q, w, x, y, deps);
         return true;
     }
     return false;
