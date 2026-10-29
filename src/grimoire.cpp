@@ -3111,6 +3111,30 @@ struct Grimoire {
         const std::vector<int>& slots, const std::vector<int>& positions,
         const std::vector<int>& remaining, std::vector<std::vector<int32_t>>& replies,
         std::vector<int>& consumed);
+    // Adaptive MTP draft depth (GRIMOIRE_MTP_ADAPT=1, 2026-10-29): the server's scheduler picks
+    // each row's depth and hands it over as that row's `remaining` (depth + 1), so under TP every
+    // rank drafts the same rows; decode_spec_batch then caps a row at GRIMOIRE_MTP_K_MAX
+    // (default 10) and the whole step at kSpecBatch verify rows instead of an even split.
+    static bool mtp_adaptive() {
+        static const bool on = [] { const char* e = std::getenv("GRIMOIRE_MTP_ADAPT");
+            return e && *e == '1'; }();
+        return on;
+    }
+    static int mtp_depth_max() {
+        static const int k = [] { const char* e = std::getenv("GRIMOIRE_MTP_K_MAX");
+            return std::clamp(e && *e ? std::atoi(e) : 10, 1, 15); }();
+        return k;
+    }
+    // The last decode_spec_batch step, for that scheduler: each row's drafts and accepted
+    // drafts, the head passes, the verify rows, and host-clock times of the three parts (no
+    // sync added: the drafts end on a token read-back, the verify on its tokens, the commit on
+    // sync()).
+    struct SpecLast {
+        std::vector<int> depth, accepted;
+        int passes = 0, rows = 0;
+        bool batched = false;
+        double draft_ms = 0, verify_ms = 0, commit_ms = 0;
+    } spec_last;
 
     // Speculative verification advances every recurrent layer optimistically.
     // Keep one device-side checkpoint so a rejection can restore the exact
@@ -9523,6 +9547,13 @@ long g_spec_batch_steps=0, g_spec_batch_proposals=0, g_spec_batch_accepted=0, g_
 // K=4 63.5 / 69.6, K=5 66.2 / 65.0 tok/s (K=3 was best before the draft
 // position fix and the faster INT4 verify).  vLLM's MTP recipe uses 4 too.
 constexpr int kMtpDefaultDepth = 4;
+// The fixed depth: GRIMOIRE_MTP_K, else kMtpDefaultDepth (what an adaptive scheduler uses
+// until it has measured this machine's step costs).
+static int mtp_fixed_depth() {
+    static const int k = [] { const char* e = std::getenv("GRIMOIRE_MTP_K");
+        return std::clamp(e ? std::atoi(e) : kMtpDefaultDepth, 0, 15); }();
+    return k;
+}
 
 // GRIMOIRE_SPEC_TIMING=1: host wall time of the three parts of a speculative step -- the
 // drafts, the target's verify pass, and the commit (state restore + the drafter's warm
@@ -9543,26 +9574,41 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     using spec_clock=std::chrono::steady_clock;
     spec_clock::time_point st0,st1,st2;
     if(g_spec_timing) { sync(); st0=spec_clock::now(); }
+    const spec_clock::time_point sl0=spec_clock::now();
     init_draft_slots();
     std::vector<int32_t> candidates;
     std::vector<int> candidate_slots, candidate_positions, begin, lengths;
     const char* configured=std::getenv("GRIMOIRE_MTP_K");
+    const bool adapt=mtp_adaptive() && !dflash2.ok;
     const int requested=dflash2.ok?dflash_block_rows()-1:
-        std::clamp(configured?std::atoi(configured):kMtpDefaultDepth,0,15);
-    const int max_depth=std::max(0,std::min(requested,kSpecBatch/n-1));
+        adapt?mtp_depth_max():std::clamp(configured?std::atoi(configured):kMtpDefaultDepth,0,15);
+    const int max_depth=std::max(0,std::min(requested,adapt?kSpecBatch-n:kSpecBatch/n-1));
+    // Every row's depth, once.  Adaptive depths can be uneven, so the step's verify rows are
+    // capped at kSpecBatch here, deepest row first (the later one on a tie) -- the same on every
+    // rank.  With even depths the total already fits and nothing changes.
+    std::vector<int> depths(static_cast<size_t>(n));
+    int total_rows=n;
+    for(int row=0;row<n;++row) {
+        const int p=positions[size_t(row)];
+        depths[size_t(row)]=std::max(0,std::min({max_depth,max_seq-p-1,remaining[size_t(row)]-1}));
+        total_rows+=depths[size_t(row)];
+    }
+    for(;total_rows>kSpecBatch;--total_rows) {
+        int r=0;
+        for(int row=1;row<n;++row) if(depths[size_t(row)]>=depths[size_t(r)]) r=row;
+        --depths[size_t(r)];
+    }
     // Batched drafting (mtp_draft_rows): every row's depth first, then ONE pass of the head
     // per depth over the rows that still draft.  The row loop below drafts only when the
     // head cannot be batched (an MoE head, DFlash, GRIMOIRE_MTP_BATCH_DRAFT=0) or n == 1.
     std::vector<std::vector<int32_t>> drafted;
     bool batched=false;
+    int passes=0;
     if(!dflash2.ok && n>1 && mtp_rows_ready()) {
-        std::vector<int> depth(static_cast<size_t>(n));
+        const std::vector<int>& depth=depths;
         int dmax=0;
-        for(int row=0;row<n;++row) {
-            const int p=positions[size_t(row)];
-            depth[size_t(row)]=std::max(0,std::min({max_depth,max_seq-p-1,remaining[size_t(row)]-1}));
-            dmax=std::max(dmax,depth[size_t(row)]);
-        }
+        for(int row=0;row<n;++row) dmax=std::max(dmax,depth[size_t(row)]);
+        passes=dmax;
         drafted.assign(size_t(n),{});
         batched=true;
         std::vector<int> act, prev, sl, ps;
@@ -9582,6 +9628,7 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
             tout.assign(act.size(),0);
             if(!mtp_draft_rows(int(act.size()),tin.data(),sl.data(),ps.data(),k>0,tout.data())) {
                 batched=false;   // declined before any work: draft row by row instead
+                passes=0;
                 break;
             }
             for(size_t i=0;i<act.size();++i) {
@@ -9595,10 +9642,11 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         sync(); bind_seq_slot(slots[size_t(row)]);
         pos=positions[size_t(row)]; set_cursor(pos);
         q.memcpy(s.h,draft_slots[size_t(seq_slot)].hidden,size_t(cfg.hidden)*sizeof(float));
-        int depth=std::max(0,std::min({max_depth,max_seq-pos-1,remaining[size_t(row)]-1}));
+        int depth=depths[size_t(row)];
         // DFlash always executes its full block, even when only a shorter
         // prefix will be verified. At the context boundary verify the anchor.
         if(dflash2.ok && pos+dflash_block_rows()>max_seq) depth=0;
+        if(!batched && !dflash2.ok) passes+=depth;
         std::vector<int32_t> block{tokens[size_t(row)]};
         if(depth>0) {
             if(dflash2.ok) {
@@ -9629,10 +9677,12 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     std::vector<int32_t> verified;
     spec_hidden_valid=false;
     if(g_spec_timing) { sync(); st1=spec_clock::now(); }
+    const spec_clock::time_point sl1=spec_clock::now();
     if(!prefill(candidates,&verified,&batch,false) ||
        verified.size()!=candidates.size() || !spec_hidden_valid)
         throw std::runtime_error("batched speculative target verification failed");
     if(g_spec_timing) { sync(); st2=spec_clock::now(); }
+    const spec_clock::time_point sl2=spec_clock::now();
     replies.assign(size_t(n),{}); consumed.assign(size_t(n),0);
     const size_t dn_n=size_t(cfg.lin_v_heads)*cfg.lin_v_dim*cfg.lin_k_dim;
     ++g_spec_batch_steps; g_spec_batch_sequences+=n;
@@ -9696,6 +9746,18 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         consumed[size_t(row)]=accepted;
     }
     sync();
+    {
+        const spec_clock::time_point sl3=spec_clock::now();
+        auto msd=[](spec_clock::time_point a,spec_clock::time_point b) {
+            return std::chrono::duration<double,std::milli>(b-a).count(); };
+        spec_last.depth.assign(size_t(n),0); spec_last.accepted.assign(size_t(n),0);
+        for(int row=0;row<n;++row) {
+            spec_last.depth[size_t(row)]=lengths[size_t(row)]-1;
+            spec_last.accepted[size_t(row)]=consumed[size_t(row)]-1;
+        }
+        spec_last.passes=passes; spec_last.rows=int(candidates.size()); spec_last.batched=batched;
+        spec_last.draft_ms=msd(sl0,sl1); spec_last.verify_ms=msd(sl1,sl2); spec_last.commit_ms=msd(sl2,sl3);
+    }
     if(g_spec_timing) {
         const auto st3=spec_clock::now();
         auto ms=[](spec_clock::time_point a,spec_clock::time_point b) {
@@ -20178,7 +20240,8 @@ int grimoire_serve_generate_batch(Grimoire& e,
             // propose past its own budget: decode_spec_batch() bounds
             // draft depth by `remaining - 1`.
             for(size_t k:which)
-                remaining.push_back(rows[k].budget-int(out_ids[rows[k].idx].size()));
+                remaining.push_back(std::min(rows[k].budget-int(out_ids[rows[k].idx].size()),
+                    Grimoire::mtp_adaptive() ? mtp_fixed_depth()+1 : e.max_seq));
             e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
         } else {
             std::vector<int32_t> got;
@@ -20248,6 +20311,10 @@ struct SchedJob {
     bool cancelled = false;         // caller hung up or said stop
     std::string error;
     FinishReason reason = FinishReason::Length;
+    // Scheduler-owned, adaptive MTP depth (GRIMOIRE_MTP_ADAPT=1): how often this conversation's
+    // draft at depth j + 1 was accepted when it was judged (a running mean, then an EMA).
+    double acc_p[16] = {}, acc_n[16] = {};
+    bool acc_init = false;
 };
 } // namespace
 
@@ -20262,7 +20329,116 @@ struct GrimoireScheduler {
     std::thread th;
 
     GrimoireScheduler(Grimoire& eng, int w)
-        : e(eng), width(w), batchable(eng.batch_unsupported_reason().empty()) {}
+        : e(eng), width(w), batchable(eng.batch_unsupported_reason().empty()) {
+        for (double& p : g_p) p = 0.8;
+    }
+
+    // ---- adaptive MTP draft depth (GRIMOIRE_MTP_ADAPT=1, 2026-10-29) -------------------
+    // A fixed depth suits one kind of text on one machine: code accepts deep drafts, prose
+    // does not, and what a head pass costs against a verify row depends on the card, the
+    // draft vocabulary and the link between two cards.  So each step's depths maximise
+    // expected tokens per millisecond: per conversation, how often the draft at each depth
+    // is accepted when it is judged (a new conversation starts from the server-wide figure,
+    // first 0.8); per step, the costs measured here (Grimoire::spec_last, host clock):
+    //   step ms = base + row_ms x verify rows + pass_ms x head passes.
+    // Rank 0 only: the depths reach the other ranks inside `remaining` (depth + 1).
+    double g_p[16], g_n[16] = {};
+    double pass_ms = -1;                              // one head pass (EMA)
+    double cw = 0, cr = 0, ct = 0, crr = 0, crt = 0;  // verify + commit ms against verify rows
+    bool multi_batched = true;                        // a multi-row step drafts in one pass
+    long ad_steps = 0; double ad_depth = 0, ad_rows = 0;
+
+    // Expected tokens of one row at depth k: the anchor plus each draft's chance that it and
+    // every draft before it are accepted.
+    static double expect_tokens(const double* p, int k) {
+        double e = 1, run = 1;
+        for (int j = 0; j < k; ++j) { run *= p[j]; e += run; }
+        return e;
+    }
+    void adapt_plan(const std::vector<std::shared_ptr<SchedJob>>& jobs, const std::vector<int>& poss,
+                    std::vector<int>& remaining) {
+        const int n = int(jobs.size());
+        for (auto& j : jobs)
+            if (!j->acc_init) { std::copy(g_p, g_p + 16, j->acc_p); j->acc_init = true; }
+        if (pass_ms < 0 || cw < 3) {      // costs not measured yet: the fixed depth
+            for (int& r : remaining) r = std::min(r, mtp_fixed_depth() + 1);
+            return;
+        }
+        const double rbar = cr / cw, tbar = ct / cw;
+        const double var = crr / cw - rbar * rbar, cov = crt / cw - rbar * tbar;
+        // the verify slope from the spread of rows seen; 1% of a step per row until there is one
+        const double row_ms = std::clamp(var > 0.25 ? cov / var : 0.01 * tbar, 0.0, 0.2 * tbar);
+        const double base_ms = std::max(0.5 * tbar, tbar - row_ms * rbar);
+        const bool one_pass = n > 1 && multi_batched;
+        auto cost = [&](int rows, int passes) { return base_ms + row_ms * rows + pass_ms * passes; };
+        std::vector<int> k(static_cast<size_t>(n), 0), cap(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            cap[size_t(i)] = std::clamp(std::min({remaining[size_t(i)] - 1, e.max_seq - poss[size_t(i)] - 1,
+                                                  Grimoire::mtp_depth_max()}), 0, 15);
+        int rows = n, passes = 0;
+        double tokens = n, rate = tokens / cost(rows, passes);
+        for (;;) {
+            // one row one draft deeper, or (one pass for all rows) every row that can one pass deeper
+            int best = -1, best_passes = passes, best_rows = rows; double best_rate = rate, best_gain = 0;
+            for (int i = 0; i < n; ++i) {
+                if (k[size_t(i)] >= cap[size_t(i)] || rows + 1 > Grimoire::kSpecBatch) continue;
+                const double gain = expect_tokens(jobs[size_t(i)]->acc_p, k[size_t(i)] + 1) -
+                                    expect_tokens(jobs[size_t(i)]->acc_p, k[size_t(i)]);
+                const int p2 = one_pass ? std::max(passes, k[size_t(i)] + 1) : passes + 1;
+                const double r2 = (tokens + gain) / cost(rows + 1, p2);
+                if (r2 > best_rate) { best = i; best_rate = r2; best_gain = gain; best_passes = p2; best_rows = rows + 1; }
+            }
+            if (one_pass) {
+                double gain = 0; int add = 0;
+                for (int i = 0; i < n; ++i)
+                    if (k[size_t(i)] == passes && k[size_t(i)] < cap[size_t(i)]) {
+                        gain += expect_tokens(jobs[size_t(i)]->acc_p, passes + 1) -
+                                expect_tokens(jobs[size_t(i)]->acc_p, passes);
+                        ++add;
+                    }
+                if (add > 1 && rows + add <= Grimoire::kSpecBatch) {
+                    const double r2 = (tokens + gain) / cost(rows + add, passes + 1);
+                    if (r2 > best_rate) { best = n; best_rate = r2; best_gain = gain; best_passes = passes + 1; best_rows = rows + add; }
+                }
+            }
+            if (best < 0) break;
+            if (best == n) { for (int i = 0; i < n; ++i) if (k[size_t(i)] == passes && k[size_t(i)] < cap[size_t(i)]) ++k[size_t(i)]; }
+            else ++k[size_t(best)];
+            rows = best_rows; passes = best_passes; tokens += best_gain; rate = best_rate;
+        }
+        for (int i = 0; i < n; ++i) remaining[size_t(i)] = std::min(remaining[size_t(i)], k[size_t(i)] + 1);
+    }
+    void adapt_learn(const std::vector<std::shared_ptr<SchedJob>>& jobs) {
+        const auto& sl = e.spec_last;
+        if (sl.depth.size() != jobs.size()) return;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            auto& j = *jobs[i];
+            if (!j.acc_init) { std::copy(g_p, g_p + 16, j.acc_p); j.acc_init = true; }
+            const int d = std::min(sl.depth[i], 16), a = sl.accepted[i];
+            for (int t = 0; t < d && t <= a; ++t) {      // draft t + 1 is judged when all before it passed
+                const double x = t < a ? 1.0 : 0.0;
+                j.acc_n[t] += 1; j.acc_p[t] += (x - j.acc_p[t]) / std::min(j.acc_n[t], 8.0);
+                g_n[t] += 1;     g_p[t] += (x - g_p[t]) / std::min(g_n[t], 64.0);
+            }
+            ad_depth += d;
+        }
+        if (sl.passes > 0) {
+            const double one = sl.draft_ms / sl.passes;
+            pass_ms = pass_ms < 0 ? one : pass_ms + 0.1 * (one - pass_ms);
+        }
+        const double t = sl.verify_ms + sl.commit_ms, r = sl.rows, lam = 0.97;
+        cw = lam * cw + 1; cr = lam * cr + r; ct = lam * ct + t; crr = lam * crr + r * r; crt = lam * crt + r * t;
+        if (jobs.size() > 1) multi_batched = sl.batched;
+        ad_rows += double(jobs.size());
+        if (++ad_steps % 256 == 0) {
+            std::fprintf(stderr, "  MTP adaptive depth: %.2f drafts a row over the last 256 steps (%.2f rows); "
+                         "accepted at depth 1..8 %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; head pass %.2f ms, "
+                         "verify + commit %.1f ms at %.1f rows\n", ad_depth / ad_rows, ad_rows / 256.0,
+                         g_p[0], g_p[1], g_p[2], g_p[3], g_p[4], g_p[5], g_p[6], g_p[7], pass_ms,
+                         ct / std::max(cw, 1e-9), cr / std::max(cw, 1e-9));
+            ad_depth = ad_rows = 0;
+        }
+    }
 
     void submit(const std::shared_ptr<SchedJob>& j) {
         { std::lock_guard<std::mutex> l(m); pending.push_back(j); }
@@ -20682,6 +20858,12 @@ void GrimoireScheduler::run() {
                         std::lock_guard<std::mutex> lock(job->mu);
                         remaining.push_back(job->budget-int(job->ready.size()));
                     }
+                const bool adapt=spec_now && Grimoire::mtp_adaptive() && !e.dflash2.ok;
+                std::vector<std::shared_ptr<SchedJob>> spec_jobs;
+                if(adapt) {
+                    for(size_t k:which) spec_jobs.push_back(active[k]);
+                    adapt_plan(spec_jobs,poss,remaining);
+                }
                 if (e.pp_enabled() || e.tp_ranked()) {
                     // Decided above, sent here: a worker runs the same kind of step
                     // (5 = speculative under Megatron TP + MTP, 3 = plain), or the
@@ -20696,6 +20878,7 @@ void GrimoireScheduler::run() {
                 }
                 if(spec_now) {
                     e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
+                    if(adapt) adapt_learn(spec_jobs);
                 } else if(toks.size()==1 && e.solo_ok()) {
                     const int t=e.decode_solo(toks[0],slots[0],poss[0]);
                     if(t<0) { failed=true; err="decode step failed"; }
