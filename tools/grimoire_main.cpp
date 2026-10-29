@@ -33,6 +33,8 @@ int grimoire_prefill_only(const std::string& dir, Fmt proj_fmt, int max_seq,
                           int n_tokens);
 int grimoire_prefix_cache_test(const std::string& dir, Fmt proj_fmt, int max_seq,
                                int n_tokens);
+int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
+                        const std::string& ids_file, const std::string& out_file);
 }
 
 int main(int argc, char** argv) {
@@ -42,6 +44,7 @@ int main(int argc, char** argv) {
     int n_predict = 128;
     int prefill_only = 0;
     int prefix_cache_test = 0;
+    std::string score_ids, score_out;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -65,6 +68,8 @@ int main(int argc, char** argv) {
         else if ((a == "-n" || a == "--n-predict") && i + 1 < argc) n_predict = std::atoi(argv[++i]);
         else if (a == "--prefill-only" && i + 1 < argc) prefill_only = std::atoi(argv[++i]);
         else if (a == "--prefix-cache-test" && i + 1 < argc) prefix_cache_test = std::atoi(argv[++i]);
+        else if (a == "--score-ids" && i + 1 < argc) score_ids = argv[++i];
+        else if (a == "--score-out" && i + 1 < argc) score_out = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::printf(
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
@@ -76,7 +81,12 @@ int main(int argc, char** argv) {
               "  --ctx    KV cache capacity for the full-attention layers.\n"
               "           The linear layers do not grow with context.\n"
               "  -p       prompt to generate from. Without it, runs benchmarks.\n"
-              "  -n       tokens to generate (default 128).\n");
+              "  -n       tokens to generate (default 128).\n"
+              "  --score-ids FILE --score-out FILE\n"
+              "           feed the token ids in FILE (one per line) one at a time and write\n"
+              "           the logits after each (fp32, vocab per position) -- for comparing\n"
+              "           with a reference.  GRIMOIRE_LM_HEAD_BF16=1 keeps the checkpoint's\n"
+              "           output head instead of converting it to --proj.\n");
 #ifdef GRIMOIRE_NATIVE_ONLY
             std::printf("\n  Standalone native build: external framework bridges disabled.\n");
 #endif
@@ -84,6 +94,12 @@ int main(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::printf("need -m <model_dir>; see --help\n"); return 1; }
+    if (!score_ids.empty() || !score_out.empty()) {
+        if (score_ids.empty() || score_out.empty()) {
+            std::printf("--score-ids and --score-out go together\n"); return 1;
+        }
+        return b70::grimoire_score_dump(model, pf, max_seq, score_ids, score_out);
+    }
     if (prefix_cache_test > 0)
         return b70::grimoire_prefix_cache_test(model, pf, max_seq, prefix_cache_test);
     if (prefill_only > 0)

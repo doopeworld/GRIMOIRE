@@ -6206,10 +6206,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     std::fflush(stdout);
     if((!pp_enabled()||pp_rank==pp_world-1)&&ck.lm_head.ok()&&ck.lm_head.t.shape.size()==2) {
         const int V = int(ck.lm_head.t.shape[0]);
-        // A quantized head (NVFP4 / scaled FP8) must be DECODED even when
-        // the target is bf16 -- the raw copy below is for a bf16 tensor.
-        const bool head_quantized = ck.lm_head.nvfp4 || ck.lm_head.row_scaled ||
-                                    ck.lm_head.block_scaled;
+        // A quantized head must be DECODED even when the target is bf16 -- the raw
+        // copy below is for a plain bf16 tensor only.  MEASURED 2026-10-29: a GPTQ
+        // checkpoint's packed int4 head taken as bf16 (--proj bf16, or
+        // GRIMOIRE_LM_HEAD_BF16=1) gave garbage logits (cosine 0.03 against the
+        // reference); a native artifact's packed head failed the load.  So anything
+        // but plain bf16 -- GPTQ, NVFP4, scaled FP8, native-packed, f16 / f32 -- goes
+        // through the decoder.
+        const bool head_plain_bf16 = ck.lm_head.t.dtype == STDtype::BF16 && !ck.lm_head.gptq &&
+                                     !ck.lm_head.native && !ck.lm_head.nvfp4 &&
+                                     !ck.lm_head.row_scaled && !ck.lm_head.block_scaled;
+        const bool head_quantized = !head_plain_bf16;
         if (!preserve_muse_lm_head && opt.quantize_lm_head &&
             opt.lm_head_fmt != Fmt::BF16) {
             lm_head = quantize_upload_t(q, ck, ck.lm_head, opt.lm_head_fmt, "lm_head", &ok);
@@ -11200,6 +11207,61 @@ int grimoire_prefill_only(const std::string& dir, Fmt proj_fmt, int max_seq,
                     ok ? 1000.0 * n_tokens / ms : 0.0);
         e.release();
         return ok ? 0 : 1;
+    } catch (const sycl::exception& ex) {
+        std::printf("\nSYCL EXCEPTION: %s\n", ex.what()); return 1;
+    }
+}
+
+// Teacher-forced scoring (2026-10-29): the token ids of ids_file (one per line) through the
+// decode path one at a time, the logits after each written to out_file (fp32, vocab floats a
+// position) -- to compare with a reference implementation: logit cosine, KL divergence,
+// top-1 agreement (tools/bench/accuracy).  An outside developer measured a cosine of 0.95 on
+// Qwen3.8-27B.  GRIMOIRE_LM_HEAD_BF16=1 keeps the checkpoint's own output head instead of
+// converting it to --proj (one of the suspects).
+int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
+                        const std::string& ids_file, const std::string& out_file) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::vector<int32_t> ids;
+    if (FILE* f = std::fopen(ids_file.c_str(), "r")) {
+        long v = 0;
+        while (std::fscanf(f, "%ld", &v) == 1) ids.push_back(int32_t(v));
+        std::fclose(f);
+    }
+    if (ids.empty()) { std::printf("score: no token ids in %s\n", ids_file.c_str()); return 1; }
+    const char* hb = std::getenv("GRIMOIRE_LM_HEAD_BF16");
+    const bool head_bf16 = hb && *hb == '1';
+    Grimoire e;
+    UploadOptions opt;
+    opt.lm_head_fmt = proj_fmt;
+    opt.quantize_lm_head = (proj_fmt != Fmt::BF16) && !head_bf16;
+    opt.max_seq = std::max(max_seq, int(ids.size()) + 2);
+    std::string err;
+    try {
+        if (!e.build(dir, opt, err)) {
+            std::printf("\nLOAD FAILED: %s\n", err.c_str()); return 1;
+        }
+        FILE* out = std::fopen(out_file.c_str(), "wb");
+        if (!out) { std::printf("score: cannot write %s\n", out_file.c_str()); return 1; }
+        const int V = e.cfg.vocab;
+        std::vector<float> host(static_cast<size_t>(V));
+        e.reset();
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const float* lg = e.forward(int(ids[i]));       // device logits after token i
+            if (!lg) { std::printf("\nscore: forward failed at position %zu\n", i); std::fclose(out); return 1; }
+            e.q.memcpy(host.data(), lg, size_t(V) * sizeof(float)).wait();
+            if (std::fwrite(host.data(), sizeof(float), size_t(V), out) != size_t(V)) {
+                std::printf("\nscore: write failed\n"); std::fclose(out); return 1;
+            }
+        }
+        std::fclose(out);
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        std::printf("\n  SCORE: %zu positions x %d logits -> %s (%.1f ms; output head %s)\n",
+                    ids.size(), V, out_file.c_str(), ms,
+                    opt.quantize_lm_head ? fmt_name(proj_fmt) : "as in the checkpoint");
+        e.release();
+        return 0;
     } catch (const sycl::exception& ex) {
         std::printf("\nSYCL EXCEPTION: %s\n", ex.what()); return 1;
     }
