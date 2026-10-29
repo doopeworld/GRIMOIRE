@@ -32,6 +32,12 @@
 //   INT4       asymmetric, per-group(128) bf16 scale+zero    4 bit/elem
 //   MXFP8      OCP Microscaling: E4M3 + E8M0 per 32          8.25 bit/elem
 //   MXFP4      OCP Microscaling: E2M1 + E8M0 per 32          4.25 bit/elem
+//   Q4_K       GGUF/ggml 256-element super-block             4.50 bit/elem
+//   Q5_K       GGUF/ggml 256-element super-block             5.50 bit/elem
+//   Q6_K       GGUF/ggml 256-element super-block             6.5625 bit/elem
+//   Q8_0       GGUF/ggml 32-element block                    8.50 bit/elem
+//   IQ4_XS     GGUF/ggml 256-element super-block             4.25 bit/elem
+//   IQ4_NL     GGUF/ggml 32-element block                    4.50 bit/elem
 //
 //  Every format decodes through one of two compute pipelines:
 //    PIPE_INT : INT8 / INT4  -> XMX int8 DPAS, int32 accumulator (2x rate)
@@ -229,7 +235,7 @@ inline uint8_t f32_to_e5m2(float v) {
 // Format enumeration and static traits
 // ---------------------------------------------------------------------
 enum class Fmt : uint8_t {
-    BF16 = 0, FP8_E4M3, FP8_E5M2, INT8, INT4, MXFP8, MXFP4
+    BF16 = 0, FP8_E4M3, FP8_E5M2, INT8, INT4, MXFP8, MXFP4, Q4_K, Q6_K, Q5_K, Q8_0, IQ4_XS, IQ4_NL
 };
 
 enum class Pipe : uint8_t { FLT, INT };   // which XMX datapath consumes it
@@ -283,6 +289,158 @@ template <> struct Traits<Fmt::MXFP4> {
     static constexpr int  bits_per_elem = 4;
     static constexpr const char* name = "mxfp4";
 };
+template <> struct Traits<Fmt::Q4_K> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 4;
+    static constexpr const char* name = "q4_k";
+};
+template <> struct Traits<Fmt::Q6_K> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 6;
+    static constexpr const char* name = "q6_k";
+};
+
+template <> struct Traits<Fmt::Q5_K> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 5;
+    static constexpr const char* name = "q5_k";
+};
+template <> struct Traits<Fmt::Q8_0> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 32, bits_per_elem = 8;
+    static constexpr const char* name = "q8_0";
+};
+template <> struct Traits<Fmt::IQ4_XS> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 256, bits_per_elem = 4;
+    static constexpr const char* name = "iq4_xs";
+};
+template <> struct Traits<Fmt::IQ4_NL> {
+    static constexpr Pipe pipe = Pipe::FLT;
+    static constexpr int block = 32, bits_per_elem = 4;
+    static constexpr const char* name = "iq4_nl";
+};
+
+template <Fmt F> struct NativeGGUFBlock;
+#define B70_NATIVE_GGUF(F, E, B, T, L) template <> struct NativeGGUFBlock<Fmt::F> { \
+    static constexpr int elems = E, bytes = B, type = T, lanes = L; \
+};
+B70_NATIVE_GGUF(Q4_K, 256, 144, 12, 8)
+B70_NATIVE_GGUF(Q5_K, 256, 176, 13, 16)
+B70_NATIVE_GGUF(Q6_K, 256, 210, 14, 16)
+B70_NATIVE_GGUF(Q8_0, 32, 34, 8, 2)
+B70_NATIVE_GGUF(IQ4_XS, 256, 136, 23, 8)
+B70_NATIVE_GGUF(IQ4_NL, 32, 18, 20, 2)
+#undef B70_NATIVE_GGUF
+constexpr bool is_native_gguf(Fmt f) {
+    return f == Fmt::Q4_K || f == Fmt::Q5_K || f == Fmt::Q6_K ||
+           f == Fmt::Q8_0 || f == Fmt::IQ4_XS || f == Fmt::IQ4_NL;
+}
+inline int native_gguf_block_elems(Fmt f) {
+    switch (f) {
+    case Fmt::Q4_K: case Fmt::Q5_K: case Fmt::Q6_K: case Fmt::IQ4_XS: return 256;
+    case Fmt::Q8_0: case Fmt::IQ4_NL: return 32;
+    default: return 0;
+    }
+}
+inline Fmt native_gguf_fmt(uint32_t type) {
+    switch (type) {
+    case 12: return Fmt::Q4_K;
+    case 13: return Fmt::Q5_K;
+    case 14: return Fmt::Q6_K;
+    case 8: return Fmt::Q8_0;
+    case 23: return Fmt::IQ4_XS;
+    case 20: return Fmt::IQ4_NL;
+    default: return Fmt::BF16;
+    }
+}
+inline bool is_native_gguf_type(uint32_t type) { return is_native_gguf(native_gguf_fmt(type)); }
+inline uint32_t native_gguf_type(Fmt f) {
+    switch (f) {
+    case Fmt::Q4_K: return 12;
+    case Fmt::Q5_K: return 13;
+    case Fmt::Q6_K: return 14;
+    case Fmt::Q8_0: return 8;
+    case Fmt::IQ4_XS: return 23;
+    case Fmt::IQ4_NL: return 20;
+    default: return UINT32_MAX;
+    }
+}
+
+// GGML super-blocks carry their own scales. These functions are shared by
+// host tests and device kernels; no side scale array is involved.
+inline float decode_q4_k(const uint8_t* row, int k) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const uint8_t* p = row + (k / 256) * 144;
+    const int group = (k % 256) / 32, i = k % 32;
+    const uint8_t* s = p + 4;
+    int sc, m;
+    if (group < 4) { sc = s[group] & 63; m = s[group + 4] & 63; }
+    else {
+        sc = (s[group + 4] & 15) | ((s[group - 4] >> 2) & 48);
+        m = (s[group + 4] >> 4) | ((s[group] >> 2) & 48);
+    }
+    const float d = f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+    const float dm = f16_to_f32(uint16_t(p[2]) | (uint16_t(p[3]) << 8));
+    const int q = (p[16 + (group / 2) * 32 + i] >> ((group % 2) * 4)) & 15;
+    const float ds = d * float(sc), mins = dm * float(m);
+    return ds * float(q) - mins;
+}
+inline float decode_q6_k(const uint8_t* row, int k) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const uint8_t* p = row + (k / 256) * 210;
+    const int idx = k % 256, half = idx / 128, lane = (idx % 128) / 32, i = idx % 32;
+    const int low = (p[half * 64 + (lane % 2) * 32 + i] >> ((lane / 2) * 4)) & 15;
+    const int high = (p[128 + half * 32 + i] >> (lane * 2)) & 3;
+    const int q = (low | (high << 4)) - 32;
+    const float d = f16_to_f32(uint16_t(p[208]) | (uint16_t(p[209]) << 8));
+    return (d * float(int8_t(p[192 + idx / 16]))) * float(q);
+}
+
+inline int iq4nl_value(int q) {
+    constexpr int values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    return values[q];
+}
+inline float decode_q5_k(const uint8_t* row, int k) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const uint8_t* p = row + (k / 256) * 176;
+    const int g = (k % 256) / 32, i = k % 32;
+    const uint8_t* s = p + 4;
+    int sc, m;
+    if (g < 4) { sc = s[g] & 63; m = s[g + 4] & 63; }
+    else { sc = (s[g + 4] & 15) | ((s[g - 4] >> 2) & 48);
+           m = (s[g + 4] >> 4) | ((s[g] >> 2) & 48); }
+    const float d = f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+    const float dm = f16_to_f32(uint16_t(p[2]) | (uint16_t(p[3]) << 8));
+    const int q = ((p[48 + (g / 2) * 32 + i] >> ((g % 2) * 4)) & 15) |
+                  (((p[16 + i] >> g) & 1) << 4);
+    return (d * float(sc)) * float(q) - dm * float(m);
+}
+inline float decode_q8_0(const uint8_t* row, int k) {
+    const uint8_t* p = row + (k / 32) * 34;
+    return f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8)) * float(int8_t(p[2 + k % 32]));
+}
+inline float decode_iq4_xs(const uint8_t* row, int k) {
+    const uint8_t* p = row + (k / 256) * 136;
+    const int g = (k % 256) / 32, i = k % 32;
+    const int h = int(uint16_t(p[2]) | (uint16_t(p[3]) << 8));
+    const int low = (p[4 + g / 2] >> (4 * (g % 2))) & 15;
+    const int sc = (low | (((h >> (2 * g)) & 3) << 4)) - 32;
+    const int q = (p[8 + g * 16 + i % 16] >> (4 * (i / 16))) & 15;
+    return (f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8)) * float(sc)) * float(iq4nl_value(q));
+}
+inline float decode_iq4_nl(const uint8_t* row, int k) {
+    const uint8_t* p = row + (k / 32) * 18;
+    const int i = k % 32;
+    const int q = (p[2 + i % 16] >> (4 * (i / 16))) & 15;
+    return f16_to_f32(uint16_t(p[0]) | (uint16_t(p[1]) << 8)) * float(iq4nl_value(q));
+}
 
 // ---------------------------------------------------------------------
 // Element decode. `payload` points at the start of the row's packed
@@ -315,6 +473,12 @@ template <> inline float decode_elem<Fmt::MXFP4>(const uint8_t* p, int i, float 
     const uint8_t nib  = (i & 1) ? (byte >> 4) : (byte & 0x0F);
     return e2m1_to_f32(nib) * s;
 }
+template <> inline float decode_elem<Fmt::Q4_K>(const uint8_t* p, int i, float) { return decode_q4_k(p, i); }
+template <> inline float decode_elem<Fmt::Q6_K>(const uint8_t* p, int i, float) { return decode_q6_k(p, i); }
+template <> inline float decode_elem<Fmt::Q5_K>(const uint8_t* p, int i, float) { return decode_q5_k(p, i); }
+template <> inline float decode_elem<Fmt::Q8_0>(const uint8_t* p, int i, float) { return decode_q8_0(p, i); }
+template <> inline float decode_elem<Fmt::IQ4_XS>(const uint8_t* p, int i, float) { return decode_iq4_xs(p, i); }
+template <> inline float decode_elem<Fmt::IQ4_NL>(const uint8_t* p, int i, float) { return decode_iq4_nl(p, i); }
 // INT4 is asymmetric so it needs the zero point too; handled separately.
 inline float decode_int4(const uint8_t* p, int i, float scale, uint8_t zero) {
     const uint8_t byte = p[i >> 1];
@@ -345,6 +509,12 @@ inline int bytes_per_row(Fmt f, int K) {
         case Fmt::INT4:     return K / 2;
         case Fmt::MXFP8:    return K;            // scales in a side array
         case Fmt::MXFP4:    return K / 2;        // scales in a side array
+        case Fmt::Q4_K:     return K % 256 ? 0 : K / 256 * 144;
+        case Fmt::Q6_K:     return K % 256 ? 0 : K / 256 * 210;
+        case Fmt::Q5_K:     return K % 256 ? 0 : K / 256 * 176;
+        case Fmt::IQ4_XS:   return K % 256 ? 0 : K / 256 * 136;
+        case Fmt::Q8_0:     return K % 32 ? 0 : K / 32 * 34;
+        case Fmt::IQ4_NL:   return K % 32 ? 0 : K / 32 * 18;
     }
     return 0;
 }
@@ -352,6 +522,12 @@ inline int bytes_per_row(Fmt f, int K) {
 inline int scales_per_row(Fmt f, int K) {
     switch (f) {
         case Fmt::BF16:     return 0;
+        case Fmt::Q4_K:
+        case Fmt::Q6_K:
+        case Fmt::Q5_K:
+        case Fmt::Q8_0:
+        case Fmt::IQ4_XS:
+        case Fmt::IQ4_NL:   return 0;
         case Fmt::FP8_E4M3:
         case Fmt::FP8_E5M2:
         case Fmt::INT8:     return 1;            // one fp32 per output channel
@@ -371,6 +547,12 @@ inline double bits_per_elem(Fmt f) {
         case Fmt::INT4:     return 4.0 + 24.0 / kInt4Group;   // bf16 scale + u8 zero
         case Fmt::MXFP8:    return 8.0 + 8.0 / kMXBlock;
         case Fmt::MXFP4:    return 4.0 + 8.0 / kMXBlock;
+        case Fmt::Q4_K:     return 4.5;
+        case Fmt::Q6_K:     return 6.5625;
+        case Fmt::Q5_K:     return 5.5;
+        case Fmt::Q8_0:     return 8.5;
+        case Fmt::IQ4_XS:   return 4.25;
+        case Fmt::IQ4_NL:   return 4.5;
     }
     return 0.0;
 }
@@ -384,6 +566,12 @@ inline const char* fmt_name(Fmt f) {
         case Fmt::INT4:     return "int4";
         case Fmt::MXFP8:    return "mxfp8";
         case Fmt::MXFP4:    return "mxfp4";
+        case Fmt::Q4_K:     return "q4_k";
+        case Fmt::Q6_K:     return "q6_k";
+        case Fmt::Q5_K:     return "q5_k";
+        case Fmt::Q8_0:     return "q8_0";
+        case Fmt::IQ4_XS:   return "iq4_xs";
+        case Fmt::IQ4_NL:   return "iq4_nl";
     }
     return "?";
 }

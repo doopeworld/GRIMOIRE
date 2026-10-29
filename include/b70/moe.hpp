@@ -48,7 +48,7 @@
 //  ------
 //  Experts are stored expert-major and contiguous:
 //
-//    gate_up[e]  = [2 * I][H]   gate and up interleaved per expert
+//    gate_up[e]  = [2 * I][H]   gate rows then up rows per expert
 //    down[e]     = [H][I]
 //
 //  so expert e's entire working set is one contiguous run. A routed set
@@ -104,10 +104,14 @@ struct MoeLayer {
     // Bytes streamed for one token, given top_k routed experts. This is
     // the number that has to divide into 608 GB/s.
     double bytes_per_token() const {
-        const double bpe = bits_per_elem(gate_up.fmt) / 8.0;
-        double b = double(cfg.top_k) * 3.0 * double(cfg.hidden) * double(cfg.inter) * bpe;
+        const double gu = bits_per_elem(gate_up.fmt) / 8.0;
+        const double dn = bits_per_elem(down.fmt) / 8.0;
+        double b = double(cfg.top_k) * double(cfg.hidden) * double(cfg.inter) *
+                   (2.0 * gu + dn);
         if (has_shared)
-            b += 3.0 * double(cfg.hidden) * double(cfg.shared_inter) * bpe;
+            b += double(cfg.hidden) * double(cfg.shared_inter) *
+                 (2.0 * bits_per_elem(shared_gate_up.fmt) / 8.0 +
+                  bits_per_elem(shared_down.fmt) / 8.0);
         return b;
     }
 };

@@ -45,6 +45,7 @@
 //  Run:  ./bin/test_qwen4_exp_config
 // =====================================================================
 #include "b70/qwen35.hpp"
+#include <unistd.h>
 #include "b70/qwen4_exp.hpp"
 #include <cstdio>
 #include <filesystem>
@@ -143,9 +144,9 @@ int main() {
     std::printf("reference: ref/qwen4_exp_config.py (vLLM), which inherits\n");
     std::printf("Qwen3NextConfig -- the base IS supported, the rest is not.\n\n");
 
-    char tmpl[] = "/tmp/grimoire-q4x-XXXXXX";
-    if (!::mkdtemp(tmpl)) { std::printf("mkdtemp failed\n"); return 1; }
-    const fs::path root = tmpl;
+    const fs::path root = fs::temp_directory_path() /
+        ("grimoire-q4x-" + std::to_string(::getpid()));
+    fs::create_directory(root);
 
     const fs::path d = root / "q4x";
     write_stub(d, config());

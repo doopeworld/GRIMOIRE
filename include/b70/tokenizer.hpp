@@ -45,6 +45,7 @@
 #include <cstdint>
 
 namespace b70 {
+class GGUFFile;
 
 // One function call of an assistant turn, arguments in their order with each
 // value as the template prints it (a string as is, anything else as JSON).
@@ -70,15 +71,27 @@ struct ChatOptions {
 class Tokenizer {
 public:
     bool load(const std::string& dir, std::string& err);
+    bool load_gguf(const GGUFFile& file, std::string& err);
 
     std::vector<int32_t> encode(const std::string& text, bool add_special = false) const;
     std::string decode(const std::vector<int32_t>& ids) const;
     std::string decode_one(int32_t id) const;
 
     int32_t bos() const { return bos_; }
+    bool add_bos_token() const { return add_bos_token_; }
+    bool add_eos_token() const { return add_eos_token_; }
     int32_t eos() const { return eos_; }
+    int32_t unk() const { return unk_; }
+    int32_t pad() const { return pad_; }
+    int32_t mask() const { return mask_; }
+    const std::vector<int32_t>& suppress_tokens() const { return suppress_tokens_; }
     size_t  vocab_size() const { return id_to_tok_.size(); }
+    const std::string& raw_token(size_t id) const { return id_to_tok_.at(id); }
     size_t  merge_count() const { return merge_rank_.size(); }
+    int32_t merge_rank(const std::string& merge) const {
+        auto it=merge_rank_.find(merge);
+        return it==merge_rank_.end() ? -1 : it->second;
+    }
     size_t  bad_merges()  const { return bad_merges_; }
     bool    has_merge(const std::string& a, const std::string& b) const {
         return merge_rank_.count(a + " " + b) != 0;
@@ -122,6 +135,19 @@ private:
     std::unordered_map<std::string, int32_t>     special_by_text_;
 
     int32_t bos_ = -1, eos_ = -1, eos2_ = -1;
+    bool add_bos_token_ = false;
+    bool add_eos_token_ = false;
+    bool sentencepiece_ = false;
+    bool gemma4_bpe_ = false; // raw UTF-8 BPE with ▁ spaces and byte fallback
+    bool qwen2_pre_ = false;  // Qwen2 regex distinguishes Unicode letters and marks
+    bool nfc_normalize_ = false;
+    std::vector<int32_t> gemma4_word(const std::string& text) const;
+    std::string gemma4_chat(const std::vector<ChatMessage>& messages, bool thinking) const;
+    bool spm_add_prefix_ = true;
+    int32_t unk_ = -1, eot_ = -1, pad_ = -1, mask_ = -1;
+    std::vector<int32_t> suppress_tokens_;
+    std::vector<int32_t> token_type_;
+    std::vector<float> scores_;
     size_t  bad_merges_ = 0;
     // read from the checkpoint's chat template (chat_template.jinja or
     // tokenizer_config.json), see apply_chat_template
@@ -134,7 +160,9 @@ private:
     std::unordered_map<std::string, uint8_t> uni_to_byte_;
 
     void build_byte_tables();
+    void set_chat_family(const std::string& tmpl);
     std::vector<std::string> bpe_word(const std::string& word) const;
+    std::vector<int32_t> spm_word(const std::string& text) const;
 
     // Splits text the way the checkpoint's Split regex does. Without it
     // whole phrases arrive at BPE as one chunk, no merge matches, and

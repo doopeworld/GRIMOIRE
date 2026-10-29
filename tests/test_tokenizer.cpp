@@ -21,6 +21,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <fstream>
+#include <cstdlib>
+#include <unistd.h>
 using namespace b70;
 static int fails = 0;
 #define CHECK(c, ...) do { if(!(c)){ std::printf("  FAIL "); std::printf(__VA_ARGS__); \
@@ -28,9 +31,31 @@ static int fails = 0;
 
 int main(int argc, char** argv) {
     std::printf("=== tokenizer ===\n\n");
+    {
+        char dir[] = "/tmp/grimoire-tokenizer-XXXXXX";
+        CHECK(::mkdtemp(dir) != nullptr, "cannot create tokenizer fixture");
+        const std::string root(dir);
+        { std::ofstream f(root + "/tokenizer.json");
+          f << R"({"model":{"vocab":{"a":0},"merges":[]},"added_tokens":[{"id":1,"content":"<s>","special":true}]})"; }
+        { std::ofstream f(root + "/tokenizer_config.json");
+          f << R"({"add_bos_token":true,"bos_token":"<s>"})"; }
+        Tokenizer yes; std::string err;
+        CHECK(yes.load(root,err) && yes.add_bos_token() && yes.bos()==1,
+              "configured BOS was not resolved: %s", err.c_str());
+        CHECK(yes.encode("a") == std::vector<int32_t>{0},
+              "raw encode unexpectedly inserted BOS");
+        { std::ofstream f(root + "/tokenizer_config.json");
+          f << R"({"add_bos_token":false,"bos_token":"<s>"})"; }
+        Tokenizer no; err.clear();
+        CHECK(no.load(root,err) && !no.add_bos_token(),
+              "configured no-BOS was ignored: %s", err.c_str());
+        ::unlink((root + "/tokenizer.json").c_str());
+        ::unlink((root + "/tokenizer_config.json").c_str());
+        ::rmdir(root.c_str());
+    }
     if (argc < 2) {
         std::printf("  no model dir given; skipping (usage: test_tokenizer <dir>)\n");
-        return 0;
+        return fails ? 1 : 0;
     }
     Tokenizer tk;
     std::string err;
@@ -76,6 +101,13 @@ int main(int argc, char** argv) {
         const std::string p = tk.apply_chat_template("Hi");
         auto ids = tk.encode(p);
         CHECK(!ids.empty(), "chat template encoded to nothing");
+        const int32_t im_start = tk.special_id("<|im_start|>");
+        if (im_start >= 0) {
+            CHECK(!ids.empty() && ids.front() == im_start,
+                  "chat template did not start with <|im_start|>");
+            CHECK(tk.encode("<|im_start|>") == std::vector<int32_t>{im_start},
+                  "special token was split by the pre-tokenizer");
+        }
         std::printf("  chat template: %zu tokens, first id %d\n",
                     ids.size(), ids.empty() ? -1 : ids[0]);
     }

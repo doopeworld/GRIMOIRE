@@ -36,6 +36,8 @@
 #define B70_GEMV_STEP_HPP
 
 #include "kernels.hpp"
+#include "b70/native_qk_gemv.hpp"
+#include <cstdlib>
 
 namespace b70 {
 
@@ -49,6 +51,28 @@ namespace b70 {
 // table is built once per work-group into SLM (1 KB) and stays resident.
 template <Fmt F, int EPL>
 struct GemvStep;
+
+template <Fmt F, int EPL> struct GemvStepGGUF {
+    static inline float run(const QuantWeight&, const uint8_t* row,
+                            const float* x, const float*, const float*, const float*, int, int k0) {
+        if constexpr (F == Fmt::Q5_K) {
+            return native_qk_scalar_step<F, EPL>(row, x, k0);
+        } else {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPL; ++i)
+                acc = sycl::fma(decode_elem<F>(row, k0 + i, 1.0f), x[k0 + i], acc);
+            return acc;
+        }
+    }
+};
+template <int EPL> struct GemvStep<Fmt::Q4_K, EPL> : GemvStepGGUF<Fmt::Q4_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q6_K, EPL> : GemvStepGGUF<Fmt::Q6_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q5_K, EPL> : GemvStepGGUF<Fmt::Q5_K, EPL> {};
+template <int EPL> struct GemvStep<Fmt::Q8_0, EPL> : GemvStepGGUF<Fmt::Q8_0, EPL> {};
+template <int EPL> struct GemvStep<Fmt::IQ4_XS, EPL> : GemvStepGGUF<Fmt::IQ4_XS, EPL> {};
+template <int EPL> struct GemvStep<Fmt::IQ4_NL, EPL> : GemvStepGGUF<Fmt::IQ4_NL, EPL> {};
+
 
 template <int EPL> struct GemvStep<Fmt::BF16, EPL> {
     static inline float run(const QuantWeight& w, const uint8_t* row,

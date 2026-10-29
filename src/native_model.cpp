@@ -52,7 +52,8 @@ bool elements(const NativeTensorRecord& r, uint64_t& n) {
 }
 size_t scale_element_bytes(Fmt f) {
     switch (f) {
-    case Fmt::BF16: return 0;
+    case Fmt::BF16: case Fmt::Q4_K: case Fmt::Q6_K: case Fmt::Q5_K: case Fmt::Q8_0:
+    case Fmt::IQ4_XS: case Fmt::IQ4_NL: return 0;
     case Fmt::FP8_E4M3: case Fmt::FP8_E5M2: case Fmt::INT8: return 4;
     case Fmt::INT4: return 2;
     case Fmt::MXFP8: case Fmt::MXFP4: return 1;
@@ -68,6 +69,9 @@ NativeEncoding native_encoding(Fmt f) {
     case Fmt::FP8_E4M3: return NativeEncoding::FP8_E4M3_CHANNEL;
     case Fmt::FP8_E5M2: return NativeEncoding::FP8_E5M2_CHANNEL;
     case Fmt::INT8: return NativeEncoding::INT8_CHANNEL;
+    case Fmt::Q4_K: case Fmt::Q6_K: case Fmt::Q5_K: case Fmt::Q8_0:
+    case Fmt::IQ4_XS: case Fmt::IQ4_NL:
+        throw std::invalid_argument("native artifact does not encode GGUF blocks");
     }
     throw std::invalid_argument("unknown weight format");
 }

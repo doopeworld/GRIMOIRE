@@ -23,8 +23,64 @@ test-correctness: bin/test_generation bin/test_http
 	./bin/test_generation
 	./bin/test_http
 
-HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp
-tools: bin/grimoire-quantize bin/inspect_native_model
+HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp
+tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect bin/tok_dump
+
+GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
+GGUF_DECODE_HEADERS = include/b70/gguf.hpp include/b70/gguf_decode.hpp src/gguf_decode_grids.hpp
+
+.PHONY: test_gguf test_gguf_asan gguf_inspect
+bin/test_gguf: tests/test_gguf.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf.cpp $(GGUF_SRC) -o $@
+
+bin/test_gguf_qwen35: tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) include/b70/gguf_qwen35.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_qwen35.cpp $(HOST_MODEL_SRC) -o $@
+
+bin/test_gguf_qwen3: tests/test_gguf_qwen3.cpp $(HOST_MODEL_SRC) src/moe_ref.cpp include/b70/gguf_qwen35.hpp include/b70/unicode_marks.hpp include/b70/unicode_nfc.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_qwen3.cpp $(HOST_MODEL_SRC) src/moe_ref.cpp -o $@
+
+bin/test_qwen3_prefill_math: tests/test_qwen3_prefill_math.cpp include/b70/prefill_qk_math.hpp include/b70/qwen35.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+bin/test_gguf_gemma4: tests/test_gguf_gemma4.cpp $(HOST_MODEL_SRC) include/b70/gguf_qwen35.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_gemma4.cpp $(HOST_MODEL_SRC) -o $@
+
+.PHONY: test_gguf_gemma4
+test_gguf_gemma4: bin/test_gguf_gemma4
+	./bin/test_gguf_gemma4
+
+.PHONY: test_gguf_qwen35
+test_gguf_qwen35: bin/test_gguf_qwen35
+	./bin/test_gguf_qwen35
+
+bin/test_gguf_native: tests/test_gguf_native.cpp $(HOST_MODEL_SRC) include/b70/weights.hpp include/b70/native_model.hpp include/b70/gguf_qwen35.hpp include/b70/native_qk_gemv.hpp include/b70/native_qk_tile.hpp include/b70/native_qk_vector_math.hpp include/b70/formats.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tests/test_gguf_native.cpp $(HOST_MODEL_SRC) -o $@
+
+.PHONY: test_gguf_native
+test_gguf_native: bin/test_gguf_native
+	./bin/test_gguf_native
+
+test_gguf: bin/test_gguf
+	./bin/test_gguf
+
+bin/test_gguf_asan: tests/test_gguf.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
+	@mkdir -p bin
+	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_gguf.cpp $(GGUF_SRC) -o $@
+
+test_gguf_asan: bin/test_gguf_asan
+	./bin/test_gguf_asan
+
+bin/gguf_inspect: tools/gguf_inspect.cpp $(GGUF_SRC) $(GGUF_DECODE_HEADERS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) tools/gguf_inspect.cpp $(GGUF_SRC) -o $@
+
+gguf_inspect: bin/gguf_inspect
 
 bin/grimoire-quantize: tools/b70_compile_model.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
 	@mkdir -p bin
@@ -98,18 +154,46 @@ bin/test_qwen4_exp_config: tests/test_qwen4_exp_config.cpp $(HOST_MODEL_SRC) $(w
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
-bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp
+bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
+bin/test_tokenizer_golden: tests/test_tokenizer_golden.cpp src/tokenizer.cpp src/gguf.cpp include/b70/tokenizer.hpp include/b70/json.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+bin/test_gguf_tokenizer: tests/test_gguf_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp include/b70/tokenizer.hpp include/b70/gguf.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+bin/test_kld: tests/test_kld.cpp include/b70/kld.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+bin/tok_dump: tools/tok_dump.cpp src/tokenizer.cpp src/gguf.cpp include/b70/tokenizer.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
+.PHONY: tok_dump
+tok_dump: bin/tok_dump
+
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_gguf_qwen3 bin/test_qwen3_prefill_math bin/test_gguf_gemma4 bin/test_gguf_native bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gguf_tokenizer bin/test_kld bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
+	@echo ""; echo "=========== gguf ==========="; ./bin/test_gguf
+	@echo ""; echo "=========== gguf qwen35 ==========="; ./bin/test_gguf_qwen35
+	@echo ""; echo "=========== gguf qwen3 ==========="; ./bin/test_gguf_qwen3
+	@echo ""; echo "=========== qwen3 prefill math ==========="; ./bin/test_qwen3_prefill_math
+	@echo ""; echo "=========== gguf gemma4 ==========="; ./bin/test_gguf_gemma4
+	@echo ""; echo "=========== gguf native ==========="; ./bin/test_gguf_native
 	@echo ""; echo "=========== moe ==========="; ./bin/test_moe
 	@echo ""; echo "=========== deltanet ==========="; ./bin/test_deltanet
 	@echo ""; echo "=========== ops ==========="; ./bin/test_ops
 	@echo ""; echo "=========== tokenizer ==========="; ./bin/test_tokenizer
+	@echo ""; echo "=========== tokenizer HF goldens ==========="; ./bin/test_tokenizer_golden
+	@echo ""; echo "=========== GGUF synthetic SPM ==========="; ./bin/test_gguf_tokenizer
+	@echo ""; echo "=========== KLD ==========="; ./bin/test_kld
 	@echo ""; echo "=========== gptq ==========="; ./bin/test_gptq
 	@echo ""; echo "=========== k2-horizon ==========="; ./bin/test_k2_horizon
 	@echo ""; echo "=========== k2-config ==========="; ./bin/test_k2_config
@@ -134,7 +218,7 @@ COMMA := ,
 NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
-NATIVE_SRC = grimoire qwen35_loader native_model safetensors quantize gptq \
+NATIVE_SRC = grimoire qwen35_loader native_model safetensors gguf gguf_decode gguf_qwen35 quantize gptq \
  gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer
 NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
 

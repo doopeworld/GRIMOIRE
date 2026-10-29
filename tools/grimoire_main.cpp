@@ -24,6 +24,7 @@
 #include <cstring>
 #include <string>
 #include <cstdlib>
+#include <climits>
 
 namespace b70 {
 int grimoire_load_report(const std::string& dir, Fmt proj_fmt, int max_seq);
@@ -35,22 +36,39 @@ int grimoire_prefix_cache_test(const std::string& dir, Fmt proj_fmt, int max_seq
                                int n_tokens);
 int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
                         const std::string& ids_file, const std::string& out_file);
+int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
+                       const std::string& path, int ctx, int chunks,
+                       const std::string& dump, bool selfcheck,
+                       const std::string& kld_base);
 }
 
 int main(int argc, char** argv) {
     std::string model, prompt;
     b70::Fmt pf = b70::Fmt::INT4;
+    bool proj_explicit = false;
     int max_seq = 8192;
     int n_predict = 128;
     int prefill_only = 0;
     int prefix_cache_test = 0;
     std::string score_ids, score_out;
+    std::string ppl_file, ppl_dump, ppl_kld_base;
+    int ppl_ctx = 0, ppl_chunks = 0;
+    bool ppl_selfcheck = false;
+    bool ppl_option = false, ctx_given = false;
+    auto positive = [](const char* value, int& out) {
+        char* end = nullptr;
+        const long n = std::strtol(value, &end, 10);
+        if (!*value || *end || n <= 0 || n > INT_MAX) return false;
+        out = int(n);
+        return true;
+    };
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "-m" && i + 1 < argc) model = argv[++i];
+        if ((a == "-m" || a == "--model") && i + 1 < argc) model = argv[++i];
         else if (a == "--proj" && i + 1 < argc) {
             const std::string v = argv[++i];
+            proj_explicit = true;
             if      (v == "int4")  pf = b70::Fmt::INT4;
             else if (v == "int8")  pf = b70::Fmt::INT8;
             else if (v == "mxfp4") pf = b70::Fmt::MXFP4;
@@ -58,24 +76,38 @@ int main(int argc, char** argv) {
             else if (v == "fp8" || v == "fp8_e4m3") pf = b70::Fmt::FP8_E4M3;
             else if (v == "fp8_e5m2") pf = b70::Fmt::FP8_E5M2;
             else if (v == "bf16")  pf = b70::Fmt::BF16;
+            else if (v == "native") { pf = b70::Fmt::MXFP4; setenv("GRIMOIRE_GGUF_NATIVE","1",1); }
             else {
                 std::fprintf(stderr, "unknown --proj format: %s\n", v.c_str());
                 return 1;
             }
         }
-        else if (a == "--ctx" && i + 1 < argc) max_seq = std::atoi(argv[++i]);
+        else if (a == "--ctx" && i + 1 < argc) { max_seq = std::atoi(argv[++i]); ctx_given = true; }
         else if ((a == "-p" || a == "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if ((a == "-n" || a == "--n-predict") && i + 1 < argc) n_predict = std::atoi(argv[++i]);
         else if (a == "--prefill-only" && i + 1 < argc) prefill_only = std::atoi(argv[++i]);
         else if (a == "--prefix-cache-test" && i + 1 < argc) prefix_cache_test = std::atoi(argv[++i]);
         else if (a == "--score-ids" && i + 1 < argc) score_ids = argv[++i];
         else if (a == "--score-out" && i + 1 < argc) score_out = argv[++i];
+        else if (a == "--ppl" && i + 1 < argc) ppl_file = argv[++i];
+        else if (a == "--ppl-kld-base" && i + 1 < argc) { ppl_kld_base = argv[++i]; ppl_option = true; }
+        else if (a == "--ppl-ctx" && i + 1 < argc) {
+            ppl_option = true;
+            if (!positive(argv[++i], ppl_ctx)) { std::fprintf(stderr, "--ppl-ctx must be positive\n"); return 1; }
+        }
+        else if (a == "--ppl-chunks" && i + 1 < argc) {
+            ppl_option = true;
+            if (!positive(argv[++i], ppl_chunks)) { std::fprintf(stderr, "--ppl-chunks must be positive\n"); return 1; }
+        }
+        else if (a == "--ppl-dump" && i + 1 < argc) { ppl_dump = argv[++i]; ppl_option = true; }
+        else if (a == "--ppl-selfcheck") { ppl_selfcheck = true; ppl_option = true; }
         else if (a == "-h" || a == "--help") {
             std::printf(
               "grimoire -- bare-metal inference for Intel Arc Pro (Battlemage)\n\n"
-              "  grimoire -m <model_dir> [--proj FORMAT] [--ctx N]\n\n"
-              "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16\n"
+              "  grimoire -m <model_dir_or_gguf> [--proj FORMAT] [--ctx N]\n\n"
+              "  FORMAT   int4, int8, mxfp4, mxfp8, fp8_e4m3, fp8_e5m2, bf16, native (GGUF)\n"
               "  --proj   format for projections converted from safetensors at load.\n"
+              "           native keeps GGUF Q4_K/Q6_K; other projections use MXFP4.\n"
               "           Native v3 artifacts preserve their saved formats.\n"
               "           Use grimoire-quantize to choose formats offline.\n"
               "  --ctx    KV cache capacity for the full-attention layers.\n"
@@ -87,18 +119,44 @@ int main(int argc, char** argv) {
               "           the logits after each (fp32, vocab per position) -- for comparing\n"
               "           with a reference.  GRIMOIRE_LM_HEAD_BF16=1 keeps the checkpoint's\n"
               "           output head instead of converting it to --proj.\n");
+            std::printf("  --ppl FILE          raw-text perplexity (no chat template).\n"
+                        "  --ppl-kld-base FILE compare against llama-perplexity base log-probs; --ppl FILE optional.\n"
+                        "  --ppl-ctx N         tokens per chunk (default 512, or base file's n_ctx).\n"
+                        "  --ppl-chunks C      score at most C complete chunks.\n"
+                        "  --ppl-dump FILE     per-token TSV logits summary.\n"
+                        "  --ppl-selfcheck     compare last scored logits with prefill.\n");
 #ifdef GRIMOIRE_NATIVE_ONLY
             std::printf("\n  Standalone native build: external framework bridges disabled.\n");
 #endif
             return 0;
         }
     }
-    if (model.empty()) { std::printf("need -m <model_dir>; see --help\n"); return 1; }
+    const char* gguf_native = std::getenv("GRIMOIRE_GGUF_NATIVE");
+    if (gguf_native && std::strcmp(gguf_native, "1") == 0) {
+        if (proj_explicit && pf != b70::Fmt::MXFP4) {
+            std::fprintf(stderr, "native GGUF requires --proj native or mxfp4 for other tensors\n");
+            return 1;
+        }
+        pf = b70::Fmt::MXFP4;
+    }
+    if (model.empty()) { std::printf("need -m/--model <model_dir_or_gguf>; see --help\n"); return 1; }
     if (!score_ids.empty() || !score_out.empty()) {
         if (score_ids.empty() || score_out.empty()) {
             std::printf("--score-ids and --score-out go together\n"); return 1;
         }
         return b70::grimoire_score_dump(model, pf, max_seq, score_ids, score_out);
+    }
+    if (!ppl_file.empty() || !ppl_kld_base.empty()) {
+        if ((ppl_ctx && ppl_ctx < 4) || ctx_given || !prompt.empty() || prefill_only || prefix_cache_test ||
+            n_predict != 128) {
+            std::fprintf(stderr, "--ppl needs --ppl-ctx >= 4 and cannot combine with --ctx, generation, or benchmark modes\n");
+            return 1;
+        }
+        return b70::grimoire_perplexity(model, pf, ppl_file, ppl_ctx ? ppl_ctx : (ppl_kld_base.empty() ? 512 : 0),
+                                        ppl_chunks, ppl_dump, ppl_selfcheck, ppl_kld_base);
+    }
+    if (ppl_option) {
+        std::fprintf(stderr, "--ppl-* requires --ppl FILE or --ppl-kld-base FILE\n"); return 1;
     }
     if (prefix_cache_test > 0)
         return b70::grimoire_prefix_cache_test(model, pf, max_seq, prefix_cache_test);

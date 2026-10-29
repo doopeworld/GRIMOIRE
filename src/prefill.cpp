@@ -34,6 +34,7 @@
 // =====================================================================
 #include "kernels.hpp"
 #include "gemv_step.hpp"
+#include "b70/prefill_qk_math.hpp"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -136,6 +137,12 @@ sycl::event launch_gemm_batched(sycl::queue& q, const QuantWeight& w,
         case Fmt::INT4:     return gemm_batched_impl<Fmt::INT4, 16>(q, w, x, y, M, deps);
         case Fmt::MXFP8:    return gemm_batched_impl<Fmt::MXFP8, 16>(q, w, x, y, M, deps);
         case Fmt::MXFP4:    return gemm_batched_impl<Fmt::MXFP4, 16>(q, w, x, y, M, deps);
+        case Fmt::Q4_K:     return gemm_batched_impl<Fmt::Q4_K, 16>(q, w, x, y, M, deps);
+        case Fmt::Q6_K:     return gemm_batched_impl<Fmt::Q6_K, 16>(q, w, x, y, M, deps);
+        case Fmt::Q5_K:     return gemm_batched_impl<Fmt::Q5_K, 16>(q, w, x, y, M, deps);
+        case Fmt::Q8_0:     return gemm_batched_impl<Fmt::Q8_0, 16>(q, w, x, y, M, deps);
+        case Fmt::IQ4_XS:     return gemm_batched_impl<Fmt::IQ4_XS, 16>(q, w, x, y, M, deps);
+        case Fmt::IQ4_NL:     return gemm_batched_impl<Fmt::IQ4_NL, 16>(q, w, x, y, M, deps);
     }
     return {};
 }
@@ -535,7 +542,6 @@ sycl::event launch_rmsnorm_residual_batched(
         return launch_rmsnorm_grouped(q, h, r0, r1, weight, out, out_bf,
                                       tokens, hidden, g_norm_groups, eps,
                                       g_norm_weight_offset, deps);
-    (void)weight_offset;
     constexpr int WG = 256;
     // Rows up to 32 * WG wide keep each thread's elements in registers: every load is
     // issued up front and the second pass does not re-read h.  Same elements per thread
@@ -640,7 +646,7 @@ sycl::event launch_rmsnorm_residual_batched(
                 for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
                 const float scale = sycl::rsqrt(total / float(hidden) + eps);
                 for (int i = lid; i < hidden; i += WG) {
-                    const float v=ht[i]*scale*(weight_offset+bf16_to_f32(weight[i]));
+                    const float v=ht[i]*scale*prefill_norm_weight(bf16_to_f32(weight[i]),weight_offset);
                     if(ot)ot[i]=v;if(obt)obt[i]=sycl_bf16(v);
                 }
             });
@@ -914,6 +920,7 @@ sycl::event launch_rmsnorm_residual_batched_quant(
     int8_t* out_q, float* out_scale, int tokens, int hidden, float eps,
     const std::vector<sycl::event>& deps) {
     constexpr int WG=256, NSG=WG/SG_SIZE;
+    const float norm_offset = g_norm_weight_offset;
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);
         sycl::local_accessor<float,1> partial(2*NSG,hd);
@@ -934,7 +941,7 @@ sycl::event launch_rmsnorm_residual_batched_quant(
             float total=0.0f;for(int i=0;i<NSG;++i)total+=pt[i];
             const float rs=sycl::rsqrt(total/float(hidden)+eps);
             float mx=0.0f;
-            for(int i=lid;i<hidden;i+=WG){float v=ht[i]*rs*(1.0f+bf16_to_f32(weight[i]));
+            for(int i=lid;i<hidden;i+=WG){float v=ht[i]*rs*prefill_norm_weight(bf16_to_f32(weight[i]),norm_offset);
                 if(out)out[int64_t(t)*hidden+i]=v;if(out_bf)out_bf[int64_t(t)*hidden+i]=sycl_bf16(v);
                 mx=sycl::fmax(mx,sycl::fabs(v));}
             mx=sycl::reduce_over_group(sg,mx,sycl::maximum<float>());
@@ -954,6 +961,7 @@ sycl::event launch_rmsnorm_moe_residual_batched(sycl::queue& q,float* h,
     const float* shared,const bf16_t* weight,float* out,sycl_bf16* out_bf,
     int tokens,int top_k,int hidden,float eps,const std::vector<sycl::event>&deps){
     constexpr int WG=256,EPI=8;
+    const float norm_offset = g_norm_weight_offset;
     return q.submit([&](sycl::handler&hd){hd.depends_on(deps);
       sycl::local_accessor<float,1> partial(WG/SG_SIZE,hd);
       hd.parallel_for(sycl::nd_range<1>(size_t(tokens)*WG,WG),
@@ -984,7 +992,7 @@ sycl::event launch_rmsnorm_moe_residual_batched(sycl::queue& q,float* h,
         const float scale=sycl::rsqrt(total/float(hidden)+eps);
         float* ot=out?out+int64_t(t)*hidden:nullptr;
         sycl_bf16* obt=out_bf?out_bf+int64_t(t)*hidden:nullptr;
-        for(int d=lid;d<hidden;d+=WG){const float v=ht[d]*scale*(1.0f+bf16_to_f32(weight[d]));
+        for(int d=lid;d<hidden;d+=WG){const float v=ht[d]*scale*prefill_norm_weight(bf16_to_f32(weight[d]),norm_offset);
           if(ot)ot[d]=v;if(obt)obt[d]=sycl_bf16(v);}
        });});
 }
@@ -1184,8 +1192,8 @@ sycl::event launch_qk_norm_rope_batched(
                 const int h0 = gh % heads_per_token;
                 const bool isq = h0 < q_heads;
                 const int hi = isq ? h0 : h0 - q_heads;
-                float* p = isq ? qv + (int64_t(t) * q_heads + hi) * dim
-                               : kv + (int64_t(t) * k_heads + hi) * dim;
+                float* p = isq ? qv + prefill_head_offset(t, hi, q_heads, dim)
+                               : kv + prefill_head_offset(t, hi, k_heads, dim);
                 const bf16_t* w = isq ? qw : kw;
                 if (w) {    // null weight = no q/k norm (K2-Horizon): RoPE only
                     float ss = 0.0f;
@@ -1194,7 +1202,7 @@ sycl::event launch_qk_norm_rope_batched(
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
                     const float scale = sycl::rsqrt(ss / float(dim) + eps);
                     for (int d = lane; d < dim; d += SG_SIZE)
-                        p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                        p[d] *= scale * prefill_norm_weight(bf16_to_f32(w[d]), weight_offset);
                 }
                 sycl::group_barrier(sg);
                 const int pos = start_pos + t;
@@ -1203,8 +1211,7 @@ sycl::event launch_qk_norm_rope_batched(
                     const float ang = float(pos) * inv;
                     const float cs = sycl::cos(ang), sn = sycl::sin(ang);
                     const float a = p[j], b = p[j + rot / 2];
-                    p[j] = a * cs - b * sn;
-                    p[j + rot / 2] = a * sn + b * cs;
+                    prefill_rope_pair(a, b, cs, sn, p[j], p[j + rot / 2]);
                 }
             });
     });
@@ -1234,9 +1241,9 @@ sycl::event launch_qk_norm_rope_batched_qg(
                 const int h0 = gh % heads_per_token;
                 const bool isq = h0 < q_heads;
                 const int hi = isq ? h0 : h0 - q_heads;
-                float* p = isq ? qdst + (int64_t(t) * q_heads + hi) * dim
-                               : kv + (int64_t(t) * k_heads + hi) * dim;
-                const float* src = isq ? qg + (int64_t(t) * q_heads + hi) * 2 * dim : p;
+                float* p = isq ? qdst + prefill_head_offset(t, hi, q_heads, dim)
+                               : kv + prefill_head_offset(t, hi, k_heads, dim);
+                const float* src = isq ? qg + prefill_head_offset(t, hi, q_heads, 2 * dim) : p;
                 const bf16_t* w = isq ? qw : kw;
                 if (w) {    // null weight = no q/k norm: copy, RoPE only
                     float ss = 0.0f;
@@ -1245,7 +1252,7 @@ sycl::event launch_qk_norm_rope_batched_qg(
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
                     const float scale = sycl::rsqrt(ss / float(dim) + eps);
                     for (int d = lane; d < dim; d += SG_SIZE)
-                        p[d] = src[d] * (scale * (weight_offset + bf16_to_f32(w[d])));
+                        p[d] = src[d] * (scale * prefill_norm_weight(bf16_to_f32(w[d]), weight_offset));
                 } else {
                     for (int d = lane; d < dim; d += SG_SIZE) p[d] = src[d];
                 }
@@ -1256,8 +1263,7 @@ sycl::event launch_qk_norm_rope_batched_qg(
                     const float ang = float(pos) * inv;
                     const float cs = sycl::cos(ang), sn = sycl::sin(ang);
                     const float a = p[j], b = p[j + rot / 2];
-                    p[j] = a * cs - b * sn;
-                    p[j + rot / 2] = a * sn + b * cs;
+                    prefill_rope_pair(a, b, cs, sn, p[j], p[j + rot / 2]);
                 }
             });
     });
@@ -2246,26 +2252,27 @@ sycl::event launch_split_qgate_bf16(sycl::queue&q,const sycl_bf16*src,
 sycl::event launch_qk_norm_rope_bf16_batched(sycl::queue&q,sycl_bf16*qv,
     sycl_bf16*kv,const bf16_t*qw,const bf16_t*kw,int tokens,int q_heads,
     int k_heads,int dim,int start_pos,float theta,float partial_factor,float eps,
-    const std::vector<sycl::event>&deps){
+    const std::vector<sycl::event>&deps,float weight_offset){
  const int rot=int(dim*partial_factor)&~1,hpt=q_heads+k_heads;
  return q.submit([&](sycl::handler&h){h.depends_on(deps);
   h.parallel_for(sycl::nd_range<1>(size_t(tokens)*hpt*SG_SIZE,SG_SIZE),
    [=](sycl::nd_item<1>it)[[sycl::reqd_sub_group_size(SG_SIZE)]]{
     auto sg=it.get_sub_group();int lane=int(sg.get_local_id()[0]);
     int gh=int(it.get_group(0)),t=gh/hpt,h0=gh%hpt;bool isq=h0<q_heads;
-    int hi=isq?h0:h0-q_heads;sycl_bf16*p=isq?qv+(int64_t(t)*q_heads+hi)*dim:
-      kv+(int64_t(t)*k_heads+hi)*dim;const bf16_t*w=isq?qw:kw;float ss=0;
+    int hi=isq?h0:h0-q_heads;sycl_bf16*p=isq?qv+prefill_head_offset(t,hi,q_heads,dim):
+      kv+prefill_head_offset(t,hi,k_heads,dim);const bf16_t*w=isq?qw:kw;float ss=0;
     for(int d=lane;d<dim;d+=SG_SIZE){float v=float(p[d]);ss=sycl::fma(v,v,ss);}
     ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
     // null weight = no q/k norm (K2-Horizon): factor 1, RoPE only
     float scale=w?sycl::rsqrt(ss/float(dim)+eps):1.0f;int pos=start_pos+t;
-    auto nf=[&](int d){return w?scale*(1.0f+bf16_to_f32(w[d])):1.0f;};
+    auto nf=[&](int d){return w?scale*prefill_norm_weight(bf16_to_f32(w[d]),weight_offset):1.0f;};
     for(int j=lane;j<rot/2;j+=SG_SIZE){
       float a=float(p[j])*nf(j);
       float b=float(p[j+rot/2])*nf(j+rot/2);
       float inv=sycl::exp(-float(2*j)/float(rot)*sycl::log(theta));
       float ang=float(pos)*inv,cs=sycl::cos(ang),sn=sycl::sin(ang);
-      p[j]=sycl_bf16(a*cs-b*sn);p[j+rot/2]=sycl_bf16(a*sn+b*cs);}
+      float first,second;prefill_rope_pair(a,b,cs,sn,first,second);
+      p[j]=sycl_bf16(first);p[j+rot/2]=sycl_bf16(second);}
     for(int d=rot+lane;d<dim;d+=SG_SIZE)
       p[d]=sycl_bf16(float(p[d])*nf(d));
    });});

@@ -46,6 +46,7 @@
 #ifdef GRIMOIRE_WITH_ONEDNN
 #include "onednn_gemm.hpp"
 #endif
+#include "b70/native_qk_tile.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -408,11 +409,18 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::MXFP4:    return dequant_vnni<Fmt::MXFP4>(q, w, dst, deps, ldn);
             case Fmt::INT8:     return dequant_vnni<Fmt::INT8>(q, w, dst, deps, ldn);
             case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps, ldn);
+            case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps, ldn);
+            case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps, ldn);
+            case Fmt::Q5_K:     return dequant_vnni<Fmt::Q5_K>(q, w, dst, deps, ldn);
+            case Fmt::Q8_0:     return dequant_vnni<Fmt::Q8_0>(q, w, dst, deps, ldn);
+            case Fmt::IQ4_XS:     return dequant_vnni<Fmt::IQ4_XS>(q, w, dst, deps, ldn);
+            case Fmt::IQ4_NL:     return dequant_vnni<Fmt::IQ4_NL>(q, w, dst, deps, ldn);
         }
         return {};
     }
     static const bool no_stream = std::getenv("GRIMOIRE_DEQUANT_TILED") != nullptr;
-    if (!no_stream && w.fmt == Fmt::MXFP4 && w.K % 128 == 0 && w.N % 256 == 0)
+    if (!no_stream && w.fmt == Fmt::MXFP4 && w.payload && w.scales &&
+        w.K % 128 == 0 && w.N % 256 == 0)
         return dequant_mxfp4_stream(q, w, dst, deps);
     if (!no_stream && int4_stream_ok(w))
         return dequant_int4_stream(q, w, dst, deps);
@@ -425,6 +433,12 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
             case Fmt::MXFP4:    return dequant_vnni_tiled<Fmt::MXFP4>(q, w, dst, deps);
             case Fmt::INT8:     return dequant_vnni_tiled<Fmt::INT8>(q, w, dst, deps);
             case Fmt::INT4:     return dequant_vnni_tiled<Fmt::INT4>(q, w, dst, deps);
+            case Fmt::Q4_K:     return dequant_vnni_tiled<Fmt::Q4_K>(q, w, dst, deps);
+            case Fmt::Q6_K:     return dequant_vnni_tiled<Fmt::Q6_K>(q, w, dst, deps);
+            case Fmt::Q5_K:     return dequant_vnni_tiled<Fmt::Q5_K>(q, w, dst, deps);
+            case Fmt::Q8_0:     return dequant_vnni_tiled<Fmt::Q8_0>(q, w, dst, deps);
+            case Fmt::IQ4_XS:     return dequant_vnni_tiled<Fmt::IQ4_XS>(q, w, dst, deps);
+            case Fmt::IQ4_NL:     return dequant_vnni_tiled<Fmt::IQ4_NL>(q, w, dst, deps);
         }
     }
     switch (w.fmt) {
@@ -435,6 +449,12 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
         case Fmt::MXFP4:    return dequant_vnni<Fmt::MXFP4>(q, w, dst, deps);
         case Fmt::INT8:     return dequant_vnni<Fmt::INT8>(q, w, dst, deps);
         case Fmt::INT4:     return dequant_vnni<Fmt::INT4>(q, w, dst, deps);
+        case Fmt::Q4_K:     return dequant_vnni<Fmt::Q4_K>(q, w, dst, deps);
+        case Fmt::Q6_K:     return dequant_vnni<Fmt::Q6_K>(q, w, dst, deps);
+        case Fmt::Q5_K:     return dequant_vnni<Fmt::Q5_K>(q, w, dst, deps);
+        case Fmt::Q8_0:     return dequant_vnni<Fmt::Q8_0>(q, w, dst, deps);
+        case Fmt::IQ4_XS:     return dequant_vnni<Fmt::IQ4_XS>(q, w, dst, deps);
+        case Fmt::IQ4_NL:     return dequant_vnni<Fmt::IQ4_NL>(q, w, dst, deps);
     }
     return {};
 }
@@ -1338,7 +1358,7 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
 // e*Ne + ..., and writes the same rows of the output.  The per-tile math
 // is gemm_mxfp4_fused's, unchanged.
 // ---------------------------------------------------------------------
-template <int EPI>
+template <int EPI, Fmt F = Fmt::MXFP4>
 sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
                                      const sycl_bf16* A, void* out,
                                      const int32_t* tile_e, const int32_t* tile_mb,
@@ -1371,6 +1391,8 @@ sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int N
             const int L = int(it.get_group(0));
             const int t = L / nNB, nb = L % nNB;
             const int e = tile_e[t], mb = tile_mb[t];
+            // Device-built tile tables pad unused entries with expert -1.
+            if constexpr (F != Fmt::MXFP4) { if (e < 0) return; }
             const int M = cnt[e];
             const int64_t rbase = off[e];
             const int s = lid / SG_SIZE, sm = s / SGN, sn = s % SGN;
@@ -1384,20 +1406,42 @@ sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int N
                 : nb * NC2 + dn;
             const int64_t grow = int64_t(e) * Ne + wrow;
             const uint8_t* prow = wc.payload + grow * wc.row_bytes;
-            const uint8_t* srow = static_cast<const uint8_t*>(wc.scales) + grow * wc.row_scales;
             uint32_t* bs = Bs.template get_multi_ptr<sycl::access::decorated::no>().get();
-            uint64_t pk = 0; uint8_t sb = 0;
+            uint64_t pk = 0; uint8_t sb = 0; int qk = 0;
+            float qk_scales[16], qk_mins[8];
+            int qk_block = -1;
             auto fetch = [&](int k) {
                 const int kb = k + dh * 16;
-                pk = *reinterpret_cast<const uint64_t*>(prow + (kb >> 1));
-                sb = srow[kb / kMXBlock];
+                if constexpr (F == Fmt::MXFP4) {
+                    const uint8_t* srow = static_cast<const uint8_t*>(wc.scales) + grow * wc.row_scales;
+                    pk = *reinterpret_cast<const uint64_t*>(prow + (kb >> 1));
+                    sb = srow[kb / kMXBlock];
+                } else {
+                    qk = kb;
+                    const int block = kb / NativeGGUFBlock<F>::elems;
+                    if (block != qk_block) {
+                        native_qk_block_scales<F>(
+                            prow + block * NativeGGUFBlock<F>::bytes,
+                            qk_scales, qk_mins);
+                        qk_block = block;
+                    }
+                }
             };
             auto decode = [&](int buf) {
-                const float sc = e8m0_to_f32(sb);
                 uint32_t* d = bs + buf * BT + dh * (KP / 2) * NC2 + dn;
-                #pragma unroll
-                for (int p = 0; p < 8; ++p)
-                    d[p * NC2] = mxfp4_pair_bf16(uint32_t(pk >> (8 * p)) & 0xFFu, sc);
+                if constexpr (F == Fmt::MXFP4) {
+                    const float sc = e8m0_to_f32(sb);
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                        d[p * NC2] = mxfp4_pair_bf16(uint32_t(pk >> (8 * p)) & 0xFFu, sc);
+                } else {
+                    float v[16];
+                    native_qk_tile_16_scaled<F>(prow, qk, qk_scales, qk_mins, v);
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                        d[p * NC2] = uint32_t(sycl::bit_cast<uint16_t>(bf16_rne(v[2 * p]))) |
+                            (uint32_t(sycl::bit_cast<uint16_t>(bf16_rne(v[2 * p + 1]))) << 16);
+                }
             };
             auto bcol = [&](int n) {
                 return EPI == 1 ? (n < 2 ? sn * (NC1 / 2) + n * TN
@@ -1540,7 +1584,7 @@ const uint32_t* mxfp4_pair_lut(sycl::queue& q) {
     return lut;
 }
 
-template <int EPI>
+template <int EPI, Fmt F = Fmt::MXFP4>
 sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const sycl_bf16* A,
                             void* out, const int32_t* tile_e, const int32_t* tile_mb,
                             const int32_t* off, const int32_t* cnt, int T,
@@ -1551,7 +1595,9 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
     constexpr int STEP = 4 * CG * 2 * 512;        // bytes of dequantized B per 128 K
     constexpr int NC = 4 * CG / TPW;              // dequant (MX block, group) pairs per thread
     static_assert(NC * TPW == 4 * CG, "dequant pairs must split evenly");
-    const uint32_t* lut = mxfp4_pair_lut(q);
+    const uint32_t* lut = F == Fmt::MXFP4 ? mxfp4_pair_lut(q) : nullptr;
+    constexpr int TWN = F == Fmt::MXFP4 ? 64 : 128;     // payload dwords per pair
+    constexpr int SWN = F == Fmt::MXFP4 ? 16 : 64;      // scale / header dwords per pair
     const int K = w.K, FI = Ne / 2, Wrows = w.N;
     const int nG = EPI == 1 ? FI / (16 * TNT) : Ne / (32 * TNT);
     const uint8_t* pay = w.payload;
@@ -1579,7 +1625,7 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
             const int t = g / nG, ng = g % nG;
             const int e = tile_e[t];
             if (e < 0) return;                        // padding of a device-built table
-            if (lid < 8)
+            if (F == Fmt::MXFP4 && lid < 8)
                 es::slm_block_store<uint32_t, 32>(lid * 128, es::block_load<uint32_t, 32>(lut + lid * 32));
             const int ti = lid / TNT, tj = lid % TNT;
             const int M = cnt[e];
@@ -1592,14 +1638,14 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
             const sycl_bf16* Ae = A + size_t(off[e]) * K;
             const unsigned AW = unsigned(K) * 2 - 1, AH = unsigned(M) - 1;
             const uint32_t* payw = reinterpret_cast<const uint32_t*>(pay);
-            const unsigned PW = unsigned(K) / 2 - 1, PH = unsigned(Wrows) - 1;
+            const unsigned PW = F == Fmt::MXFP4 ? unsigned(K) / 2 - 1 : unsigned(w.row_bytes) - 1, PH = unsigned(Wrows) - 1;
             const uint32_t* sclw = reinterpret_cast<const uint32_t*>(scl);
             const es::simd<uint32_t, 16> iv(0, 1);
             es::barrier();                            // table staged
             es::simd<float, 4 * 2 * 128> acc = 0.0f;
             const int nsteps = K / 128;
-            es::simd<uint32_t, 64 * NC> tw;           // payload [4 dwords][16 rows] per pair
-            es::simd<uint32_t, 16 * NC> sw;           // scale dwords (4 MX blocks) per pair
+            es::simd<uint32_t, TWN * NC> tw;          // payload [dwords][16 rows] per pair
+            es::simd<uint32_t, SWN * NC> sw;          // MX: scale dwords; native: block header [4 dwords][16 rows]
             // (lambdas are not allowed in ESIMD kernels)
             #define MOE_ESIMD_FETCH(st)                                                        \
             {                                                                              \
@@ -1610,13 +1656,28 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
                     const int nbc = ng * TNT + (cg >> 1);                                  \
                     const int rh = e * Ne + (EPI == 1 ? ((cg & 1) ? FI : 0) + nbc * 16     \
                                                       : nbc * 32 + (cg & 1) * 16);         \
-                    tw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>( \
-                        payw, PW, PH, PP, (k1 + 32 * mxc) / 8, rh);                        \
-                    sw.template select<16, 1>(16 * i) = es::gather<uint32_t, 16>(sclw,     \
-                        (iv + unsigned(rh)) * SB + unsigned(k1 / 32));                     \
-                    if (PFD > 0 && mxc == 0 && (st) + PFD < nsteps)                        \
-                        es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP,                \
-                            ((st) + PFD) * 16, rh, PFH);                                   \
+                    if constexpr (F == Fmt::MXFP4) {                                       \
+                        tw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>( \
+                            payw, PW, PH, PP, (k1 + 32 * mxc) / 8, rh);                    \
+                        sw.template select<16, 1>(16 * i) = es::gather<uint32_t, 16>(sclw, \
+                            (iv + unsigned(rh)) * SB + unsigned(k1 / 32));                 \
+                        if (PFD > 0 && mxc == 0 && (st) + PFD < nsteps)                    \
+                            es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP,            \
+                                ((st) + PFD) * 16, rh, PFH);                               \
+                    } else {                                                               \
+                        /* Q4_K: 144-byte blocks; step st = half (st&1) of block st/2.     \
+                           32 quant bytes of group pair mxc>>1, plus the 16 B header. */   \
+                        const int qoff = ((k1 >> 8) * 144 + 16 + 64 * ((k1 >> 7) & 1) + 32 * (mxc >> 1)) >> 2; \
+                        tw.template select<128, 1>(128 * i) = es::load_2d<uint32_t, 8, 16, 1, true, false>( \
+                            payw, PW, PH, PP, qoff, rh);                                   \
+                        sw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>( \
+                            payw, PW, PH, PP, ((k1 >> 8) * 144) >> 2, rh);                 \
+                        if (PFD > 0 && mxc == 0 && (st) + PFD < nsteps) {                  \
+                            const int kn = ((st) + PFD) * 128;                             \
+                            es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP,            \
+                                ((kn >> 8) * 144 + 16 + 64 * ((kn >> 7) & 1)) >> 2, rh, PFH); \
+                        }                                                                  \
+                    }                                                                      \
                 }                                                                          \
             }
             MOE_ESIMD_FETCH(0)
@@ -1653,29 +1714,80 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
                     #pragma unroll
                     for (int i = 0; i < NC; ++i) {
                         const int cidx = lid + i * TPW, mxc = cidx / CG, cg = cidx % CG;
-                        es::simd<uint32_t, 16> ev =
-                            (es::simd<uint32_t, 16>(sw.template select<16, 1>(16 * i)) >> (8 * mxc)) & 0xFFu;
-                        es::simd<uint32_t, 16> sb = ev << 23;
-                        sb.merge(es::simd<uint32_t, 16>(0x00400000u), ev == 0u);
-                        const es::simd<float, 16> s16 = sb.template bit_cast_view<float>().read();
                         es::simd<uint32_t, 256> vb;           // [K half][8 k-pairs][16 cols]
-                        #pragma unroll
-                        for (int hk = 0; hk < 2; ++hk) {
+                        if constexpr (F == Fmt::MXFP4) {
+                            es::simd<uint32_t, 16> ev =
+                                (es::simd<uint32_t, 16>(sw.template select<16, 1>(16 * i)) >> (8 * mxc)) & 0xFFu;
+                            es::simd<uint32_t, 16> sb = ev << 23;
+                            sb.merge(es::simd<uint32_t, 16>(0x00400000u), ev == 0u);
+                            const es::simd<float, 16> s16 = sb.template bit_cast_view<float>().read();
                             #pragma unroll
-                            for (int kp = 0; kp < 8; ++kp) {
-                                const int dw = 2 * hk + (kp >> 2);
-                                es::simd<uint32_t, 16> wx = tw.template select<16, 1>(64 * i + dw * 16);
-                                const int j = kp & 3;
-                                es::simd<uint32_t, 16> addr;
-                                if (j == 0) addr = (wx << 2) & 0x3FCu;
-                                else        addr = (wx >> (8 * j - 2)) & 0x3FCu;
-                                es::simd<uint32_t, 16> p = es::slm_gather<uint32_t, 16>(addr);
-                                es::simd<uint32_t, 16> lo = p << 16, hi = p & 0xFFFF0000u;
-                                es::simd<float, 16> lof = lo.template bit_cast_view<float>().read() * s16;
-                                es::simd<float, 16> hif = hi.template bit_cast_view<float>().read() * s16;
-                                vb.template select<16, 1>((hk * 8 + kp) * 16) =
-                                    hif.template bit_cast_view<uint32_t>().read() |
-                                    (lof.template bit_cast_view<uint32_t>().read() >> 16);
+                            for (int hk = 0; hk < 2; ++hk) {
+                                #pragma unroll
+                                for (int kp = 0; kp < 8; ++kp) {
+                                    const int dw = 2 * hk + (kp >> 2);
+                                    es::simd<uint32_t, 16> wx = tw.template select<16, 1>(64 * i + dw * 16);
+                                    const int j = kp & 3;
+                                    es::simd<uint32_t, 16> addr;
+                                    if (j == 0) addr = (wx << 2) & 0x3FCu;
+                                    else        addr = (wx >> (8 * j - 2)) & 0x3FCu;
+                                    es::simd<uint32_t, 16> p = es::slm_gather<uint32_t, 16>(addr);
+                                    es::simd<uint32_t, 16> lo = p << 16, hi = p & 0xFFFF0000u;
+                                    es::simd<float, 16> lof = lo.template bit_cast_view<float>().read() * s16;
+                                    es::simd<float, 16> hif = hi.template bit_cast_view<float>().read() * s16;
+                                    vb.template select<16, 1>((hk * 8 + kp) * 16) =
+                                        hif.template bit_cast_view<uint32_t>().read() |
+                                        (lof.template bit_cast_view<uint32_t>().read() >> 16);
+                                }
+                            }
+                        } else {
+                            // Q4_K group g = 4*(step&1) + mxc of this 256-block.
+                            const int g = 4 * ((s + 1) & 1) + mxc;
+                            const int nsel = mxc & 1;
+                            es::simd<uint32_t, 16> h0 = sw.template select<16, 1>(64 * i);
+                            es::simd<uint32_t, 16> w1 = sw.template select<16, 1>(64 * i + 16);
+                            es::simd<uint32_t, 16> w2 = sw.template select<16, 1>(64 * i + 32);
+                            es::simd<uint32_t, 16> w3 = sw.template select<16, 1>(64 * i + 48);
+                            es::simd<uint32_t, 16> scq, mnq;
+                            if (g < 4) {
+                                scq = (w1 >> (8 * g)) & 63u;
+                                mnq = (w2 >> (8 * g)) & 63u;
+                            } else {
+                                const int sh = 8 * (g - 4);
+                                scq = ((w3 >> sh) & 15u) | (((w1 >> sh) >> 2) & 48u);
+                                mnq = (((w3 >> sh) >> 4) & 15u) | (((w2 >> sh) >> 2) & 48u);
+                            }
+                            es::simd<uint16_t, 16> dh = h0.template bit_cast_view<uint16_t>().template select<16, 2>(0);
+                            es::simd<uint16_t, 16> mh = h0.template bit_cast_view<uint16_t>().template select<16, 2>(1);
+                            es::simd<float, 16> dfl = dh.template bit_cast_view<sycl::half>().read();
+                            es::simd<float, 16> mfl = mh.template bit_cast_view<sycl::half>().read();
+                            es::simd<float, 16> scf = dfl * es::convert<float>(scq);
+                            es::simd<float, 16> mnf = mfl * es::convert<float>(mnq);
+                            #pragma unroll
+                            for (int P = 0; P < 16; ++P) {
+                                es::simd<uint32_t, 16> wx = tw.template select<16, 1>(128 * i + (P >> 1) * 16);
+                                const int sh0 = 16 * (P & 1);
+                                es::simd<uint32_t, 16> q0 = (wx >> (sh0 + 4 * nsel)) & 15u;
+                                es::simd<uint32_t, 16> q1 = (wx >> (sh0 + 8 + 4 * nsel)) & 15u;
+#ifdef NQ_EXPERIMENT_SKIP
+                                vb.template select<16, 1>(P * 16) = q0 | (q1 << 16);
+                                continue;
+#endif
+                                es::simd<float, 16> f0 = es::convert<float>(q0) * scf - mnf;
+                                es::simd<float, 16> f1 = es::convert<float>(q1) * scf - mnf;
+#ifdef NQ_MANUAL_RNE
+                                es::simd<uint32_t, 16> u0 = f0.template bit_cast_view<uint32_t>().read();
+                                es::simd<uint32_t, 16> u1 = f1.template bit_cast_view<uint32_t>().read();
+                                es::simd<uint32_t, 16> r0 = (u0 + 0x7FFFu + ((u0 >> 16) & 1u)) >> 16;
+                                es::simd<uint32_t, 16> r1 = (u1 + 0x7FFFu + ((u1 >> 16) & 1u)) & 0xFFFF0000u;
+                                vb.template select<16, 1>(P * 16) = r1 | r0;
+#else
+                                // hardware float -> bf16 conversion (RNE), packed [lo=k even | hi=k odd]
+                                es::simd<sycl_bf16, 32> pk;
+                                pk.template select<16, 2>(0) = es::simd<sycl_bf16, 16>(f0);
+                                pk.template select<16, 2>(1) = es::simd<sycl_bf16, 16>(f1);
+                                vb.template select<16, 1>(P * 16) = pk.template bit_cast_view<uint32_t>().read();
+#endif
                             }
                         }
                         es::slm_block_store<uint32_t, 256>(base + unsigned((mxc * CG + cg) * 2) * 512u, vb);
@@ -1902,6 +2014,20 @@ bool moe_esimd_ok(const QuantWeight& w, int Ne, bool swiglu) {
            (swiglu ? (Ne / 2) % 32 == 0 : Ne % 64 == 0);
 }
 
+bool moe_native_esimd_grouped_ok(const QuantWeight& w, int Ne, bool swiglu) {
+    static const bool on = [] {
+        const char* v = std::getenv("GRIMOIRE_MOE_NATIVE_ESIMD_GROUPED");
+        return !(v && *v == '0');
+    }();
+    static const bool esimd_on = [] {
+        const char* v = std::getenv("GRIMOIRE_MOE_ESIMD");
+        return !(v && *v == '0');
+    }();
+    return on && esimd_on && w.fmt == Fmt::Q4_K && w.payload && !w.scales && !w.zeros &&
+           w.K % 256 == 0 && w.row_bytes == int64_t(w.K / 256) * 144 && w.row_bytes % 16 == 0 &&
+           (swiglu ? (Ne / 2) % 32 == 0 : Ne % 64 == 0);
+}
+
 // Opt-in (GRIMOIRE_FAST_GEMM_FUSED=1).  MEASURED 2026-09-25, Qwen3.8-27B,
 // 4088 tokens: correct (identical text) but 1.65x SLOWER than dequantize +
 // gemm_bf16_vnni (prefill 4.49 s vs 3.14 s): B fragments from SLM plus a
@@ -1918,6 +2044,39 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 // Grouped MoE entry points (see gemm_mxfp4_fused_grouped).  The host builds
 // the m-tile table in units of moe_grouped_rows() rows per tile.
 int moe_grouped_rows() { return MC2; }
+bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne) {
+    return is_native_gguf(w.fmt) && w.payload &&
+           !w.scales && !w.zeros && Ne > 0 && Ne % NC2 == 0 &&
+           w.K > 0 && w.K % native_gguf_block_elems(w.fmt) == 0 && w.N % Ne == 0 &&
+           w.row_bytes == bytes_per_row(w.fmt, w.K);
+}
+sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+                                         bool swiglu, const sycl_bf16* A, void* out,
+                                         const int32_t* tile_e, const int32_t* tile_mb,
+                                         const int32_t* off, const int32_t* cnt, int T,
+                                         const std::vector<sycl::event>& deps) {
+    if (!moe_native_qk_grouped_supported(w, Ne))
+        throw std::runtime_error("launch_moe_native_qk_grouped: unsupported native QK weight or shape");
+    // Q4_K: ESIMD tile (same structure as the MXFP4 kernel: B tile decoded once
+    // per work-group into SLM, DPAS from SLM). GRIMOIRE_MOE_NATIVE_ESIMD_GROUPED=0
+    // (or GRIMOIRE_MOE_ESIMD=0) selects the joint_matrix reference kernel.
+    if (w.fmt == Fmt::Q4_K && moe_native_esimd_grouped_ok(w, Ne, swiglu))
+        return swiglu ? moe_mxfp4_esimd<1, Fmt::Q4_K>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
+                      : moe_mxfp4_esimd<0, Fmt::Q4_K>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);
+#define B70_GROUPED_NATIVE(F) case Fmt::F: \
+    return swiglu ? gemm_mxfp4_fused_grouped<1, Fmt::F>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps) \
+                  : gemm_mxfp4_fused_grouped<0, Fmt::F>(q,w,Ne,A,out,tile_e,tile_mb,off,cnt,T,deps)
+    switch (w.fmt) {
+    B70_GROUPED_NATIVE(Q4_K);
+    B70_GROUPED_NATIVE(Q5_K);
+    B70_GROUPED_NATIVE(Q6_K);
+    B70_GROUPED_NATIVE(Q8_0);
+    B70_GROUPED_NATIVE(IQ4_XS);
+    B70_GROUPED_NATIVE(IQ4_NL);
+    default: throw std::runtime_error("unknown native GGUF format");
+    }
+#undef B70_GROUPED_NATIVE
+}
 // Upload the ESIMD MoE kernels' byte -> bf16 table now: its first use waits
 // on the queue, which a queue recording a command graph refuses.
 void moe_esimd_warmup(sycl::queue& q) { (void)mxfp4_pair_lut(q); }

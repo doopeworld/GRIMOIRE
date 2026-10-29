@@ -31,6 +31,7 @@
 #include <limits>
 #include "kernels.hpp"
 #include "b70/int8_embedding.hpp"
+#include "gemv_step.hpp"
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -42,7 +43,8 @@ namespace b70 {
 // The norm convention for the loaded model, set once by Grimoire::build.
 // K2 takes the variance per contiguous group and applies the weight
 // DIRECTLY (its parameter is initialised to ones); Qwen3.5 takes it over
-// the whole row and applies (1 + w).  Holding it here rather than at ~60
+// the whole row and applies (1 + w); Qwen3 uses plain w. Holding it here
+// rather than at ~60
 // call sites means a path cannot silently keep the wrong one.
 int   g_norm_groups = 1;
 float g_norm_weight_offset = 1.0f;
@@ -856,6 +858,7 @@ sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                                 float partial_factor, float eps,
                                 const std::vector<sycl::event>& deps) {
     const int rot = int(dim * partial_factor) & ~1;
+    const float weight_offset = g_norm_weight_offset;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(q_heads + k_heads) * SG_SIZE, SG_SIZE),
@@ -876,7 +879,7 @@ sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
                     const float scale = sycl::rsqrt(ss / float(dim) + eps);
                     for (int i = lane; i < dim; i += SG_SIZE)
-                        p[i] *= scale * (1.0f + bf16_to_f32(w[i]));
+                        p[i] *= scale * (weight_offset + bf16_to_f32(w[i]));
                 }
                 sycl::group_barrier(sg);
                 const int pos = *d_pos;
@@ -897,6 +900,7 @@ sycl::event launch_rmsnorm_heads(sycl::queue& q, float* x, const bf16_t* w,
                                  int n_heads, int dim, float eps,
                                  bool zero_centered,
                                  const std::vector<sycl::event>& deps = {}) {
+    const float weight_offset = zero_centered ? g_norm_weight_offset : 0.0f;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(
@@ -914,7 +918,7 @@ sycl::event launch_rmsnorm_heads(sycl::queue& q, float* x, const bf16_t* w,
                 //   RMSNorm       (q/k norms) init zeros -> (1 + w) * x
                 for (int i = lane; i < dim; i += SG_SIZE) {
                     const float wv = bf16_to_f32(w[i]);
-                    p[i] = p[i] * s * (zero_centered ? (1.0f + wv) : wv);
+                    p[i] = p[i] * s * (weight_offset + wv);
                 }
             });
     });
@@ -2162,6 +2166,11 @@ static sycl::event mova_value_packed_impl(
         int M, int N, int E, int top_k,
         const std::vector<sycl::event>& deps) {
     const int K = w.K;
+    const bool fast = [&] {
+        if constexpr (is_native_gguf(F))
+            return native_qk_fast_weight<F>(w);
+        return false;
+    }();
     constexpr int WG = 128;
     const size_t total  = size_t(M) * size_t(N);
     const size_t groups = (total + WG - 1) / WG;
@@ -2183,9 +2192,22 @@ static sycl::event mova_value_packed_impl(
                     const int64_t row = int64_t(e) * N + n;
                     const uint8_t* rp = wc.payload + row * wc.row_bytes;
                     float a = 0.0f;
+                    if constexpr (is_native_gguf(F)) {
+                        if (fast) {
+                            const float* xp[1] = {xr};
+                            for (int lane = 0; lane < (NativeGGUFBlock<F>::lanes); ++lane) {
+                                float partial = 0.0f;
+                                native_qk_row_lane<F, 1>(rp, xp, K, lane, 1, &partial);
+                                a += partial;
+                            }
+                        } else {
+                            for (int k = 0; k < K; ++k)
+                                a = sycl::fma(decode_elem<F>(rp, k, 1.0f), xr[k], a);
+                        }
+                    } else {
                     for (int k = 0; k < K; ++k) {
                         float sc;
-                        if constexpr (F == Fmt::BF16) {
+                        if constexpr (F == Fmt::BF16 || is_native_gguf(F)) {
                             sc = 1.0f;
                         } else if constexpr (F == Fmt::FP8_E4M3 ||
                                              F == Fmt::FP8_E5M2 ||
@@ -2208,6 +2230,7 @@ static sycl::event mova_value_packed_impl(
                             wv = decode_elem<F>(rp, k, sc);
                         }
                         a = sycl::fma(wv, xr[k], a);
+                    }
                     }
                     // silu THEN weight, matching launch_silu_scale_accum:
                     // the router weight scales the activated expert output,
@@ -2233,6 +2256,12 @@ sycl::event launch_mova_value_packed(
         case Fmt::INT4:     return mova_value_packed_impl<Fmt::INT4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::MXFP8:    return mova_value_packed_impl<Fmt::MXFP8>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
         case Fmt::MXFP4:    return mova_value_packed_impl<Fmt::MXFP4>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q4_K:     return mova_value_packed_impl<Fmt::Q4_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q6_K:     return mova_value_packed_impl<Fmt::Q6_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q5_K:     return mova_value_packed_impl<Fmt::Q5_K>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::Q8_0:     return mova_value_packed_impl<Fmt::Q8_0>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::IQ4_XS:     return mova_value_packed_impl<Fmt::IQ4_XS>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
+        case Fmt::IQ4_NL:     return mova_value_packed_impl<Fmt::IQ4_NL>(q,w,x,rex,rwt,y,M,N,E,top_k,deps);
     }
     return {};
 }

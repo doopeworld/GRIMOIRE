@@ -171,7 +171,8 @@ icpx -O2 -std=c++17 -I include \
   && echo "built  : bin/b70-inspect" || echo "warn: b70-inspect failed"
 
 icpx -O2 -std=c++17 -I include \
-     tools/load.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp -o bin/b70-load \
+     tools/load.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp \
+     src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp -o bin/b70-load \
   && echo "built  : bin/b70-load" || echo "warn: b70-load failed"
 
 # ---------------------------------------------------------------------
@@ -206,6 +207,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      -I include -I src \
      tools/grimoire_main.cpp src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp \
      src/safetensors.cpp src/quantize.cpp src/gptq.cpp src/gemv_decode.cpp \
+     src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
@@ -226,6 +228,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      -I include -I src \
      tools/grimoire_server.cpp src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp \
      src/safetensors.cpp src/quantize.cpp src/gptq.cpp src/gemv_decode.cpp \
+     src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp \
@@ -243,6 +246,7 @@ icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
      -I include -I src \
      tools/count_launches_probe.cpp src/grimoire.cpp src/qwen35_loader.cpp \
      src/native_model.cpp src/safetensors.cpp src/quantize.cpp src/gptq.cpp \
+     src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
      src/tokenizer.cpp src/gemm_fast.cpp -o bin/count_launches_probe \
@@ -250,14 +254,15 @@ icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
   || echo "warn: count_launches_probe failed to build"
 
 icpx -O2 -std=c++17 -I include \
-     tools/verify_tokenizer.cpp src/tokenizer.cpp -o bin/b70-verify-tok \
+     tools/verify_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp -o bin/b70-verify-tok \
   && echo "built  : bin/b70-verify-tok" || echo "warn: verify-tok failed"
 
 # Offline BF16 -> B70-native execution-format compiler. Host-only: model
 # conversion never needs a GPU framework or device runtime.
 icpx -O3 -std=c++20 -I include \
      tools/b70_compile_model.cpp src/quantize.cpp src/qwen35_loader.cpp \
-     src/safetensors.cpp src/native_model.cpp -o bin/b70-compile-model \
+     src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp \
+     src/gguf_qwen35.cpp src/tokenizer.cpp -o bin/b70-compile-model \
   && echo "built  : bin/b70-compile-model" || echo "warn: native model compiler failed"
 
 icpx -O2 -std=c++20 -I include tools/inspect_native_model.cpp \
@@ -321,6 +326,7 @@ icpx -fsycl -fsycl-targets=spir64 \
 #                              in a row, and rank 0 gets the tokens back
 ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/safetensors.cpp src/quantize.cpp src/gptq.cpp
+            src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
             src/deltanet.cpp src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp
             src/ops.cpp src/prefill.cpp src/tokenizer.cpp src/gemm_fast.cpp)
