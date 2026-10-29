@@ -254,6 +254,7 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
 // Matrix-unit causal prefill attention (src/gemm_fast.cpp);
 // launch_flash_prefill() takes it whenever the geometry fits.
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads);
+const char* flash_prefill_kernel(int head_dim, int num_heads, int num_kv_heads);
 sycl::event launch_flash_prefill_fast(sycl::queue& q, const float* qv,
     const uint8_t* k_cache, const uint8_t* v_cache, float* out, int tokens,
     int start_pos, int num_heads, int num_kv_heads, int head_dim, int seq_cap,

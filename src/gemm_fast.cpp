@@ -1102,6 +1102,14 @@ bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads) {
            num_heads % num_kv_heads == 0;
 }
 
+// What launch_flash_prefill runs for this geometry (its one-time log line).
+const char* flash_prefill_kernel(int head_dim, int num_heads, int num_kv_heads) {
+    if (!flash_fast_supported(head_dim, num_heads, num_kv_heads))
+        return "generic kernel, no matrix units (slow on long prompts)";
+    return flash_use_esimd(head_dim, num_heads, num_kv_heads) ? "ESIMD flash on DPAS"
+                                                               : "joint_matrix flash on XMX";
+}
+
 sycl::event launch_flash_prefill_fast(sycl::queue& q, const float* qv, const uint8_t* k_cache,
                                       const uint8_t* v_cache, float* out, int tokens,
                                       int start_pos, int num_heads, int num_kv_heads,

@@ -40,6 +40,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <type_traits>
 
 namespace b70 {
@@ -1873,6 +1876,17 @@ sycl::event launch_flash_prefill(
     const uint8_t* v_cache, float* out, int tokens, int start_pos,
     int num_heads, int num_kv_heads, int head_dim, int seq_cap,
     float softmax_scale, const std::vector<sycl::event>& deps) {
+    {   // Name the kernel once per geometry, so a log shows what a prompt got (2026-10-29:
+        // a two-B60 build from before the ESIMD kernel for a TP rank's 12 / 2 heads ran
+        // 32K-token prompts at ~900 tok/s and said nothing about it).
+        static std::mutex mu;
+        static std::set<std::tuple<int, int, int>> said;
+        std::lock_guard<std::mutex> lk(mu);
+        if (said.insert({head_dim, num_heads, num_kv_heads}).second)
+            std::fprintf(stderr, "  prompt attention: %s -- %d heads, %d KV heads, width %d\n",
+                         flash_prefill_kernel(head_dim, num_heads, num_kv_heads),
+                         num_heads, num_kv_heads, head_dim);
+    }
     if (flash_fast_supported(head_dim, num_heads, num_kv_heads))
         return launch_flash_prefill_fast(q, qv, k_cache, v_cache, out, tokens, start_pos,
                                          num_heads, num_kv_heads, head_dim, seq_cap,
