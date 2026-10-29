@@ -63,3 +63,18 @@ What it says:
 - An NVFP4 checkpoint converted to MXFP4 at load is the least accurate run (83.2%); the same file
   held as INT8 gives 91.4%.  Running NVFP4 natively is planned.
 - The GPTQ checkpoint's loss is in the file itself: held as INT8 it scores the same.
+
+## GGUF files, 2026-10-29 (main eb6526f, same reference and tokens)
+
+Unsloth's Qwen3.8-27B GGUF files (`-m <file>.gguf`), one Arc Pro B70:
+
+| GGUF file, GRIMOIRE mode | cosine mean / min | KL mean | top-1 |
+|---|---|---:|---:|
+| `Q8_0`, `--proj int8` | 0.9995 / 0.9981 | 0.003 | 99.2% |
+| `Q8_0`, `--proj mxfp4` | 0.9712 / 0.8749 | 0.249 | 91.4% |
+| `UD-Q4_K_XL`, `--proj native` (the file's own blocks) | 0.9920 / 0.9649 | 0.063 | 94.5% |
+| `UD-Q4_K_XL`, `--proj mxfp4` | 0.9648 / 0.8701 | 0.324 | 87.5% |
+
+- An 8-bit GGUF run as INT8 is as close to the original as anything measured here.
+- A 4-bit GGUF keeps much more of its accuracy in its own format (`--proj native`) than converted
+  to MXFP4; native Qwen3.8 decoding is still slower (256 scored tokens 20.5 s against 7.8 s).
