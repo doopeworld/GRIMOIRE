@@ -349,8 +349,10 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
     const I norm_inv=m.cfg.is_qwen3 ? I::NONE : I::NORM;
     for(const auto& t:m.gguf_file->tensors()) {
         const std::string& s=t.name;
-        if(s.rfind("nextn.",0)==0||
-           s.rfind("blk."+std::to_string(m.cfg.n_layers)+".",0)==0)continue;
+        if(s.rfind("nextn.",0)==0)continue;
+        // The MTP block (blk.<n_layers>.*, nextn_predict_layers 1) is mapped below when the
+        // config has it; without mtp_num_hidden_layers it stays unused, as before.
+        if(s.rfind("blk."+std::to_string(m.cfg.n_layers)+".",0)==0&&m.cfg.mtp_n_layers<1)continue;
         // Ask the decoder itself whether it can decode this type (one zero
         // block), instead of keeping a second list that drifts from it: a
         // hard-coded 7-type list here refused Unsloth's Q4_0/IQ* files after
@@ -375,10 +377,23 @@ bool gguf_qwen35_index(Qwen35Model& m,std::string& err) {
         const size_t dot=s.find('.',4);
         if(dot==std::string::npos){err="unmapped GGUF tensor: "+s;return false;}
         int l=-1;try{l=std::stoi(s.substr(4,dot-4));}catch(...){err="unmapped GGUF tensor: "+s;return false;}
-        if(l>=m.cfg.n_layers && l<m.cfg.n_layers+1)continue; // MTP block
-        if(l<0||l>=m.cfg.n_layers){err="unmapped GGUF layer tensor: "+s;return false;}
+        const bool mtp_block=l==m.cfg.n_layers&&m.cfg.mtp_n_layers>=1;
+        if(l<0||(l>=m.cfg.n_layers&&!mtp_block)){err="unmapped GGUF layer tensor: "+s;return false;}
         const std::string role=s.substr(dot+1);
-        const std::string b=p+"layers."+std::to_string(l)+".";
+        // MTP block (2026-10-29): llama.cpp's names for the HF mtp.* tensors.  The layer's own
+        // tensors take the transformer layers' roles under mtp.layers.0.; nextn.eh_proj is
+        // mtp.fc ([H][2H], same order); the three nextn norms carry the +1 of every zero-centred
+        // Qwen3.5 norm (norm_inv) like the layers' norms.  The head shares the main embedding
+        // and output head (a nextn copy of either, if a file has one, is not needed).
+        if(mtp_block&&role.rfind("nextn.",0)==0){
+            if(role=="nextn.eh_proj.weight"){add(t,"mtp.fc.weight");continue;}
+            if(role=="nextn.enorm.weight"){add(t,"mtp.pre_fc_norm_embedding.weight",norm_inv);continue;}
+            if(role=="nextn.hnorm.weight"){add(t,"mtp.pre_fc_norm_hidden.weight",norm_inv);continue;}
+            if(role=="nextn.shared_head_norm.weight"){add(t,"mtp.norm.weight",norm_inv);continue;}
+            if(role=="nextn.embed_tokens.weight"||role=="nextn.shared_head_head.weight")continue;
+            err="unmapped GGUF MTP tensor: "+s;return false;
+        }
+        const std::string b=mtp_block ? std::string("mtp.layers.0.") : p+"layers."+std::to_string(l)+".";
         const bool dense_layer=!m.cfg.is_moe() ||
             (m.cfg.is_qwen3 && std::find(m.cfg.mlp_only_layers.begin(),
                                         m.cfg.mlp_only_layers.end(),l)!=m.cfg.mlp_only_layers.end());

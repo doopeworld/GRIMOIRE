@@ -502,6 +502,14 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 bool fp8_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
 sycl::event launch_fp8_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
     float* Y, int M, const std::vector<sycl::event>& deps = {});
+// GGUF native blocks (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS / IQ4_NL) at 1..8 rows: the same DPAS
+// small-M design (native_smallm.hpp, gemv_decode.cpp; GRIMOIRE_GGUF_SMALLM=0 = off).
+bool native_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
+sycl::event launch_native_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
+// 9..16 rows (two DPAS row blocks) in libgrimoire_gemm.so's 256 registers.
+sycl::event launch_native_smallm_wide(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
 // M > 8 (libgrimoire_gemm.so); launch_int4_smallm (gemv_decode.cpp) takes M <= 8.
 sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
     float* Y, int M, const std::vector<sycl::event>& deps = {});

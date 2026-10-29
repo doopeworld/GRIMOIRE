@@ -39,6 +39,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "gemv_step.hpp"
 #include "native_qk_esimd.hpp"
+#include "native_smallm.hpp"
 #include <sycl/ext/intel/esimd.hpp>
 #include <cstdlib>
 
@@ -1487,6 +1488,17 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 // Qwen3.8-27B FP8 + MTP on two B70s ran 4.1 tok/s against 9.4 plain
 // (2026-10-06).  GRIMOIRE_FP8_SMALLM=0 = the old path.
 // INT8 too (2026-10-29): same layout, the kernel's I8 decode.
+bool native_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_GGUF_SMALLM");
+        return !(e && *e == '0'); }();
+    auto a64 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 63) == 0; };
+    return on && native_smallm_layout_ok(w, M) && (!X || a64(X)) && (!Y || a64(Y));
+}
+sycl::event launch_native_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                                 float* Y, int M, const std::vector<sycl::event>& deps) {
+    if (M > 8) return launch_native_smallm_wide(q, w, X, Y, M, deps);
+    return native_smallm_launch<1>(q, w, X, Y, M, deps);
+}
 bool fp8_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_FP8_SMALLM");
         return !(e && *e == '0'); }();

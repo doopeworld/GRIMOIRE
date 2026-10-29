@@ -48,6 +48,7 @@
 #endif
 #include "b70/native_qk_tile.hpp"
 #include "native_dequant.hpp"
+#include "native_smallm.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -3903,6 +3904,13 @@ sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const 
                         : int4_smallm_fdq_impl<2, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
     return g64 ? int4_smallm_impl<2, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
                : int4_smallm_impl<2, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
+}
+
+// GGUF native blocks at 9..16 rows (native_smallm.hpp with two row blocks); M <= 8 runs from
+// gemv_decode.cpp (launch_native_smallm).
+sycl::event launch_native_smallm_wide(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                                      float* Y, int M, const std::vector<sycl::event>& deps) {
+    return native_smallm_launch<2>(q, w, X, Y, M, deps);
 }
 
 // Grouped: every row offset must keep the 2-D bases 64-byte aligned, i.e.

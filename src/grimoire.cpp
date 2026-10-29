@@ -5939,9 +5939,10 @@ std::string Grimoire::unsupported_reason() const {
         return "qwen3 rope_scaling is not implemented by the RoPE kernels";
     if (cfg.is_qwen3 && cfg.is_moe() && !cfg.norm_topk_prob)
         return "qwen3_moe norm_topk_prob=false is not implemented by the router kernels";
-    if(ck.gguf_file && mtp_enabled())
-        return "GGUF MTP (GRIMOIRE_MTP) is not mapped: blk."+
-               std::to_string(cfg.n_layers)+".* and nextn.*";
+    // GGUF MTP (2026-10-29): gguf_qwen35.cpp maps blk.<n_layers>.* and its nextn.* tensors to
+    // mtp.*; a file without them (nextn_predict_layers 0, e.g. Unsloth's UD-IQ2_XXS) cannot draft.
+    if(ck.gguf_file && mtp_enabled() && !ck.index.count("mtp.fc.weight"))
+        return "this GGUF file has no MTP head (nextn_predict_layers 0): run it without GRIMOIRE_MTP";
     // Qwen4-Exp / Qwen3.8-Flash-Next.  The loader resolves this config
     // (rule 10: the loader says what the file IS), and the engine says
     // here what it cannot RUN.  Its Qwen3-Next base -- Gated DeltaNet
@@ -13888,12 +13889,14 @@ void Grimoire::mtpr_mm(const QuantWeight& w, const float* x, float* y, int M) {
     const bool mx = !dnnl && !f8 && mxfp4_smallm_ok(w, M, nullptr, y);
     const bool i4 = !dnnl && !f8 && !mx && int4_smallm_ok(w, M, nullptr, y);
     const bool bf = !dnnl && !f8 && !mx && !i4 && bf16_smallm_ok(w, M, nullptr, y);
-    if (!(dnnl || f8 || mx || i4 || bf)) { rows(); return; }
+    const bool nq = !dnnl && !f8 && !mx && !i4 && !bf && native_smallm_ok(w, M, nullptr, y);
+    if (!(dnnl || f8 || mx || i4 || bf || nq)) { rows(); return; }
     launch_f32_to_bf16(q, x, mtpr.bf, need);
     if (dnnl) onednn_gemm(q, w, mtpr.bf, y, M, false);
     else if (f8) launch_fp8_smallm(q, w, mtpr.bf, y, M);
     else if (mx) launch_mxfp4_smallm(q, w, mtpr.bf, y, M);
     else if (i4) launch_int4_smallm(q, w, mtpr.bf, y, M);
+    else if (nq) launch_native_smallm(q, w, mtpr.bf, y, M);
     else launch_bf16_smallm(q, w, mtpr.bf, y, M);
 }
 
@@ -17749,6 +17752,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // 3e-4 .. 1.5e-3 on every Qwen3.8-27B verify shape, the bf16 X rounding).
         const bool dpas_f8 = smallm_dpas && M>=2 && M<=8 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && fp8_smallm_ok(w.w,M,nullptr,y);
+        // GGUF native blocks (2026-10-29, native_smallm.hpp): before this a --proj native verify
+        // took launch_gemv_batch below (SIMT, the weights re-read every 4 rows).  MEASURED
+        // tools/bench_native_smallm.cpp, Qwen3.8-27B shapes: 8 rows cost 0.97-1.13x one decode GEMV.
+        const bool dpas_nq = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && native_smallm_ok(w.w,M,nullptr,y);
         // FP8 / BF16 weights at 2..16 rows (a verify block) through oneDNN rather
         // than the small-M kernels.  MEASURED 2026-10-25, Qwen3.8-27B-FP8 + DFlash2
         // on two cards: verify 48.5 -> 42.9 ms per step, decode 100 -> 108 tok/s,
@@ -17764,7 +17772,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // stays first and the small-M kernel is what INT8 gets when it declines.
         const bool dnnl_small = smallm_dnnl && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                                 !w.has_i4() && onednn_gemm_ok(w.w,M);
-        const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+        const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || dpas_nq || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
@@ -17782,6 +17790,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     if(dnnl_small) onednn_gemm(q,w.w,xin,y,M,false);
                     else if(dpas_i4) launch_int4_smallm(q,w.w,xin,y,M);
                     else if(dpas_f8) launch_fp8_smallm(q,w.w,xin,y,M);
+                    else if(dpas_nq) launch_native_smallm(q,w.w,xin,y,M);
                     else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
                     else launch_mxfp4_smallm(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
@@ -17790,7 +17799,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
                         for(int r=0;r<M;++r)
                             launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
-                        smallm_report(dnnl_small?"oneDNN":dpas_i4?"int4":dpas_f8?(w.w.fmt==Fmt::INT8?"int8":"fp8"):
+                        smallm_report(dnnl_small?"oneDNN":dpas_i4?"int4":dpas_nq?"gguf":dpas_f8?(w.w.fmt==Fmt::INT8?"int8":"fp8"):
                                       dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
                         sycl::free(ref,q);
                     }
@@ -19970,7 +19979,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         } else if ((lm_head.w.fmt == Fmt::MXFP4 ||
                     (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
                     ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
-                     fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)))
+                     fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+                    (!exact_verify && native_smallm_ok(lm_head.w, M, nullptr, nullptr)))
                    && lm_head.w.payload) {
             // Verification is a matrix multiplication, not M independent
             // decode GEMVs.  Load the large vocabulary matrix once per batch.
@@ -19981,7 +19991,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         const bool lm_batched = lm_head.w.fmt == Fmt::MXFP4 ||
             (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
             ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
-             fp8_smallm_ok(lm_head.w, M, nullptr, nullptr));
+             fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+            // GGUF native heads (2026-10-29): the Qwen3.8-27B Q6_K head row by row was 5 x 1.8 ms
+            // of a 52 ms MTP verify (M = 5).
+            (!exact_verify && native_smallm_ok(lm_head.w, M, nullptr, nullptr));
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
             if (!tp_enabled() && !lm_head.has_i4() && !lm_batched)
