@@ -871,3 +871,15 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - Unraid path trap again: tower_build.sh lives only under /mnt/user/isos/grimoire-runs/bench-1022
   (not /mnt/storage/...).  New files: write them under /mnt/storage, call tower_build.sh by its
   /mnt/user path.
+- GGUF accuracy vs the BF16 original (tools/bench/accuracy/gguf_scores.sh): Qwen3.8 Q8_0 as INT8
+  99.2% top-1 (KL 0.003), as MXFP4 91.4%; UD-Q4_K_XL native 94.5% (KL 0.063), as MXFP4 87.5%.
+- GGUF native decode is 2.7x slower than MXFP4 on UD-Q4_K_XL (GRIMOIRE_TIMELINE=1 +
+  GRIMOIRE_DECODE_GRAPH=0 -- the graph path never reaches the timeline): one token 79.9 vs 29.3 ms.
+  MXFP4 layers are all ~430 us; native ones 434 .. 2,506 us by block type.  Layer 0: ssm_out Q8_0
+  6144x5120 394 us (~85 GB/s), ffn_down IQ4_XS 17408x5120 571 us (~82 GB/s); gate_up (IQ4_XS +
+  Q3_K) 173 us = fine.  The 2.5 ms layers have ffn_down IQ4_NL.  Cause: gemv_native_qk (generic
+  16-lane sub-group per row, block by block) on small-block types.  Fix order: (1) Q8_0 tensors ->
+  INT8 at load in native mode (fast ESIMD INT8 GEMV, ~lossless), (2) ESIMD row-streaming GEMVs for
+  IQ4_XS / IQ4_NL / IQ3_S like Q4_K / Q6_K.  bench-1022/gguf_types.py lists a file's tensor types.
+- Image grimoire-b70:v1.10.1-rc3 = main eb6526f (GGUF merged); release notes draft in the
+  session scratchpad (gm/release-notes-v1.10.1.md); publishing needs Ian's OK (PAT).
