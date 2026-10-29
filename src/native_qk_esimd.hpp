@@ -12,21 +12,24 @@ namespace nqes = sycl::ext::intel::esimd;
 // Accumulator lanes: Q4_K has 32-value groups, Q6_K 16-value groups. A row
 // keeps ONE vector accumulator over all its blocks and reduces it once.
 template <Fmt F> constexpr int nq_acc_lanes() {
-    return F == Fmt::Q4_K || F == Fmt::Q5_K ? 32 : F == Fmt::IQ4_NL || F == Fmt::Q8_0 ? 8 : 16;
+    return F == Fmt::Q4_K || F == Fmt::Q5_K ? 32 : 16;
 }
 // Bytes of 256 consecutive values of a row: one K-quant / IQ4_XS block, or 8 blocks of 32 (IQ4_NL
 // 18 B, Q8_0 34 B).  Every 256-value step of a packed row stays 16-byte aligned for those two.
 template <Fmt F> constexpr int nq_bytes_256() {
     return 256 / NativeGGUFBlock<F>::elems * NativeGGUFBlock<F>::bytes;
 }
-// The IQ4_NL / IQ4_XS value table (formats.hpp iq4nl_value) as a register vector, for iselect.
-SYCL_ESIMD_FUNCTION inline nqes::simd<float, 16> nq_iq4_table() {
-    constexpr float v[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
-                             1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f};
-    nqes::simd<float, 16> t;
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) t[i] = v[i];
-    return t;
+// The IQ4_NL / IQ4_XS value table {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
+// 69, 89, 113} (gguf_decode_grids.hpp kvalues_iq4nl) of a 4-bit index i (as float): a degree-4
+// minimax polynomial (largest error 0.433), rounded to nearest = exactly the table value.  Five
+// vector instructions; a register-table iselect was ~3x slower (2026-10-29,
+// tools/bench_native_esgemv.cpp: IQ4_XS gate_up 34816 x 5120 664 -> 223 us).
+SYCL_ESIMD_FUNCTION inline nqes::simd<float, 16> nq_iq4_value(nqes::simd<float, 16> i) {
+    nqes::simd<float, 16> v = i * 0.00158604281f + 0.0310864393f;
+    v = v * i - 1.37192702f;
+    v = v * i + 24.17383f;
+    v = v * i - 126.567009f;
+    return nqes::rnde<float>(v);
 }
 template <Fmt F> using nq_acc_t = nqes::simd<float, nq_acc_lanes<F>()>;
 
@@ -43,61 +46,63 @@ SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
     if constexpr (F == Fmt::IQ4_NL || F == Fmt::Q8_0) {
         // IQ4_NL / Q8_0 (2026-10-29): blocks of 32 values -- d (fp16), then 16 bytes of two 4-bit
         // table indices (IQ4_NL: low nibbles = values 0..15, high = 16..31) or 32 int8 (Q8_0).  256
-        // values = 8 blocks; accumulator lane b = block b, its bytes picked by strided register
-        // selects (stride = the block size), the x values of block b by a stride-32 select.
+        // values = 8 blocks; the 16 lanes take 16 consecutive values of one block (contiguous
+        // register selects -- lanes = blocks needed stride-18 / 34 byte selects, 2-4x slower).
         constexpr int BS = NativeGGUFBlock<F>::bytes, NB = nq_bytes_256<F>();
         nqes::simd<uint8_t, NB> raw;
         raw.template select<NB - 16, 1>(0) = nqes::block_load<uint8_t, NB - 16>(p);
         raw.template select<16, 1>(NB - 16) = nqes::block_load<uint8_t, 16>(p + NB - 16);
-        nqes::simd<uint16_t, 8> dlo = raw.template select<8, BS>(0);
-        nqes::simd<uint16_t, 8> dhi = raw.template select<8, BS>(1);
-        nqes::simd<uint16_t, 8> dbits = dlo | (dhi << 8);
-        nqes::simd<sycl::half, 8> dh = dbits.template bit_cast_view<sycl::half>().read();
-        nqes::simd<float, 8> d = dh;
-        nqes::simd<float, 8> dot = 0.0f;
-        if constexpr (F == Fmt::IQ4_NL) {
-            nqes::simd<float, 16> tab = nq_iq4_table();
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                nqes::simd<uint16_t, 8> b = raw.template select<8, BS>(2 + i);
-                nqes::simd<uint16_t, 8> i0 = b & 15;
-                nqes::simd<uint16_t, 8> i1 = b >> 4;
-                nqes::simd<float, 8> v0 = tab.iselect(i0);
-                nqes::simd<float, 8> v1 = tab.iselect(i1);
-                dot += v0 * x.template select<8, 32>(xoff + i) +
-                       v1 * x.template select<8, 32>(xoff + 16 + i);
+        #pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const float d = float(sycl::bit_cast<sycl::half>(
+                uint16_t(uint32_t(raw[b * BS]) | (uint32_t(raw[b * BS + 1]) << 8))));
+            nqes::simd<float, 16> v0, v1;
+            if constexpr (F == Fmt::IQ4_NL) {
+                nqes::simd<uint16_t, 16> q = raw.template select<16, 1>(b * BS + 2);
+                nqes::simd<uint16_t, 16> i0 = q & 15;
+                nqes::simd<uint16_t, 16> i1 = q >> 4;
+                v0 = nq_iq4_value(nqes::convert<float>(i0));
+                v1 = nq_iq4_value(nqes::convert<float>(i1));
+            } else {
+                nqes::simd<uint8_t, 32> q = raw.template select<32, 1>(b * BS + 2);
+                nqes::simd<int8_t, 32> s = q.template bit_cast_view<int8_t>().read();
+                nqes::simd<float, 32> f = nqes::convert<float>(s);
+                v0 = f.template select<16, 1>(0);
+                v1 = f.template select<16, 1>(16);
             }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                nqes::simd<uint8_t, 8> b = raw.template select<8, BS>(2 + i);
-                nqes::simd<int8_t, 8> s = b.template bit_cast_view<int8_t>().read();
-                dot += nqes::convert<float>(s) * x.template select<8, 32>(xoff + i);
-            }
+            nqes::simd<float, 16> t = v0 * x.template select<16, 1>(xoff + 32 * b);
+            t += v1 * x.template select<16, 1>(xoff + 32 * b + 16);
+            acc += t * d;
         }
-        acc += dot * d;
     } else if constexpr (F == Fmt::IQ4_XS) {
         // IQ4_XS (2026-10-29): 136-byte blocks of 256 -- d (fp16), scales_h (2 bits a sub-block),
         // scales_l (4 bits a sub-block), then 8 sub-blocks of 32 as 16 bytes each: low nibbles =
-        // values 0..15, high nibbles = 16..31, each an index into the IQ4_NL table (iselect).
-        // Blocks are 8-byte aligned; every load here starts on one.
+        // values 0..15, high nibbles = 16..31, each an index into the IQ4_NL table (nq_iq4_value).
+        // The 8 sub-block scales are decoded as one vector.  Blocks are 8-byte aligned; every
+        // load here starts on one.
         nqes::simd<uint8_t, 8> hdr = nqes::block_load<uint8_t, 8>(p);
         nqes::simd<uint8_t, 128> qs = nqes::block_load<uint8_t, 128>(p + 8);
         const float d = float(sycl::bit_cast<sycl::half>(
             uint16_t(uint32_t(hdr[0]) | (uint32_t(hdr[1]) << 8))));
-        const uint32_t h = uint32_t(hdr[2]) | (uint32_t(hdr[3]) << 8);
-        nqes::simd<float, 16> tab = nq_iq4_table();
+        nqes::simd<uint32_t, 8> h = uint32_t(hdr[2]) | (uint32_t(hdr[3]) << 8);
+        nqes::simd<uint32_t, 8> sh(0, 2);
+        nqes::simd<uint32_t, 4> s4 = hdr.template select<4, 1>(4);
+        nqes::simd<uint32_t, 8> lo;
+        lo.template select<4, 2>(0) = s4 & 15;
+        lo.template select<4, 2>(1) = s4 >> 4;
+        nqes::simd<uint32_t, 8> hi = (h >> sh) & 3;
+        nqes::simd<int32_t, 8> si = lo | (hi << 4);
+        nqes::simd<float, 8> sc = (nqes::convert<float>(si) - 32.0f) * d;
         #pragma unroll
         for (int l = 0; l < 8; ++l) {
-            const uint32_t low = (uint32_t(hdr[4 + l / 2]) >> (4 * (l % 2))) & 15;
-            const float sc = d * float(int(low | (((h >> (2 * l)) & 3) << 4)) - 32);
             nqes::simd<uint16_t, 16> b = qs.template select<16, 1>(16 * l);
             nqes::simd<uint16_t, 16> i0 = b & 15;
             nqes::simd<uint16_t, 16> i1 = b >> 4;
-            nqes::simd<float, 16> v0 = tab.iselect(i0);
-            nqes::simd<float, 16> v1 = tab.iselect(i1);
-            acc += (v0 * sc) * x.template select<16, 1>(xoff + 32 * l);
-            acc += (v1 * sc) * x.template select<16, 1>(xoff + 32 * l + 16);
+            nqes::simd<float, 16> v0 = nq_iq4_value(nqes::convert<float>(i0));
+            nqes::simd<float, 16> v1 = nq_iq4_value(nqes::convert<float>(i1));
+            const float s = sc[l];
+            acc += (v0 * s) * x.template select<16, 1>(xoff + 32 * l);
+            acc += (v1 * s) * x.template select<16, 1>(xoff + 32 * l + 16);
         }
     } else if constexpr (F == Fmt::Q5_K) {
         // Q5_K (2026-10-29): Q4_K's header (d, dmin, 12 scale/min bytes), then qh (32 B: bit g of
