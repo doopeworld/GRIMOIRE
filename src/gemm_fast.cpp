@@ -47,6 +47,7 @@
 #include "onednn_gemm.hpp"
 #endif
 #include "b70/native_qk_tile.hpp"
+#include "native_dequant.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
@@ -424,6 +425,8 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
         return dequant_mxfp4_stream(q, w, dst, deps);
     if (!no_stream && int4_stream_ok(w))
         return dequant_int4_stream(q, w, dst, deps);
+    if (!no_stream && native_stream_ok(w))          // GGUF native blocks (native_dequant.hpp)
+        return dequant_native_stream(q, w, dst, deps);
     if (w.N % 64 == 0 && w.K % 64 == 0) {
         switch (w.fmt) {
             case Fmt::BF16:     return dequant_vnni_tiled<Fmt::BF16>(q, w, dst, deps);
@@ -3194,7 +3197,8 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
         e = dequant_any(q, w, s.w, {e}, Np);
     } else if (EPI == 1) {
         e = w.fmt == Fmt::INT4 ? dequant_int4_stream(q, w, s.w, deps, N / 2)
-                               : dequant_mxfp4_stream(q, w, s.w, deps, N / 2);
+          : native_stream_ok(w) ? dequant_native_stream(q, w, s.w, deps, N / 2)
+                                : dequant_mxfp4_stream(q, w, s.w, deps, N / 2);
     } else {
         e = dequant_any(q, w, s.w, deps);
     }
@@ -3222,7 +3226,7 @@ sycl::event launch_gemm_fast_residual(sycl::queue& q, const QuantWeight& w,
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FUSED_SWIGLU") != nullptr;
     return !off && gemm_fast_supported(w, M) &&
-           (w.fmt == Fmt::MXFP4 || int4_stream_ok(w)) && w.K % 128 == 0 &&
+           (w.fmt == Fmt::MXFP4 || int4_stream_ok(w) || native_stream_ok(w)) && w.K % 128 == 0 &&
            w.N % NC2 == 0 && (w.N / 2) % 32 == 0;
 }
 
