@@ -3730,6 +3730,14 @@ sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const 
     const SmallmPlan p = smallm_plan(w.N, w.K);
     if (M <= 8) return g64 ? int4_smallm_impl<1, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
                            : int4_smallm_impl<1, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
+    // 9..16 rows: the fast dequant M <= 8 has used since 2026-10-09 (int4_smallm_fdq_impl), two
+    // row blocks.  The old dequant here made every verify past 8 rows ~12 ms slower -- MEASURED
+    // 2026-10-29, Qwen3.8-27B GPTQ + MTP on one B70: K=8 (9 rows) 105 tok/s on code against 128
+    // at K=6 with MORE tokens a step (5.70 vs 5.40).  GRIMOIRE_I4_WIDE_FDQ=0 = the old dequant.
+    static const bool fdq = [] { const char* e = std::getenv("GRIMOIRE_I4_WIDE_FDQ");
+        return !(e && *e == '0'); }();
+    if (fdq) return g64 ? int4_smallm_fdq_impl<2, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
+                        : int4_smallm_fdq_impl<2, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
     return g64 ? int4_smallm_impl<2, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
                : int4_smallm_impl<2, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
 }

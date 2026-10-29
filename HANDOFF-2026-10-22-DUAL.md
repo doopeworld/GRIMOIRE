@@ -821,10 +821,13 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   verify).  Tables in the commit message: two cards FP8 / INT8 pp4096 3,531 / 3,481, tg128
   28.97 / 29.10, 4 users 93.75 / 90.72; one card MTP verify 54.2 (FP8) / 53.3 (INT8 oneDNN) /
   53.6 (INT8 small-M) ms a step -- memory-bound, equal.
-- Two cards never use oneDNN or the small-M kernels at 2..4 rows: tp_enabled() sets exact_verify
-  in prefill(), and those rows go to launch_gemv_batch (SIMT, MB=4) for every format.
-- The 10-29 morning "4 users -13%" for INT8 was mostly run-to-run spread (FP8 97.30 -> 93.75
-  between two runs of the same code).
+- CORRECTED 10-29 afternoon: an earlier line here said two cards never use oneDNN or the small-M
+  kernels at 2..4 rows because tp_enabled() sets exact_verify.  Wrong: tp_enabled() is the LEGACY
+  all-gather TP only (tp_rank >= 0 && !tp_mega); under Megatron TP exact_verify is false and the
+  small-M kernels / oneDNN run exactly as on one card.  So the INT8 v3 build's small-M kernel DID
+  run at 4 users on two cards (v2 oneDNN s8 84.98 vs FP8 97.30; v3 own kernel 90.72 vs FP8 93.75,
+  different sessions); the final build (oneDNN first) measured 96.15 vs 96.61 with MTP on.
+  Re-measure INT8 own-kernel vs oneDNN at 4 users on two cards when gpu1 is usable.
 - Trap: g0run.sh / tune.sh EXTRA_ENV is ONE K=V PER LINE (b70run.sh GRIM_ENV); "A=1 B=1" made
   GRIMOIRE_MTP="1 B=1" and the debug flag never existed (a wasted gpu0 run).  dual.sh's env
   argument is space-separated and fine.
@@ -845,3 +848,9 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
 - /mnt/user vs /mnt/storage: a NEW file scp'd to /mnt/user/isos/... can land on another disk than
   the storage pool, and /mnt/storage/isos/... (dual.sh's $B) does not see it -- copy new bench
   files to /mnt/storage/isos/grimoire-runs/bench-1022 directly.
+- INT4 small-M past 8 rows (launch_int4_smallm_wide) ran the OLD dequant: every verify over 8 rows
+  (1 user at depth 8+, 2 users x 7, 4 users x 4) paid it.  Now the fast dequant (fdq) with two row
+  blocks: GPTQ + MTP K=6 one card, 2 / 4 users 98.8 / 159.2 -> 107.7 / 172.5, conc4 134 -> 141
+  (texts identical); 1 user unchanged.  GRIMOIRE_I4_WIDE_FDQ=0 = old.  K=8 / K=10 still slower than
+  K=6 on one user (9+ verify rows cost more than they return).  Adaptive depth (branch mtp-adapt)
+  slower than K=6, not merged.  New dual.sh mode T0 = multi TP with both ranks on gpu0.
