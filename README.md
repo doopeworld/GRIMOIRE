@@ -10,7 +10,7 @@ The aim is straightforward: make high-performance local LLM inference possible o
 
 > **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`). Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; the GGUF speed-ups of the 29th's evening (native decode, MTP on GGUF) are on main and come in v1.10.2. Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -23,7 +23,7 @@ Every number on this page was measured on one machine:
 | GPU 1 | Intel Arc Pro B70, 32 GB, on an **M.2-to-OCuLink adapter with a PCIe redriver**: **PCIe Gen4 x4** (a passive adapter made the card drop off the bus under load; the redriver fixed it) |
 | Power | each GPU on its own 550 W supply; GRIMOIRE runs the cards at their own firmware limit (no governor) |
 | GPU-to-GPU | **no peer-to-peer**: Linux does not allow PCIe P2P between these two root ports on this CPU, so every byte between the cards goes through host memory |
-| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs, one GRIMOIRE process per GPU; the v1.10.0 image ships oneAPI 2026.2, driver 26.35 and oneDNN 3.14 (checked 2026-10-28: same answers, same speed) |
+| Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs, one GRIMOIRE process per GPU; the v1.10.x images ship oneAPI 2026.2, driver 26.35 and oneDNN 3.14 (checked 2026-10-28: same answers, same speed) |
 | Benchmark | [llama-benchy](https://github.com/eugr/llama-benchy) 0.4.0 through GRIMOIRE's OpenAI-compatible server, one user unless noted, greedy decoding |
 
 This is a small desktop with one card on a x4 link, not a workstation with two x16 slots. Two-GPU
@@ -59,8 +59,8 @@ MTP head drafts for all users in one pass (main): with 2 / 4 / 8 users speculati
 +16% on two cards and +14% at 4 users on one card (llama-benchy), answers identical to drafting
 one user at a time (`GRIMOIRE_MTP_BATCH_DRAFT=0`).
 
-**Run the official FP8 checkpoint with `--proj int8`** (main since 2026-10-29; the v1.10.0 image
-still runs INT8 slower, use `--proj fp8` with it): it is closer to
+**Run the official FP8 checkpoint with `--proj int8`** (since v1.10.1; the older v1.10.0 image
+runs INT8 slower, use `--proj fp8` with that one): it is closer to
 the original model -- top-1 agreement with the BF16 original 98.0% against 94.9% with `--proj fp8`
 ([accuracy check](tools/bench/accuracy/README.md)) -- at the same speed.  Two cards, tensor
 parallel, `GRIMOIRE_MTP=1`, same build back to back:
@@ -113,13 +113,14 @@ top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.0/grimoire-b70-v1.10.0.tar.gz
-docker load < grimoire-b70-v1.10.0.tar.gz              # -> grimoire-b70:v1.10.0
-docker tag grimoire-b70:v1.10.0 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.1/grimoire-b70-v1.10.1.tar.gz
+docker load < grimoire-b70-v1.10.1.tar.gz              # -> grimoire-b70:v1.10.1
+docker tag grimoire-b70:v1.10.1 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.10.0 runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
-two GPUs, and ships oneAPI 2026.2, GPU driver 26.35 and oneDNN 3.14 (see its release notes).
+v1.10.1 runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
+two GPUs, reads GGUF files, runs the FP8 checkpoint as fast INT8 (`--proj int8`), and ships oneAPI
+2026.2, GPU driver 26.35 and oneDNN 3.14 (see its release notes).
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
 build the image yourself: `docker build -t grimoire-b70 .`
@@ -267,8 +268,8 @@ docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-si
 
 `GRIMOIRE_PP_SPLIT` is the number of layers the first GPU keeps (Ornith has 40, Qwen3.8-Flash-Next
 48). For tensor parallel, replace `multi --model ...` with `multi TP --model /models/Qwen3.8-27B-FP8
---proj int8 ...` and leave out `GRIMOIRE_PP_SPLIT` (fast INT8 is in main since 2026-10-29; the
-v1.10.0 image runs INT8 slower, so keep `--proj fp8` with that image). Use two GPUs only for checkpoints that do not fit
+--proj int8 ...` and leave out `GRIMOIRE_PP_SPLIT` (fast INT8 since v1.10.1; with the older
+v1.10.0 image keep `--proj fp8`). Use two GPUs only for checkpoints that do not fit
 one card -- a model that fits runs faster on one GPU.
 
 Qwen3.8-Flash-Next on two cards: `multi TP` with `--proj bf16 --ctx 65536`,
