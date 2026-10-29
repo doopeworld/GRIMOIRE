@@ -11,7 +11,14 @@ namespace nqes = sycl::ext::intel::esimd;
 
 // Accumulator lanes: Q4_K has 32-value groups, Q6_K 16-value groups. A row
 // keeps ONE vector accumulator over all its blocks and reduces it once.
-template <Fmt F> constexpr int nq_acc_lanes() { return F == Fmt::Q4_K || F == Fmt::Q5_K ? 32 : 16; }
+template <Fmt F> constexpr int nq_acc_lanes() {
+    return F == Fmt::Q4_K || F == Fmt::Q5_K ? 32 : F == Fmt::IQ4_NL || F == Fmt::Q8_0 ? 8 : 16;
+}
+// Bytes of 256 consecutive values of a row: one K-quant / IQ4_XS block, or 8 blocks of 32 (IQ4_NL
+// 18 B, Q8_0 34 B).  Every 256-value step of a packed row stays 16-byte aligned for those two.
+template <Fmt F> constexpr int nq_bytes_256() {
+    return 256 / NativeGGUFBlock<F>::elems * NativeGGUFBlock<F>::bytes;
+}
 // The IQ4_NL / IQ4_XS value table (formats.hpp iq4nl_value) as a register vector, for iselect.
 SYCL_ESIMD_FUNCTION inline nqes::simd<float, 16> nq_iq4_table() {
     constexpr float v[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
@@ -31,8 +38,45 @@ template <Fmt F> using nq_acc_t = nqes::simd<float, nq_acc_lanes<F>()>;
 template <Fmt F, bool ODD, int NX>
 SYCL_ESIMD_FUNCTION inline void native_qk_esacc_256(
         const uint8_t* p, nqes::simd<float, NX>& x, int xoff, nq_acc_t<F>& acc) {
-    static_assert(F == Fmt::Q4_K || F == Fmt::Q5_K || F == Fmt::Q6_K || F == Fmt::IQ4_XS);
-    if constexpr (F == Fmt::IQ4_XS) {
+    static_assert(F == Fmt::Q4_K || F == Fmt::Q5_K || F == Fmt::Q6_K || F == Fmt::IQ4_XS ||
+                  F == Fmt::IQ4_NL || F == Fmt::Q8_0);
+    if constexpr (F == Fmt::IQ4_NL || F == Fmt::Q8_0) {
+        // IQ4_NL / Q8_0 (2026-10-29): blocks of 32 values -- d (fp16), then 16 bytes of two 4-bit
+        // table indices (IQ4_NL: low nibbles = values 0..15, high = 16..31) or 32 int8 (Q8_0).  256
+        // values = 8 blocks; accumulator lane b = block b, its bytes picked by strided register
+        // selects (stride = the block size), the x values of block b by a stride-32 select.
+        constexpr int BS = NativeGGUFBlock<F>::bytes, NB = nq_bytes_256<F>();
+        nqes::simd<uint8_t, NB> raw;
+        raw.template select<NB - 16, 1>(0) = nqes::block_load<uint8_t, NB - 16>(p);
+        raw.template select<16, 1>(NB - 16) = nqes::block_load<uint8_t, 16>(p + NB - 16);
+        nqes::simd<uint16_t, 8> dlo = raw.template select<8, BS>(0);
+        nqes::simd<uint16_t, 8> dhi = raw.template select<8, BS>(1);
+        nqes::simd<uint16_t, 8> dbits = dlo | (dhi << 8);
+        nqes::simd<sycl::half, 8> dh = dbits.template bit_cast_view<sycl::half>().read();
+        nqes::simd<float, 8> d = dh;
+        nqes::simd<float, 8> dot = 0.0f;
+        if constexpr (F == Fmt::IQ4_NL) {
+            nqes::simd<float, 16> tab = nq_iq4_table();
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                nqes::simd<uint16_t, 8> b = raw.template select<8, BS>(2 + i);
+                nqes::simd<uint16_t, 8> i0 = b & 15;
+                nqes::simd<uint16_t, 8> i1 = b >> 4;
+                nqes::simd<float, 8> v0 = tab.iselect(i0);
+                nqes::simd<float, 8> v1 = tab.iselect(i1);
+                dot += v0 * x.template select<8, 32>(xoff + i) +
+                       v1 * x.template select<8, 32>(xoff + 16 + i);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                nqes::simd<uint8_t, 8> b = raw.template select<8, BS>(2 + i);
+                nqes::simd<int8_t, 8> s = b.template bit_cast_view<int8_t>().read();
+                dot += nqes::convert<float>(s) * x.template select<8, 32>(xoff + i);
+            }
+        }
+        acc += dot * d;
+    } else if constexpr (F == Fmt::IQ4_XS) {
         // IQ4_XS (2026-10-29): 136-byte blocks of 256 -- d (fp16), scales_h (2 bits a sub-block),
         // scales_l (4 bits a sub-block), then 8 sub-blocks of 32 as 16 bytes each: low nibbles =
         // values 0..15, high nibbles = 16..31, each an index into the IQ4_NL table (iselect).
@@ -177,7 +221,7 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
                              const float* x, float* y,
                              const std::vector<sycl::event>& deps) {
     constexpr int KP = 512, R = 2, RP = 4, MAXT = 32;
-    constexpr int BB = NativeGGUFBlock<F>::bytes;
+    constexpr int BB = nq_bytes_256<F>();          // bytes of 256 values (one K-quant block)
     // At most MAXT threads a row pair; past MAXT slices of 512 each thread takes `per`
     // consecutive ones (2026-10-29: Qwen3.8-27B's ffn_down, K = 17408 = 34 slices, was refused
     // and ran the SIMT GEMV at ~85 GB/s).  per == 1 is the original kernel exactly.
@@ -232,8 +276,9 @@ sycl::event native_qk_esgemv(sycl::queue& q, const QuantWeight& w,
 // SIMT GEMV (GRIMOIRE_GGUF_ESGEMV / GRIMOIRE_MOE_NATIVE_ESIMD select it too).
 template <Fmt F>
 inline bool native_qk_es_layout_ok(const QuantWeight& w) {
-    constexpr int BB = NativeGGUFBlock<F>::bytes;
-    constexpr uintptr_t AL = F == Fmt::Q4_K || F == Fmt::Q5_K ? 16 : F == Fmt::IQ4_XS ? 8 : 4;
+    constexpr int BB = nq_bytes_256<F>();
+    constexpr uintptr_t AL = F == Fmt::Q4_K || F == Fmt::Q5_K || F == Fmt::IQ4_NL || F == Fmt::Q8_0
+                                 ? 16 : F == Fmt::IQ4_XS ? 8 : 4;
     return native_qk_fast_weight<F>(w) && w.K % 512 == 0 &&
            w.row_bytes == int64_t(w.K / 256) * BB && w.row_bytes % int64_t(AL) == 0 &&
            reinterpret_cast<uintptr_t>(w.payload) % AL == 0;
@@ -268,6 +313,16 @@ inline bool native_qk_esgemv_try(sycl::queue& q, const QuantWeight& w,
         return !(e && *e == '0'); }();
     if (iq4xs && w.fmt == Fmt::IQ4_XS && native_qk_es_layout_ok<Fmt::IQ4_XS>(w)) {
         out = native_qk_esgemv<Fmt::IQ4_XS>(q, w, x, y, deps);
+        return true;
+    }
+    static const bool b32 = [] { const char* e = std::getenv("GRIMOIRE_GGUF_ESGEMV_B32");
+        return !(e && *e == '0'); }();     // IQ4_NL and Q8_0, the 32-value blocks
+    if (b32 && w.fmt == Fmt::IQ4_NL && native_qk_es_layout_ok<Fmt::IQ4_NL>(w)) {
+        out = native_qk_esgemv<Fmt::IQ4_NL>(q, w, x, y, deps);
+        return true;
+    }
+    if (b32 && w.fmt == Fmt::Q8_0 && native_qk_es_layout_ok<Fmt::Q8_0>(w)) {
+        out = native_qk_esgemv<Fmt::Q8_0>(q, w, x, y, deps);
         return true;
     }
     return false;

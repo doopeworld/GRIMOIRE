@@ -883,3 +883,10 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   IQ4_XS / IQ4_NL / IQ3_S like Q4_K / Q6_K.  bench-1022/gguf_types.py lists a file's tensor types.
 - Image grimoire-b70:v1.10.1-rc3 = main eb6526f (GGUF merged); release notes draft in the
   session scratchpad (gm/release-notes-v1.10.1.md); publishing needs Ian's OK (PAT).
+- GGUF native dense ESIMD GEMVs (7ea78fb, 84200a1): Q4_K / Q6_K past K = 16384 (ffn_down 17408 was
+  refused: one thread per 512 slice, 32 max -> now 'per' slices a thread), new Q5_K (Q4_K header +
+  qh, bytes widened before shifts), new IQ4_XS (iselect table).  UD-Q4_K_XL one token 79.9 -> 74.4 ->
+  63.1 -> 52.0 ms; texts identical to GRIMOIRE_GGUF_ESGEMV=0, top-1 94.5% throughout.  Switches:
+  GRIMOIRE_GGUF_ESGEMV_Q5K / _IQ4XS / _B32 (IQ4_NL + Q8_0) =0.  Floor for this file ~30 ms (bytes);
+  Q5_K layers 575 us vs MXFP4 430.  Build CLI only while iterating: tower_build.sh grimoire (19 min;
+  the server part adds 20+ min since the GGUF merge).
