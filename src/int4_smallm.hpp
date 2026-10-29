@@ -364,7 +364,9 @@ sycl::event int4_smallm_fdq_impl(sycl::queue& q, const QuantWeight& w, const syc
 // and the fp32 top half is the bf16 (at most 4 significant bits).  One scale
 // per row, so the DPAS results accumulate unscaled and the row scale (x 256)
 // is applied once at the end.  Only rounding: DPAS's and the bf16 X.
-template <int RBN>
+// I8: GRIMOIRE's INT8 (same layout, symmetric per-row scale).  The byte is
+// sign-extended to fp32, exact in bf16 (|v| <= 128), and the scale has no x 256.
+template <int RBN, bool I8 = false>
 sycl::event fp8_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                             float* Y, int M, int KS, int kc, int TPT,
                             const std::vector<sycl::event>& deps) {
@@ -419,12 +421,21 @@ sycl::event fp8_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf1
                             const es::simd<uint32_t, 16> wv = tq[s4].template select<16, 1>(j * CT);
                             #pragma unroll
                             for (int qb = 0; qb < 2; ++qb) {   // k-pair (4j + 2qb, 4j + 2qb + 1)
-                                const es::simd<uint32_t, 16> b0 = (wv >> (16 * qb)) & 0xFFu;
-                                const es::simd<uint32_t, 16> b1 = (wv >> (16 * qb + 8)) & 0xFFu;
-                                es::simd<uint16_t, 16> h0 = ((b0 & 0x7Fu) << 7) | ((b0 & 0x80u) << 8);
-                                es::simd<uint16_t, 16> h1 = ((b1 & 0x7Fu) << 7) | ((b1 & 0x80u) << 8);
-                                es::simd<float, 16> f0 = h0.template bit_cast_view<sycl::half>().read();
-                                es::simd<float, 16> f1 = h1.template bit_cast_view<sycl::half>().read();
+                                es::simd<float, 16> f0, f1;
+                                if constexpr (I8) {
+                                    // byte 2qb (2qb + 1) to the top, arithmetic shift back down
+                                    es::simd<uint32_t, 16> u0 = wv << (24 - 16 * qb);
+                                    es::simd<uint32_t, 16> u1 = wv << (16 - 16 * qb);
+                                    f0 = es::simd<int32_t, 16>(u0.template bit_cast_view<int32_t>().read() >> 24);
+                                    f1 = es::simd<int32_t, 16>(u1.template bit_cast_view<int32_t>().read() >> 24);
+                                } else {
+                                    const es::simd<uint32_t, 16> b0 = (wv >> (16 * qb)) & 0xFFu;
+                                    const es::simd<uint32_t, 16> b1 = (wv >> (16 * qb + 8)) & 0xFFu;
+                                    es::simd<uint16_t, 16> h0 = ((b0 & 0x7Fu) << 7) | ((b0 & 0x80u) << 8);
+                                    es::simd<uint16_t, 16> h1 = ((b1 & 0x7Fu) << 7) | ((b1 & 0x80u) << 8);
+                                    f0 = h0.template bit_cast_view<sycl::half>().read();
+                                    f1 = h1.template bit_cast_view<sycl::half>().read();
+                                }
                                 const es::simd<uint32_t, 16> pk =
                                     (f0.template bit_cast_view<uint32_t>().read() >> 16) |
                                     (f1.template bit_cast_view<uint32_t>().read() & 0xFFFF0000u);
@@ -453,7 +464,7 @@ sycl::event fp8_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf1
             } else if (!live) {
                 return;
             }
-            const es::simd<float, 16> sc = es::block_load<float, 16>(scl + n0) * 256.0f;
+            const es::simd<float, 16> sc = es::block_load<float, 16>(scl + n0) * (I8 ? 1.0f : 256.0f);
             #pragma unroll
             for (int rb = 0; rb < RBN; ++rb) {
                 #pragma unroll

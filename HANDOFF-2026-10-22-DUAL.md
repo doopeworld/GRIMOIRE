@@ -771,3 +771,67 @@ Same session, Qwen3.8-27B-FP8, both B70s, llama-benchy c1 / code probe (2,153 to
   region 7.27 -> 6.18 ms a token, one token 19.4 ms.  Same three answers as the old code
   (frozen placement).  llama-benchy tg128 44.60 (2K) / 42.18 (4K), pp 1,292 / 1,474.
   DAY TOTAL, Flash-Next two cards: tg128 38.47 -> 44.60 and 36.36 -> 42.18 (+16%), exact.
+
+### 12.15 2026-10-28 (rest of the day): everything on main, B60 fixes, multi-user MTP on two cards, v1.10.0
+- 08:12 gpu1 dropped off the bus while idle (fatal MalfTLP, config space ffff); Ian rebooted
+  twice.  Since then: builds on CPUs 6-13 only (bench-1022/tower_build.sh), every command logged
+  with a timestamp (bench-1022/logs/claude-commands-1028.log), nothing runs after a drop until
+  Ian says so.
+- Outside tester (B60 x2, Discord): branches all over the place, oneDNN not on main.  Fixed:
+  the tested two-card work merged into main (8bae8c7), README says main is the current code
+  (a048f6c).  Work goes to main the same day it is tested; no long-lived side branches.
+- bf9d8db, from the B60 report: bridge "fallback" lines only with GRIMOIRE_BRIDGE_DEBUG=1 (they
+  were false alarms in pure mode); builds for BMG-G31 (B70) + BMG-G21 (B60 / B580) by default;
+  dev_build.sh GRIM_BUILD_CPUS; the KV cache is allocated after the weights with the slot count
+  fitted to the free VRAM (GRIMOIRE_SLOTS_FIT, GRIMOIRE_VRAM_GB, GRIMOIRE_VRAM_RESERVE_GB) and
+  zero-filled.
+- ae25f19: two cards run MTP for several users at once (PPRequest kind 5 = one speculative batch
+  step on every rank; GRIMOIRE_SPEC_MAX_SEQS default 2 under TP, 4 on one card): Qwen3.8-27B-FP8
+  1 / 2 / 4 / 8 users 56.5 / 62.9 / 95.0 / 161.9 tok/s total.
+- 3fb9df7 image v1.10.0: oneAPI DPC++ 2026.2.0, compute-runtime 26.35.39758.10 + IGC 2.41.5,
+  oneDNN 3.14 (3.13.4 before), libdnnl.so.3 copied whatever its minor version.  Same code built
+  both ways, two cards, plain decode: new 30.25 tok/s, old 29.25 (no regression).  Released as
+  v1.10.0 (grimoire-b70-v1.10.0.tar.gz, 736,685,487 bytes, sha256
+  6786c9c1595ea677878823346d8a3ef36fda6c4dd5489697f31b93dde7355efa); README download + `latest`.
+- Unraid: four containers kept, all on grimoire-b70:v1.10.0 (ORNITH 203 tok/s, QWEN3.8 78,
+  DUAL-QWEN3.8 47.6 short test, DUAL-FLASH-NEXT 53.5); the other templates stay in
+  templates-user.
+- Parked on their branches (rebased on main): flashnext-mtp (Flash-Next MTP, verify 285 ms a
+  step -- slower than plain), mtp-batch-draft 2cddfa1 (one MTP head pass per depth for all users;
+  compiled, not run).
+- Tester notes kept for 10-29: prefill at 32K ~900 on B60s ("missing attention libraries");
+  K4 step on B60 = draft 4.2 + check 35.4 + commit 1.1 ms; ideas: bf16 all-reduce in the check,
+  fuse small kernels, drafts kept on the GPU, adaptive K / user limit; P2P on PCIe 5.0 boards.
+
+### 12.16 2026-10-29: accuracy against the original model; INT8 at FP8 speed
+- Tester's friend: "cosine only 0.95".  New tool tools/bench/accuracy (879a635): GRIMOIRE's
+  decode-path logits for given token ids (grimoire --score-ids / --score-out) against the BF16
+  original in transformers on the CPU (grimoire-ref:cpu, a separate measuring container), cosine /
+  KL / top-1.  Results table in tools/bench/accuracy/README.md.  Engine itself: INT8 from BF16
+  cosine 0.9996, top-1 98.4% (FP8 KV cache included).  Official FP8 checkpoint as --proj fp8:
+  0.9968 / KL 0.030 / 94.9% -- its 128x128 block scales are unpacked and every weight rounded
+  again per row; as --proj int8: 0.9981 / 0.018 / 98.0%.
+- Found on the way (879a635): a quantized output head taken as bf16 (--proj bf16 or
+  GRIMOIRE_LM_HEAD_BF16=1) gave garbage for GPTQ (cosine 0.03) and failed to load for native
+  MXFP4; anything but plain bf16 now goes through the decoder.
+- INT8 had none of FP8's fast paths (two cards: decode 23.2, 4 users 46.1, pp4096 2,448).  Now
+  (commit "INT8 at FP8 speed"): oneDNN s8 weights decompression for prompts, the ESIMD
+  row-streaming decode GEMV with an INT8 decode, the FP8 small-M kernel with an INT8 decode
+  (fallback when oneDNN declines; the sandwich batched decode; the batched output head of a
+  verify).  Tables in the commit message: two cards FP8 / INT8 pp4096 3,531 / 3,481, tg128
+  28.97 / 29.10, 4 users 93.75 / 90.72; one card MTP verify 54.2 (FP8) / 53.3 (INT8 oneDNN) /
+  53.6 (INT8 small-M) ms a step -- memory-bound, equal.
+- Two cards never use oneDNN or the small-M kernels at 2..4 rows: tp_enabled() sets exact_verify
+  in prefill(), and those rows go to launch_gemv_batch (SIMT, MB=4) for every format.
+- The 10-29 morning "4 users -13%" for INT8 was mostly run-to-run spread (FP8 97.30 -> 93.75
+  between two runs of the same code).
+- Trap: g0run.sh / tune.sh EXTRA_ENV is ONE K=V PER LINE (b70run.sh GRIM_ENV); "A=1 B=1" made
+  GRIMOIRE_MTP="1 B=1" and the debug flag never existed (a wasted gpu0 run).  dual.sh's env
+  argument is space-separated and fine.
+- Two cards + MTP (bench-1022/i8v4.sh), FP8 / INT8: code 88.1-88.5 / 84.9-85.4 tok/s (4.40 /
+  4.21 tokens a step), pp4096 3,522 / 3,566, tg128 53.45 / 53.60, 4 users 96.61 / 96.15.
+  README now says: run the FP8 checkpoint with --proj int8 (main; the v1.10.0 image is still slow
+  at INT8).
+- Next: image with INT8 -> DUAL-QWEN3.8 container on --proj int8; pp32768 on two cards (tester:
+  ~900 at 32K on B60s); MTP multi-user items from 12.15; W8A8 prompts (INT8 DPAS = 2x bf16, lossy,
+  accuracy check decides); native block-scaled FP8; native NVFP4.

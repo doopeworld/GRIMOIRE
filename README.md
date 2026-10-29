@@ -56,6 +56,20 @@ On two cards, MTP serves several users at once since 2026-10-28 (it drafts for u
 with more, the step is a plain batched one): 1 / 2 / 4 / 8 users = 56.5 / 62.9 / 95.0 / 161.9
 tok/s in total.  DFlash2 still serves one request at a time on two cards.
 
+**Run the official FP8 checkpoint with `--proj int8`** (main since 2026-10-29; the v1.10.0 image
+still runs INT8 slower, use `--proj fp8` with it): it is closer to
+the original model -- top-1 agreement with the BF16 original 98.0% against 94.9% with `--proj fp8`
+([accuracy check](tools/bench/accuracy/README.md)) -- at the same speed.  Two cards, tensor
+parallel, `GRIMOIRE_MTP=1`, same build back to back:
+
+| Qwen3.8-27B-FP8 checkpoint, two B70s + MTP | pp4096 | tg128, 1 user | tg128, 4 users (total) | top-1 |
+|---|---:|---:|---:|---:|
+| `--proj int8` | 3,566 | 53.6 | 96.2 | **98.0%** |
+| `--proj fp8` | 3,522 | 53.5 | 96.6 | 94.9% |
+
+(FP8 checkpoints store one scale per 128 x 128 block; GRIMOIRE keeps one scale per row, so
+`--proj fp8` rounds every weight a second time.  INT8 with a row scale keeps more of the file.)
+
 Same machine, same llama-benchy test, Qwen3.8-27B-FP8 on both cards without MTP: **vLLM (XPU build)
 1,400 tok/s prompt (pp4096) and 21 tok/s decode, using 56 GB of VRAM; GRIMOIRE 3,530 and 29.5
 (56.2 with MTP).** Correctness: on a 2,153-token coding prompt, every tensor-parallel speed-up
@@ -216,9 +230,9 @@ serves HTTP. Each GPU stays in its own process and exchanges data through host m
 on boards without GPU-to-GPU P2P. Two layouts:
 
 - `multi TP` (tensor parallel): both cards work on every token, each holding half of every layer.
-  Use it for dense models such as Qwen3.8-27B-FP8 (~3,500 tok/s prompt, 29.5 decode for one user,
-  165 total for 8 users; with `GRIMOIRE_MTP=1` 56.5 for one user, 88 on code, 162 total for 8
-  users) and for Qwen3.8-Flash-Next (tensor + expert parallel, see below).
+  Use it for dense models such as Qwen3.8-27B-FP8 with `--proj int8` (~3,500 tok/s prompt, 29.5
+  decode for one user, 165 total for 8 users; with `GRIMOIRE_MTP=1` 56.5 for one user, 88 on
+  code, 162 total for 8 users) and for Qwen3.8-Flash-Next (tensor + expert parallel, see below).
 - `multi PP` (pipeline parallel): each card holds a block of layers. Use it for MoE models such as
   Ornith-1.5-35B-A3B-FP8.
 
@@ -237,7 +251,8 @@ docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-si
 
 `GRIMOIRE_PP_SPLIT` is the number of layers the first GPU keeps (Ornith has 40, Qwen3.8-Flash-Next
 48). For tensor parallel, replace `multi --model ...` with `multi TP --model /models/Qwen3.8-27B-FP8
---proj fp8 ...` and leave out `GRIMOIRE_PP_SPLIT`. Use two GPUs only for checkpoints that do not fit
+--proj int8 ...` and leave out `GRIMOIRE_PP_SPLIT` (fast INT8 is in main since 2026-10-29; the
+v1.10.0 image runs INT8 slower, so keep `--proj fp8` with that image). Use two GPUs only for checkpoints that do not fit
 one card -- a model that fits runs faster on one GPU.
 
 Qwen3.8-Flash-Next on two cards: `multi TP` with `--proj bf16 --ctx 65536`,

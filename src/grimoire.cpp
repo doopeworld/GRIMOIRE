@@ -14790,7 +14790,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
                 launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
                 if (w.w.fmt == Fmt::BF16) launch_bf16_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::INT4) launch_int4_smallm(q, w.w, xb, y, M);
-                else if (w.w.fmt == Fmt::FP8_E4M3) launch_fp8_smallm(q, w.w, xb, y, M);
+                else if (w.w.fmt == Fmt::FP8_E4M3 || w.w.fmt == Fmt::INT8) launch_fp8_smallm(q, w.w, xb, y, M);
                 else launch_mxfp4_smallm(q, w.w, xb, y, M);
                 return;
             }
@@ -17114,7 +17114,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                              !w.has_i4() && int4_smallm_ok(w.w,M,nullptr,y);
         // FP8 E4M3 (2026-10-06): before this it took launch_gemv_batch below,
         // the SIMT GEMV at ~50 GB/s -- Qwen3.8-27B FP8 + MTP on two B70s 4.1
-        // tok/s against 9.4 without speculation.
+        // tok/s against 9.4 without speculation.  INT8 too since 2026-10-29
+        // (same layout; GRIMOIRE_SMALLM_VERIFY=1 against the decode GEMV: rel
+        // 3e-4 .. 1.5e-3 on every Qwen3.8-27B verify shape, the bf16 X rounding).
         const bool dpas_f8 = smallm_dpas && M>=2 && M<=8 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && fp8_smallm_ok(w.w,M,nullptr,y);
         // FP8 / BF16 weights at 2..16 rows (a verify block) through oneDNN rather
@@ -17126,6 +17128,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             const char* v = std::getenv("GRIMOIRE_SMALLM_ONEDNN");
             return !(v && *v == '0');
         }();
+        // INT8 the same (2026-10-29): MEASURED one card, Qwen3.8-27B as --proj int8
+        // + MTP depth 4, verify 53.3 ms per step through oneDNN s8, 53.6 through
+        // the small-M kernel's INT8 decode (dpas_f8), FP8 54.2 -- equal, so oneDNN
+        // stays first and the small-M kernel is what INT8 gets when it declines.
         const bool dnnl_small = smallm_dnnl && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                                 !w.has_i4() && onednn_gemm_ok(w.w,M);
         const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
@@ -17154,7 +17160,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
                         for(int r=0;r<M;++r)
                             launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
-                        smallm_report(dpas_i4?"int4":dpas_f8?"fp8":dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
+                        smallm_report(dnnl_small?"oneDNN":dpas_i4?"int4":dpas_f8?(w.w.fmt==Fmt::INT8?"int8":"fp8"):
+                                      dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
                         sycl::free(ref,q);
                     }
                     return;
@@ -19280,7 +19287,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
         } else if ((lm_head.w.fmt == Fmt::MXFP4 ||
                     (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
-                    (lm_head.w.fmt == Fmt::FP8_E4M3 && fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)))
+                    ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
+                     fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)))
                    && lm_head.w.payload) {
             // Verification is a matrix multiplication, not M independent
             // decode GEMVs.  Load the large vocabulary matrix once per batch.
@@ -19290,7 +19298,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         const bool lm_batched = lm_head.w.fmt == Fmt::MXFP4 ||
             (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
-            (lm_head.w.fmt == Fmt::FP8_E4M3 && fp8_smallm_ok(lm_head.w, M, nullptr, nullptr));
+            ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
+             fp8_smallm_ok(lm_head.w, M, nullptr, nullptr));
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
             if (!tp_enabled() && !lm_head.has_i4() && !lm_batched)

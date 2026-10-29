@@ -57,7 +57,9 @@ What it says:
   GRIMOIRE's FP8 KV cache, so the KV cache is not where accuracy goes.
 - The official FP8 checkpoint loses accuracy in GRIMOIRE's conversion, not in the format: its 128x128
   block scales are unpacked and every weight is rounded again with one scale per row (94.9% top-1,
-  against 97.7-98.0% when the weights are rounded once).  Being fixed.
+  against 97.7-98.0% when the weights are rounded once).  **Run these checkpoints with
+  `--proj int8`**: 98.0% top-1, and since 2026-10-29 the same speed as `--proj fp8` on one card
+  and on two (prompt, decode, several users, MTP).
 - An NVFP4 checkpoint converted to MXFP4 at load is the least accurate run (83.2%); the same file
   held as INT8 gives 91.4%.  Running NVFP4 natively is planned.
 - The GPTQ checkpoint's loss is in the file itself: held as INT8 it scores the same.

@@ -1081,7 +1081,11 @@ sycl::event esgemv2_int4(sycl::queue& q, const QuantWeight& w, const float* x, f
 // the 256x is folded into the row scale.  The SIMT kernel streamed
 // Qwen3.8-27B-FP8 at ~250 GB/s: 9.4 tok/s on two B70s (2026-10-06).  Not
 // bit-identical to it (summation order).  GRIMOIRE_ESGEMV_FP8=0 = SIMT.
-template <int R, int KP>
+// I8 (2026-10-29): GRIMOIRE's INT8 through the same kernel -- the same layout (a byte a
+// weight, an f32 scale a row), the byte read as a signed integer instead of E4M3, no 256x.
+// INT8 took the SIMT kernel before: Qwen3.8-27B on two cards decoded at 23.2 tok/s against
+// FP8's 26-30.  GRIMOIRE_ESGEMV_INT8=0 = SIMT.
+template <int R, int KP, bool I8 = false>
 sycl::event esgemv2_fp8(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
                         const std::vector<sycl::event>& deps) {
     constexpr int RP = R < 4 ? 4 : R;
@@ -1108,9 +1112,16 @@ sycl::event esgemv2_fp8(sycl::queue& q, const QuantWeight& w, const float* x, fl
                 es::simd<float, 16> acc = 0.0f;
                 #pragma unroll
                 for (int c = 0; c < KP / 64; ++c) {
-                    es::simd<uint16_t, 64> u = pb[r].template select<64, 1>(c * 64);
-                    es::simd<uint16_t, 64> hb = ((u & 0x7F) << 7) | ((u & 0x80) << 8);
-                    es::simd<float, 64> wf = hb.template bit_cast_view<sycl::half>().read();
+                    es::simd<float, 64> wf;
+                    if constexpr (I8) {
+                        es::simd<uint8_t, 64> ub = pb[r].template select<64, 1>(c * 64);
+                        es::simd<int8_t, 64> sb = ub.template bit_cast_view<int8_t>().read();
+                        wf = es::simd<float, 64>(sb);
+                    } else {
+                        es::simd<uint16_t, 64> u = pb[r].template select<64, 1>(c * 64);
+                        es::simd<uint16_t, 64> hb = ((u & 0x7F) << 7) | ((u & 0x80) << 8);
+                        wf = hb.template bit_cast_view<sycl::half>().read();
+                    }
                     #pragma unroll
                     for (int b = 0; b < 4; ++b)
                         acc += wf.template select<16, 1>(16 * b) * xs.template select<16, 1>(c * 64 + 16 * b);
@@ -1125,9 +1136,22 @@ sycl::event esgemv2_fp8(sycl::queue& q, const QuantWeight& w, const float* x, fl
                 for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
             }
             #pragma unroll
-            for (int r = 0; r < R; ++r) y[row0 + r] = red[r] * (scl[row0 + r] * 256.0f);
+            for (int r = 0; r < R; ++r) y[row0 + r] = red[r] * (scl[row0 + r] * (I8 ? 1.0f : 256.0f));
         });
     });
+}
+
+bool esgemv_int8_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                     const std::vector<sycl::event>& deps, sycl::event& out) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV_INT8");
+        return !(e && *e == '0'); }();
+    if (!on || w.fmt != Fmt::INT8 || !w.payload || !w.scales || w.N % 2 != 0 ||
+        w.row_bytes < int64_t(w.K) || w.row_bytes % 64 != 0)
+        return false;
+    const int K = w.K;
+    if (K % 256 == 0 && K / 256 <= kEs4MaxKS) { out = esgemv2_fp8<2, 256, true>(q, w, x, y, deps); return true; }
+    if (K % 512 == 0 && K / 512 <= kEs4MaxKS) { out = esgemv2_fp8<2, 512, true>(q, w, x, y, deps); return true; }
+    return false;
 }
 
 bool esgemv_fp8_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
@@ -1199,6 +1223,10 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
     if constexpr (F == Fmt::FP8_E4M3 && MB == 1) {
         sycl::event ev;
         if (esgemv_fp8_try(q, w, x, y, deps, ev)) return ev;
+    }
+    if constexpr (F == Fmt::INT8 && MB == 1) {
+        sycl::event ev;
+        if (esgemv_int8_try(q, w, x, y, deps, ev)) return ev;
     }
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;
@@ -1395,11 +1423,13 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 // to launch_gemv_batch: the SIMT GEMV, the weights read once per 4 rows --
 // Qwen3.8-27B FP8 + MTP on two B70s ran 4.1 tok/s against 9.4 plain
 // (2026-10-06).  GRIMOIRE_FP8_SMALLM=0 = the old path.
+// INT8 too (2026-10-29): same layout, the kernel's I8 decode.
 bool fp8_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_FP8_SMALLM");
         return !(e && *e == '0'); }();
     auto a64 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 63) == 0; };
-    return on && w.fmt == Fmt::FP8_E4M3 && w.payload && w.scales && M >= 1 && M <= 8 &&
+    return on && (w.fmt == Fmt::FP8_E4M3 || w.fmt == Fmt::INT8) && w.payload && w.scales &&
+           w.row_scales == 1 && M >= 1 && M <= 8 &&
            w.K % 512 == 0 && w.N % 16 == 0 && w.row_bytes >= int64_t(w.K) && w.row_bytes % 64 == 0 &&
            a64(w.payload) && a64(w.scales) && (!X || a64(X)) && (!Y || a64(Y));
 }
@@ -1412,7 +1442,8 @@ sycl::event launch_fp8_smallm(sycl::queue& q, const QuantWeight& w, const sycl_b
     KS = (K + kc - 1) / kc;
     int TPT = 1;
     while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
-    return fp8_smallm_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
+    return w.fmt == Fmt::INT8 ? fp8_smallm_impl<1, true>(q, w, X, Y, M, KS, kc, TPT, deps)
+                              : fp8_smallm_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
 }
 
 // ---------------------------------------------------------------------

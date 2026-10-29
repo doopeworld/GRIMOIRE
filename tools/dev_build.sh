@@ -19,4 +19,5 @@ docker image inspect "$IMG" >/dev/null 2>&1 || docker build --target builder -t 
 CPUS="${GRIM_BUILD_CPUS:-all}"
 CPUSET=()
 [ "$CPUS" = all ] || CPUSET=(--cpuset-cpus "$CPUS")
-exec docker run --rm ${CPUSET[@]+"${CPUSET[@]}"} -e GRIM_TARGETS="${GRIM_TARGETS:-}" -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"
+exec docker run --rm ${CPUSET[@]+"${CPUSET[@]}"} -e GRIM_TARGETS="${GRIM_TARGETS:-}" \
+    -e GRIM_ONEDNN="${GRIM_ONEDNN:-}" -v "$REPO":/grimoire -w /grimoire "$IMG" bash -lc "$cmd"

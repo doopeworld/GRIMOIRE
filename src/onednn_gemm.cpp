@@ -142,18 +142,24 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
     if (it != c.prims.end()) return it->second;
     const auto t0 = std::chrono::steady_clock::now();
     const bool fp8 = w.fmt == Fmt::FP8_E4M3;
+    // INT8 (2026-10-29): GRIMOIRE's symmetric per-row int8 -- the same layout as its FP8, one
+    // byte a weight and one f32 scale a row -- as oneDNN weights decompression: s8 weights,
+    // bf16 source, fpmath bf16 applied to integers.  Before, INT8 had no oneDNN or small-M
+    // path: Qwen3.8-27B on two cards pp4096 2,448 / 4 users 46 tok/s against FP8 3,475 / 89.
+    const bool s8 = w.fmt == Fmt::INT8;
     Prim p;
     p.src = dnnl::memory::desc({M, w.K}, dt::bf16, tag::ab);
     // W is [N][K] row-major: oneDNN's [K][N] weights in the transposed tag.
-    p.wei = dnnl::memory::desc({w.K, w.N}, fp8 ? dt::f8_e4m3 : dt::bf16, tag::ba);
+    p.wei = dnnl::memory::desc({w.K, w.N}, fp8 ? dt::f8_e4m3 : s8 ? dt::s8 : dt::bf16, tag::ba);
     p.dst = dnnl::memory::desc({M, w.N}, dt::f32, tag::ab);
     dnnl::primitive_attr attr;
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
     attr.set_deterministic(true);
-    if (fp8) {
+    if (fp8 || s8) {
         attr.set_scales_mask(DNNL_ARG_WEIGHTS, 1 << 1);    // one f32 scale per output column
         p.scl = dnnl::memory::desc({w.N}, dt::f32, tag::a);
     }
+    if (s8) attr.set_fpmath_mode(dnnl::fpmath_mode::bf16, true);
     if (acc) {
         dnnl::post_ops po;
         po.append_sum(1.0f);
@@ -166,7 +172,7 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
     static const bool verbose = std::getenv("GRIMOIRE_ONEDNN_VERBOSE") != nullptr;
     if (verbose)
         std::fprintf(stderr, "  oneDNN matmul %s M=%d N=%d K=%d%s: %s, scratchpad %zu B, "
-                     "created in %.1f ms\n", fp8 ? "fp8" : "bf16", M, w.N, w.K,
+                     "created in %.1f ms\n", fp8 ? "fp8" : s8 ? "s8" : "bf16", M, w.N, w.K,
                      acc ? " (+=)" : "", pd.impl_info_str(), p.scr.get_size(),
                      std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - t0).count());
@@ -185,7 +191,7 @@ sycl::event exec(Ctx& c, const Prim& p, const QuantWeight& w, const sycl_bf16* x
     args[DNNL_ARG_DST]     = make_memory(p.dst, c.eng, memory_kind::usm, y);
     if (p.scr.get_size())
         args[DNNL_ARG_SCRATCHPAD] = make_memory(p.scr, c.eng, memory_kind::usm, c.scratch);
-    if (w.fmt == Fmt::FP8_E4M3)
+    if (w.fmt == Fmt::FP8_E4M3 || w.fmt == Fmt::INT8)
         args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS] =
             make_memory(p.scl, c.eng, memory_kind::usm, const_cast<void*>(w.scales));
     return execute(p.prim, c.strm, args, deps);
@@ -195,7 +201,7 @@ sycl::event exec(Ctx& c, const Prim& p, const QuantWeight& w, const sycl_bf16* x
 
 bool onednn_gemm_ok(const QuantWeight& w, int M) {
     if (!enabled() || M <= 0 || !w.payload) return false;
-    if (w.fmt == Fmt::FP8_E4M3)
+    if (w.fmt == Fmt::FP8_E4M3 || w.fmt == Fmt::INT8)
         return w.scales && w.row_scales == 1 && w.row_bytes == int64_t(w.K);
     if (w.fmt == Fmt::BF16)
         return w.row_bytes == int64_t(w.K) * 2;
