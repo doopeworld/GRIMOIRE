@@ -2,6 +2,8 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-29 evening: GGUF native decode (--proj native keeps the file's K-quant / IQ blocks) on one B70: Qwen3.8-27B UD-Q4_K_XL one token 79.9 -> 46.9 ms with ESIMD GEMVs for Q4_K / Q5_K / Q6_K / IQ4_XS / IQ4_NL / Q8_0 (main 7ea78fb, 84200a1, 1c62a4d; GRIMOIRE_GGUF_ESGEMV=0 = the generic kernels), answers identical, top-1 94.5% vs the BF16 original (the same file as MXFP4: 29.3 ms but 87.5%).  Next: IQ4_XS layers (~1.05 ms vs ~0.35 ms of bytes), GGUF prefill.  Release v1.10.1 (image rc3, validated) waits for Ian's yes.  gpu1 still paused.**
+
 **2026-10-29 afternoon: GGUF (feature/gguf-battlemage) MERGED INTO MAIN -- one branch for everything; gate A 4/4 identical, regression 41/44 identical to pre-merge (3 Muse near-tie flips, deterministic).  INT4 small-M past 8 rows on the fast dequant (MTP 2 / 4 users +9 / +8%).  Adaptive MTP depth tried, slower (branch mtp-adapt).  Correction: tp_enabled() = LEGACY TP only; Megatron runs the small-M kernels like one card.  gpu1 still paused; dual.sh T0 = both TP ranks on gpu0.  Handoff 12.17.**
 
 **2026-10-29 late morning: MTP batched drafting on main (answers identical, +5-16% at 2-8 users); prompt-attention kernel named in the log; two cards pp32768 = 2,570 tok/s.  TWO-CARD WORK PAUSED: 10:43 gpu1 root-port receive-error burst during a load (guard STOP), switch RxErr ~2,170/s idle -- gpu0 only until Ian says.  Handoff 12.16.**
