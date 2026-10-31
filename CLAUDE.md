@@ -2,9 +2,9 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**PAUSED 2026-10-31 13:53 CET: Ian needs both GPUs. No Grimoire GPU jobs remain; leave his
-COMFYUI-BETA alone. CPU-only build container quirky_rubin is paused, preserving compilation.
-Wait for Ian to resume. Full unfinished engine scope and current prototype state are in
+**RESUMED by Ian 2026-10-31 14:15 CET. Full engine work is active on GPU0; GPU1 remains
+off limits after its link errors. Native small-M MoE, MTP device drafting and oneDNN W8A8
+are separate candidates, with model gates before merging. Full unfinished scope is in
 [ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md); do not stop the project at the release checkpoint.**
 
 **2026-10-31 scope correction from Ian: continue the FULL engine work, including oneDNN,

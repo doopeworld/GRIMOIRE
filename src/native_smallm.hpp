@@ -184,6 +184,37 @@ SYCL_ESIMD_FUNCTION inline void q6k_block(const uint32_t* pay, u32x16 roff, uint
 }
 } // namespace nsm
 
+// Keep the dense capture free of expert-table pointers and dimensions. With the
+// engine's code-split=off build, constexpr ternaries still captured their unused
+// operands on the host while AOT removed them from the device argument list.
+// A typed layout gives each kernel only the state it actually consumes.
+struct NativeSmallmDenseLayout {
+    int M;
+    SYCL_ESIMD_FUNCTION int expert(int) const { return 0; }
+    SYCL_ESIMD_FUNCTION bool active(int) const { return true; }
+    SYCL_ESIMD_FUNCTION int rows(int) const { return M; }
+    SYCL_ESIMD_FUNCTION int tile(int g, int tw, int tpt) const { return g*tpt+tw; }
+    SYCL_ESIMD_FUNCTION const sycl_bf16* input(const sycl_bf16* p, int) const { return p; }
+    SYCL_ESIMD_FUNCTION float* output(float* p, int) const { return p; }
+    SYCL_ESIMD_FUNCTION const uint32_t* weights(const uint32_t* p, int) const { return p; }
+};
+struct NativeSmallmGroupedLayout {
+    int groups, N, K;
+    uint32_t rbytes;
+    const int32_t *table, *off, *cnt;
+    SYCL_ESIMD_FUNCTION int expert(int g) const { return table[g/groups]; }
+    SYCL_ESIMD_FUNCTION bool active(int e) const { return e>=0 && cnt[e]!=0; }
+    SYCL_ESIMD_FUNCTION int rows(int e) const { return cnt[e]; }
+    SYCL_ESIMD_FUNCTION int tile(int g, int tw, int tpt) const { return (g%groups)*tpt+tw; }
+    SYCL_ESIMD_FUNCTION const sycl_bf16* input(const sycl_bf16* p, int e) const {
+        return p+size_t(off[e])*K;
+    }
+    SYCL_ESIMD_FUNCTION float* output(float* p, int e) const { return p+size_t(off[e])*N; }
+    SYCL_ESIMD_FUNCTION const uint32_t* weights(const uint32_t* p, int e) const {
+        return p+size_t(e)*N*rbytes/4;
+    }
+};
+
 template <Fmt F, int RBN, bool GROUPED = false>
 sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                float* Y, int M, int KS, int kc, int TPT,
@@ -199,6 +230,10 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
     const uint32_t rbytes = uint32_t(w.row_bytes);
     const unsigned XW = unsigned(K) * 2 - 1;
     const unsigned YW = unsigned(N) * 4 - 1;
+    const auto layout = [&] {
+        if constexpr (GROUPED) return NativeSmallmGroupedLayout{groups,N,K,rbytes,tile_e,off,cnt};
+        else return NativeSmallmDenseLayout{M};
+    }();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(size_t(T) * groups * TPT * KS, size_t(TPT) * KS),
@@ -211,18 +246,15 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
             const int lid = int(it.get_local_id(0));
             const int tw = lid / KS, ks = lid % KS;
             const int g = int(it.get_group(0));
-            const int e = GROUPED ? tile_e[g / groups] : 0;
-            if constexpr (GROUPED) {
-                // Uniform across the work-group, before any split-K barrier.
-                if (e < 0 || cnt[e] == 0) return;
-            }
-            const int rows = GROUPED ? cnt[e] : M;
-            const size_t row_base = GROUPED ? size_t(off[e]) : 0;
+            const int e = layout.expert(g);
+            // Uniform across the work-group, before any split-K barrier.
+            if (!layout.active(e)) return;
+            const int rows = layout.rows(e);
             const unsigned XH = unsigned(rows) - 1;
-            const sycl_bf16* Xe = X + row_base * K;
-            float* Ye = Y + row_base * N;
-            const uint32_t* pay = pay_base + size_t(e) * N * rbytes / 4;
-            const int tile = (GROUPED ? g % groups : g) * TPT + tw;
+            const sycl_bf16* Xe = layout.input(X,e);
+            float* Ye = layout.output(Y,e);
+            const uint32_t* pay = layout.weights(pay_base,e);
+            const int tile = layout.tile(g,tw,TPT);
             const bool live = tile < tiles;
             const int n0 = (live ? tile : 0) * CT;
             const int kb = ks * kc;
