@@ -50,6 +50,7 @@
 #include "onednn_gemm.hpp"
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
+#include <sycl/ext/intel/math.hpp>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -88,15 +89,16 @@ bool exact_m() {
 }
 
 struct Key {
-    int fmt, M, N, K, acc;
+    int fmt, M, N, K, acc, a8;
     bool operator<(const Key& o) const {
-        return std::tie(fmt, M, N, K, acc) < std::tie(o.fmt, o.M, o.N, o.K, o.acc);
+        return std::tie(fmt, M, N, K, acc, a8) < std::tie(o.fmt, o.M, o.N, o.K, o.acc, o.a8);
     }
 };
 
 struct Prim {
     dnnl::matmul       prim;
-    dnnl::memory::desc src, wei, dst, scr, scl;
+    dnnl::memory::desc src, wei, dst, scr, scl, ascl;
+    bool a8=false;
 };
 
 struct Ctx {
@@ -109,6 +111,10 @@ struct Ctx {
     size_t               xs_cap = 0;
     float*               ys = nullptr;
     size_t               ys_cap = 0;
+    int8_t*              x8 = nullptr;
+    size_t               x8_cap = 0;
+    float*               as = nullptr;
+    size_t               as_cap = 0;
 };
 
 std::mutex& mu() { static std::mutex m; return m; }
@@ -137,7 +143,11 @@ void grow(sycl::queue& q, T*& p, size_t& cap, size_t need, const char* what) {
 }
 
 const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool acc) {
-    const Key k{int(w.fmt), M, w.N, w.K, acc ? 1 : 0};
+    static const bool requested=[] {
+        const char* e=std::getenv("GRIMOIRE_ONEDNN_W8A8");return e&&std::atoi(e)!=0;
+    }();
+    const bool a8=requested&&w.fmt==Fmt::INT8&&M>=32&&w.N>=256&&w.K%64==0;
+    const Key k{int(w.fmt), M, w.N, w.K, acc ? 1 : 0, a8?1:0};
     auto it = c.prims.find(k);
     if (it != c.prims.end()) return it->second;
     const auto t0 = std::chrono::steady_clock::now();
@@ -148,7 +158,8 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
     // path: Qwen3.8-27B on two cards pp4096 2,448 / 4 users 46 tok/s against FP8 3,475 / 89.
     const bool s8 = w.fmt == Fmt::INT8;
     Prim p;
-    p.src = dnnl::memory::desc({M, w.K}, dt::bf16, tag::ab);
+    p.a8=a8;
+    p.src = dnnl::memory::desc({M, w.K}, a8?dt::s8:dt::bf16, tag::ab);
     // W is [N][K] row-major: oneDNN's [K][N] weights in the transposed tag.
     p.wei = dnnl::memory::desc({w.K, w.N}, fp8 ? dt::f8_e4m3 : s8 ? dt::s8 : dt::bf16, tag::ba);
     p.dst = dnnl::memory::desc({M, w.N}, dt::f32, tag::ab);
@@ -159,20 +170,25 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
         attr.set_scales_mask(DNNL_ARG_WEIGHTS, 1 << 1);    // one f32 scale per output column
         p.scl = dnnl::memory::desc({w.N}, dt::f32, tag::a);
     }
-    if (s8) attr.set_fpmath_mode(dnnl::fpmath_mode::bf16, true);
+    if(a8){
+        attr.set_scales_mask(DNNL_ARG_SRC,1<<0);
+        p.ascl=dnnl::memory::desc({M},dt::f32,tag::a);
+    }else if (s8) attr.set_fpmath_mode(dnnl::fpmath_mode::bf16, true);
     if (acc) {
         dnnl::post_ops po;
         po.append_sum(1.0f);
         attr.set_post_ops(po);
     }
     dnnl::matmul::primitive_desc pd(c.eng, p.src, p.wei, p.dst, attr);
+    if(a8&&std::string(pd.impl_info_str()).find(":ref:")!=std::string::npos)
+        throw std::runtime_error("oneDNN W8A8: only a reference implementation is available for this shape");
     p.scr  = pd.scratchpad_desc();
     p.prim = dnnl::matmul(pd);
     grow(q, c.scratch, c.scratch_cap, p.scr.get_size(), "scratchpad");
     static const bool verbose = std::getenv("GRIMOIRE_ONEDNN_VERBOSE") != nullptr;
     if (verbose)
         std::fprintf(stderr, "  oneDNN matmul %s M=%d N=%d K=%d%s: %s, scratchpad %zu B, "
-                     "created in %.1f ms\n", fp8 ? "fp8" : s8 ? "s8" : "bf16", M, w.N, w.K,
+                     "created in %.1f ms\n", a8?"W8A8":fp8 ? "fp8" : s8 ? "s8" : "bf16", M, w.N, w.K,
                      acc ? " (+=)" : "", pd.impl_info_str(), p.scr.get_size(),
                      std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - t0).count());
@@ -180,12 +196,38 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
 }
 
 // One primitive over exactly its own row count, x and y at those rows.
-sycl::event exec(Ctx& c, const Prim& p, const QuantWeight& w, const sycl_bf16* x, float* y,
+sycl::event exec(sycl::queue& q,Ctx& c, const Prim& p, const QuantWeight& w, const sycl_bf16* x, float* y,
                  const std::vector<sycl::event>& deps) {
     using namespace dnnl::sycl_interop;
     std::unordered_map<int, dnnl::memory> args;
-    args[DNNL_ARG_SRC]     = make_memory(p.src, c.eng, memory_kind::usm,
-                                         const_cast<sycl_bf16*>(x));
+    std::vector<sycl::event> ready=deps;
+    void* source=const_cast<sycl_bf16*>(x);
+    if(p.a8){
+        const int M=int(p.src.get_dims()[0]),K=w.K;
+        grow(q,c.x8,c.x8_cap,size_t(M)*K,"int8 activations");
+        grow(q,c.as,c.as_cap,size_t(M),"activation scales");
+        int8_t* out=c.x8;float* scales=c.as;
+        constexpr size_t WG=256;
+        const auto quant=q.submit([&](sycl::handler& h){
+            h.depends_on(ready);
+            h.parallel_for(sycl::nd_range<1>(size_t(M)*WG,WG),[=](sycl::nd_item<1> it){
+                const int row=int(it.get_group(0)),lid=int(it.get_local_id(0));
+                float local=0.f;
+                for(int k=lid;k<K;k+=WG)local=sycl::fmax(local,sycl::fabs(float(x[size_t(row)*K+k])));
+                const float maximum=sycl::reduce_over_group(it.get_group(),local,sycl::maximum<float>());
+                const float scale=maximum>0.f?sycl::ext::intel::math::fdiv_rn(maximum,127.f):1.f;
+                const float inverse=sycl::ext::intel::math::fdiv_rn(1.f,scale);
+                if(lid==0)scales[row]=scale;
+                for(int k=lid;k<K;k+=WG){
+                    const float v=sycl::rint(float(x[size_t(row)*K+k])*inverse);
+                    out[size_t(row)*K+k]=int8_t(sycl::clamp(v,-127.f,127.f));
+                }
+            });
+        });
+        ready={quant};source=c.x8;
+        args[DNNL_ARG_ATTR_SCALES|DNNL_ARG_SRC]=make_memory(p.ascl,c.eng,memory_kind::usm,c.as);
+    }
+    args[DNNL_ARG_SRC]     = make_memory(p.src, c.eng, memory_kind::usm,source);
     args[DNNL_ARG_WEIGHTS] = make_memory(p.wei, c.eng, memory_kind::usm,
                                          const_cast<uint8_t*>(w.payload));
     args[DNNL_ARG_DST]     = make_memory(p.dst, c.eng, memory_kind::usm, y);
@@ -194,7 +236,7 @@ sycl::event exec(Ctx& c, const Prim& p, const QuantWeight& w, const sycl_bf16* x
     if (w.fmt == Fmt::FP8_E4M3 || w.fmt == Fmt::INT8)
         args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS] =
             make_memory(p.scl, c.eng, memory_kind::usm, const_cast<void*>(w.scales));
-    return execute(p.prim, c.strm, args, deps);
+    return execute(p.prim, c.strm, args, ready);
 }
 
 } // namespace
@@ -213,7 +255,7 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
     std::lock_guard<std::mutex> lk(mu());
     Ctx& c = ctx_for(q);
     if (exact_m() || w.N < kWideN || M < kPieceMinM)
-        return exec(c, prim_for(q, c, w, M, accumulate), w, x, y, deps);
+        return exec(q,c, prim_for(q, c, w, M, accumulate), w, x, y, deps);
     const size_t K = size_t(w.K), N = size_t(w.N);
     std::vector<sycl::event> d = deps;
     sycl::event e;
@@ -221,7 +263,7 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
     for (const int P : kPieces) {
         while (M - r0 >= P) {            // after the 1024s at most one of each smaller piece
             const Prim& p = prim_for(q, c, w, P, accumulate);
-            e = exec(c, p, w, x + size_t(r0) * K, y + size_t(r0) * N, d);
+            e = exec(q,c, p, w, x + size_t(r0) * K, y + size_t(r0) * N, d);
             d = {e};
             r0 += P;
         }
@@ -242,7 +284,7 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
         e = q.memcpy(c.xs, x + size_t(r0) * K, size_t(rem) * K * sizeof(sycl_bf16), d);
         if (accumulate)
             e = q.memcpy(c.ys, y + size_t(r0) * N, size_t(rem) * N * sizeof(float), {e});
-        e = exec(c, p, w, c.xs, c.ys, {e});
+        e = exec(q,c, p, w, c.xs, c.ys, {e});
         e = q.memcpy(y + size_t(r0) * N, c.ys, size_t(rem) * N * sizeof(float), {e});
     }
     return e;
