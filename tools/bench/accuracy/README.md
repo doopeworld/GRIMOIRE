@@ -33,6 +33,11 @@ docker run --rm -v /data/acc:/acc grimoire-ref:cpu \
 `grimoire --score-ids` feeds the ids one at a time through the decode path, the path generation uses.
 `GRIMOIRE_LM_HEAD_BF16=1` keeps the checkpoint's output head instead of converting it to `--proj`.
 
+For changes to prompt arithmetic, set `GRIMOIRE_SCORE_PREFILL=1`. It resets the state and
+prefills each prefix of the same token file, then writes its final vocabulary logits in
+the same format. This costs more work, but includes prompt GEMMs that single-token scoring
+does not exercise. Compare both the ordinary and changed prompt paths with the same reference.
+
 ## Results 2026-10-29: Qwen3.8-27B, one Arc Pro B70
 
 256 tokens of English prose (the opening of "A Scandal in Bohemia"); reference = the BF16 original in
