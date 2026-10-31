@@ -8,9 +8,9 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.0**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.2**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; the GGUF speed-ups of the 29th's evening (native decode, MTP on GGUF) are on main and come in v1.10.2. Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF. Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -108,17 +108,44 @@ about the cost of one).  The BF16 GGUF gives **token-identical** output to the s
 UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (Q8_0 as `--proj int8`: 99.2%
 top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 
+### Served image validation, 2026-10-31 (v1.10.2)
+
+The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128.
+Concurrent decode is the total across the stated number of users. Qwen uses eight sequence
+slots, MTP K=6 and a draft vocabulary of 65,536; Ornith uses eight slots without MTP.
+These HTTP measurements differ from the short-prompt CLI measurements above.
+
+| Checkpoint and mode | Prompt, 1 user | Decode, 1 user | Concurrent decode, total | Coding decode |
+|---|---:|---:|---:|---:|
+| Qwen3.8-27B GPTQ-Int4 + MTP | 2,020 | 67.1 | 180.5 (4 users) | 127.9 |
+| Qwen3.8-27B UD-Q4_K_XL, native + MTP | 1,973 | 59.4 | 141.6 (4 users) | 96.2 |
+| Ornith Q4_K_M, native | 7,259 | 155.2 | 133.8 (8 users) | -- |
+| Ornith Q4_K_M, converted to MXFP4 | 8,753 | 175.1 | 378.4 (8 users) | -- |
+| Ornith safetensors, MXFP4 | 8,804 | 174.7 | 378.9 (8 users) | -- |
+
+Both Qwen modes passed two coding answers and eight concurrent coding answers. Each row passed
+the benchmark's coherence check. The coding probe uses a 2,153-token prompt and generates until
+the answer finishes; it is a separate workload from llama-benchy's tg128. MTP acceptance and
+throughput vary with the prompt.
+
+**Ornith native GGUF has a known concurrency limit:** its native expert GEMMs group prompt batches
+of at least 32 tokens, but small batches still reread each expert's weights per token. Eight users
+can therefore be slower in total than one. `--proj mxfp4` uses the grouped small-batch kernels and
+is faster for concurrent serving, with the accuracy tradeoff shown above. The native small-batch
+expert kernel remains to be implemented.
+
 ## Run a model
 
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.1/grimoire-b70-v1.10.1.tar.gz
-docker load < grimoire-b70-v1.10.1.tar.gz              # -> grimoire-b70:v1.10.1
-docker tag grimoire-b70:v1.10.1 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.2/grimoire-b70-v1.10.2.tar.gz
+docker load < grimoire-b70-v1.10.2.tar.gz              # -> grimoire-b70:v1.10.2
+docker tag grimoire-b70:v1.10.2 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.10.1 runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
+v1.10.2 includes native GGUF decode and prompt speed-ups and MTP from the GGUF file's own head.
+It runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
 two GPUs, reads GGUF files, runs the FP8 checkpoint as fast INT8 (`--proj int8`), and ships oneAPI
 2026.2, GPU driver 26.35 and oneDNN 3.14 (see its release notes).
 
@@ -305,8 +332,9 @@ release (4 of 4 prompts), and the Q4_K_M / UD-Q4_K_XL files answer correctly.
   Qwen3.8-27B (Unsloth BF16 and five quants, from Q8_0 down to IQ2_XXS), gemma-4-12B.
 - MTP works from the file's own MTP head (the `nextn` block; `GRIMOIRE_MTP=1`): Qwen3.8-27B
   UD-Q4_K_XL 28.0 -> 71.6 tok/s on one B70 with exactly the same tokens.  Files without the head
-  (Unsloth's UD-IQ1_S / UD-IQ2_XXS) refuse `GRIMOIRE_MTP`.  Ornith's MoE MTP head on GGUF and DFlash
-  on GGUF are not tested yet.
+  (Unsloth's UD-IQ1_S / UD-IQ2_XXS) refuse `GRIMOIRE_MTP`. Ornith's MoE MTP head on GGUF was tested
+  on 2026-10-30: the answer matched plain decoding, but MTP was slower (94.5 vs 179.8 tok/s, CLI),
+  so leave it off. DFlash on GGUF is not tested yet.
 - Qwen3.8-Flash-Next GGUF needs the RAM expert tiering and is not supported yet.
 
 Results are in [Results at a glance](#gguf-files-one-arc-pro-b70-ornith-measured-2026-10-15--21-qwen38-27b-2026-10-29-on-main).
