@@ -3913,6 +3913,7 @@ struct Grimoire {
               *att = nullptr, *y = nullptr, *f = nullptr, *ff = nullptr, *out = nullptr,
               *lg = nullptr, *val = nullptr;
         int32_t *tok = nullptr, *dtok = nullptr;
+        int32_t *history = nullptr, *host_history = nullptr;
         sycl_bf16* bf = nullptr;
         size_t bf_cap = 0;
         int dv = 0;
@@ -3921,7 +3922,8 @@ struct Grimoire {
     bool mtp_rows_ready();
     void mtpr_mm(const QuantWeight& w, const float* x, float* y, int M);
     bool mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, const int* position,
-                        bool chained, int32_t* tok_out);
+                        bool chained, int32_t* tok_out,
+                        const int32_t* device_in = nullptr, int32_t* device_out = nullptr);
     // keep[i] = the previous call's row that becomes row i (rows that still draft)
     void mtp_rows_keep(const std::vector<int>& keep);
     // Populate the MTP head's KV cache over prompt positions so the drafter
@@ -9859,6 +9861,12 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     std::vector<std::vector<int32_t>> drafted;
     bool batched=false;
     if(!dflash2.ok && n>1 && mtp_rows_ready()) {
+        static const bool gpu_draft_requested = [] {
+            const char* e=std::getenv("GRIMOIRE_MTP_GPU_DRAFT");return e&&std::atoi(e)!=0;
+        }();
+        // TP still agrees on its proposals on the host. Keep that transport
+        // unchanged until multi-device token agreement is separately validated.
+        const bool gpu_draft=gpu_draft_requested && !tp_ranked() && !pp_enabled();
         std::vector<int> depth(static_cast<size_t>(n));
         int dmax=0;
         for(int row=0;row<n;++row) {
@@ -9874,24 +9882,59 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
             act.clear(); tin.clear(); sl.clear(); ps.clear();
             for(int row=0;row<n;++row) if(depth[size_t(row)]>k) {
                 act.push_back(row);
-                tin.push_back(k==0?tokens[size_t(row)]:drafted[size_t(row)].back());
+                tin.push_back(k==0?tokens[size_t(row)]:
+                    (gpu_draft?0:drafted[size_t(row)].back()));
                 sl.push_back(slots[size_t(row)]); ps.push_back(positions[size_t(row)]+k);
             }
+            const int32_t* device_tokens=nullptr;
             if(k>0) {   // rows whose depth is reached drop out: move the others' head outputs up
                 std::vector<int> keep;
                 for(int row:act) keep.push_back(int(std::find(prev.begin(),prev.end(),row)-prev.begin()));
                 mtp_rows_keep(keep);
+                if(gpu_draft){
+                    const int32_t* previous=mtpr.history+size_t(k-1)*kSpecBatch;
+                    bool prefix=true;
+                    for(size_t i=0;i<keep.size();++i)prefix&=keep[i]==int(i);
+                    if(prefix)device_tokens=previous;
+                    else{
+                        for(size_t i=0;i<keep.size();++i)
+                            q.memcpy(mtpr.dtok+i,previous+keep[i],sizeof(int32_t));
+                        device_tokens=mtpr.dtok;
+                    }
+                }
+            }else if(gpu_draft){
+                // Pinned storage remains unchanged until the final fence;
+                // never enqueue a copy from a temporary/reused host vector.
+                for(size_t i=0;i<tin.size();++i)mtpr.tok[i]=tin[i];
+                q.memcpy(mtpr.dtok,mtpr.tok,tin.size()*sizeof(int32_t));
+                device_tokens=mtpr.dtok;
             }
             tout.assign(act.size(),0);
-            if(!mtp_draft_rows(int(act.size()),tin.data(),sl.data(),ps.data(),k>0,tout.data())) {
+            if(!mtp_draft_rows(int(act.size()),tin.data(),sl.data(),ps.data(),k>0,tout.data(),
+                    device_tokens,
+                    gpu_draft?mtpr.history+size_t(k)*kSpecBatch:nullptr)) {
                 batched=false;   // declined before any work: draft row by row instead
                 break;
             }
-            for(size_t i=0;i<act.size();++i) {
+            for(size_t i=0;!gpu_draft&&i<act.size();++i) {
                 if(tout[i]<0 || tout[i]>=cfg.vocab) throw std::runtime_error("batched MTP proposal failed");
                 drafted[size_t(act[i])].push_back(tout[i]);
             }
             prev=act;
+        }
+        if(gpu_draft&&batched&&dmax>0){
+            q.memcpy(mtpr.host_history,mtpr.history,size_t(dmax)*kSpecBatch*sizeof(int32_t)).wait();
+            for(int k=0;k<dmax;++k){
+                int packed=0;
+                for(int row=0;row<n;++row)if(depth[size_t(row)]>k){
+                    const int32_t t=mtpr.host_history[size_t(k)*kSpecBatch+packed++];
+                    if(t<0||t>=cfg.vocab)throw std::runtime_error("device MTP proposal failed");
+                    drafted[size_t(row)].push_back(t);
+                }
+            }
+            static bool reported=false;
+            if(!reported){reported=true;std::fprintf(stderr,
+                "  MTP device chaining: %d draft depths, %d sequences, one proposal readback\n",dmax,n);}
         }
     }
     for(int row=0;row<n;++row) {
@@ -10781,6 +10824,16 @@ void Grimoire::release() {
     tm_ring_slots = 0;
     tm_gpos = 0; tm_slot_ev.clear(); tm_slot_has.clear(); tm_pref_ev.clear();
     tm_pref_d = nullptr; tm_pref_n = 0;
+    // Batched drafter scratch owns its allocations independently of mtp.L.
+    // Release it on reload too, including partial initialization failures.
+    for(void* p:{(void*)mtpr.hid,(void*)mtpr.emb,(void*)mtpr.cat,(void*)mtpr.x,
+                (void*)mtpr.h2,(void*)mtpr.qkv,(void*)mtpr.qs,(void*)mtpr.gs,
+                (void*)mtpr.k,(void*)mtpr.v,(void*)mtpr.att,(void*)mtpr.y,
+                (void*)mtpr.f,(void*)mtpr.ff,(void*)mtpr.out,(void*)mtpr.lg,
+                (void*)mtpr.val,(void*)mtpr.tok,(void*)mtpr.dtok,(void*)mtpr.bf,
+                (void*)mtpr.history,(void*)mtpr.host_history})
+        if(p)sycl::free(p,q);
+    mtpr={};
     {
         LayerDev& d = mtp.L;
         mtp.fc.release(q);
@@ -13855,9 +13908,12 @@ bool Grimoire::mtp_rows_ready() {
         mtpr.out = f(size_t(R) * H);  mtpr.lg = f(size_t(R) * mtpr.dv); mtpr.val = f(R);
         mtpr.dtok = sycl::malloc_device<int32_t>(R, q);
         mtpr.tok = sycl::malloc_host<int32_t>(R, q);
+        mtpr.history = sycl::malloc_device<int32_t>(R*R, q);
+        mtpr.host_history = sycl::malloc_host<int32_t>(R*R, q);
         ok = mtpr.hid && mtpr.emb && mtpr.cat && mtpr.x && mtpr.h2 && mtpr.qkv && mtpr.qs &&
              mtpr.gs && mtpr.k && mtpr.v && mtpr.att && mtpr.y && mtpr.f && mtpr.ff && mtpr.out &&
-             mtpr.lg && mtpr.val && mtpr.dtok && mtpr.tok;
+             mtpr.lg && mtpr.val && mtpr.dtok && mtpr.tok && mtpr.history && mtpr.host_history;
+        if(ok)q.memset(mtpr.history,0,size_t(R)*R*sizeof(int32_t));
     }
     // every rank drafts the same way, or the collectives below do not line up
     if (tp_ranked() && !tp_agree_min(ok)) ok = 0;
@@ -13909,11 +13965,13 @@ void Grimoire::mtp_rows_keep(const std::vector<int>& keep) {
 }
 
 bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, const int* position,
-                              bool chained, int32_t* tok_out) {
+                              bool chained, int32_t* tok_out,
+                              const int32_t* device_in, int32_t* device_out) {
     if (n <= 0 || n > kSpecBatch || !mtp_rows_ready()) return false;
+    if(device_in&&(!device_out||tp_ranked()||pp_enabled()||!has_embed()))return false;
     for (int r = 0; r < n; ++r)
         if (slot[r] < 0 || slot[r] >= int(draft_slots.size()) || position[r] < 0 ||
-            position[r] >= max_seq || tok_in[r] < 0 || tok_in[r] >= cfg.vocab)
+            position[r] >= max_seq || (!device_in&&(tok_in[r] < 0 || tok_in[r] >= cfg.vocab)))
             return false;
     const int H = cfg.hidden, H2 = 2 * H;
     const float eps = cfg.rms_eps;
@@ -13925,6 +13983,15 @@ bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, con
     const int FI2 = d.sh_gu.w.N, FI = FI2 / 2;
     auto row = [](float* base, int r, int width) { return base + size_t(r) * size_t(width); };
 
+    if(device_in){
+        // Range-checked kernels prevent an invalid argmax ID from reading
+        // outside the table before the final host-side proposal validation.
+        if(embed_i8)
+            launch_embed_int8_batched(q,embed_i8,embed_i8_scales,device_in,mtpr.emb,n,H,
+                                       embed_begin,embed_count,none);
+        else
+            launch_embed_batched_shard(q,embed,device_in,mtpr.emb,n,H,0,cfg.vocab,none);
+    }
     // ---- the head's input: [norm(embedding) ; norm(hidden)], embedding first (mtp_draft) ----
     for (int r = 0; r < n; ++r) {
         const float* src = chained ? row(mtpr.out, r, H) : draft_slots[size_t(slot[r])].hidden;
@@ -13935,7 +14002,7 @@ bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, con
         }
         launch_rmsnorm_residual(q, const_cast<float*>(src), nullptr, mtp.pre_h,
                                 row(mtpr.cat, r, H2) + H, H, eps, none);
-        if (!embed_one(int(tok_in[r]), row(mtpr.emb, r, H)))
+        if (!device_in && !embed_one(int(tok_in[r]), row(mtpr.emb, r, H)))
             throw std::runtime_error("MTP batched draft: embedding failed");
         launch_rmsnorm_residual(q, row(mtpr.emb, r, H), nullptr, mtp.pre_e, row(mtpr.cat, r, H2),
                                 H, eps, none);
@@ -14025,8 +14092,12 @@ bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, con
                 gemv_any(lm_head, row(mtpr.out, r, H), row(mtpr.lg, r, dv), none);
         }
     }
+    // Write directly into this depth's history. The next depth can embed
+    // those IDs in place; ordinary batches need no intermediate device copies.
+    int32_t* proposals=device_out?device_out:mtpr.dtok;
     for (int r = 0; r < n; ++r)
-        launch_argmax(q, row(mtpr.lg, r, dv), dv, mtpr.dtok + r, mtpr.val + r, none);
+        launch_argmax(q, row(mtpr.lg, r, dv), dv, proposals + r, mtpr.val + r, none);
+    if(device_out)return true;
     q.memcpy(mtpr.tok, mtpr.dtok, size_t(n) * sizeof(int32_t)).wait();
     std::vector<int32_t> t(mtpr.tok, mtpr.tok + n);
     if (tp_ranked() && !tp_sync_tokens(t))
