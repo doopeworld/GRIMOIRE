@@ -471,6 +471,13 @@ sycl::event launch_moe_native_qk_grouped(sycl::queue& q, const QuantWeight& w, i
     bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
     const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
     const std::vector<sycl::event>& deps = {});
+// Native small-M grouped DPAS: raw fp32 [sum(cnt)][Ne]. The caller may reuse
+// the down-output scratch for gate/up, then apply SwiGLU before the down GEMM.
+bool moe_native_smallm_ok(const QuantWeight& w, int Ne, int M);
+sycl::event launch_moe_native_smallm(sycl::queue& q, const QuantWeight& w, int Ne,
+    const sycl_bf16* A, float* out, const int32_t* tile_e,
+    const int32_t* off, const int32_t* cnt, int T, int M,
+    const std::vector<sycl::event>& deps = {});
 void moe_esimd_warmup(sycl::queue& q);
 bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne);
 // True when launch_moe_mxfp4_grouped takes the ESIMD kernel, which also skips

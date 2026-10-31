@@ -19542,6 +19542,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_tmoe_gate_up(q,tm_view(d),rex,bn,mh,M,{});
                     launch_tmoe_down(q,tm_view(d),rex,rwt,mh,r0,M,{});
                 }
+            }else if(M>1 && M<=16 && device_can_matrix(q) && !tp_enabled() && !exact_verify &&
+                     std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM") &&
+                     std::atoi(std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM"))!=0 &&
+                     !std::getenv("GRIMOIRE_MOE_SMALLM_PLAIN") &&
+                     cfg.top_k==8 && cfg.n_experts<=1024 && 2*I<=H &&
+                     d.moe.gate_up.N==cfg.n_experts*2*I && d.moe.gate_up.K==H &&
+                     d.moe.down.N==cfg.n_experts*H && d.moe.down.K==I &&
+                     moe_native_smallm_ok(d.moe.gate_up,2*I,M) &&
+                     moe_native_smallm_ok(d.moe.down,H,M)){
+                // Group the native Q4_K/Q6_K expert pair for tiny batches too.
+                // yperm has Rpad*H floats; 2*I<=H lets it hold the raw gate/up
+                // result until SwiGLU has consumed it. No extra VRAM allocation.
+                const int E=cfg.n_experts;
+                int32_t* d_te=moe_tab; int32_t* d_tm=moe_tab+moe_tab_tiles;
+                int32_t* d_off=moe_tab+2*moe_tab_tiles; int32_t* d_cnt=d_off+E;
+                launch_moe_route_grouped(q,bn,rex,xperm,nullptr,d_cnt,d_off,pinv,d_te,d_tm,
+                                         moe_tab_tiles,M,H,E,moe_grouped_rows());
+                const int tcap=std::min(moe_tab_tiles,M*cfg.top_k);
+                sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                launch_moe_native_smallm(q,d.moe.gate_up,2*I,xperm,yperm,d_te,d_off,d_cnt,tcap,M);
+                launch_swiglu_bf16_out(q,yperm,hb,R,I);
+                launch_moe_native_smallm(q,d.moe.down,H,hb,yperm,d_te,d_off,d_cnt,tcap,M);
+                launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>1 && M<32 && device_can_matrix(q) && !tp_enabled() && !exact_verify &&
                      cfg.top_k==8 && cfg.n_experts<=1024 && (H%8)==0 &&
                      !std::getenv("GRIMOIRE_MOE_SMALLM_PLAIN") &&

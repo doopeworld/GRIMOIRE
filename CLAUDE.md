@@ -2,6 +2,18 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**PAUSED 2026-10-31 13:53 CET: Ian needs both GPUs. No Grimoire GPU jobs remain; leave his
+COMFYUI-BETA alone. CPU-only build container quirky_rubin is paused, preserving compilation.
+Wait for Ian to resume. Full unfinished engine scope and current prototype state are in
+[ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md); do not stop the project at the release checkpoint.**
+
+**2026-10-31 scope correction from Ian: continue the FULL engine work, including oneDNN,
+DFlash2, MTP, GGUF and the other original roadmap items. Finishing the release was only one
+checkpoint; do not stop there. Read [ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md).
+Native grouped small-M prototype: 32 independent numerical/guard cases pass on GPU0, full
+server build running in isolated grimoire-native-smallm-1031; opt-in until real model gates.
+DFlash2 + native GGUF check in progress. GPU1 remains paused.**
+
 **2026-10-31 (Codex resumed Claude's interrupted 10-30 work): read
 [HANDOFF-2026-10-31-IMAGE.md](HANDOFF-2026-10-31-IMAGE.md) first. The 44-run suite finished
 (42 identical texts, two Muse wording changes), and image v1.10.2-rc1 built successfully.
