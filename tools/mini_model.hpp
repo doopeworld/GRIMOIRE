@@ -388,6 +388,7 @@ inline void add_mtp(std::vector<Tn>& t, int H, int Q, int KV, int HD,
 // Hv == 0 prefill bug.
 inline Arch dense(int L = 4, bool mtp = false) {
     const int H=64, Q=64, KV=32, I=128, V=128;
+    auto ones = [](int n) { return std::vector<float>(size_t(n), 1.0f); };
     std::ostringstream c;
     c << R"JSON({
   "model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": )JSON" << L
@@ -867,6 +868,7 @@ inline Arch qwen4_exp(int L = 4, bool fp8_table = false) {
 // Exercises the routed path, the shared expert and TP expert sharding.
 inline Arch moe(int L = 4, bool mtp = false) {
     const int H=64, Q=64, KV=32, MI=32, E=8, V=128;
+    auto ones = [](int n) { return std::vector<float>(size_t(n), 1.0f); };
     std::ostringstream c;
     c << R"JSON({
   "model_type": "qwen3_moe", "hidden_size": 64, "num_hidden_layers": )JSON" << L
