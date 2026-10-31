@@ -11605,6 +11605,8 @@ int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
     if (ids.empty()) { std::printf("score: no token ids in %s\n", ids_file.c_str()); return 1; }
     const char* hb = std::getenv("GRIMOIRE_LM_HEAD_BF16");
     const bool head_bf16 = hb && *hb == '1';
+    const char* sp = std::getenv("GRIMOIRE_SCORE_PREFILL");
+    const bool score_prefill = sp && std::atoi(sp) != 0;
     Grimoire e;
     UploadOptions opt;
     opt.lm_head_fmt = proj_fmt;
@@ -11619,12 +11621,24 @@ int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
         if (!out) { std::printf("score: cannot write %s\n", out_file.c_str()); return 1; }
         const int V = e.cfg.vocab;
         std::vector<float> host(static_cast<size_t>(V));
+        std::vector<int32_t> prefix;
+        if(score_prefill)prefix.reserve(ids.size());
         e.reset();
         const auto t0 = std::chrono::high_resolution_clock::now();
         for (size_t i = 0; i < ids.size(); ++i) {
-            const float* lg = e.forward(int(ids[i]));       // device logits after token i
+            const float* lg = nullptr;
+            if(score_prefill){
+                // Score the same position through a fresh prompt. Per-token
+                // decode never exercises activation quantization in prompt GEMMs.
+                prefix.push_back(ids[i]);
+                e.reset();
+                if(e.prefill(prefix,nullptr,nullptr,false))lg=e.s.logits;
+            }else lg = e.forward(int(ids[i]));
             if (!lg) { std::printf("\nscore: forward failed at position %zu\n", i); std::fclose(out); return 1; }
             e.q.memcpy(host.data(), lg, size_t(V) * sizeof(float)).wait();
+            for(float v:host)if(!std::isfinite(v)){
+                std::printf("\nscore: non-finite logit at position %zu\n",i);std::fclose(out);return 1;
+            }
             if (std::fwrite(host.data(), sizeof(float), size_t(V), out) != size_t(V)) {
                 std::printf("\nscore: write failed\n"); std::fclose(out); return 1;
             }
@@ -11632,8 +11646,9 @@ int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
         std::fclose(out);
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - t0).count();
-        std::printf("\n  SCORE: %zu positions x %d logits -> %s (%.1f ms; output head %s)\n",
+        std::printf("\n  SCORE: %zu positions x %d logits -> %s (%.1f ms; %s; output head %s)\n",
                     ids.size(), V, out_file.c_str(), ms,
+                    score_prefill ? "independent prompt prefixes" : "per-token decode",
                     opt.quantize_lm_head ? fmt_name(proj_fmt) : "as in the checkpoint");
         e.release();
         return 0;
