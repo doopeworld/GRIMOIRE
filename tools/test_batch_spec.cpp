@@ -163,7 +163,15 @@ int main() {
                     if(errors[k]) std::rethrow_exception(errors[k]);
                     auto expected=reference[k];
                     if(round==0 && k==1) expected.resize(3);
-                    if(expected!=replies[k]) throw std::runtime_error("scheduled speculative tokens differ");
+                    if(expected!=replies[k]) {
+                        std::fprintf(stderr,"%s%s round=%d row=%d expected:",
+                                     arch.c_str(),kind[draft_kind],round,k);
+                        for(int token:expected)std::fprintf(stderr," %d",token);
+                        std::fprintf(stderr,"\nactual:");
+                        for(int token:replies[k])std::fprintf(stderr," %d",token);
+                        std::fprintf(stderr,"\n");
+                        throw std::runtime_error("scheduled speculative tokens differ");
+                    }
                 }
             }
             grimoire_scheduler_delete(scheduler);
