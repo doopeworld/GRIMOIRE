@@ -143,10 +143,14 @@ void grow(sycl::queue& q, T*& p, size_t& cap, size_t need, const char* what) {
 }
 
 const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool acc) {
-    static const bool requested=[] {
-        const char* e=std::getenv("GRIMOIRE_ONEDNN_W8A8");return e&&std::atoi(e)!=0;
+    static const int requested=[] {
+        const char* e=std::getenv("GRIMOIRE_ONEDNN_W8A8");return e?std::atoi(e):0;
     }();
-    const bool a8=requested&&w.fmt==Fmt::INT8&&M>=32&&w.N>=256&&w.K%64==0;
+    // Mode 2 limits activation quantization to large projections. Mode 3
+    // further excludes narrow outputs fed by unnormalized FFN activations.
+    const bool selected=requested==1 || (requested==2 && (w.N>=32768 || w.K>=16384)) ||
+                        (requested==3 && w.N>=32768);
+    const bool a8=selected&&w.fmt==Fmt::INT8&&M>=32&&w.N>=256&&w.K%64==0;
     const Key k{int(w.fmt), M, w.N, w.K, acc ? 1 : 0, a8?1:0};
     auto it = c.prims.find(k);
     if (it != c.prims.end()) return it->second;
