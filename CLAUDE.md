@@ -2,6 +2,11 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-11-01 NIGHT: PAUSED by Ian until he asks to resume. No GPU/CPU jobs, GPU holders,
+book server or future queue remain. Read [HANDOFF-2026-11-01-PAUSED.md](HANDOFF-2026-11-01-PAUSED.md)
+first. Full engine scope is preserved. Regression is only 22/44 complete; release build
+is interrupted; v1.10.2 remains latest. GPU1 still off limits. Do not run anything automatically.**
+
 **2026-11-01: Ian resumed the FULL engine project. Read
 [ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md), not only the completed release handoff.
 Combined candidates are in engine-integration-1101: native grouped GGUF experts, optional

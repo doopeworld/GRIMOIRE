@@ -1,0 +1,8 @@
+# CPU-built G31/G21 executables over the unchanged, pinned v1.10.2 runtime.
+# assemble-image.sh verifies the exact base image and oneDNN library first.
+FROM grimoire-b70:v1.10.2
+LABEL org.opencontainers.image.source="https://github.com/doopeworld/GRIMOIRE" \
+      org.opencontainers.image.revision="546ce890beaba05e025dac6434decb8e03c42450" \
+      org.opencontainers.image.version="v1.10.3-rc1"
+COPY --chmod=0755 bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so bin/libgrimoire_attn.so /grimoire/bin/
+COPY build-manifest.json /usr/share/doc/grimoire/build-manifest.json
