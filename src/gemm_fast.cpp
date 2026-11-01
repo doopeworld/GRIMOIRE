@@ -2048,6 +2048,17 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 // Grouped MoE entry points (see gemm_mxfp4_fused_grouped).  The host builds
 // the m-tile table in units of moe_grouped_rows() rows per tile.
 int moe_grouped_rows() { return MC2; }
+bool moe_native_smallm_ok(const QuantWeight& w, int Ne, int M) {
+    return native_moe_smallm_layout_ok(w, Ne, M);
+}
+sycl::event launch_moe_native_smallm(sycl::queue& q, const QuantWeight& w, int Ne,
+    const sycl_bf16* A, float* out, const int32_t* tile_e,
+    const int32_t* off, const int32_t* cnt, int T, int M,
+    const std::vector<sycl::event>& deps) {
+    return M <= 8
+        ? native_moe_smallm_launch<1>(q,w,Ne,A,out,M,tile_e,off,cnt,T,deps)
+        : native_moe_smallm_launch<2>(q,w,Ne,A,out,M,tile_e,off,cnt,T,deps);
+}
 bool moe_native_qk_grouped_supported(const QuantWeight& w, int Ne) {
     return is_native_gguf(w.fmt) && w.payload &&
            !w.scales && !w.zeros && Ne > 0 && Ne % NC2 == 0 &&

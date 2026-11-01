@@ -184,21 +184,58 @@ SYCL_ESIMD_FUNCTION inline void q6k_block(const uint32_t* pay, u32x16 roff, uint
 }
 } // namespace nsm
 
-template <Fmt F, int RBN>
+// The dense specialization needs only M. Separate layout types keep unused
+// expert-table state out of its capture; the integrated server rejected the
+// earlier capture with unused expert arguments even though the oracle passed.
+struct NativeSmallmDenseLayout {
+    int M;
+    SYCL_ESIMD_FUNCTION int expert(int) const { return 0; }
+    SYCL_ESIMD_FUNCTION bool active(int) const { return true; }
+    SYCL_ESIMD_FUNCTION int rows(int) const { return M; }
+    SYCL_ESIMD_FUNCTION int tile(int g, int tw, int tpt) const { return g*tpt+tw; }
+    SYCL_ESIMD_FUNCTION const sycl_bf16* input(const sycl_bf16* p, int) const { return p; }
+    SYCL_ESIMD_FUNCTION float* output(float* p, int) const { return p; }
+    SYCL_ESIMD_FUNCTION const uint32_t* weights(const uint32_t* p, int) const { return p; }
+};
+struct NativeSmallmGroupedLayout {
+    int groups, N, K;
+    uint32_t rbytes;
+    const int32_t *table, *off, *cnt;
+    SYCL_ESIMD_FUNCTION int expert(int g) const { return table[g/groups]; }
+    SYCL_ESIMD_FUNCTION bool active(int e) const { return e>=0 && cnt[e]!=0; }
+    SYCL_ESIMD_FUNCTION int rows(int e) const { return cnt[e]; }
+    SYCL_ESIMD_FUNCTION int tile(int g, int tw, int tpt) const { return (g%groups)*tpt+tw; }
+    SYCL_ESIMD_FUNCTION const sycl_bf16* input(const sycl_bf16* p, int e) const {
+        return p+size_t(off[e])*K;
+    }
+    SYCL_ESIMD_FUNCTION float* output(float* p, int e) const { return p+size_t(off[e])*N; }
+    SYCL_ESIMD_FUNCTION const uint32_t* weights(const uint32_t* p, int e) const {
+        return p+size_t(e)*N*rbytes/4;
+    }
+};
+
+template <Fmt F, int RBN, bool GROUPED = false>
 sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                float* Y, int M, int KS, int kc, int TPT,
-                               const std::vector<sycl::event>& deps) {
+                               const std::vector<sycl::event>& deps,
+                               int Ne = 0, const int32_t* tile_e = nullptr,
+                               const int32_t* off = nullptr, const int32_t* cnt = nullptr,
+                               int T = 1) {
     constexpr int CT = 16;
-    const int N = w.N, K = w.K;
+    const int N = GROUPED ? Ne : w.N, K = w.K;
     const int tiles = N / CT;
     const int groups = (tiles + TPT - 1) / TPT;
-    const uint32_t* pay = reinterpret_cast<const uint32_t*>(w.payload);
+    const uint32_t* pay_base = reinterpret_cast<const uint32_t*>(w.payload);
     const uint32_t rbytes = uint32_t(w.row_bytes);
-    const unsigned XW = unsigned(K) * 2 - 1, XH = unsigned(M) - 1;
+    const unsigned XW = unsigned(K) * 2 - 1;
     const unsigned YW = unsigned(N) * 4 - 1;
+    const auto layout = [&] {
+        if constexpr (GROUPED) return NativeSmallmGroupedLayout{groups,N,K,rbytes,tile_e,off,cnt};
+        else return NativeSmallmDenseLayout{M};
+    }();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<1>(size_t(groups) * TPT * KS, size_t(TPT) * KS),
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * groups * TPT * KS, size_t(TPT) * KS),
                        [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
@@ -207,7 +244,16 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
             es::slm_init<32 * RBN * 128 * 4>();
             const int lid = int(it.get_local_id(0));
             const int tw = lid / KS, ks = lid % KS;
-            const int tile = int(it.get_group(0)) * TPT + tw;
+            const int g = int(it.get_group(0));
+            const int e = layout.expert(g);
+            // Uniform across the work-group, before any split-K barrier.
+            if (!layout.active(e)) return;
+            const int rows = layout.rows(e);
+            const unsigned XH = unsigned(rows) - 1;
+            const sycl_bf16* Xe = layout.input(X,e);
+            float* Ye = layout.output(Y,e);
+            const uint32_t* pay = layout.weights(pay_base,e);
+            const int tile = layout.tile(g,tw,TPT);
             const bool live = tile < tiles;
             const int n0 = (live ? tile : 0) * CT;
             const int kb = ks * kc;
@@ -254,7 +300,7 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
                                         dw |= ((qh.template select<16, 1>(16 * j) >> g) & 0x01010101u) << 4;
                                     nsm::put_codes(vb, c, dw);
                                 }
-                                nsm::load_a<RBN>(X, XW, XH, k + 32 * g + 16 * hf, a);
+                                nsm::load_a<RBN>(Xe, XW, XH, k + 32 * g + 16 * hf, a);
                                 nsm::dpas2<RBN>(tmp, tsx, vb, a, ones, true);
                             }
                             nsm::fold<RBN>(acc, tmp, tsx, ds, ds * 128.0f + mins, true);
@@ -275,7 +321,7 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
                                 #pragma unroll
                                 for (int c = 0; c < 4; ++c)
                                     nsm::iq4_vals(vb, c, qs.template select<16, 1>(16 * (4 * g + c)), 4 * hf);
-                                nsm::load_a<RBN>(X, XW, XH, k + 32 * g + 16 * hf, a);
+                                nsm::load_a<RBN>(Xe, XW, XH, k + 32 * g + 16 * hf, a);
                                 nsm::dpas2<RBN>(tmp, tsx, vb, a, ones, false);
                             }
                             nsm::fold<RBN>(acc, tmp, tsx, ds, ds, false);
@@ -306,7 +352,7 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
                                     for (int hf = 0; hf < 2; ++hf) {   // low nibbles = values 0..15
                                         #pragma unroll
                                         for (int c = 0; c < 4; ++c) nsm::iq4_vals(vb, c, qd[c], 4 * hf);
-                                        nsm::load_a<RBN>(X, XW, XH, k0 + 16 * hf, a);
+                                        nsm::load_a<RBN>(Xe, XW, XH, k0 + 16 * hf, a);
                                         nsm::dpas2<RBN>(tmp, tsx, vb, a, ones, false);
                                     }
                                     nsm::fold<RBN>(acc, tmp, tsx, d, d, false);
@@ -321,7 +367,7 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
                                     for (int hf = 0; hf < 2; ++hf) {
                                         #pragma unroll
                                         for (int c = 0; c < 4; ++c) nsm::put_codes(vb, c, qd[4 * hf + c] & 0x0F0F0F0Fu);
-                                        nsm::load_a<RBN>(X, XW, XH, k0 + 16 * hf, a);
+                                        nsm::load_a<RBN>(Xe, XW, XH, k0 + 16 * hf, a);
                                         nsm::dpas2<RBN>(tmp, tsx, vb, a, ones, true);
                                         #pragma unroll
                                         for (int c = 0; c < 4; ++c)
@@ -339,8 +385,8 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
                         }
                     } else {
                         static_assert(F == Fmt::Q6_K);
-                        if (u & 1u) nsm::q6k_block<true, RBN>(pay, roff, u, k, X, XW, XH, acc, tmp, tsx, vb, a, ones);
-                        else nsm::q6k_block<false, RBN>(pay, roff, u, k, X, XW, XH, acc, tmp, tsx, vb, a, ones);
+                        if (u & 1u) nsm::q6k_block<true, RBN>(pay, roff, u, k, Xe, XW, XH, acc, tmp, tsx, vb, a, ones);
+                        else nsm::q6k_block<false, RBN>(pay, roff, u, k, Xe, XW, XH, acc, tmp, tsx, vb, a, ones);
                     }
                 }
             }
@@ -355,7 +401,7 @@ sycl::event native_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_
             }
             #pragma unroll
             for (int rb = 0; rb < RBN; ++rb)
-                es::store_2d<float, 16, 8>(Y, YW, XH, YW, n0, rb * 8,
+                es::store_2d<float, 16, 8>(Ye, YW, XH, YW, n0, rb * 8,
                     es::simd<float, 128>(acc.template select<128, 1>(rb * 128)));
         });
     });
@@ -373,6 +419,54 @@ inline bool native_smallm_layout_ok(const QuantWeight& w, int M) {
            w.row_bytes == bytes_per_row(w.fmt, w.K) && w.row_bytes % 4 == 0 &&
            uint64_t(w.N) * uint64_t(w.row_bytes) < (uint64_t(1) << 32) &&
            reinterpret_cast<uintptr_t>(w.payload) % 64 == 0;
+}
+
+// Rows are already packed by expert. A table entry names one expert whose
+// count is <= M; negative entries are padding. Ne is the expert's output
+// width, not the concatenated E*Ne width in w.N.
+inline bool native_moe_smallm_layout_ok(const QuantWeight& w, int Ne, int M) {
+    return native_smallm_layout_ok(w, M) && Ne > 0 && Ne % 16 == 0 &&
+           w.N % Ne == 0;
+}
+
+template <Fmt F, int RBN>
+sycl::event native_moe_smallm_launch_t(sycl::queue& q, const QuantWeight& w, int Ne,
+    const sycl_bf16* X, float* Y, int M, const int32_t* tile_e,
+    const int32_t* off, const int32_t* cnt, int T,
+    const std::vector<sycl::event>& deps) {
+    const int tiles = Ne / 16, K = w.K;
+    int KS = 1;
+    while (KS < 32 && int64_t(T) * tiles * KS < 4096 && K / (KS * 2) >= 256)
+        KS *= 2;
+    int kc = ((K + KS - 1) / KS + 255) / 256 * 256;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32 && TPT * 2 <= tiles) TPT *= 2;
+    return native_smallm_impl<F, RBN, true>(q, w, X, Y, M, KS, kc, TPT, deps,
+                                            Ne, tile_e, off, cnt, T);
+}
+
+template <int RBN>
+sycl::event native_moe_smallm_launch(sycl::queue& q, const QuantWeight& w, int Ne,
+    const sycl_bf16* X, float* Y, int M, const int32_t* tile_e,
+    const int32_t* off, const int32_t* cnt, int T,
+    const std::vector<sycl::event>& deps) {
+    if (!native_moe_smallm_layout_ok(w, Ne, M) || !X || !Y ||
+        reinterpret_cast<uintptr_t>(X) % 64 || reinterpret_cast<uintptr_t>(Y) % 64 ||
+        !tile_e || !off || !cnt || T <= 0 || M > RBN * 8)
+        throw std::runtime_error("native_moe_smallm_launch: invalid layout or rows");
+#define B70_MOE_NATIVE_SMALLM(F) case Fmt::F: \
+    return native_moe_smallm_launch_t<Fmt::F, RBN>(q,w,Ne,X,Y,M,tile_e,off,cnt,T,deps)
+    switch (w.fmt) {
+    B70_MOE_NATIVE_SMALLM(Q4_K);
+    B70_MOE_NATIVE_SMALLM(Q5_K);
+    B70_MOE_NATIVE_SMALLM(Q6_K);
+    B70_MOE_NATIVE_SMALLM(Q8_0);
+    B70_MOE_NATIVE_SMALLM(IQ4_XS);
+    B70_MOE_NATIVE_SMALLM(IQ4_NL);
+    default: throw std::runtime_error("native_moe_smallm_launch: unsupported format");
+    }
+#undef B70_MOE_NATIVE_SMALLM
 }
 
 // launch_int4_smallm's split-K plan with 256-K steps.
