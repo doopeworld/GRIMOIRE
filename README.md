@@ -10,7 +10,7 @@ The aim is straightforward: make high-performance local LLM inference possible o
 
 > **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.2**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF. Still on a branch: the not-yet-tested Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF. Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -128,11 +128,12 @@ the benchmark's coherence check. The coding probe uses a 2,153-token prompt and 
 the answer finishes; it is a separate workload from llama-benchy's tg128. MTP acceptance and
 throughput vary with the prompt.
 
-**Ornith native GGUF has a known concurrency limit:** its native expert GEMMs group prompt batches
-of at least 32 tokens, but small batches still reread each expert's weights per token. Eight users
-can therefore be slower in total than one. `--proj mxfp4` uses the grouped small-batch kernels and
-is faster for concurrent serving, with the accuracy tradeoff shown above. The native small-batch
-expert kernel remains to be implemented.
+**Optional native GGUF expert batching in source builds:** add
+`-e GRIMOIRE_MOE_NATIVE_SMALLM=1` to keep the file's blocks while sharing expert reads across
+small batches. Ornith Q4_K_M on one B70 measured 133.7 -> 364.8 tok/s total at eight users;
+single-user decode stayed at 156. The independent numerical oracle passes 32 cases. Concurrent
+coding passed 6/8 in both modes, so this is a throughput result with that quality limitation,
+not a token-parity claim. The option defaults off. [Detailed results](tools/bench/onednn/RESULTS-2026-11-01.md).
 
 ## Run a model
 
@@ -257,15 +258,37 @@ a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
 - **MTP** uses the checkpoint's own multi-token-prediction head, so there is nothing extra to
   download: add `-e GRIMOIRE_MTP=1`. The head drafts 4 tokens per step (`GRIMOIRE_MTP_K`, default 4;
   v1.8 at 1 user, tg128 after pp512 / pp4096: K=3 61.9 / 56.0, K=4 63.5 / 69.6, K=5 66.2 / 65.0
-  tok/s). The head is stored in MXFP4 to draft faster; it only proposes tokens, every token you get
-  is still the model's own greedy choice (`GRIMOIRE_MTP_HEAD_FMT=bf16` keeps it in BF16).
+  tok/s). The head proposes tokens and the target verifies them. Fast verification uses different
+  arithmetic from single-token decode and can change greedy answers through rounding.
+  `GRIMOIRE_MTP_HEAD_FMT=bf16` keeps a converted draft head in BF16; saved head formats are preserved.
 - **DFlash2** is a separate draft model: download it next to the checkpoint and add
   `--dflash-model /models/<draft folder>` after `server`.
 - Today both are faster than plain decoding on Qwen3.8-27B only. On Ornith they are not faster
   yet, so leave them off there.
 
+`GRIMOIRE_MTP_GPU_DRAFT=1` is an experimental source-build option for single-GPU batched MTP.
+Draft depths keep their proposed IDs on the device and use one final proposal readback.
+The paired test preserved all 38 responses, including 28 uneven token budgets; coding passed
+10/10 in each mode. Measured two/four-user rates changed from 96/179 to 106/184 tok/s, with
+overlapping variance. It defaults off; single-user drafting and TP/PP keep their existing paths.
+
+DFlash2 also works with the native Qwen UD-Q4_K_XL GGUF target: coding 10/10 and coherence pass,
+but tg128 was slower than native MTP (51.6 vs 59.4 tok/s for one user, 73.2 vs 141.6 total for four).
+The existing exact-verification option matched the 64-token reference fixture; this does not
+establish universal token parity. [Measurements and limits](tools/bench/onednn/RESULTS-2026-11-01.md).
+
 **Prefill (prompt) speed on INT4.** Since v1.8 GPTQ / INT4 checkpoints use the same fast prefill
 path as MXFP4: 2,069 - 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.7.1: 1,731).
+
+**Optional INT8 prompt arithmetic in source builds.** `GRIMOIRE_ONEDNN_W8A8` quantizes activation
+rows for existing INT8 weights; it defaults to `0` (BF16 activations). Mode `1` selects all eligible
+projections, `2` selects large projections, and `3` selects wide outputs while retaining BF16
+activations for narrow outputs. Decode and verify batches below 32 rows are unchanged.
+On Qwen FP8 loaded with `--proj int8`, mode 1 increased pp4096 from 2,077 to 2,909 tok/s, while
+256-prefix top-1 agreement with the BF16 original fell from 98.4% to 93.8%. Modes 2/3 measured
+95.7%/97.7% agreement. These are lossy options, not fidelity-preserving defaults. Selection uses
+each rank's local matrix shape, so conservative modes may select nothing after TP sharding.
+See [the accuracy and speed table](tools/bench/onednn/RESULTS-2026-11-01.md) before choosing a mode.
 
 ### Two GPUs (models that do not fit one card)
 

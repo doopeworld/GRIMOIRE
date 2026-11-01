@@ -2,6 +2,14 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-11-01: Ian resumed the FULL engine project. Read
+[ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md), not only the completed release handoff.
+Combined candidates are in engine-integration-1101: native grouped GGUF experts, optional
+oneDNN activation quantization and device MTP drafts. Keep all three opt-in until their
+measured limits are understood. GPU0 only; GPU1 remains off limits. Validate the combined
+build before updating main or images. New measurements are in
+[RESULTS-2026-11-01.md](tools/bench/onednn/RESULTS-2026-11-01.md).**
+
 **2026-10-31 (Codex resumed Claude's interrupted 10-30 work): read
 [HANDOFF-2026-10-31-IMAGE.md](HANDOFF-2026-10-31-IMAGE.md) first. The 44-run suite finished
 (42 identical texts, two Muse wording changes), and image v1.10.2-rc1 built successfully.
