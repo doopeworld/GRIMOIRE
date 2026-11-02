@@ -16125,18 +16125,21 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
                 cpus = b70::hybrid_pool_cpus(ranks, pp_enabled() ? pp_rank : tp_ranked() ? tp_rank : 0);
             const int nt = tn ? std::atoi(tn) : !cpus.empty() ? int(cpus.size()) : ranks > 1 ? share : 0;
             cpu_exp.start(nt, cpus);
-            // The decode thread (the pool's worker 0) is always busy -- it spins on the device
-            // and the peer -- and, left to the scheduler, it ran on the 2.5 GHz low-power cores
-            // or on a pinned worker's CPU half the time (10-27, per-thread samples).  It gets
+            // Two ranks: the decode thread (the pool's worker 0) is always busy -- it spins on the
+            // device and the peer -- and, left to the scheduler, it ran on the 2.5 GHz low-power
+            // cores or on a pinned worker's CPU half the time (10-27, per-thread samples).  It gets
             // cpus[0] for the length of each decode step (forward_qwen4_exp).
-            // GRIMOIRE_CPU_PIN_CALLER=0 = left unpinned.
+            // One rank: left free.  A process stuck on that CPU made Flash-Next 64 tokens 39.5 s,
+            // free 3.7 s, and free costs nothing on a quiet machine, 3.07 s (11-02).
+            // GRIMOIRE_CPU_PIN_CALLER=1 / 0 = pinned / free either way.
             const char* pc = std::getenv("GRIMOIRE_CPU_PIN_CALLER");
-            cx_caller_cpu = !cpus.empty() && !(pc && *pc == '0') ? cpus[0] : -1;
+            const bool pin_caller = pc && *pc ? *pc != '0' : ranks > 1;
+            cx_caller_cpu = !cpus.empty() && pin_caller ? cpus[0] : -1;
             if (!cpus.empty()) {
                 std::string cl;
                 for (size_t c = 1; c < cpus.size() && int(c) < nt; ++c) cl += (cl.empty() ? "" : ",") + std::to_string(cpus[c]);
-                std::printf("  CPU experts: pool threads pinned to CPUs %s, the decode thread to CPU %d during "
-                            "decode steps%s\n", cl.c_str(), cpus[0], cx_caller_cpu < 0 ? " -- off (GRIMOIRE_CPU_PIN_CALLER=0)" : "");
+                std::printf("  CPU experts: pool threads pinned to CPUs %s, the decode thread %s\n", cl.c_str(),
+                            cx_caller_cpu < 0 ? "free" : ("to CPU " + std::to_string(cx_caller_cpu) + " during decode steps").c_str());
             }
             const int K = cfg.top_k;
             cx_route = sycl::malloc_host<int32_t>(size_t(K), lq);

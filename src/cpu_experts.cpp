@@ -199,19 +199,23 @@ void CpuExperts::worker(int tid, uint64_t seen) {
     using clk = std::chrono::steady_clock;
     auto last = clk::now();
     for (;;) {
-        uint64_t s = state_.load(std::memory_order_acquire);
+        uint64_t s;
         int spins = 0;
-        // Entering checks "open" and counts this worker in one step, so run() knows who is inside when it closes.
-        while (!((s & CX_OPEN) && (s >> CX_GEN_SHIFT) != seen &&
-                 state_.compare_exchange_weak(s, s + 1, std::memory_order_acq_rel, std::memory_order_acquire))) {
-            if (quit_.load(std::memory_order_acquire)) return;
-            if (++spins < 4096) _mm_pause();
-            else {
-                spins = 0;
-                if (clk::now() - last < std::chrono::milliseconds(50)) std::this_thread::yield();
-                else std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
+        for (;;) {
             s = state_.load(std::memory_order_acquire);
+            if ((s & CX_OPEN) && (s >> CX_GEN_SHIFT) != seen) {
+                // Count in first, then read whether the job was still open, so run() knows who is inside
+                // when it closes.  One step with no retry: 13 workers retrying a compare-exchange here cost
+                // 6 us of every 85 us call on a quiet machine.  One that came too late counts out again.
+                s = state_.fetch_add(1, std::memory_order_acq_rel);
+                if ((s & CX_OPEN) && (s >> CX_GEN_SHIFT) != seen) break;
+                state_.fetch_sub(1, std::memory_order_release);
+            }
+            if (quit_.load(std::memory_order_acquire)) return;
+            if (++spins < 4096) { _mm_pause(); continue; }
+            spins = 0;
+            if (clk::now() - last < std::chrono::milliseconds(50)) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         seen = s >> CX_GEN_SHIFT;
         (*job_)(tid);
@@ -226,8 +230,8 @@ void CpuExperts::worker(int tid, uint64_t seen) {
 // waiting for the last worker 96% of each call (11-02, cpu_expert_bench: 3,225 of 3,347 us).
 void CpuExperts::run(const std::function<void(int)>& job) {
     job_ = &job;
-    const uint64_t g = (state_.load(std::memory_order_relaxed) >> CX_GEN_SHIFT) + 1;
-    state_.store(g << CX_GEN_SHIFT | CX_OPEN, std::memory_order_release);
+    // Next generation, open.  Adds, because a worker that came too late may be counted in for a moment.
+    state_.fetch_add((uint64_t(1) << CX_GEN_SHIFT) + CX_OPEN, std::memory_order_acq_rel);
     job(0);
     state_.fetch_and(~CX_OPEN, std::memory_order_acq_rel);
     const auto t = std::chrono::steady_clock::now();
