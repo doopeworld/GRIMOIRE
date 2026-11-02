@@ -677,6 +677,15 @@ static bool device_can_matrix(const sycl::queue& q) {
     return trust && d.has(sycl::aspect::ext_intel_matrix);
 }
 
+// GGUF native experts grouped across 2..16 rows, so several users share expert reads.  Ornith Q4_K_M:
+// 134 -> 365 tok/s total at 8 users, one user unchanged, answers run alone byte-identical to the
+// ungrouped path (11-02).  GRIMOIRE_MOE_NATIVE_SMALLM=0 = ungrouped.
+static bool moe_native_smallm_enabled() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM");
+        return !(e && *e == '0'); }();
+    return on;
+}
+
 sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
                                  float, bool, const std::vector<sycl::event>&);
 sycl::event launch_scale(sycl::queue&, float*, float, int,
@@ -19632,8 +19641,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_tmoe_down(q,tm_view(d),rex,rwt,mh,r0,M,{});
                 }
             }else if(M>1 && M<=16 && device_can_matrix(q) && !tp_enabled() && !exact_verify &&
-                     std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM") &&
-                     std::atoi(std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM"))!=0 &&
+                     moe_native_smallm_enabled() &&
                      !std::getenv("GRIMOIRE_MOE_SMALLM_PLAIN") &&
                      cfg.top_k==8 && cfg.n_experts<=1024 && 2*I<=H &&
                      d.moe.gate_up.N==cfg.n_experts*2*I && d.moe.gate_up.K==H &&
