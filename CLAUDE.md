@@ -2,11 +2,13 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-02 17:52: GPUs HANDED TO IAN ("i need to use both gpus now"); COMFYUI-BETA is Ian's, never stop it. Nothing of
-ours is running or queued; do not run anything until Ian says resume. Read
-[HANDOFF-2026-11-02-GPUS-HANDED.md](HANDOFF-2026-11-02-GPUS-HANDED.md) first, it has the exact resume order. Combined build:
-44/44 regression answers identical to 10-30. Release build stopped from outside: CLI done, server not, no v1.10.3 image;
-v1.10.2 remains latest, main remains b0674cd. GPU1 still off limits.**
+**2026-11-02 19:11: RESUMED by Ian ("resume work"). Read [HANDOFF-2026-11-02-GPUS-HANDED.md](HANDOFF-2026-11-02-GPUS-HANDED.md)
+first: results since the resume, then "Order from here". Doing now: finish the G31/G21 server build, assemble and validate
+image v1.10.3-rc1, publish v1.10.3. Combined build: 44/44 regression answers identical to 10-30. Next engine change waiting:
+CPU-expert pool fix on `cpu-pool-late-workers-1102`. The narrow INT4 verify plan is dropped; do not cite its 47%. v1.10.2 remains latest,
+main remains b0674cd until v1.10.3 passes. GPU1 still off limits; GPU0 only, one GPU job at a time.**
+
+**2026-11-02 17:52: GPUs handed to Ian ("i need to use both gpus now"). Historical; superseded by the entry above.**
 
 **2026-11-01 NIGHT: PAUSED by Ian until he asks to resume. Historical; superseded by the entry above. Read
 [HANDOFF-2026-11-01-PAUSED.md](HANDOFF-2026-11-01-PAUSED.md) for the older checkpoints. Full engine scope is preserved.**
