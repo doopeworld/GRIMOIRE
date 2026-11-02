@@ -202,6 +202,7 @@ int main(int argc, char** argv) {
     std::vector<double> t;
     t.reserve(size_t(calls));
     double w0 = 0.0;
+    uint64_t yhash = 14695981039346656037ull;     // same seed = same experts: must not depend on the thread count
     for (int c = 0; c < calls + 50; ++c) {
         const uint8_t* blk[16]; float w[16];
         for (int j = 0; j < nper && j < 16; ++j) { blk[j] = pool + L.bytes * size_t(pick(rng)); w[j] = 0.1f; }
@@ -211,12 +212,14 @@ int main(int argc, char** argv) {
         const auto t0 = clk::now();
         cx.ffn(L, blk, w, nper, x.data(), y.data());
         if (c >= 50) t.push_back(us_since(t0));       // the first 50 warm the pool up
+        for (float v : y) { uint32_t u; std::memcpy(&u, &v, 4); yhash = (yhash ^ u) * 1099511628211ull; }
     }
     char tag[96];
     std::snprintf(tag, sizeof tag, "rank %d/%d %d thr %s", rank, ranks, cx.threads(),
                   cl.empty() ? "unpinned" : ("pin " + cl).c_str());
     report(tag, t, double(nper) * double(L.bytes));
-    std::printf("  the caller waited %.1f us a call for the last worker\n", (cx.wait_us() - w0) / double(calls));
+    std::printf("  the caller waited %.1f us a call for the last worker; output hash %016llx\n",
+                (cx.wait_us() - w0) / double(calls), static_cast<unsigned long long>(yhash));
     cx.stop();
     return 0;
 }

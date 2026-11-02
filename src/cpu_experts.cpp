@@ -119,6 +119,10 @@ std::vector<int> read_cpu_list(const char* path) {      // "0-5", "6-13,16"
 }
 } // namespace
 
+// CpuExperts::state_: generation << 17 | job open << 16 | workers inside the job
+constexpr uint64_t CX_OPEN = uint64_t(1) << 16, CX_INSIDE = CX_OPEN - 1;
+constexpr int CX_GEN_SHIFT = 17;
+
 static_assert(sizeof(cpu_set_t) <= 128, "ScopedCpuPin keeps the old mask in 128 bytes");
 
 ScopedCpuPin::ScopedCpuPin(int cpu) {
@@ -171,17 +175,16 @@ void CpuExperts::start(int threads, const std::vector<int>& cpus) {
     // stays free for it.
     cpus_ = cpus;
     // The generation every worker starts from is read HERE, not in the new
-    // thread: a worker that only got going after the first run() bumped gen_
-    // took that job's generation as already seen, never ran it, and the
-    // caller waited for it forever (10-27, cpu_expert_bench with 14 threads).
-    const uint64_t g0 = gen_.load(std::memory_order_acquire);
+    // thread: a worker that only got going after the first run() opened a job
+    // would take that job's generation as already seen (10-27, cpu_expert_bench
+    // with 14 threads: the caller then waited for it forever).
+    const uint64_t g0 = state_.load(std::memory_order_acquire) >> CX_GEN_SHIFT;
     for (int t = 1; t < threads; ++t) workers_.emplace_back(&CpuExperts::worker, this, t, g0);
 }
 
 void CpuExperts::stop() {
     if (!workers_.empty()) {
         quit_ = true;
-        gen_.fetch_add(1, std::memory_order_release);
         for (auto& t : workers_) t.join();
         workers_.clear();
     }
@@ -196,29 +199,39 @@ void CpuExperts::worker(int tid, uint64_t seen) {
     using clk = std::chrono::steady_clock;
     auto last = clk::now();
     for (;;) {
-        uint64_t g;
+        uint64_t s = state_.load(std::memory_order_acquire);
         int spins = 0;
-        while ((g = gen_.load(std::memory_order_acquire)) == seen) {
-            if (++spins < 4096) { _mm_pause(); continue; }
-            spins = 0;
-            if (clk::now() - last < std::chrono::milliseconds(50)) std::this_thread::yield();
-            else std::this_thread::sleep_for(std::chrono::microseconds(200));
+        // Entering checks "open" and counts this worker in one step, so run() knows who is inside when it closes.
+        while (!((s & CX_OPEN) && (s >> CX_GEN_SHIFT) != seen &&
+                 state_.compare_exchange_weak(s, s + 1, std::memory_order_acq_rel, std::memory_order_acquire))) {
+            if (quit_.load(std::memory_order_acquire)) return;
+            if (++spins < 4096) _mm_pause();
+            else {
+                spins = 0;
+                if (clk::now() - last < std::chrono::milliseconds(50)) std::this_thread::yield();
+                else std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+            s = state_.load(std::memory_order_acquire);
         }
-        seen = g;
-        if (quit_.load(std::memory_order_acquire)) return;
+        seen = s >> CX_GEN_SHIFT;
         (*job_)(tid);
         last = clk::now();
-        left_.fetch_sub(1, std::memory_order_acq_rel);
+        state_.fetch_sub(1, std::memory_order_release);
     }
 }
 
+// The caller works through every item of the job itself, so a job never needs a given worker: one that is
+// off its core when the job runs misses it and nothing waits for it.  Only workers inside hold items, and
+// run() waits for those.  With every worker counted, one other busy process on the machine left the caller
+// waiting for the last worker 96% of each call (11-02, cpu_expert_bench: 3,225 of 3,347 us).
 void CpuExperts::run(const std::function<void(int)>& job) {
     job_ = &job;
-    left_.store(nthreads_ - 1, std::memory_order_relaxed);
-    gen_.fetch_add(1, std::memory_order_release);
+    const uint64_t g = (state_.load(std::memory_order_relaxed) >> CX_GEN_SHIFT) + 1;
+    state_.store(g << CX_GEN_SHIFT | CX_OPEN, std::memory_order_release);
     job(0);
+    state_.fetch_and(~CX_OPEN, std::memory_order_acq_rel);
     const auto t = std::chrono::steady_clock::now();
-    while (left_.load(std::memory_order_acquire) > 0) _mm_pause();
+    while (state_.load(std::memory_order_acquire) & CX_INSIDE) _mm_pause();
     wait_us_ += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
 }
 

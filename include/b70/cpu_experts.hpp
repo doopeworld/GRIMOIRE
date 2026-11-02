@@ -63,13 +63,12 @@ public:
              int n, const float* x, float* y);
 
 private:
-    void run(const std::function<void(int)>& job);   // all threads, then join
+    void run(const std::function<void(int)>& job);   // the caller and the workers that reach it in time
     void worker(int tid, uint64_t seen);   // seen = the generation it starts from
     int nthreads_ = 0;
     std::vector<int> cpus_;
     std::vector<std::thread> workers_;
-    std::atomic<uint64_t> gen_{0};
-    std::atomic<int> left_{0};
+    std::atomic<uint64_t> state_{0};     // generation, job open, workers inside (cpu_experts.cpp)
     std::atomic<bool> quit_{false};
     const std::function<void(int)>* job_ = nullptr;
     double wait_us_ = 0.0;
