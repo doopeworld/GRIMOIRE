@@ -101,15 +101,4 @@ Quiet-machine cost and the real engine are still to measure.
 
 ## Order from here
 
-All scripts are in `grimoire-runs/bench-1022`, copies in [tools/bench/release_1101](tools/bench/release_1101).
-GPU work is one job at a time, GPU0 only.
-
-1. `run_release_server_1102.sh`: running since 19:12. `bin/grimoire` from 17:43 is kept. Must end `RELEASE_BUILD_PASS`.
-2. After the build: `run_fn_ab_1102.sh /mnt/storage/isos/grimoire-engine-1101 new-quiet`, closing the Flash-Next row above.
-3. Pool branch: engine build running (`build_cxpool_cli_1102.sh`); Flash-Next text identity and seconds under load and quiet, then merge.
-4. `assemble-image-1101.sh` (never run; BuildKit 0.37 and image layout already checked), then
-   `validate_v1103_1102.sh`: five v1.10.2 configurations plus the three options, plus `conc4,seq4` on three Ornith
-   formats. `verify_image_logs_1102.py` prints the before/after table and gates the release.
-5. Package as `package_v1102.sh` did, update main (fast-forward from `b0674cd`), publish a NEW v1.10.3 keeping
-   v1.10.2 (standing authorization in the release workflow notes), then the profile switch and smoke as on 10-31.
-6. Continue [the roadmap](ROADMAP-2026-10-31.md): native block-scaled FP8, mixed GGUF gate/up.
+Superseded: read [HANDOFF-2026-11-02-PAUSED.md](HANDOFF-2026-11-02-PAUSED.md).

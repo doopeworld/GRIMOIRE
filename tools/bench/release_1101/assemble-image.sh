@@ -18,7 +18,15 @@ docker create --name grimoire-runtime-inspect-1101 grimoire-b70:v1.10.2 >/dev/nu
 trap 'docker rm grimoire-runtime-inspect-1101 >/dev/null' EXIT
 docker cp grimoire-runtime-inspect-1101:/grimoire/bin/libdnnl.so.3 "$C/libdnnl-base.so.3"
 docker cp grimoire-runtime-inspect-1101:/usr/local/bin/docker-entrypoint.sh "$C/entrypoint-base.sh"
-cmp "$C/libdnnl-base.so.3" "$R/bin/libdnnl.so.3"
+# The image compiled oneDNN on 10-30 and this tree holds the 10-28 compile of the same version. The only allowed
+# difference is the assembler temp-file name left in the symbol table (ittptmark64-XXXXXX.o).
+python3 - "$C/libdnnl-base.so.3" "$R/bin/libdnnl.so.3" <<PY_DNNL
+import re,sys
+a,b=(open(p,"rb").read() for p in sys.argv[1:3])
+pat=re.compile(rb"ittptmark64-[0-9a-f]{6}\\.o")
+assert len(pat.findall(a))==1 and len(pat.findall(b))==1
+assert pat.sub(b"X",a)==pat.sub(b"X",b),"oneDNN libraries differ beyond the temp-file name"
+PY_DNNL
 cmp "$C/entrypoint-base.sh" "$R/docker-entrypoint.sh"
 export GRIM_RELEASE_CONTEXT="$C" GRIM_RELEASE_TREE="$R"
 python3 - <<'MANIFEST'

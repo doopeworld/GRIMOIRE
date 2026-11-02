@@ -2,11 +2,13 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-02 19:11: RESUMED by Ian ("resume work"). Read [HANDOFF-2026-11-02-GPUS-HANDED.md](HANDOFF-2026-11-02-GPUS-HANDED.md)
-first: results since the resume, then "Order from here". Doing now: finish the G31/G21 server build, assemble and validate
-image v1.10.3-rc1, publish v1.10.3. Combined build: 44/44 regression answers identical to 10-30. Next engine change waiting:
-CPU-expert pool fix on `cpu-pool-late-workers-1102`. The narrow INT4 verify plan is dropped; do not cite its 47%. v1.10.2 remains latest,
-main remains b0674cd until v1.10.3 passes. GPU1 still off limits; GPU0 only, one GPU job at a time.**
+**2026-11-02 21:05: PAUSED by Ian until he asks to resume; nothing is running or queued. Read
+[HANDOFF-2026-11-02-PAUSED.md](HANDOFF-2026-11-02-PAUSED.md) first, it has the exact resume order. v1.10.3-rc1 is built and passed its
+validation gate; next step is to package and publish it (not done). v1.10.2 remains latest, main remains b0674cd. Next candidate:
+`cpu-pool-late-workers-1102` (CPU-expert pool fix, native GGUF experts grouped by default), code only, not built. The narrow INT4 verify
+plan is dropped; do not cite its 47%. GPU1 still off limits; GPU0 only, one GPU job at a time.**
+
+**2026-11-02 19:11: Resumed by Ian. Historical; superseded by the entry above.**
 
 **2026-11-02 17:52: GPUs handed to Ian ("i need to use both gpus now"). Historical; superseded by the entry above.**
 
