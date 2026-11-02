@@ -2,10 +2,14 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-01 NIGHT: PAUSED by Ian until he asks to resume. No GPU/CPU jobs, GPU holders,
-book server or future queue remain. Read [HANDOFF-2026-11-01-PAUSED.md](HANDOFF-2026-11-01-PAUSED.md)
-first. Full engine scope is preserved. Regression is only 22/44 complete; release build
-is interrupted; v1.10.2 remains latest. GPU1 still off limits. Do not run anything automatically.**
+**2026-11-02 17:52: GPUs HANDED TO IAN ("i need to use both gpus now"); COMFYUI-BETA is Ian's, never stop it. Nothing of
+ours is running or queued; do not run anything until Ian says resume. Read
+[HANDOFF-2026-11-02-GPUS-HANDED.md](HANDOFF-2026-11-02-GPUS-HANDED.md) first, it has the exact resume order. Combined build:
+44/44 regression answers identical to 10-30. Release build stopped from outside: CLI done, server not, no v1.10.3 image;
+v1.10.2 remains latest, main remains b0674cd. GPU1 still off limits.**
+
+**2026-11-01 NIGHT: PAUSED by Ian until he asks to resume. Historical; superseded by the entry above. Read
+[HANDOFF-2026-11-01-PAUSED.md](HANDOFF-2026-11-01-PAUSED.md) for the older checkpoints. Full engine scope is preserved.**
 
 **2026-11-01: Ian resumed the FULL engine project. Read
 [ROADMAP-2026-10-31.md](ROADMAP-2026-10-31.md), not only the completed release handoff.
