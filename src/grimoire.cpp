@@ -2443,6 +2443,10 @@ struct Grimoire {
         // prefill receive ring; sp_piece floats per piece; sp_cnt = pieces finished, published in
         // the flag at base+1024+64*rank.  GRIMOIRE_TP_SMALL_BAR=0 = the plain host round trip.
         size_t small_max = 65536, sp_piece = 0; uint64_t sp_cnt = 0;
+        // GRIMOIRE_TP_SMALL_BF16=1 (11-04, opt-in): the small all-reduce sends each rank's partial as bf16
+        // (half the bytes over the link, which matters with gpu1 at Gen3 x4) and sums the two in fp32 in
+        // rank order, so both ranks keep identical bits.  The CPU-expert fold (host_add) stays fp32.
+        bool small_bf16 = false;
         uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
     } tshm;
     bool tp_shm_setup(std::string& err);
@@ -2711,6 +2715,8 @@ struct Grimoire {
     const void* kjob_s[4] = {}; void* kjob_d[4] = {}; size_t kjob_b[4] = {};
     bool ksend_on();
     uint64_t ksend(int n, const void* const* src, void* const* dst, const size_t* bytes);
+    // ksend's converting twin for the bf16 small all-reduce: n floats -> n bf16 (round to nearest even)
+    uint64_t ksend_bf16(const float* src, uint16_t* dst, size_t n);
     bool kwait(uint64_t tag, const char* what);
     // the same, M rows at a time (short-prompt prefill), grown on demand
     size_t    px_cap = 0;
@@ -4965,6 +4971,14 @@ bool Grimoire::tp_shm_setup(std::string& err){
             std::printf("  TP small all-reduce (<= %zu floats): pieces of %zu floats, sum written by the CPU"
                         " into this card's VRAM through the BAR (GRIMOIRE_TP_SMALL_BAR=0 = off)\n",
                         tshm.small_max,tshm.sp_piece);
+            // bf16 partials only if BOTH ranks ask for them: the slots then hold half-size elements
+            const char* be=std::getenv("GRIMOIRE_TP_SMALL_BF16");
+            int b16=(be&&*be&&*be!='0')?1:0;
+            if(!tp_agree_min(b16)){err="TP small all-reduce handshake failed";return false;}
+            tshm.small_bf16=b16==1;
+            if(tshm.small_bf16)
+                std::printf("  TP small all-reduce: bf16 partials, summed in fp32 in rank order "
+                            "(GRIMOIRE_TP_SMALL_BF16=1; the CPU-expert fold stays fp32)\n");
         }
     }
     if(tshm.pipe_piece){
@@ -5291,6 +5305,30 @@ static void tp_bar_sum(float* dst,const float* a,const float* b,size_t n){
             _mm_stream_ps(dst+i+8,x2); _mm_stream_ps(dst+i+12,x3);
         }
     for(;i<n;++i)dst[i]=a[i]+b[i];
+}
+
+// tp_bar_sum for bf16 partials (GRIMOIRE_TP_SMALL_BF16): each bf16 widened exactly to fp32, then the same
+// fp32 add in rank order, so both ranks write the same bits.
+static void tp_bar_sum_bf16(float* dst,const uint16_t* a,const uint16_t* b,size_t n){
+    size_t i=0;
+    if((reinterpret_cast<uintptr_t>(dst)&15)==0){
+        const __m128i z=_mm_setzero_si128();
+        for(;i+16<=n;i+=16){
+            const __m128i a0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a+i));
+            const __m128i a1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a+i+8));
+            const __m128i b0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(b+i));
+            const __m128i b1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(b+i+8));
+            _mm_stream_ps(dst+i,   _mm_add_ps(_mm_castsi128_ps(_mm_unpacklo_epi16(z,a0)),_mm_castsi128_ps(_mm_unpacklo_epi16(z,b0))));
+            _mm_stream_ps(dst+i+4, _mm_add_ps(_mm_castsi128_ps(_mm_unpackhi_epi16(z,a0)),_mm_castsi128_ps(_mm_unpackhi_epi16(z,b0))));
+            _mm_stream_ps(dst+i+8, _mm_add_ps(_mm_castsi128_ps(_mm_unpacklo_epi16(z,a1)),_mm_castsi128_ps(_mm_unpacklo_epi16(z,b1))));
+            _mm_stream_ps(dst+i+12,_mm_add_ps(_mm_castsi128_ps(_mm_unpackhi_epi16(z,a1)),_mm_castsi128_ps(_mm_unpackhi_epi16(z,b1))));
+        }
+    }
+    for(;i<n;++i){
+        const uint32_t x=uint32_t(a[i])<<16, y=uint32_t(b[i])<<16;
+        float fx,fy; std::memcpy(&fx,&x,4); std::memcpy(&fy,&y,4);
+        dst[i]=fx+fy;
+    }
 }
 
 // The receive thread (TpShm): every published piece in order -- the peer's
@@ -5706,6 +5744,41 @@ uint64_t Grimoire::ksend(int n, const void* const* src, void* const* dst, const 
     return tag;
 }
 
+// n floats on the device -> n bf16 in pinned RAM (round to nearest even; NaN stays NaN), eight per lane so
+// each lane writes 16 bytes, then the next tag into kflag as ksend does.  Every rank rounds its own partial
+// with this same kernel; the CPU sum reads the two rounded partials, so both ranks get the same bits.
+uint64_t Grimoire::ksend_bf16(const float* src, uint16_t* dst, size_t n) {
+    const uint64_t tag = ++kflag_tag;
+    kjob_tag = 0;                                    // GRIMOIRE_KSEND_CHECK compares plain copies only
+    uint64_t* fl = kflag;
+    const bool v16 = ((uintptr_t(src) | uintptr_t(dst)) & 15) == 0;
+    constexpr int WG = 256;
+    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const size_t lid = it.get_local_id(0);
+        auto rne = [](float f) -> uint32_t {
+            uint32_t u = sycl::bit_cast<uint32_t>(f);
+            if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+            return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+        };
+        const size_t n8 = v16 ? n / 8 : 0;
+        const sycl::float4* s = reinterpret_cast<const sycl::float4*>(src);
+        sycl::uint4* d = reinterpret_cast<sycl::uint4*>(dst);
+        for (size_t i = lid; i < n8; i += WG) {
+            const sycl::float4 a = s[2 * i], b = s[2 * i + 1];
+            d[i] = sycl::uint4(rne(a.x()) | (rne(a.y()) << 16), rne(a.z()) | (rne(a.w()) << 16),
+                               rne(b.x()) | (rne(b.y()) << 16), rne(b.z()) | (rne(b.w()) << 16));
+        }
+        for (size_t i = n8 * 8 + lid; i < n; i += WG) dst[i] = uint16_t(rne(src[i]));
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group());
+        if (lid == 0) {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *reinterpret_cast<volatile uint64_t*>(fl) = tag;
+        }
+    });
+    return tag;
+}
+
 bool Grimoire::kwait(uint64_t tag, const char* what) {
     const volatile uint64_t* f = kflag;
     uint64_t spins = 0;
@@ -5771,6 +5844,34 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     double t_peer=0, t_sum=0, t_out=0;
     if(st){t0=clk::now();q.wait();t1=clk::now();}
     const size_t P=tshm.sp_piece, np=(elems+P-1)/P;
+    float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
+    // bf16 partials (GRIMOIRE_TP_SMALL_BF16=1): one converting copy out, then the same pieces, flags and
+    // rank-order sum as the fp32 path below.  The CPU-expert fold (host_add / pre_tag) stays fp32.
+    if(tshm.small_bf16&&!host_add&&!pre_tag&&ksend_on()){
+        uint16_t* const st16=reinterpret_cast<uint16_t*>(tshm.stage);
+        uint16_t* const mine16=reinterpret_cast<uint16_t*>(slot(tp_rank));
+        const uint16_t* const a16=reinterpret_cast<const uint16_t*>(slot(0));
+        const uint16_t* const b16=reinterpret_cast<const uint16_t*>(slot(1));
+        if(!kwait(ksend_bf16(dev,st16,elems),"TP small all-reduce (bf16)"))return false;
+        if(st){tb=clk::now(); t_out+=std::chrono::duration<double,std::micro>(tb-t1).count();}
+        for(size_t k=0;k<np;++k){
+            const size_t o=k*P, n=std::min(P,elems-o);
+            std::memcpy(mine16+o,st16+o,n*sizeof(uint16_t));
+            const uint64_t c=++tshm.sp_cnt;
+            sflag(tp_rank)->store(c,std::memory_order_release);
+            auto* f=sflag(peer); uint64_t spins=0; const auto tw=clk::now();
+            while(f->load(std::memory_order_acquire)<c){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&clk::now()-tw>std::chrono::seconds(120)){
+                    std::fprintf(stderr,"TP rank %d: small all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                    return false;
+                }
+            }
+            if(st){ta=clk::now(); t_peer+=std::chrono::duration<double,std::micro>(ta-tw).count();}
+            tp_bar_sum_bf16(bar+o,a16+o,b16+o,n);
+            if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
+        }
+    }else{
     sycl::event ev[64];
     // one piece (decode): the copy out is a kernel + pinned flag (ksend)
     const bool kpath=pre_tag||(np==1&&ksend_on());
@@ -5785,7 +5886,6 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     float* const mine=slot(tp_rank);
     const float* const s0=slot(0);
     const float* const s1=slot(1);
-    float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
     for(size_t k=0;k<np;++k){
         const size_t o=k*P, n=std::min(P,elems-o);
         if(st)ta=clk::now();
@@ -5826,6 +5926,7 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
         tp_bar_sum(bar+o,s0+o,s1+o,n);
         if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
     }
+    }   // fp32 partials
     _mm_sfence();
     (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
     if(st)ta=clk::now();
@@ -16000,9 +16101,11 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         if (const char* v = std::getenv("GRIMOIRE_EXPERT_VRAM_PER_LAYER")) {
             nv = std::max(0, std::min(Ehalf, std::atoi(v)));
         } else {
+            // Default: all experts if they fit 60% of the card, else 16 GB -- but never more than 60% of
+            // the card (11-04: 16 GB is more than a B580 has; a B70 still gets 16 GB, a B60 14.4 GB)
             const char* g = std::getenv("GRIMOIRE_EXPERT_VRAM_GB");
             const size_t budget = g ? size_t(std::max(0.0, std::atof(g)) * 1073741824.0)
-                                : (all <= dev / 10 * 6 ? all : size_t(16) << 30);
+                                : (all <= dev / 10 * 6 ? all : std::min(size_t(16) << 30, dev / 10 * 6));
             nv = int(std::min<size_t>(size_t(Ehalf), budget / (lay.bytes * size_t(moe_layers))));
         }
         tm_vram_per_layer = nv;
