@@ -2443,9 +2443,10 @@ struct Grimoire {
         // prefill receive ring; sp_piece floats per piece; sp_cnt = pieces finished, published in
         // the flag at base+1024+64*rank.  GRIMOIRE_TP_SMALL_BAR=0 = the plain host round trip.
         size_t small_max = 65536, sp_piece = 0; uint64_t sp_cnt = 0;
-        // GRIMOIRE_TP_SMALL_BF16=1 (11-04, opt-in): the small all-reduce sends each rank's partial as bf16
-        // (half the bytes over the link, which matters with gpu1 at Gen3 x4) and sums the two in fp32 in
-        // rank order, so both ranks keep identical bits.  The CPU-expert fold (host_add) stays fp32.
+        // bf16 small all-reduce (11-04, default; GRIMOIRE_TP_SMALL_BF16=0 = fp32): each rank's partial goes
+        // out as bf16 (half the bytes over the link, which matters with gpu1 at Gen3 x4) and the two are
+        // summed in fp32 in rank order, so both ranks keep identical bits -- the same rounding the prompt
+        // path's pipelined all-reduce already uses.  The CPU-expert fold (host_add) stays fp32.
         bool small_bf16 = false;
         uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
     } tshm;
@@ -4971,14 +4972,16 @@ bool Grimoire::tp_shm_setup(std::string& err){
             std::printf("  TP small all-reduce (<= %zu floats): pieces of %zu floats, sum written by the CPU"
                         " into this card's VRAM through the BAR (GRIMOIRE_TP_SMALL_BAR=0 = off)\n",
                         tshm.small_max,tshm.sp_piece);
-            // bf16 partials only if BOTH ranks ask for them: the slots then hold half-size elements
+            // bf16 partials (default since 11-04: two B70s, Qwen3.8-27B-FP8 TP + MTP, code 81.4 -> 83.1 tok/s,
+            // 4 users 95.7 -> 98.0, every coding answer byte-identical), only if BOTH ranks keep them on:
+            // the slots then hold half-size elements.  GRIMOIRE_TP_SMALL_BF16=0 = fp32 partials.
             const char* be=std::getenv("GRIMOIRE_TP_SMALL_BF16");
-            int b16=(be&&*be&&*be!='0')?1:0;
+            int b16=(be&&*be=='0')?0:1;
             if(!tp_agree_min(b16)){err="TP small all-reduce handshake failed";return false;}
             tshm.small_bf16=b16==1;
-            if(tshm.small_bf16)
-                std::printf("  TP small all-reduce: bf16 partials, summed in fp32 in rank order "
-                            "(GRIMOIRE_TP_SMALL_BF16=1; the CPU-expert fold stays fp32)\n");
+            std::printf("  TP small all-reduce: %s partials, summed in fp32 in rank order "
+                        "(GRIMOIRE_TP_SMALL_BF16=0 = fp32; the CPU-expert fold stays fp32)\n",
+                        tshm.small_bf16?"bf16":"fp32");
         }
     }
     if(tshm.pipe_piece){
