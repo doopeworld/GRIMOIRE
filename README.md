@@ -8,9 +8,9 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.2**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.3**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF. Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default. Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -108,47 +108,57 @@ about the cost of one).  The BF16 GGUF gives **token-identical** output to the s
 UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (Q8_0 as `--proj int8`: 99.2%
 top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 
-### Served image validation, 2026-10-31 (v1.10.2)
+### Served image validation, 2026-11-02 (v1.10.3)
 
-The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128.
-Concurrent decode is the total across the stated number of users. Qwen uses eight sequence
-slots, MTP K=6 and a draft vocabulary of 65,536; Ornith uses eight slots without MTP.
-These HTTP measurements differ from the short-prompt CLI measurements above.
+The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128. Each cell
+is v1.10.2 (measured 2026-10-31) -> v1.10.3, same machine and test. Concurrent decode is the total
+across the stated number of users. Qwen uses eight sequence slots, MTP K=6 and a draft vocabulary
+of 65,536; Ornith uses eight slots without MTP. These HTTP measurements differ from the
+short-prompt CLI measurements above.
 
 | Checkpoint and mode | Prompt, 1 user | Decode, 1 user | Concurrent decode, total | Coding decode |
 |---|---:|---:|---:|---:|
-| Qwen3.8-27B GPTQ-Int4 + MTP | 2,020 | 67.1 | 180.5 (4 users) | 127.9 |
-| Qwen3.8-27B UD-Q4_K_XL, native + MTP | 1,973 | 59.4 | 141.6 (4 users) | 96.2 |
-| Ornith Q4_K_M, native | 7,259 | 155.2 | 133.8 (8 users) | -- |
-| Ornith Q4_K_M, converted to MXFP4 | 8,753 | 175.1 | 378.4 (8 users) | -- |
-| Ornith safetensors, MXFP4 | 8,804 | 174.7 | 378.9 (8 users) | -- |
+| Qwen3.8-27B GPTQ-Int4 + MTP | 2,020 -> 2,062 | 67.1 -> 61.6 | 180.5 -> 171.9 (4 users) | 127.9 -> 127.8 |
+| Qwen3.8-27B UD-Q4_K_XL, native + MTP | 1,973 -> 1,969 | 59.4 -> 56.2 | 141.6 -> 143.8 (4 users) | 96.2 -> 95.5 |
+| Ornith Q4_K_M, native | 7,259 -> 7,130 | 155.2 -> 155.2 | 133.8 -> 133.8 (8 users) | -- |
+| Ornith Q4_K_M, converted to MXFP4 | 8,753 -> 8,525 | 175.1 -> 174.8 | 378.4 -> 377.7 (8 users) | -- |
+| Ornith safetensors, MXFP4 | 8,804 -> 8,633 | 174.7 -> 174.8 | 378.9 -> 377.1 (8 users) | -- |
 
-Both Qwen modes passed two coding answers and eight concurrent coding answers. Each row passed
-the benchmark's coherence check. The coding probe uses a 2,153-token prompt and generates until
-the answer finishes; it is a separate workload from llama-benchy's tg128. MTP acceptance and
+v1.10.3 changes no default: a 44-run regression on its source gave the same answers as before.
+The one-user tg128 figures for Qwen are two-run samples whose ranges overlap (GPTQ 61.6 +/- 3.9
+against 67.1 +/- 2.8, GGUF 56.2 +/- 4.9 against 59.4 +/- 8.6); the coding probe, a fixed 2,153-token prompt that generates until the
+answer finishes, is unchanged. Both Qwen modes passed two coding answers and eight concurrent
+coding answers, and each row passed the benchmark's coherence check. MTP acceptance and
 throughput vary with the prompt.
 
-**Optional native GGUF expert batching in source builds:** add
-`-e GRIMOIRE_MOE_NATIVE_SMALLM=1` to keep the file's blocks while sharing expert reads across
-small batches. Ornith Q4_K_M on one B70 measured 133.7 -> 364.8 tok/s total at eight users;
-single-user decode stayed at 156. The independent numerical oracle passes 32 cases. Concurrent
-coding passed 6/8 in both modes, so this is a throughput result with that quality limitation,
-not a token-parity claim. The option defaults off. [Detailed results](tools/bench/onednn/RESULTS-2026-11-01.md).
+**Three opt-in modes in v1.10.3, all off by default:**
+
+| Add to `docker run` | Measured on one B70 | Limit |
+|---|---|---|
+| `-e GRIMOIRE_MOE_NATIVE_SMALLM=1` | Ornith Q4_K_M native, 8 users: 133.8 -> **359.3** tok/s total; 1 user 155.2 -> 156.0 | native GGUF experts, 2-16 rows; concurrent coding 6/8, and the same prompts fail when run alone |
+| `-e GRIMOIRE_MTP_GPU_DRAFT=1` | Qwen3.8-27B GPTQ-Int4 + MTP, 4 users: 171.9 -> 183.2 tok/s total | run-to-run ranges overlap; not a firm speed claim |
+| `-e GRIMOIRE_ONEDNN_W8A8=3` | Qwen3.8-27B-FP8 as `--proj int8`, pp4096: 2,072 -> **2,457** tok/s | 8-bit activations in the widest prompt projections: top-1 vs BF16 98.4% -> 97.7% on a limited text sample |
+
+The native expert batching passes an independent numerical oracle (32 cases); its concurrent
+answers are not token-identical to the default, so treat it as a throughput option.
+[Detailed results](tools/bench/onednn/RESULTS-2026-11-02.md).
 
 ## Run a model
 
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.2/grimoire-b70-v1.10.2.tar.gz
-docker load < grimoire-b70-v1.10.2.tar.gz              # -> grimoire-b70:v1.10.2
-docker tag grimoire-b70:v1.10.2 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.3/grimoire-b70-v1.10.3.tar.gz
+docker load < grimoire-b70-v1.10.3.tar.gz              # -> grimoire-b70:v1.10.3
+docker tag grimoire-b70:v1.10.3 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.10.2 includes native GGUF decode and prompt speed-ups and MTP from the GGUF file's own head.
-It runs on the Arc Pro B70 and the Arc Pro B60 / Arc B580, serves MTP to several users on
-two GPUs, reads GGUF files, runs the FP8 checkpoint as fast INT8 (`--proj int8`), and ships oneAPI
-2026.2, GPU driver 26.35 and oneDNN 3.14 (see its release notes).
+v1.10.3 behaves like v1.10.2 by default and adds three opt-in speed modes
+([above](#served-image-validation-2026-11-02-v1103)). Like v1.10.2 it includes native GGUF decode
+and prompt speed-ups and MTP from the GGUF file's own head, runs on the Arc Pro B70 and the Arc Pro
+B60 / Arc B580, serves MTP to several users on two GPUs, reads GGUF files, runs the FP8 checkpoint
+as fast INT8 (`--proj int8`), and ships oneAPI 2026.2, GPU driver 26.35 and oneDNN 3.14 (see the
+release notes).
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
 build the image yourself: `docker build -t grimoire-b70 .`
@@ -266,7 +276,7 @@ a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
 - Today both are faster than plain decoding on Qwen3.8-27B only. On Ornith they are not faster
   yet, so leave them off there.
 
-`GRIMOIRE_MTP_GPU_DRAFT=1` is an experimental source-build option for single-GPU batched MTP.
+`GRIMOIRE_MTP_GPU_DRAFT=1` is an experimental option for single-GPU batched MTP (in the image since v1.10.3).
 Draft depths keep their proposed IDs on the device and use one final proposal readback.
 The paired test preserved all 38 responses, including 28 uneven token budgets; coding passed
 10/10 in each mode. Measured two/four-user rates changed from 96/179 to 106/184 tok/s, with
@@ -280,7 +290,7 @@ establish universal token parity. [Measurements and limits](tools/bench/onednn/R
 **Prefill (prompt) speed on INT4.** Since v1.8 GPTQ / INT4 checkpoints use the same fast prefill
 path as MXFP4: 2,069 - 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.7.1: 1,731).
 
-**Optional INT8 prompt arithmetic in source builds.** `GRIMOIRE_ONEDNN_W8A8` quantizes activation
+**Optional INT8 prompt arithmetic (in the image since v1.10.3).** `GRIMOIRE_ONEDNN_W8A8` quantizes activation
 rows for existing INT8 weights; it defaults to `0` (BF16 activations). Mode `1` selects all eligible
 projections, `2` selects large projections, and `3` selects wide outputs while retaining BF16
 activations for narrow outputs. Decode and verify batches below 32 rows are unchanged.

@@ -2,7 +2,11 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-02 21:05: PAUSED by Ian until he asks to resume; nothing is running or queued. Read
+**2026-11-04 17:47: RESUMED by Ian. Read [HANDOFF-2026-11-04.md](HANDOFF-2026-11-04.md) first. v1.10.3 is packaged, the three
+profiles run it and pass their smoke test, but the GitHub release waits for a token with Contents write (both stored tokens fail).
+The v1.10.4 candidate (`cpu-pool-late-workers-1102`) is building. New hardware: an Arc B580 at 0b:00.0; GPU0 only still.**
+
+**2026-11-02 21:05: PAUSED by Ian. Historical; superseded by the entry above. Read
 [HANDOFF-2026-11-02-PAUSED.md](HANDOFF-2026-11-02-PAUSED.md) first, it has the exact resume order. v1.10.3-rc1 is built and passed its
 validation gate; next step is to package and publish it (not done). v1.10.2 remains latest, main remains b0674cd. Next candidate:
 `cpu-pool-late-workers-1102` (CPU-expert pool fix, native GGUF experts grouped by default), code only, not built. The narrow INT4 verify

@@ -7,7 +7,8 @@ BK=$B/templates-backup/2026-11-02-v1103
 EXPECTED=$1
 exec 8>/mnt/user/isos/grimoire-runs/gpu0.lock
 flock -n 8 || exit 9
-test -z "$(docker ps -q)" || exit 9
+# Nothing may run except the CPU-only release build (no devices).
+test -z "$(docker ps --format "{{.Names}}" | grep -vx grim-release-build-1102b)" || exit 9
 test "$(docker image inspect -f "{{.Id}}" grimoire-b70:v1.10.3)" = "$EXPECTED"
 test ! -e "$BK"
 NAMES="GRIMOIRE-QWEN3.8 GRIMOIRE-ORNITH GRIMOIRE-QWEN3.8-GGUF"

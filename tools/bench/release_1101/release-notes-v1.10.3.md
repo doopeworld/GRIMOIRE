@@ -26,9 +26,10 @@ Ornith uses eight slots without MTP.
 | Ornith-1.5 Q4_K_M converted to MXFP4 | 8,525 | 174.8 | 377.7 (8 users) |
 | Ornith-1.5 safetensors MXFP4 | 8,633 | 174.8 | 377.1 (8 users) |
 
-Both Qwen modes passed two single-request and eight concurrent coding answers. Qwen GPTQ's one-user tg128 is lower than
-v1.10.2's 67.1, a two-run sample with overlapping ranges (61.62 +/- 3.92 against 67.08 +/- 2.79); the fixed coding probe is
-unchanged at 127.8 tok/s against 127.9. MTP acceptance varies with the text.
+Both Qwen modes passed two single-request and eight concurrent coding answers. Qwen's one-user tg128 figures are lower than
+v1.10.2's, but each is a two-run sample with overlapping ranges: GPTQ 61.62 +/- 3.92 against 67.08 +/- 2.79, GGUF 56.25 +/- 4.87
+against 59.41 +/- 8.62. The fixed coding probe (2,153-token prompt) is unchanged: GPTQ 127.8 tok/s against 127.9, GGUF 95.5 against
+96.2. MTP acceptance varies with the text.
 
 The image contains G31 (B70) and G21 (B60/B580) targets. Only a B70 was tested here. Two-GPU
 runtime validation was not repeated: the second card's link on the test machine still logs errors.
@@ -44,10 +45,11 @@ runtime validation was not repeated: the second card's link on the test machine 
 ## Load the image
 
 ```bash
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.3/grimoire-b70-v1.10.3.tar.gz
 docker load < grimoire-b70-v1.10.3.tar.gz
 docker tag grimoire-b70:v1.10.3 grimoire-b70:latest
 ```
 
 Image ID: `sha256:3663f7a7c5cc745b7a16ee5de8b57ba7da37f8bace87cc4ad238af3f9b761e45`.
-Asset size: FILL_BYTES bytes. gzip integrity check passed.
-Asset SHA-256: `FILL_SHA`.
+Asset size: 923,617,984 bytes. gzip integrity check passed.
+Asset SHA-256: `972338bee4334215c5e0c5ba4a1d8cc5834601efbafbcaa652640ca71259d5f6`.

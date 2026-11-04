@@ -29,6 +29,8 @@ if st == 404:
                                'body': BODY, 'prerelease': True}).encode(), {'Content-Type': 'application/json'})
     print('create release:', st, rel.get('html_url') or rel.get('message'))
     if st != 201: sys.exit(1)
+elif st != 200:
+    print('release lookup failed:', st, rel.get('message')); sys.exit(1)
 else:
     print('release exists:', st, rel.get('html_url'))
 name = os.path.basename(ASSET)
