@@ -2,9 +2,13 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-04 17:47: RESUMED by Ian. Read [HANDOFF-2026-11-04.md](HANDOFF-2026-11-04.md) first. v1.10.3 is packaged, the three
-profiles run it and pass their smoke test, but the GitHub release waits for a token with Contents write (both stored tokens fail).
-The v1.10.4 candidate (`cpu-pool-late-workers-1102`) is building. New hardware: an Arc B580 at 0b:00.0; GPU0 only still.**
+**2026-11-04 ~20:25: PAUSED by Ian until he says resume; nothing runs. Read [HANDOFF-2026-11-04.md](HANDOFF-2026-11-04.md)
+first: state, branches, exact resume order. v1.10.3 is PUBLISHED; main = engine-integration-1101. The v1.10.4 candidate and the
+bf16 two-card exchange are on their own branches (gate half done). The goal, in Ian's words: "grimoire must be the fastest
+possible tool to do inference on b70 and b60 and b580 for single and dual gpu". GPU1 and the B580 (0b:00.0) are in use; corrected
+link errors are not failures. Check git history before proposing any work item (Ian, 11-04).**
+
+**2026-11-04 17:47: RESUMED by Ian. Historical; superseded by the entry above.**
 
 **2026-11-02 21:05: PAUSED by Ian. Historical; superseded by the entry above. Read
 [HANDOFF-2026-11-02-PAUSED.md](HANDOFF-2026-11-02-PAUSED.md) first, it has the exact resume order. v1.10.3-rc1 is built and passed its
