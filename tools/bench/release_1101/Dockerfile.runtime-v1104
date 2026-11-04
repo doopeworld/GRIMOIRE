@@ -1,0 +1,8 @@
+# v1.10.4: the two executables rebuilt from cpu-pool-late-workers-1102 (G31/G21, CPU only) over the unchanged v1.10.3 image.
+# assemble-image-v1104.sh checks the exact base image and that its libraries equal the build tree's first.
+FROM grimoire-b70:v1.10.3
+LABEL org.opencontainers.image.source="https://github.com/doopeworld/GRIMOIRE" \
+      org.opencontainers.image.revision="18818301be63fec3b64b49e6adef75df5c99b488" \
+      org.opencontainers.image.version="v1.10.4-rc1"
+COPY --chmod=0755 bin/grimoire bin/grimoire-server /grimoire/bin/
+COPY build-manifest.json /usr/share/doc/grimoire/build-manifest.json
