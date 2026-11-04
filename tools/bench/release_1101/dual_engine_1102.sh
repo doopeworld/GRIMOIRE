@@ -7,6 +7,7 @@
 #            T0        (10-29) "multi TP" with BOTH ranks on gpu0 (GRIMOIRE_MULTI_DEVICES=0,0):
 #                      the two-card code paths without touching gpu1 -- correctness, not speed
 #            G1 | G0   one card only (G1 = the second B70)
+#            B5        (11-04) the Arc B580 alone (Battlemage G21, the B60's chip); holds b580.lock only
 #     MODEL  path inside the container: /models/<dir> = /mnt/storage/Models,
 #            /models2/<dir> = /mnt/models (Qwen3.8 checkpoints since 10-22)
 #     TESTS  comma list of ctest, gen, code, prose, benchy (benchy gets the extra args),
@@ -17,10 +18,9 @@
 # agents use the same locks).  Server = host bin/ of grimoire-fuse in grimoire-b70:latest;
 # IMG=<image> HOSTBIN=0 runs an image's OWN binaries instead (a release image as shipped).
 # Link guard, sampled every 2 s from container start to stop:
-#   STOP on any non-fatal/fatal AER on either card's path; gpu1 root-port receive errors
-#        (card->host direction, where every old drop started) >= RP_WIN (5) in one 10-s window or
-#        >= RP_RUN (20) in the run; a hardware link retrain (BWMgmt+ on gpu1's root port); any xe
-#        error line in syslog; or gpu1's config space reading ffffffff.  (10-22: the first TP
+#   STOP only when a card fails: any non-fatal/fatal AER on either card's path, any xe error line in
+#        syslog, or gpu1's config space reading ffffffff. Corrected errors and link retrains are logged,
+#        never a reason to stop (11-04, Ian: an error count does not mean the card is not working).  (10-22: the first TP
 #        prefill under load logged 1 RxErr + 1 BadTLP there, corrected by replay, link stayed up.)  On STOP the test client is killed; the server
 #        finishes its in-flight work and is stopped gracefully -- never killed.
 #   LOG  the host->card RxErr count at gpu1's switch port (~5/s idle on this adapter) and the
@@ -34,13 +34,20 @@ case $MODEL in /models2/*) HOSTM=/mnt/models/${MODEL#/models2/} ;; /models/*) HO
   *) echo "MODEL must be /models/... or /models2/..."; exit 2 ;; esac
 [ -d "$HOSTM" ] || [ -f "$HOSTM" ] || { echo "no checkpoint at $HOSTM"; exit 2; }   # a .gguf file too (10-30)
 
-exec 8>/mnt/user/isos/grimoire-runs/gpu0.lock 9>/mnt/user/isos/grimoire-runs/gpu1.lock
-# a one-card run holds only its own card's lock (10-27)
+exec 7>/mnt/user/isos/grimoire-runs/b580.lock 8>/mnt/user/isos/grimoire-runs/gpu0.lock 9>/mnt/user/isos/grimoire-runs/gpu1.lock
+# a one-card run holds only its own card's lock (10-27); B5 = the Arc B580 alone (11-04)
+if [ "$MODE" = B5 ]; then flock -n 7 || { echo "b580.lock is held by another job -- not starting"; exit 9; }
+else
 [ "$MODE" = G1 ] || flock -n 8 || { echo "gpu0.lock is held by another job -- not starting"; exit 9; }
 [ "$MODE" = G0 ] || [ "$MODE" = T0 ] || flock -n 9 || { echo "gpu1.lock is held by another job -- not starting"; exit 9; }
+fi
 
 N0=$($R/tools/gpunode.sh gpu0 2>/dev/null) && N1=$($R/tools/gpunode.sh gpu1 2>/dev/null) ||
   { echo "cannot resolve both B70s"; exit 9; }
+if [ "$MODE" = B5 ]; then   # the "gpu1" slot (its link checks, its render node) becomes the Arc B580 (8086:e20b)
+  PB=$(for d in /sys/bus/pci/devices/*; do [ "$(cat $d/vendor)" = 0x8086 ] && [ "$(cat $d/device)" = 0xe20b ] && basename $d; done | head -1)
+  [ -n "$PB" ] && N1=$($R/tools/gpunode.sh "$PB" 2>/dev/null) || { echo "cannot resolve the B580"; exit 9; }
+fi
 P0=$(basename "$(readlink -f /sys/class/drm/$N0/device)"); P1=$(basename "$(readlink -f /sys/class/drm/$N1/device)")
 chain() { readlink -f /sys/bus/pci/devices/$1 | tr / '\n' | grep -E '^[0-9a-f]{4}:'; }
 PORTS="$(chain $P0) $(chain $P1)"; RP1=$(chain $P1 | head -1); SW1=$(chain $P1 | sed -n 2p)
@@ -53,20 +60,20 @@ linkstat() { echo "gpu1 $P1: switch $SW1 RxErr=$(cnt $SW1 RxErr correctable) Bad
 
 watch_link() {
   local u0=$(uncorr) r0=$(rp_rx) s0=$(cnt $SW1 RxErr correctable) t0=$(cnt $RP1 Timeout correctable)
-  local sl=$(wc -l < /var/log/syslog) n=0 s_last=$s0 r_win=$(rp_rx) why u r cfg xe bw
+  local sl=$(wc -l < /var/log/syslog) n=0 s_last=$s0 r_win=$(rp_rx) why u r cfg xe bw=""
   while [ ! -e $L.DONE ]; do
     sleep 2; n=$((n+1)); why=""
     u=$(uncorr); r=$(rp_rx); cfg=$(od -An -tx4 -N4 /sys/bus/pci/devices/$P1/config 2>/dev/null | tr -d ' ')
     xe=$(tail -n +$((sl+1)) /var/log/syslog 2>/dev/null | grep -E "xe 0000:(${P0#0000:}|${P1#0000:})" |
+         grep -viE "severity=correct|corrected" |
          grep -iE "unreliable|timedout|reset|wedged|lost|fail|fault|error|guc" | head -1 | cut -c1-200)
     [ "$u" != "$u0" ] && why="uncorrectable AER on a GPU path ($u0 -> $u)"
-    # gpu1's own link rules; a gpu0-only run (G0) only logs them (10-27)
+    # 11-04, Ian: corrected link errors are repaired by the link and the card keeps working, so they are
+    # only logged (every 10 s in $L.link). A run stops only when a card actually fails.
     if [ "$MODE" != G0 ] && [ "$MODE" != T0 ]; then
-    [ $((r - r0)) -ge ${RP_RUN:-20} ] && why="gpu1 root port receive errors in this run: $((r - r0)) ($r0 -> $r)"
-    [ $((r - r_win)) -ge ${RP_WIN:-5} ] && why="gpu1 root port receive errors: $((r - r_win)) within 10 s"
-    bw=$(lspci -vv -s ${RP1#0000:} 2>/dev/null | grep -oE "BWMgmt[+-]" | head -1)
-    [ "$bw" = "BWMgmt+" ] && why="gpu1 root port reports a hardware link retrain (BWMgmt+)"
-    [ "$cfg" = ffffffff ] || [ -z "$cfg" ] && why="gpu1 config space unreadable ($cfg)"
+    if [ -z "$bw" ] && lspci -vv -s ${RP1#0000:} 2>/dev/null | grep -q "BWMgmt+"; then
+      bw=seen; echo "$(date +%T) NOTE gpu1 root port reports a hardware link retrain (BWMgmt+)" >> $L.link; fi
+    [ "$cfg" = ffffffff ] || [ -z "$cfg" ] && why="gpu1 config space unreadable ($cfg): the card is gone"
     fi
     [ -n "$xe" ] && why="xe: $xe"
     if [ -n "$why" ] && [ ! -e $L.STOP ]; then
@@ -129,9 +136,9 @@ guard || exit 9
 case $MODE in
   TP|PP) DEVS=(--device /dev/dri/$N0 --device /dev/dri/$N1); ENTRY=(multi $MODE); AFF=0,1 ;;
   G0)    DEVS=(--device /dev/dri/$N0); ENTRY=(server); AFF=0 ;;
-  G1)    DEVS=(--device /dev/dri/$N1); ENTRY=(server); AFF=0 ;;
+  G1|B5) DEVS=(--device /dev/dri/$N1); ENTRY=(server); AFF=0 ;;
   T0)    DEVS=(--device /dev/dri/$N0); ENTRY=(multi TP); AFF=0 ;;
-  *) echo "MODE must be TP, PP, T0, G0 or G1"; exit 2 ;;
+  *) echo "MODE must be TP, PP, T0, G0, G1 or B5"; exit 2 ;;
 esac
 envs=(-e ONEAPI_DEVICE_SELECTOR=level_zero:gpu -e ZE_AFFINITY_MASK=$AFF -e UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
       -e SYCL_CACHE_PERSISTENT=1 -e SYCL_CACHE_DIR=/cache/sycl)
