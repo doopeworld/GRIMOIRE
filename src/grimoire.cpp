@@ -17495,6 +17495,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // verify block or a prompt span is consecutive tokens of one sequence,
     // which a parallel DeltaNet/conv update would race on.
     const bool rows_ok = seqb && !seqb->verify && !seqb->spans && rows_batch && M <= kMaxRowSlots;
+    // q/k norm + rope and the KV append need no such care: each row rotates only itself and
+    // writes only its own position's K/V, so they run over all rows in one launch for a verify
+    // block too (11-05).  The per-row loop launched 2 kernels per row: Qwen3.8-27B GPTQ + MTP,
+    // 4 users (16 verify rows), "attn rope + kv append" was 2.14 ms of a 48 ms verify pass.
+    const bool rows_rope_ok = seqb && !seqb->spans && rows_batch && M <= kMaxRowSlots;
     // Batched admission (seqb->spans): the runs of rows that are one prompt
     // each.  Conv, DeltaNet and attention run per run with the prompt kernels;
     // everything row-wise (projections, MoE, norms) runs once over all rows.
@@ -17514,7 +17519,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         for (const auto& d : L) unsupported = unsupported || d.k2_sparse || d.ple || d.tiered;
         if (unsupported) return false;
     }
-    if (rows_ok) for (int r = 0; r < M; ++r) { rslots.slot[r] = seqb->slot[r]; rslots.pos[r] = seqb->pos[r]; }
+    if (rows_rope_ok) for (int r = 0; r < M; ++r) { rslots.slot[r] = seqb->slot[r]; rslots.pos[r] = seqb->pos[r]; }
     // Each row's attention length (pos + 1), uploaded once per step from a
     // pinned staging buffer (in-order queue; the previous step's copy is
     // waited on before the staging buffer is rewritten).
@@ -19271,7 +19276,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                             d.head_dim,max_seq);
                     }
                 }else
-                if(rows_ok && !d.rope_proportional){
+                if(rows_rope_ok && !d.rope_proportional){
                     // every row in one launch each, at its own position and
                     // into its own cache (bit-identical to the loop below)
                     static const bool rope_verify = std::getenv("GRIMOIRE_ROWS_VERIFY") != nullptr;
