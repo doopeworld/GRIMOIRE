@@ -2,6 +2,11 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-11-06 01:05: the Tower has been unreachable on the LAN since 11-05 23:12. Work since then is committed LOCALLY on
+the Mac (mxfp4-smallm-1105 28d19e8 / 065aa38 / 5d92ddd, this branch) and must be pushed through the Tower when it is
+back: INT4 from BF16 by a llama.cpp imatrix (+ input-norm fold), Radiance's interleave share. Top of
+[HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md) has the files to copy and the two scripts to run.**
+
 **2026-11-05 17:15: RESUMED by Ian. 17:17 Ian: THE ARC B580 (0b:00.0, renderD131) IS ONLY FOR COMFYUI -- never run
 anything on it; GRIMOIRE work uses the two B70s only (small-card code paths are checked on gpu0 with a small expert
 budget). Queue on the Tower and next steps: top of [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md). v1.10.4 is PUBLISHED
