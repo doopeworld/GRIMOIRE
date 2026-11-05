@@ -3371,6 +3371,24 @@ sycl::event mxfp4_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_b
     constexpr int CT = 16;
     const int N = w.N, K = w.K;
     SmallmPlan p = smallm_plan(N, K);
+    // 9..16 rows (2026-11-05): fewer K slices than smallm_plan for the wide outputs and for the ~6K-wide ones.
+    // MEASURED, mx4rows_probe ONLY_LIB16 sweep, M = 14 (us, smallm_plan -> this): Qwen3.8-27B gate_up 216.2 ->
+    // 183.5 (4), lm_head 1368.9 -> 1211.1 (4), dn_qkv 71.8 -> 68.2 (4), attn_q 82.9 -> 79.0 (4), z 47.1 -> 38.5 (2),
+    // o 45.7 -> 39.5 (2); down (K = 17408), k / v and Ornith's K = 2048 shapes keep smallm_plan (best or within 5%).
+    if (RBN == 2) {
+        const int tiles = N / 16;
+        int ks = 0;
+        if (tiles >= 600 && K >= 4096 && K < 12288) ks = 4;
+        else if (tiles >= 256 && K >= 4096 && K < 12288) ks = 2;
+        if (ks > 0) {
+            int kc = (K + ks - 1) / ks;
+            kc = (kc + 127) / 128 * 128;
+            ks = (K + kc - 1) / kc;
+            int tpt = 1;
+            while (tpt * ks < 8 && tpt * 2 * ks <= 32) tpt *= 2;
+            p = {ks, kc, tpt};
+        }
+    }
     // GRIMOIRE_MX_SMALLM16_KS=<n> (diagnostic, 2026-11-05): n K slices (sweeps the plan of this kernel)
     static const int mx_ks = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM16_KS");
         return e && *e ? std::atoi(e) : 0; }();
