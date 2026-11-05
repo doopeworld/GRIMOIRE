@@ -496,6 +496,10 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
 bool mxfp4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
 sycl::event launch_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
     float* Y, int M, const std::vector<sycl::event>& deps = {});
+// gemv_decode.cpp (2026-11-05): M <= 8 at 128 registers with the INT4 split-K plan, the
+// rest through launch_mxfp4_smallm.  Same contract (mxfp4_smallm_ok).
+sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
 // The same for BF16 weights (no decode): the MoE router, DeltaNet gates.
 bool bf16_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
 sycl::event launch_bf16_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,

@@ -14078,7 +14078,7 @@ void Grimoire::mtpr_mm(const QuantWeight& w, const float* x, float* y, int M) {
     launch_f32_to_bf16(q, x, mtpr.bf, need);
     if (dnnl) onednn_gemm(q, w, mtpr.bf, y, M, false);
     else if (f8) launch_fp8_smallm(q, w, mtpr.bf, y, M);
-    else if (mx) launch_mxfp4_smallm(q, w, mtpr.bf, y, M);
+    else if (mx) launch_mxfp4_smallm_fast(q, w, mtpr.bf, y, M);
     else if (i4) launch_int4_smallm(q, w, mtpr.bf, y, M);
     else if (nq) launch_native_smallm(q, w, mtpr.bf, y, M);
     else launch_bf16_smallm(q, w, mtpr.bf, y, M);
@@ -15603,7 +15603,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
                 if (w.w.fmt == Fmt::BF16) launch_bf16_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::INT4) launch_int4_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::FP8_E4M3 || w.w.fmt == Fmt::INT8) launch_fp8_smallm(q, w.w, xb, y, M);
-                else launch_mxfp4_smallm(q, w.w, xb, y, M);
+                else launch_mxfp4_smallm_fast(q, w.w, xb, y, M);
                 return;
             }
             for (int r = 0; r < M; ++r)
@@ -17996,7 +17996,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     else if(dpas_f8) launch_fp8_smallm(q,w.w,xin,y,M);
                     else if(dpas_nq) launch_native_smallm(q,w.w,xin,y,M);
                     else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
-                    else launch_mxfp4_smallm(q,w.w,xin,y,M);
+                    else launch_mxfp4_smallm_fast(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
                     if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
                         // reference: the decode GEMV, fp32 activations, row by row
