@@ -21273,6 +21273,18 @@ void GrimoireScheduler::run() {
             static const int hold_ms = [] {
                 const char* v = std::getenv("GRIMOIRE_ADMIT_HOLD_MS");
                 return v && *v ? std::max(0, std::atoi(v)) : 8; }();
+            // Long prompts reach the scheduler further apart (each is read and
+            // tokenized first): a burst with a prompt of >= 2048 tokens waits up to
+            // GRIMOIRE_ADMIT_HOLD_LONG_MS (default 100; never less than the hold
+            // above).  MEASURED 2026-11-05, Qwen3.8-27B MXFP4 + MTP, llama-benchy
+            // 4 x 16K, three runs: with 8 ms the late requests of a round were fed
+            // in 1024-token chunks between the others' decode steps, c4 tg128
+            // 107 +- 62 tok/s total (pp16384 1,749 +- 130); 100 ms admitted every
+            // round as one batch, 148.5 +- 7.9 (1,846 +- 9).  Bursts of short
+            // prompts keep the short hold.
+            static const int hold_long_ms = [] {
+                const char* v = std::getenv("GRIMOIRE_ADMIT_HOLD_LONG_MS");
+                return std::max(hold_ms, v && *v ? std::max(0, std::atoi(v)) : 100); }();
             // A lone request is held too, but ONLY when the previous busy
             // period served concurrent requests and ended < 10 s ago: a burst
             // whose first request ran ahead (llama-benchy c4 was admitted as
@@ -21282,7 +21294,10 @@ void GrimoireScheduler::run() {
                 std::chrono::steady_clock::now() - idle_since < std::chrono::seconds(10);
             if (hold_ms > 0 && batchable && active.empty() && prefilling.empty() &&
                 (taking.size() >= 2 || lone_burst) && int(taking.size()) < width) {
-                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
+                size_t longest = 0;
+                for (const auto& j : taking) longest = std::max(longest, j->prompt.size());
+                const int hold = longest >= 2048 ? hold_long_ms : hold_ms;
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold);
                 while (int(taking.size()) < width && !stopping) {
                     if (pending.empty() &&
                         !cv.wait_until(l, until, [&]{ return stopping || !pending.empty(); }))
