@@ -13652,11 +13652,45 @@ const float* Grimoire::forward(int token) {
                 MK("  moe_down");
                 if (i == probe_layer) probe("L0 moe total", s.moe_y, H);
             } else {
-            if (d.tiered) launch_tmoe_gate_up(q,tm_view(d),route_expert,s.h2,s.moe_h,1,none);
+            // CPU split for tiered experts (2026-11-05, as forward_qwen4_exp has done for Flash-Next): the route
+            // and the block input go to the host first, the GPU runs only the VRAM-resident experts, and the
+            // CPU pool computes the RAM-resident ones while the GPU works; their sum is added below.  Without
+            // it the GPU read every RAM expert over PCIe: Ornith-1.5 NVFP4 on an Arc B580 (12 GB, Gen3 x4,
+            // 166 of 256 experts per layer in RAM) decoded 8.8 tok/s.  One card (no Megatron / legacy TP),
+            // never while a graph records (build_graph refuses when the CPU pool is armed).
+            // GRIMOIRE_CPU_SPLIT_DECODE=0 = every expert on the GPU.
+            static const bool split_on = [] { const char* e = std::getenv("GRIMOIRE_CPU_SPLIT_DECODE");
+                return !(e && *e == '0'); }();
+            const bool cpu_split = split_on && d.tiered && cpu_moe && d.tm_nhost > 0 &&
+                                   !tp_enabled() && !tp_mega && !recording;
+            sycl::event cx_ready;
+            uint64_t cx_tag = 0;
+            if (cpu_split) {
+                const int K = cfg.top_k;
+                if (ksend_on()) {
+                    const void* sp[3] = {route_expert, route_weight, s.h2};
+                    void* dp[3] = {cx_route, cx_wt, cx_x};
+                    const size_t nb[3] = {size_t(K) * sizeof(int32_t), size_t(K) * sizeof(float),
+                                          size_t(H) * sizeof(float)};
+                    cx_tag = ksend(3, sp, dp, nb);
+                } else {
+                    q.memcpy(cx_route, route_expert, size_t(K) * sizeof(int32_t));
+                    q.memcpy(cx_wt, route_weight, size_t(K) * sizeof(float));
+                    cx_ready = q.memcpy(cx_x, s.h2, size_t(H) * sizeof(float));
+                }
+                const int32_t* re = route_expert; const uint8_t* tier = d.tm_tier_d;
+                int32_t* ve = cx_vexp;
+                q.parallel_for(sycl::range<1>(size_t(K)), [=](sycl::id<1> k) {
+                    const int e = re[k];
+                    ve[k] = (e >= 0 && tier[e] == 0) ? e : -1;
+                });
+            }
+            const int32_t* gpu_route = cpu_split ? cx_vexp : route_expert;
+            if (d.tiered) launch_tmoe_gate_up(q,tm_view(d),gpu_route,s.h2,s.moe_h,1,none);
             else launch_moe_gate_up(q,d.moe,route_expert,s.h2,s.moe_h,none);
             MK("  moe_gate_up");
             if (i == probe_layer) probe("L0 moe_h (gate_up)", s.moe_h, cfg.top_k * I);
-            if (d.tiered) launch_tmoe_down(q,tm_view(d),route_expert,route_weight,s.moe_h,s.moe_y,1,none);
+            if (d.tiered) launch_tmoe_down(q,tm_view(d),gpu_route,route_weight,s.moe_h,s.moe_y,1,none);
             else launch_moe_down(q,d.moe,route_expert,route_weight,s.moe_h,s.moe_y,none);
             if(tp_enabled()&&!tp_allreduce_sum(s.moe_y,H)){
                 std::fprintf(stderr,"TP MoE all-reduce failed\n");return nullptr;
@@ -13678,6 +13712,23 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("L0 shared out", s.sh_out, H);
             if (!(fusion_mask & 4)) launch_add(q, s.moe_y, s.sh_out, H, none);
             else sh_out_dirty = true;
+            }
+            if (cpu_split) {
+                // the GPU has the VRAM experts and the shared expert queued: the RAM experts now, on the host
+                if (cx_tag) { if (!kwait(cx_tag, "CPU experts route")) return nullptr; }
+                else cx_ready.wait();
+                const uint8_t* blk[64]; float wt[64]; int n = 0;
+                for (int k = 0; k < cfg.top_k && n < 64; ++k) {
+                    const int e = cx_route[k];
+                    if (e >= 0 && e < cfg.n_experts && size_t(e) < d.tm_hits.size()) ++d.tm_hits[size_t(e)];
+                    if (e < 0 || e >= cfg.n_experts || d.tm_tier_h[size_t(e)] != 1) continue;
+                    blk[n] = d.tm_hptr[size_t(e)]; wt[n] = cx_wt[k]; ++n;
+                }
+                if (n > 0) {
+                    cpu_exp.ffn(tm_lay, blk, wt, n, cx_x, cx_y);
+                    q.memcpy(cx_dy, cx_y, size_t(H) * sizeof(float));
+                    launch_add(q, s.moe_y, cx_dy, H, none);
+                }
             }
             MK("  add shared");
             if (i == probe_layer) probe("L0 moe total", s.moe_y, H);
@@ -20515,6 +20566,9 @@ bool Grimoire::build_graph() {
     // device cursor AND has a number saying it is worth it; nobody has
     // measured this model on a B70 at all yet (rule 8).
     if (cfg.is_qwen4_exp) return false;
+    // Tiered experts with the CPU pool armed (2026-11-05): forward() computes the RAM-resident experts on the
+    // host between kernels (the CPU split), which a recorded graph cannot replay.
+    if (cpu_moe) return false;
     // Saved OUTSIDE the try: capture moves the live sequence state before
     // recording, and the catch has to be able to put it back.  Declared in
     // the try they were out of scope exactly where they were needed.
