@@ -1,0 +1,9 @@
+# v1.10.4 (11-05, combined candidate): the two executables and libgrimoire_gemm.so rebuilt from mxfp4-smallm-1105
+# (G31/G21, CPU only) over the unchanged v1.10.3 runtime. assemble-image-v1104b.sh checks the exact base image and that
+# the attention library and oneDNN equal v1.10.3's.
+FROM grimoire-b70:v1.10.3
+LABEL org.opencontainers.image.source="https://github.com/doopeworld/GRIMOIRE" \
+      org.opencontainers.image.revision="dd33cbe69b3b91f544011350e473a89500a9b13b" \
+      org.opencontainers.image.version="v1.10.4-rc1"
+COPY --chmod=0755 bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so /grimoire/bin/
+COPY build-manifest.json /usr/share/doc/grimoire/build-manifest.json

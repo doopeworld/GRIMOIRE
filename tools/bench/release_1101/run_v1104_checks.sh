@@ -8,12 +8,14 @@
 #   3. Ornith Q4_K_M native with no option set: alone answers must equal r1102-opt-moe (option on, 11-02).
 set -u
 B=/mnt/storage/isos/grimoire-runs/bench-1022
-NEW=/mnt/storage/isos/grimoire-release-1102b
+# NEW_TREE / BUILD_LOG (11-05): the combined candidate's tree and build log
+NEW=${NEW_TREE:-/mnt/storage/isos/grimoire-release-1102b}
+BLOG=${BUILD_LOG:-release-build-1102b.out}
 cd "$B" || exit 9
 exec >"$B/logs/v1104-checks.out" 2>&1
 end() { echo "V1104_CHECKS_END rc=$1 $(date +%T)"; exit "$1"; }
 echo "V1104_CHECKS_START $(date +%T) source=$(git -C "$NEW" rev-parse --short HEAD)"
-grep -qx RELEASE_BUILD_PASS logs/release-build-1102b.out || { echo "build did not pass"; end 9; }
+grep -qx RELEASE_BUILD_PASS "logs/$BLOG" || { echo "build did not pass"; end 9; }
 [ -x "$NEW/bin/grimoire" ] && [ -x "$NEW/bin/grimoire-server" ] || { echo "no binaries"; end 9; }
 
 # SKIP_MATRIX=1 (11-05): the matrix passed on 11-04 19:26 with the 1881830 build; 35201c2 adds only the two-card
