@@ -34,6 +34,12 @@ if grep -qx GGUFBENCH_BUILD_PASS logs/build-ggufbench-1105.out 2>/dev/null; then
   )
   rm -f "$B/logs/HOLD-gguf"
 fi
+# B580: the tiered-expert CPU split in decode (build_split_g21_1105.sh), against today's v1.10.4 run b5-v1104-grimoire
+until grep -qE "^SPLIT_BUILD_(PASS|FAIL)" logs/build-split-g21-1105.out 2>/dev/null; do sleep 20; done
+if grep -qx SPLIT_BUILD_PASS logs/build-split-g21-1105.out; then
+  echo "== $(date +%T) B580 CPU split"
+  GTREE=/mnt/storage/isos/grimoire-runs/split-tree-1105 NCPU=26 bash "$B/run_b580_1104.sh" split grimoire grimoire-default
+fi
 export GRIM_TREE=$T HOSTBIN=1 IMG=grimoire-b70:latest LOAD_MAX=1500 CLIENT_CPUS=14,15
 Q="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_SEQ_SLOTS=4 GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=6 GRIMOIRE_MTP_DRAFT_VOCAB=65536 GRIMOIRE_BATCH_HOST_TIMING=1"
 for spec in "hold8 " "hold100 GRIMOIRE_ADMIT_HOLD_MS=100"; do
