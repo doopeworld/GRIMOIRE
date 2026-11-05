@@ -3,7 +3,7 @@
 # the attention library and oneDNN equal v1.10.3's.
 FROM grimoire-b70:v1.10.3
 LABEL org.opencontainers.image.source="https://github.com/doopeworld/GRIMOIRE" \
-      org.opencontainers.image.revision="dd33cbe69b3b91f544011350e473a89500a9b13b" \
+      org.opencontainers.image.revision="315167c9f8e8512ef2dbacc123ca04adfa9d7918" \
       org.opencontainers.image.version="v1.10.4-rc1"
 COPY --chmod=0755 bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so /grimoire/bin/
 COPY build-manifest.json /usr/share/doc/grimoire/build-manifest.json

@@ -1,15 +1,16 @@
 #!/bin/bash
 # v1.10.4-rc1, combined candidate (11-05) = the v1.10.3 image with the two executables AND libgrimoire_gemm.so rebuilt
-# from mxfp4-smallm-1105 dd33cbe (G31+G21, CPU only). libgrimoire_attn.so, oneDNN and the runtime stay v1.10.3's.
+# from mxfp4-smallm-1105 315167c (executables built at dd33cbe; the library after the 9-16-row plan rule, fold_lib_1105.sh). libgrimoire_attn.so, oneDNN and the runtime stay v1.10.3's.
 # Run only after RELEASE_BUILD_PASS and the GPU checks.
 set -euo pipefail
 R=/mnt/storage/isos/grimoire-release-1105
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 C=$B/release-1104b-context
 BASE=sha256:3663f7a7c5cc745b7a16ee5de8b57ba7da37f8bace87cc4ad238af3f9b761e45
-SRC=dd33cbe69b3b91f544011350e473a89500a9b13b
+SRC=315167c9f8e8512ef2dbacc123ca04adfa9d7918
 [ "$(docker image inspect grimoire-b70:v1.10.3 --format '{{.Id}}')" = "$BASE" ]
 grep -qx RELEASE_BUILD_PASS "$B/logs/release-build-1105.out"
+grep -qx FOLD_PASS "$B/logs/fold-lib-1105.out" 2>/dev/null || grep -q "^FOLD_PASS" "$B/logs/fold-lib-1105.out"
 [ "$(git -C "$R" rev-parse HEAD)" = "$SRC" ]
 [ -z "$(git -C "$R" status --porcelain)" ]
 if docker image inspect grimoire-b70:v1.10.4-rc1 >/dev/null 2>&1; then echo "v1.10.4-rc1 already exists"; exit 1; fi
