@@ -18484,16 +18484,23 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         !std::getenv("GRIMOIRE_BF16_QKV")&&!std::getenv("GRIMOIRE_BF16_DN_QKV")&&
         prefill_layer_begin==0&&prefill_layer_limit==cfg.n_layers&&M>=2*tp_wave_rows+256&&
         tshm.sjobs.empty();
+    // 4-bit FFN weights (MXFP4, INT4 / GPTQ, GGUF native) on the wavefront too (2026-11-05): it was
+    // written and measured for FP8 (10-26) and kept the 4-bit formats on the per-layer path, whose
+    // FFN phase waits for gpu1's x4 link -- two B70s, Qwen3.8-27B GPTQ-Int4, pp4096 1,733 tok/s
+    // against 2,062 on ONE card.  The wavefront dequantizes each FFN weight once per layer
+    // (predq) and applies SwiGLU as its own pass, as for FP8.  GRIMOIRE_TP_WAVE_4BIT=0 = the old rule.
+    static const bool wave_4bit=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE_4BIT");return !(e&&*e=='0');}();
     size_t wave_ngu=0, wave_ndn=0;
     for(int li=0;tp_wave&&li<cfg.n_layers;++li){
         const LayerDev& d=L[size_t(li)];
         wave_ngu=std::max(wave_ngu,gemm_fast_predq_elems(d.sh_gu.w));
         wave_ndn=std::max(wave_ndn,gemm_fast_predq_elems(d.sh_down.w));
         const int FIc=d.sh_gu.output_rows()/2;
-        const bool ffn_ok=!d.moe_layer&&d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+        const bool fmt_ok=wave_4bit||(d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+            !gemm_fast_swiglu_supported(d.sh_gu.w,M));
+        const bool ffn_ok=!d.moe_layer&&fmt_ok&&
             !d.sh_gu.has_i4()&&!d.sh_down.has_i4()&&!(a8&&a8s&&xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4)&&
             d.sh_gu.w.N==2*FIc&&d.sh_down.w.K==FIc&&d.sh_down.w.N==H&&
-            !gemm_fast_swiglu_supported(d.sh_gu.w,M)&&
             gemm_fast_predq_supported(d.sh_gu.w,M)&&gemm_fast_predq_supported(d.sh_down.w,M);
         bool mix_ok;
         if(d.kind==LayerKind::LINEAR_ATTN)
