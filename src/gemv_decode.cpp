@@ -1494,8 +1494,12 @@ sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_KS");
         return (e && *e) ? std::atoi(e) : 0; }();
     if (old || M > 8) return launch_mxfp4_smallm(q, w, X, Y, M, deps);
-    const int N = w.N, K = w.K, tiles = N / 16;
-    int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    const int K = w.K;
+    // INT4's rule without its "wide outputs: 4 slices" clause: 256-K slices unless K is long.
+    // MEASURED (mx4rows_probe SWEEP, M = 7 / 4): Qwen3.8-27B gate_up 4 -> 20 slices 195.2 ->
+    // 170.0 / 191.4 -> 168.6 us, lm_head 1228.8 -> 1177.6 / 1205.2 -> 1156.5, Ornith lm_head
+    // 501.1 -> 490.7 / 486.6 -> 474.0; down (K = 17408) stays best at 4 (92.6 vs 102.1 at 28).
+    int KS = K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
     if (force_ks > 0) KS = std::min(32, force_ks);
     int kc = (K + KS - 1) / KS;
     kc = (kc + 127) / 128 * 128;
