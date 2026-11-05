@@ -3409,11 +3409,28 @@ sycl::event mxfp4_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_b
                     #pragma unroll
                     for (int b = 0; b < 4; ++b) {
                         const int kk = k + 32 * b;
+                        // 2026-11-05: VNNI pairs are nibbles (k, k + 4) of a payload dword, as in
+                        // int4_smallm_fdq_impl and gemv_decode.cpp's M <= 8 MXFP4 kernel
+                        // (mxfp4_smallm_k_impl: 6-27% faster at M = 7), so the activation tile is
+                        // reordered to [x0 x4 x1 x5 x2 x6 x3 x7] per 8 K.  Same values.
                         es::simd<sycl_bf16, 128> a0[RBN], a1[RBN];
                         #pragma unroll
                         for (int rb = 0; rb < RBN; ++rb) {
-                            a0[rb] = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk, rb * 8);
-                            a1[rb] = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk + 16, rb * 8);
+                            es::simd<sycl_bf16, 128> n0t = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk, rb * 8);
+                            es::simd<sycl_bf16, 128> n1t = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk + 16, rb * 8);
+                            es::simd<uint16_t, 128> s0 = n0t.template bit_cast_view<uint16_t>();
+                            es::simd<uint16_t, 128> s1 = n1t.template bit_cast_view<uint16_t>();
+                            es::simd<uint16_t, 128> d0, d1;
+                            auto sv0 = s0.template bit_cast_view<uint16_t, 16, 8>();
+                            auto sv1 = s1.template bit_cast_view<uint16_t, 16, 8>();
+                            auto dv0 = d0.template bit_cast_view<uint16_t, 16, 8>();
+                            auto dv1 = d1.template bit_cast_view<uint16_t, 16, 8>();
+                            dv0.template select<16, 1, 4, 2>(0, 0) = sv0.template select<16, 1, 4, 1>(0, 0);
+                            dv0.template select<16, 1, 4, 2>(0, 1) = sv0.template select<16, 1, 4, 1>(0, 4);
+                            dv1.template select<16, 1, 4, 2>(0, 0) = sv1.template select<16, 1, 4, 1>(0, 0);
+                            dv1.template select<16, 1, 4, 2>(0, 1) = sv1.template select<16, 1, 4, 1>(0, 4);
+                            a0[rb] = d0.template bit_cast_view<sycl_bf16>().read();
+                            a1[rb] = d1.template bit_cast_view<sycl_bf16>().read();
                         }
                         es::simd<uint32_t, 16> ev = (sw >> (8 * b)) & 0xFFu;
                         es::simd<uint32_t, 16> sbits = (ev + 14u) << 23;
@@ -3426,15 +3443,14 @@ sycl::event mxfp4_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_b
                             if (dw < 8) wv = tw0.template select<16, 1>(dw * CT);
                             else        wv = tw1.template select<16, 1>((dw - 8) * CT);
                             #pragma unroll
-                            for (int qb = 0; qb < 4; ++qb) {
-                                es::simd<uint32_t, 16> tb = qb ? (wv >> (8 * qb)) : wv;
-                                es::simd<uint32_t, 16> u = (tb & 0x0Fu) | ((tb & 0xF0u) << 12);
+                            for (int i = 0; i < 4; ++i) {      // nibbles i and i + 4 = K 8j + i, 8j + i + 4
+                                es::simd<uint32_t, 16> u = (i ? (wv >> (4 * i)) : wv) & 0x000F000Fu;
                                 es::simd<uint32_t, 16> hb = ((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12);
                                 es::simd<sycl::half, 32> hv = hb.template bit_cast_view<sycl::half>().read();
                                 es::simd<float, 32> fv = hv;
                                 es::simd<uint32_t, 32> fb = fv.template bit_cast_view<uint32_t>().read();
                                 es::simd<uint16_t, 32> bb = fb >> 16;
-                                const int kp = 4 * j + qb;
+                                const int kp = 4 * j + i;
                                 vb[kp >> 3].template select<16, 1>((kp & 7) * 16) =
                                     bb.template bit_cast_view<uint32_t>().read();
                             }

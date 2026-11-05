@@ -231,7 +231,7 @@ int main(int argc, char** argv) {
             w.fmt = Fmt::MXFP4; w.N = N; w.K = K; w.payload = p; w.scales = s;
             w.row_bytes = K / 2; w.row_scales = rsc;
         }
-        constexpr int MR = 8;
+        constexpr int MR = 16;
         std::vector<float> hx(size_t(MR) * K);
         std::vector<sycl_bf16> hxb(hx.size());
         for (size_t i = 0; i < hx.size(); ++i) {
@@ -272,21 +272,24 @@ int main(int argc, char** argv) {
         for (int m = 0; m < MR; ++m) launch_gemv(q, ws[0], x + size_t(m) * K, yr + size_t(m) * N);
         q.wait();
         timeit("gemv M=1 (engine decode)", [&](const QuantWeight& w) { launch_gemv(q, w, x, y); });
-        launch_mxfp4_smallm(q, ws[0], xb, y, MR); check("library M=8 vs gemv", y, yr, MR);
-        launch_mxfp4_smallm_fast(q, ws[0], xb, y2, MR); check("fast M=8 vs gemv", y2, yr, MR);
-        check("fast vs library M=8", y2, y, MR);
-        for (int M : {1, 2, 4, 7, 8}) {
+        launch_mxfp4_smallm(q, ws[0], xb, y, 8); check("library M=8 vs gemv", y, yr, 8);
+        launch_mxfp4_smallm(q, ws[0], xb, y, MR); check("library M=16 vs gemv", y, yr, MR);
+        launch_mxfp4_smallm_fast(q, ws[0], xb, y2, 8); check("fast M=8 vs gemv", y2, yr, 8);
+        launch_mxfp4_smallm(q, ws[0], xb, y, 8); check("fast vs library M=8", y2, y, 8);
+        for (int M : {1, 2, 4, 7, 8, 12, 14, 16}) {
             char nm[64];
             std::snprintf(nm, sizeof nm, "library (256 GRF) M=%d", M);
             timeit(nm, [&](const QuantWeight& w) { launch_mxfp4_smallm(q, w, xb, y, M); });
+            if (M > 8) continue;
             std::snprintf(nm, sizeof nm, "fast (128 GRF, INT4 plan) M=%d", M);
             timeit(nm, [&](const QuantWeight& w) { launch_mxfp4_smallm_fast(q, w, xb, y, M); });
         }
         // y holds the last timed call: fast at M = 8 (every copy holds the same bytes); since
         // 2026-11-05 the engine's fast kernel IS DEC 2
-        mx_local<2>(q, ws[0], xb, y2, MR, 0); check("local DEC2 vs fast (expect 0)", y2, y, MR);
-        mx_local<2>(q, ws[0], xb, y, MR, 0); check("local DEC2 vs gemv", y, yr, MR);
-        mx_local<3>(q, ws[0], xb, y, MR, 0); check("local DEC3 vs gemv", y, yr, MR);
+        launch_mxfp4_smallm_fast(q, ws[0], xb, y, 8);
+        mx_local<2>(q, ws[0], xb, y2, 8, 0); check("local DEC2 vs fast (expect 0)", y2, y, 8);
+        mx_local<2>(q, ws[0], xb, y, 8, 0); check("local DEC2 vs gemv", y, yr, 8);
+        mx_local<3>(q, ws[0], xb, y, 8, 0); check("local DEC3 vs gemv", y, yr, 8);
         for (int dec = 0; dec <= 3; ++dec) {
             char nm[64];
             std::snprintf(nm, sizeof nm, "local DEC%d M=7 rule", dec);
