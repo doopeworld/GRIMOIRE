@@ -53,6 +53,7 @@
 #include "b70/cpu_experts.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
+#include "b70/imatrix.hpp"
 #include "b70/kld.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/memory_export.hpp>
@@ -66,6 +67,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <cstdio>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <array>
 #include <cctype>
 #include <cstring>
@@ -1446,6 +1448,171 @@ static sycl::event launch_gguf_ssm_out_gather(sycl::queue& q,const T* grouped,T*
     });
 }
 
+// GRIMOIRE_IMATRIX=<file>: a llama.cpp importance matrix (b70/imatrix.hpp; Unsloth
+// ships imatrix_unsloth.gguf beside its GGUFs).  A dense source (BF16 / F16 / F32,
+// safetensors or GGUF) converted to INT4 then picks every group's range by the
+// expected OUTPUT error of its layer instead of the weight's own -- same INT4 format,
+// same kernels, only the codes differ.  Read once, on the first weight that asks.
+static const b70::ImportanceMatrix* load_imatrix() {
+    static const std::unique_ptr<b70::ImportanceMatrix> im = [] {
+        std::unique_ptr<b70::ImportanceMatrix> m;
+        const char* p = std::getenv("GRIMOIRE_IMATRIX");
+        if (!p || !*p) return m;
+        m.reset(new b70::ImportanceMatrix);
+        std::string err;
+        if (!m->load(p, err)) {
+            std::printf("\n  imatrix %s: %s -- INT4 keeps the plain rounding\n", p, err.c_str());
+            m.reset();
+        } else {
+            std::printf("\n  imatrix %s: %zu tensors -- INT4 rounds by each layer's output error\n",
+                        p, m->entries());
+        }
+        std::fflush(stdout);
+        return m;
+    }();
+    return im.get();
+}
+static bool imatrix_asked = false;  // an INT4 conversion looked: build() reports the counts
+// llama.cpp tiles a DeltaNet layer's value heads (gguf_v_tiled_index), so its imatrix
+// lists out_proj's INPUT channels in that order, while the checkpoint's out_proj (HF,
+// or GGUF after GGUFInverse::V_COLS) groups them by key head.  The importance has to
+// follow the columns.  Set from the config before the layers upload.
+static int imx_nk = 0, imx_nv = 0, imx_dv = 0;
+static const float* int4_importance(const TensorRef& r, int K, Fmt use) {
+    if (use != Fmt::INT4) return nullptr;
+    imatrix_asked = true;
+    const b70::ImportanceMatrix* m = load_imatrix();
+    const float* v = m ? m->find(r.t.name, K) : nullptr;
+    static const std::string out = "linear_attn.out_proj.weight";
+    if (v && imx_nk > 0 && imx_nv % imx_nk == 0 && K == imx_nv * imx_dv &&
+        r.t.name.size() >= out.size() &&
+        r.t.name.compare(r.t.name.size() - out.size(), out.size(), out) == 0) {
+        static std::vector<float> grouped;  // consumed before the next call (one loader thread)
+        grouped.resize(size_t(K));
+        for (int k = 0; k < K; ++k)
+            grouped[size_t(k)] = v[gguf_v_tiled_index(uint64_t(k / imx_dv), uint64_t(imx_nk),
+                                                      uint64_t(imx_nv)) * uint64_t(imx_dv) + uint64_t(k % imx_dv)];
+        return grouped.data();
+    }
+    return v;
+}
+
+// GRIMOIRE_IMATRIX_FOLD=<alpha> (with GRIMOIRE_IMATRIX; unset / 0 = off): AWQ-style
+// activation scaling of each layer's input projections, folded into the input norm
+// so nothing changes at run time.  The norm's output channel k is divided by
+// s_k = m_k^(alpha/2) (m = the imatrix's mean square of that input; s normalized by
+// sqrt(max*min)) and every projection reading it -- q/k/v, or DeltaNet's qkv / z
+// and the BF16 a / b -- gets column k multiplied by s_k before it is quantized:
+// W (x / s) * s = W x exactly, but a loud channel's weights now span more INT4
+// steps.  The INT4 search weighs the scaled matrix's error by m_k / s_k^2, which
+// is the original output error again.  Measured offline (2026-11-06, Qwen3.8-27B
+// BF16 layers 10-11, Unsloth imatrix, output error vs plain INT4 g128): q 0.20,
+// k 0.18, v 0.24, DeltaNet qkv / z 0.33 at alpha 0.30-0.45 (rounding by the
+// imatrix alone: 0.32 / 0.58 / 0.71 / 0.62 / 0.56); INT8: q 0.41, k 0.25, v 0.20,
+// DeltaNet 0.56-0.62.  The scales are set per layer before its weights upload.
+struct InFold {
+    std::vector<float> s;                        // empty = this layer is not folded
+    std::unordered_map<std::string, int> names;  // the projections reading the norm
+};
+static InFold in_fold;
+static double fold_alpha() {
+    static const double a = [] {
+        const char* v = std::getenv("GRIMOIRE_IMATRIX_FOLD");
+        return v && *v ? std::min(1.0, std::max(0.0, std::atof(v))) : 0.0; }();
+    return a;
+}
+static const std::vector<float>* fold_cols(const TensorRef& r) {
+    return !in_fold.s.empty() && in_fold.names.count(r.t.name) ? &in_fold.s : nullptr;
+}
+static void fold_scale_cols(float* f32, int rows, int K, const std::vector<float>& s) {
+    for (int n = 0; n < rows; ++n)
+        for (int k = 0; k < K; ++k) f32[size_t(n) * K + k] *= s[size_t(k)];
+}
+// A folded projection that reaches a raw-copy path (pre-quantized source) would
+// keep its columns unscaled under a scaled norm: a model that loads and is wrong.
+// The planner registers only dense sources; this is the net under every such path.
+static bool fold_refused(const std::vector<float>* fs, const char* what, bool* ok) {
+    if (!fs) return false;
+    std::printf("\n  GRIMOIRE_IMATRIX_FOLD: %s is not read as floats here, cannot carry the "
+                "input norm's scales -- refused\n", what);
+    *ok = false;
+    return true;
+}
+// The INT4 search's importance for a column-scaled matrix: m_k / s_k^2.
+static const float* folded_importance(const float* imp, const std::vector<float>* fs, int K,
+                                      std::vector<float>& buf) {
+    if (!imp || !fs) return imp;
+    buf.resize(size_t(K));
+    for (int k = 0; k < K; ++k) buf[size_t(k)] = imp[k] / ((*fs)[size_t(k)] * (*fs)[size_t(k)]);
+    return buf.data();
+}
+static int fold_layers = 0, fold_skipped = 0;  // reported by build()
+// Plans one layer's input-norm fold: fills in_fold, or leaves it empty where the
+// layer cannot take it -- another architecture, a format it is not measured for,
+// a pre-quantized source (its stored precision stays authoritative), no imatrix
+// entry.  Called before the layer's norm and projections upload.
+static void plan_in_fold(const Qwen35Model& ck, const Qwen35Config& cfg,
+                         const Qwen35Layer& src, Fmt PF) {
+    in_fold = InFold{};
+    const double alpha = fold_alpha();
+    if (!(alpha > 0.0) || cfg.is_qwen4_exp || cfg.is_muse || cfg.is_k2 || cfg.is_gemma4) return;
+    if (PF != Fmt::INT4 && PF != Fmt::INT8) return;
+    const b70::ImportanceMatrix* im = load_imatrix();
+    if (!im) {
+        static bool said = false;
+        if (!said) std::printf("\n  GRIMOIRE_IMATRIX_FOLD needs GRIMOIRE_IMATRIX (the file it folds by) -- off\n");
+        said = true;
+        return;
+    }
+    std::vector<const TensorRef*> grp;
+    if (src.kind == LayerKind::LINEAR_ATTN)
+        grp = {&src.la_in_qkv, &src.la_in_z, &src.la_in_a, &src.la_in_b};
+    else
+        grp = {&src.q_proj, &src.k_proj, &src.v_proj};
+    const int K = cfg.hidden;
+    bool ok = src.input_norm.ok() && int(src.input_norm.t.numel()) == K;
+    for (const TensorRef* r : grp) {
+        if (!ok) break;
+        ok = r->ok() && r->t.shape.size() == 2 && int(r->t.shape[1]) == K &&
+             (r->gguf ? !gguf_native_ref(ck, *r)
+                      : !r->native && !r->gptq && !r->compressed_int4 && !packed_mxfp4_src(*r));
+    }
+    const float* m = ok ? im->find(grp[0]->t.name, K, false) : nullptr;
+    if (!m) { ++fold_skipped; return; }
+    std::vector<float> s(size_t(K));
+    double mx = 0.0, mn = 1e300;
+    for (int k = 0; k < K; ++k) {
+        const double v = std::pow(std::max(double(m[k]), 1e-12), alpha / 2.0);
+        s[size_t(k)] = float(v); mx = std::max(mx, v); mn = std::min(mn, v);
+    }
+    const double c = std::sqrt(mx * mn);
+    for (auto& v : s) v = float(double(v) / c);
+    in_fold.s = std::move(s);
+    for (const TensorRef* r : grp) in_fold.names[r->t.name] = 1;
+    ++fold_layers;
+}
+// The input norm of a folded layer: its output channel k divided by s_k, i.e.
+// (off + w') = (off + w) / s_k with off the model's convention (1 for Qwen3.5's
+// zero-centred (1 + w), 0 for a plain w).
+static bf16_t* upload_folded_norm(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
+                                  const std::vector<float>& s, float off, const char* what, bool* ok) {
+    if (!r.ok() || size_t(r.t.numel()) != s.size()) {
+        std::printf("\n  %s: cannot fold (missing or not %zu wide)\n", what, s.size());
+        *ok = false; return nullptr;
+    }
+    std::vector<float> w(s.size());
+    std::string err;
+    if (!read_matrix_f32(ck, r, w.data(), err)) {
+        std::printf("\n  %s: read failed: %s\n", what, err.c_str());
+        *ok = false; return nullptr;
+    }
+    std::vector<bf16_t> h(s.size());
+    for (size_t k = 0; k < s.size(); ++k) h[k] = f32_to_bf16((w[k] + off) / s[k] - off);
+    bf16_t* d = dev_copy<bf16_t>(q, h.data(), h.size() * sizeof(bf16_t));
+    if (!d) *ok = false;
+    return d;
+}
+
 DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
                            const TensorRef& r, Fmt fmt, const char* what,
                            bool* ok) {
@@ -1457,8 +1624,18 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     }
     const int N = int(r.t.shape[0]);
     const int K = int(r.t.shape[1]);
+    // GRIMOIRE_IMATRIX_FOLD: this projection's columns carry its input norm's
+    // scales (in_fold).  Only the f32 paths below can apply them; the planner
+    // registers no tensor that would take a direct (raw) path.
+    const std::vector<float>* fs = fold_cols(r);
+    if (fs && int(fs->size()) != K) {
+        std::printf("\n  GRIMOIRE_IMATRIX_FOLD: %s is %d wide, its norm %zu -- refused\n", what, K, fs->size());
+        *ok = false; return d;
+    }
+    std::vector<float> imp_buf;
     if(r.gguf){
         if(gguf_native_ref(ck,r)){
+            if(fold_refused(fs,what,ok))return d;
             const int block=native_gguf_block_elems(gguf_ref_fmt(r));
             if(K%block){
                 std::printf("\n  native GGUF refused for %s: K=%d is not divisible by %d\n",what,K,block);
@@ -1483,13 +1660,15 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         std::string rr;
         const int batch=std::max(1,(1<<20)/K);
         std::vector<float> f32(size_t(batch)*K);
+        const float* imp=folded_importance(int4_importance(r,K,use),fs,K,imp_buf);
         for(int row=0;row<N;row+=batch){
             const int nr=std::min(batch,N-row);
             if(!ck.read_gguf_f32(r,f32.data(),rr,row,nr)){
                 std::printf("\n  GGUF decode failed for %s: %s\n",what,rr.c_str());
                 *ok=false;return d;
             }
-            PackedWeight part=quantize(f32.data(),nr,K,use);
+            if(fs)fold_scale_cols(f32.data(),nr,K,*fs);
+            PackedWeight part=quantize(f32.data(),nr,K,use,imp);
             if(row==0){
                 out.row_bytes=part.row_bytes;out.row_scales=part.row_scales;
                 out.payload.reserve(size_t(N)*part.row_bytes);
@@ -1502,7 +1681,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         }
         return upload_packed(q,out);
     }
-    const bool direct_fp8=!r.gguf&&row_scales_ok(r,N)&&
+    const bool direct_fp8=!r.gguf&&!fs&&row_scales_ok(r,N)&&
         ((fmt==Fmt::FP8_E4M3&&r.t.dtype==STDtype::F8_E4M3)||
          (fmt==Fmt::FP8_E5M2&&r.t.dtype==STDtype::F8_E5M2));
     if(direct_fp8){
@@ -1520,7 +1699,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // is K/2 bytes per row, so a straight BF16 read would ask for 4x the
     // bytes that exist.  The dtype test alone should already exclude it;
     // one more term costs nothing and removes the whole class.
-    if(fmt==Fmt::BF16&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16){
+    if(fmt==Fmt::BF16&&!fs&&!r.gguf&&!r.row_scaled&&!r.native&&!r.nvfp4&&r.t.dtype==STDtype::BF16){
         std::vector<uint8_t> hp(size_t(N)*K*sizeof(bf16_t));std::string rr;
         if(!ck.read_raw(r,hp.data(),rr)){std::printf("\n  direct BF16 read failed for %s: %s\n",what,rr.c_str());*ok=false;return d;}
         d.payload=dev_copy<uint8_t>(q,hp.data(),hp.size());
@@ -1543,6 +1722,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     if (!r.gguf && r.t.name.find("weight_packed") != std::string::npos && !r.native &&
         !r.nvfp4 && (fmt == Fmt::MXFP4 ||
                      (fmt != Fmt::BF16 && packed_mxfp4_src(r)))) {
+        if (fold_refused(fs, what, ok)) return d;
         DevQuant d;
         const size_t pb = size_t(N) * K / 2;
         const size_t sb = size_t(N) * (K / kMXBlock);
@@ -1575,6 +1755,7 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     PackedWeight p;
     if (!r.gguf && r.native && (r.native->encoding!=uint32_t(NativeEncoding::RAW) ||
                      ck.native_model->header().version>=3)) {
+        if (fold_refused(fs, what, ok)) return d;
         QuantWeight w;
         if (!ck.native_view(r,w,rerr) || (keep_qwen_bf16(r.t.name) && w.fmt!=Fmt::BF16 &&
                                        ck.native_model->header().version>=3)) {
@@ -1583,12 +1764,14 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         }
         p=copy_packed(w); // Saved precision is authoritative; no second quantization.
     } else if (!r.gguf && r.compressed_int4 && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
+        if (fold_refused(fs, what, ok)) return d;
         if (!read_compressed_int4_ref(ck, r, p, rerr)) {
             std::printf("\n  direct compressed INT4 read failed for %s: %s\n",
                         what, rerr.c_str());
             *ok = false; return d;
         }
     } else if (!r.gguf && r.gptq && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
+        if (fold_refused(fs, what, ok)) return d;
         if (!repack_gptq_ref(ck, r, p, rerr)) {
             std::printf("\n  direct GPTQ read failed for %s: %s\n", what, rerr.c_str());
             *ok = false; return d;
@@ -1601,7 +1784,9 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
         *ok = false;
         return d;
         }
-        p = quantize(f32.data(), N, K, use);
+        if (fs) fold_scale_cols(f32.data(), N, K, *fs);
+        p = quantize(f32.data(), N, K, use,
+                     folded_importance(int4_importance(r, K, use), fs, K, imp_buf));
     }
     return upload_packed(q, p);
 }
@@ -1817,12 +2002,22 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const int Nb = int(rb.t.shape[0]);
     const int K  = int(ra.t.shape[1]);
     const int N  = Na + Nb;
+    // GRIMOIRE_IMATRIX_FOLD (in_fold): both halves read the same input, so
+    // both carry its scales or neither does.
+    const std::vector<float>* fa = fold_cols(ra);
+    const std::vector<float>* fb = fold_cols(rb);
+    if ((fa && int(fa->size()) != K) || (fb && int(fb->size()) != K) || (!fa != !fb)) {
+        std::printf("\n  GRIMOIRE_IMATRIX_FOLD: %s halves disagree about the input scales -- refused\n", what);
+        *ok = false; return d;
+    }
+    std::vector<float> imp_buf;
 
     // Dense UD quants may give gate and up different block formats;
     // those cannot share one raw matrix, so they fall through to the
     // dequantize-and-repack path below instead of failing the load.
     if(ra.gguf && rb.gguf && gguf_native_ref(ck,ra) && gguf_native_ref(ck,rb) &&
        ra.gguf->type==rb.gguf->type){
+        if(fold_refused(fa,what,ok))return d;
         const int block=native_gguf_block_elems(gguf_ref_fmt(ra));
         if(K%block){
             std::printf("\n  native GGUF refused for %s: K=%d is not divisible by %d\n",what,K,block);
@@ -1842,7 +2037,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         return d;
     }
 
-    if(fmt==Fmt::BF16&&!ra.gguf&&!rb.gguf&&!ra.row_scaled&&!rb.row_scaled&&!ra.native&&!rb.native&&
+    if(fmt==Fmt::BF16&&!fa&&!ra.gguf&&!rb.gguf&&!ra.row_scaled&&!rb.row_scaled&&!ra.native&&!rb.native&&
        ra.t.dtype==STDtype::BF16&&rb.t.dtype==STDtype::BF16){
         std::vector<uint8_t> hp(size_t(N)*K*sizeof(bf16_t));std::string rr;
         if(!ck.read_raw(ra,hp.data(),rr)||
@@ -1852,7 +2047,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         d.w=QuantWeight{Fmt::BF16,N,K,d.payload,nullptr,nullptr,int64_t(K*2),0};
         if(!d.payload)*ok=false;return d;
     }
-    const bool direct_fp8=!ra.gguf&&!rb.gguf&&
+    const bool direct_fp8=!ra.gguf&&!rb.gguf&&!fa&&
        ((fmt==Fmt::FP8_E4M3&&ra.t.dtype==STDtype::F8_E4M3&&rb.t.dtype==STDtype::F8_E4M3)||
         (fmt==Fmt::FP8_E5M2&&ra.t.dtype==STDtype::F8_E5M2&&rb.t.dtype==STDtype::F8_E5M2))&&
        row_scales_ok(ra,Na)&&row_scales_ok(rb,Nb);
@@ -1891,6 +2086,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         (fmt == Fmt::MXFP4 ||
          (fmt != Fmt::BF16 && packed_mxfp4_src(ra) && packed_mxfp4_src(rb)));
     if (hf_packed) {
+        if (fold_refused(fa, what, ok)) return d;
         const size_t pba=size_t(Na)*K/2, pbb=size_t(Nb)*K/2;
         const size_t sba=size_t(Na)*(K/kMXBlock), sbb=size_t(Nb)*(K/kMXBlock);
         std::vector<uint8_t> hp(pba+pbb), hs(sba+sbb);
@@ -1914,6 +2110,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     PackedWeight p;
     if (!ra.gguf && !rb.gguf && ra.native && rb.native && (ck.native_model->header().version>=3 ||
         (ra.native->encoding!=0 && rb.native->encoding!=0))) {
+        if (fold_refused(fa, what, ok)) return d;
         QuantWeight a,b;
         if (!ck.native_view(ra,a,rerr) || !ck.native_view(rb,b,rerr) || a.fmt!=b.fmt ||
             ((keep_qwen_bf16(ra.t.name) || keep_qwen_bf16(rb.t.name)) && a.fmt!=Fmt::BF16 && ck.native_model->header().version>=3)) {
@@ -1926,6 +2123,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.zeros.insert(p.zeros.end(),tail.zeros.begin(),tail.zeros.end());
     } else if (!ra.gguf && !rb.gguf && ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4 &&
                int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
+        if (fold_refused(fa, what, ok)) return d;
         PackedWeight a,b;
         if(!read_compressed_int4_ref(ck,ra,a,rerr)||
            !read_compressed_int4_ref(ck,rb,b,rerr)){
@@ -1943,6 +2141,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.zeros.insert(p.zeros.end(),b.zeros.begin(),b.zeros.end());
     } else if (!ra.gguf && !rb.gguf && ra.gptq && rb.gptq && use == Fmt::INT4 &&
                int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
+        if (fold_refused(fa, what, ok)) return d;
         PackedWeight a,b;
         if(!repack_gptq_ref(ck,ra,a,rerr)||!repack_gptq_ref(ck,rb,b,rerr)){
             std::printf("\n  direct GPTQ concatenate failed for %s: %s\n",what,rerr.c_str());
@@ -1959,7 +2158,10 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
             std::printf("\n  read failed for %s: %s\n", what, rerr.c_str());
             std::fflush(stdout); *ok = false; return d;
         }
-        p = quantize(f32.data(), N, K, use);
+        if (fa) fold_scale_cols(f32.data(), N, K, *fa);  // fb is the same input's
+        // Both halves read the same input (gate | up), so either's importance serves.
+        p = quantize(f32.data(), N, K, use,
+                     folded_importance(int4_importance(ra, K, use), fa, K, imp_buf));
     }
     d.payload = dev_copy<uint8_t>(q, p.payload.data(), p.payload.size());
     if (!p.scales_raw.empty())
@@ -6770,6 +6972,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     // Muse decoder projections remain checkpoint INT4-W4A16 while its
     // excluded lm_head stays BF16; these formats are intentionally distinct.
     const Fmt PF = cfg.is_muse ? Fmt::INT4 : opt.lm_head_fmt;
+    imx_nk = cfg.lin_k_heads; imx_nv = cfg.lin_v_heads; imx_dv = cfg.lin_v_dim;
 
     for (int i = 0; i < cfg.n_layers; ++i) {
         const Qwen35Layer& src = ck.layers[i];
@@ -6790,7 +6993,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         // reports a missing tensor for something the file correctly does
         // not contain.
         if (!cfg.is_qwen4_exp) {
-            d.in_norm   = dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok);
+            // GRIMOIRE_IMATRIX_FOLD: this layer's input projections carry the
+            // norm's scales (in_fold); planned before anything of it uploads.
+            plan_in_fold(ck, cfg, src, PF);
+            d.in_norm   = in_fold.s.empty()
+                ? dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok)
+                : upload_folded_norm(lq, ck, src.input_norm, in_fold.s, cfg.norm_weight_offset(),
+                                     "input_layernorm", &ok);
             d.post_norm = dev_copy_t<bf16_t>(lq, ck, src.post_attn_norm, "post_attention_layernorm", &ok);
         }
         if(cfg.is_muse){
@@ -9222,6 +9431,16 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     }
     load_seconds = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - t0).count();
+    // A file for another model names nothing: say so instead of a silent no-op.
+    if (imatrix_asked)
+        if (const b70::ImportanceMatrix* im = load_imatrix())
+            std::printf("  imatrix: %d INT4 weights rounded by their output error, %d without an entry\n",
+                        im->hits.load(), im->misses.load());
+    if (fold_layers || fold_skipped)
+        std::printf("  imatrix fold (alpha %.2f): %d layers' input norms folded into their projections, "
+                    "%d left as they were (no entry or a pre-quantized source)\n",
+                    fold_alpha(), fold_layers, fold_skipped);
+    in_fold = InFold{};
 
     // ---- capability matrix ----------------------------------------
     // Several features degrade SILENTLY: speculation simply does not load

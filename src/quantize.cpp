@@ -79,6 +79,10 @@ static void for_rows(int N, size_t work, F&& fn) {
 }
 
 PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
+    return quantize(src, N, K, fmt, nullptr);
+}
+
+PackedWeight quantize(const float* src, int N, int K, Fmt fmt, const float* importance) {
     if (!src || N <= 0 || K <= 0 || K > std::numeric_limits<int>::max() / 2)
         throw std::invalid_argument("quantize: invalid matrix dimensions or null input");
     switch (fmt) {
@@ -172,6 +176,14 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
         //                                minimises its squared reconstruction error, instead of
         //                                plain min / max (an outlier no longer widens every step)
         // Defaults: 128 and plain min / max, as before.
+        // An importance vector (GRIMOIRE_IMATRIX, b70/imatrix.hpp) turns the search on and
+        // weights every channel's squared error by it, so the range follows the expected
+        // OUTPUT error: channels the layer's input drives hard keep their precision.
+        // Measured offline (2026-11-06, Qwen3.8-27B BF16 layers 10-11 with Unsloth's
+        // imatrix, output error relative to plain min / max at 128), groups of 128 / 64:
+        // q_proj 0.32 / 0.28, in_proj_z 0.56 / 0.45, in_proj_qkv 0.62 / 0.50, k_proj
+        // 0.58 / 0.48, v_proj 0.71 / 0.59, o / out_proj 0.80-0.85 / 0.66-0.71, MLP
+        // 0.83-0.88 / 0.70-0.74 (the range search alone at 64: 0.74-0.83).
         static const int rtn_group = [] {
             const char* e = std::getenv("GRIMOIRE_INT4_RTN_GROUP");
             return e && std::atoi(e) == 64 ? 64 : kInt4Group; }();
@@ -216,7 +228,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                 }
                 bf16_t sb; float s; int z;
                 pick(lo, hi, sb, s, z);
-                if (rtn_search) {
+                if (rtn_search || importance) {
                     double best = -1.0;
                     for (int c = 0; c <= 12; ++c) {
                         const double f = 1.0 - 0.02 * c;
@@ -227,7 +239,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                             int q = int(std::nearbyint(double(in[base + i]) / cs)) + cz;
                             q = std::max(0, std::min(15, q));
                             const double d = double(in[base + i]) - (double(q) - cz) * cs;
-                            err += d * d;
+                            err += importance ? d * d * double(importance[base + i]) : d * d;
                         }
                         if (best < 0.0 || err < best) { best = err; sb = cb; s = cs; z = cz; }
                     }
@@ -291,3 +303,189 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
 }
 
 } // namespace b70
+
+// =====================================================================
+//  llama.cpp importance matrices (b70/imatrix.hpp).  Here rather than in a
+//  file of their own so every binary that links the quantizer has them
+//  without a build-script change.
+// =====================================================================
+#include "b70/imatrix.hpp"
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <unordered_map>
+
+namespace b70 {
+namespace {
+
+struct File {
+    FILE* f = nullptr;
+    ~File() { if (f) std::fclose(f); }
+    bool read(void* p, size_t n) { return std::fread(p, 1, n, f) == n; }
+    template <class T> bool get(T& v) { return read(&v, sizeof(T)); }
+};
+
+bool gguf_string(File& f, std::string& s) {
+    uint64_t n = 0;
+    if (!f.get(n) || n > (uint64_t(1) << 20)) return false;
+    s.resize(size_t(n));
+    return n == 0 || f.read(&s[0], size_t(n));
+}
+
+// Skip one GGUF metadata value of type t (reading general.alignment on the way).
+bool gguf_skip(File& f, uint32_t t, uint64_t* as_u64) {
+    static const int width[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    if (t == 8) { std::string s; return gguf_string(f, s); }
+    if (t == 9) {
+        uint32_t et = 0; uint64_t n = 0;
+        if (!f.get(et) || !f.get(n)) return false;
+        for (uint64_t i = 0; i < n; ++i) if (!gguf_skip(f, et, nullptr)) return false;
+        return true;
+    }
+    if (t > 12) return false;
+    uint64_t v = 0;
+    if (!f.read(&v, size_t(width[t]))) return false;
+    if (as_u64) *as_u64 = v;
+    return true;
+}
+
+}  // namespace
+
+bool ImportanceMatrix::load(const std::string& path, std::string& err) {
+    m_.clear();
+    File f; f.f = std::fopen(path.c_str(), "rb");
+    if (!f.f) { err = "cannot open " + path; return false; }
+    char magic[4] = {};
+    if (!f.read(magic, 4)) { err = "empty file"; return false; }
+    if (std::memcmp(magic, "GGUF", 4) == 0) {
+        uint32_t ver = 0; uint64_t nt = 0, nkv = 0;
+        if (!f.get(ver) || ver < 2 || !f.get(nt) || !f.get(nkv)) { err = "unsupported GGUF header"; return false; }
+        uint64_t align = 32;
+        for (uint64_t i = 0; i < nkv; ++i) {
+            std::string k; uint32_t t = 0; uint64_t v = 0;
+            if (!gguf_string(f, k) || !f.get(t) || !gguf_skip(f, t, &v)) { err = "bad GGUF metadata"; return false; }
+            if (k == "general.alignment" && v > 0) align = v;
+        }
+        struct TI { std::string name; std::vector<uint64_t> dims; uint32_t type = 0; uint64_t off = 0; };
+        std::vector<TI> ti(static_cast<size_t>(nt));
+        for (auto& t : ti) {
+            uint32_t nd = 0;
+            if (!gguf_string(f, t.name) || !f.get(nd) || nd > 4) { err = "bad GGUF tensor info"; return false; }
+            t.dims.resize(nd);
+            for (auto& d : t.dims) if (!f.get(d)) { err = "bad GGUF tensor info"; return false; }
+            if (!f.get(t.type) || !f.get(t.off)) { err = "bad GGUF tensor info"; return false; }
+        }
+        const long here = std::ftell(f.f);
+        const uint64_t base = (uint64_t(here) + align - 1) / align * align;
+        std::unordered_map<std::string, const TI*> by;
+        for (auto& t : ti) by[t.name] = &t;
+        auto read_f32 = [&](const TI& t, std::vector<float>& out) {
+            uint64_t n = 1; for (auto d : t.dims) n *= d;
+            if (t.type != 0 || n > (uint64_t(1) << 32)) return false;  // F32 only
+            out.resize(size_t(n));
+            return std::fseek(f.f, long(base + t.off), SEEK_SET) == 0 && f.read(out.data(), size_t(n) * 4);
+        };
+        const std::string sfx = ".in_sum2";
+        for (auto& t : ti) {
+            if (t.name.size() <= sfx.size() || t.name.compare(t.name.size() - sfx.size(), sfx.size(), sfx)) continue;
+            const std::string base_name = t.name.substr(0, t.name.size() - sfx.size());
+            auto c = by.find(base_name + ".counts");
+            if (c == by.end() || t.dims.empty()) continue;
+            std::vector<float> s2, cnt;
+            if (!read_f32(t, s2) || !read_f32(*c->second, cnt)) { err = "cannot read " + t.name; return false; }
+            Entry e; e.K = int(t.dims[0]); e.n_mat = int(s2.size() / size_t(e.K));
+            if (e.K <= 0 || cnt.size() != size_t(e.n_mat)) continue;
+            e.v.resize(s2.size());
+            for (int m = 0; m < e.n_mat; ++m)
+                for (int k = 0; k < e.K; ++k)
+                    e.v[size_t(m) * e.K + k] = cnt[size_t(m)] > 0.f ? s2[size_t(m) * e.K + k] / cnt[size_t(m)] : 0.f;
+            m_[base_name] = std::move(e);
+        }
+        return true;
+    }
+    // imatrix.dat: int32 n; n x { int32 len, name, int32 ncall, int32 nval, f32[nval] }.
+    // Each value is mean * ncall; only the relative size within a tensor matters here.
+    std::fseek(f.f, 0, SEEK_SET);
+    int32_t n = 0;
+    if (!f.get(n) || n < 0 || n > (1 << 20)) { err = "neither a GGUF nor an imatrix.dat file"; return false; }
+    for (int32_t i = 0; i < n; ++i) {
+        int32_t len = 0, ncall = 0, nval = 0;
+        if (!f.get(len) || len <= 0 || len > 4096) { err = "bad imatrix.dat entry"; return false; }
+        std::string name(size_t(len), ' ');
+        if (!f.read(&name[0], size_t(len)) || !f.get(ncall) || !f.get(nval) || nval <= 0) { err = "bad imatrix.dat entry"; return false; }
+        Entry e; e.v.resize(size_t(nval));
+        if (!f.read(e.v.data(), size_t(nval) * 4)) { err = "short imatrix.dat"; return false; }
+        e.K = nval; e.n_mat = 1;  // a merged expert entry's width is resolved by find()
+        m_[name] = std::move(e);
+    }
+    return true;
+}
+
+const float* ImportanceMatrix::find(const std::string& tensor_name, int K, bool count) const {
+    int expert = -1;
+    const std::string g = imatrix_gguf_name(tensor_name, &expert);
+    auto it = g.empty() ? m_.end() : m_.find(g);
+    if (it == m_.end() || K <= 0) { if (count) ++misses; return nullptr; }
+    const Entry& e = it->second;
+    const int n_mat = e.K == K ? e.n_mat : (e.n_mat == 1 && int(e.v.size()) % K == 0 ? int(e.v.size()) / K : 0);
+    const int row = expert < 0 ? 0 : expert;
+    if (n_mat <= 0 || (expert < 0 && n_mat != 1) || row >= n_mat) { if (count) ++misses; return nullptr; }
+    if (count) ++hits;
+    return e.v.data() + size_t(row) * size_t(K);
+}
+
+std::string imatrix_gguf_name(const std::string& name, int* expert) {
+    if (expert) *expert = -1;
+    if (name.compare(0, 4, "blk.") == 0 || name == "output.weight") return name;
+    if (name == "lm_head.weight") return "output.weight";
+    // The MTP head's "layers.0" is not the trunk's layer 0 (llama.cpp files it as
+    // blk.<n_layer>, which only the config knows): no importance rather than the
+    // wrong layer's.
+    if (name.compare(0, 4, "mtp.") == 0 || name.find(".mtp.") != std::string::npos) return "";
+    // [model.][language_model.]layers.N.rest  (also model.language_model.layers.N.rest)
+    const std::string key = "layers.";
+    const size_t at = name.find(key);
+    if (at == std::string::npos) return "";
+    size_t p = at + key.size(), q = p;
+    while (q < name.size() && name[q] >= '0' && name[q] <= '9') ++q;
+    if (q == p || q >= name.size() || name[q] != '.') return "";
+    const std::string layer = name.substr(p, q - p);
+    std::string rest = name.substr(q + 1);
+    // per-expert HF tensors: mlp.experts.E.{gate,up,down}_proj.weight
+    const std::string ex = "mlp.experts.";
+    if (rest.compare(0, ex.size(), ex) == 0) {
+        size_t a = ex.size(), b = a;
+        while (b < rest.size() && rest[b] >= '0' && rest[b] <= '9') ++b;
+        if (b == a || b >= rest.size()) return "";
+        if (expert) *expert = std::atoi(rest.substr(a, b - a).c_str());
+        rest = "mlp.experts." + rest.substr(b + 1);
+    }
+    static const std::pair<const char*, const char*> map[] = {
+        {"self_attn.q_proj.weight", "attn_q.weight"},
+        {"self_attn.k_proj.weight", "attn_k.weight"},
+        {"self_attn.v_proj.weight", "attn_v.weight"},
+        {"self_attn.o_proj.weight", "attn_output.weight"},
+        {"linear_attn.in_proj_qkv.weight", "attn_qkv.weight"},
+        {"linear_attn.in_proj_qkvz.weight", "attn_qkv.weight"},   // Qwen3-Next: same input
+        {"linear_attn.in_proj_z.weight", "attn_gate.weight"},
+        {"linear_attn.in_proj_a.weight", "ssm_alpha.weight"},
+        {"linear_attn.in_proj_b.weight", "ssm_beta.weight"},
+        {"linear_attn.in_proj_ba.weight", "ssm_beta.weight"},     // same input
+        {"linear_attn.out_proj.weight", "ssm_out.weight"},
+        {"mlp.gate_proj.weight", "ffn_gate.weight"},
+        {"mlp.up_proj.weight", "ffn_up.weight"},
+        {"mlp.down_proj.weight", "ffn_down.weight"},
+        {"mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"},
+        {"mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"},
+        {"mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"},
+        {"mlp.gate.weight", "ffn_gate_inp.weight"},
+        {"mlp.experts.gate_proj.weight", "ffn_gate_exps.weight"},
+        {"mlp.experts.up_proj.weight", "ffn_up_exps.weight"},
+        {"mlp.experts.down_proj.weight", "ffn_down_exps.weight"},
+    };
+    for (const auto& m : map)
+        if (rest == m.first) return "blk." + layer + "." + m.second;
+    return "";
+}
+
+}  // namespace b70
