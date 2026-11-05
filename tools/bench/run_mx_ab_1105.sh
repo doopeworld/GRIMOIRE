@@ -55,4 +55,24 @@ if grep -qx MXLIB_BUILD_PASS logs/build-mxlib-1105.out; then
 else
   echo "library build failed: no M > 8 probe"
 fi
+# INT4 prompts vs MXFP4 (11-04: Swift 2-13% behind on prompts): dequantize vs GEMM time of the prompt GEMMs,
+# GRIMOIRE_FAST_GEMM_TIMING=1 (waits after each stage: diagnosis only), CLI, the 4K regression prompt, v1.10.4 CLI
+if grep -qx RELEASE_BUILD_PASS logs/release-build-1102b.out; then
+  exec 9>/mnt/storage/isos/grimoire-runs/gpu0.lock
+  if flock -n 9; then
+    cd /mnt/storage/isos/grimoire-fuse && {
+      for spec in "pdiag-mx /models2/Qwen3.8-27B-MXFP4-GRIMOIRE-MTPBF16 mxfp4" \
+                  "pdiag-swift /models2/Swift-1.5-Qwen3.8-27b-GPTQ-Int4-baked-v1-embed-int8 int4"; do
+        set -- $spec
+        EXTRA_ENV=GRIMOIRE_FAST_GEMM_TIMING=1 GRIM_TREE=/mnt/storage/isos/grimoire-release-1102b LIM=900 TAILN=30 \
+          bash tools/g0run.sh "$1" /grimoire/bin/grimoire -m "$2" --proj "$3" --ctx 8192 -p "$(cat real4k_ascii.txt)" -n 2 9>&- > /dev/null
+        cp "/tmp/grim-$1.log" "$B/logs/$1-1105.log"
+        echo "$1: $(grep -E "fast GEMM" "$B/logs/$1-1105.log" | tail -1)  $(grep -oE "elapsed=[0-9.]+" "$B/logs/$1-1105.log" | tail -1)"
+      done
+    }
+    cd "$B"
+    flock -u 9
+  fi
+  exec 9>&-
+fi
 echo "MXAB_DONE $(date +%T)"
