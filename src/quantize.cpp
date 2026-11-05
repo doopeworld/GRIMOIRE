@@ -24,6 +24,7 @@
 // =====================================================================
 #include "b70/weights.hpp"
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -161,40 +162,79 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
     // This is the GPTQ/AWQ convention, so converted checkpoints from the
     // usual toolchains drop straight in.
     case Fmt::INT4: {
+        // Round-to-nearest from a dense (BF16 / FP32) weight -- what --proj int4 does to every
+        // linear a checkpoint does not already store as GPTQ / compressed INT4 (Flash-Next's dense
+        // part, a BF16 GGUF, Qwen3.8-27B from its BF16 original).  Two opt-in refinements
+        // (2026-11-05, both read only here; the kernels take any group of 64 or 128 from the
+        // weight's shape, WeightView::int4_gshift):
+        //   GRIMOIRE_INT4_RTN_GROUP=64   groups of 64 along K instead of 128 (+0.19 bits a weight)
+        //   GRIMOIRE_INT4_RTN_SEARCH=1   each group's range shrunk by the factor (1.00 .. 0.76) that
+        //                                minimises its squared reconstruction error, instead of
+        //                                plain min / max (an outlier no longer widens every step)
+        // Defaults: 128 and plain min / max, as before.
+        static const int rtn_group = [] {
+            const char* e = std::getenv("GRIMOIRE_INT4_RTN_GROUP");
+            return e && std::atoi(e) == 64 ? 64 : kInt4Group; }();
+        static const bool rtn_search = [] {
+            const char* e = std::getenv("GRIMOIRE_INT4_RTN_SEARCH");
+            return e && *e == '1'; }();
+        const int GS = (K % rtn_group == 0) ? rtn_group : kInt4Group;
+        if (GS != kInt4Group) w.row_scales = K / GS;
         const int G = w.row_scales;
         w.scales_raw.assign(size_t(N) * G * sizeof(bf16_t), 0);
         w.zeros.assign(size_t(N) * G, 0);
         bf16_t* sc = reinterpret_cast<bf16_t*>(w.scales_raw.data());
+        // The scale and zero for range [lo, hi] (lo <= 0 <= hi), as the kernel will see them.
+        auto pick = [](double lo, double hi, bf16_t& sb, float& s, int& z) {
+            s = float((hi - lo) / 15.0);
+            if (!(s > 0.0f)) s = 1.0f;
+            // Round the scale to bf16 *before* choosing the codes, so
+            // the packer quantizes against the value the kernel will
+            // actually see. Skipping this is a classic silent 2x
+            // error amplifier at group boundaries.
+            sb = f32_to_bf16(s);
+            if (sb.bits == 0) sb.bits = 1; // smallest positive BF16 scale
+            s = bf16_to_f32(sb);
+            if (!std::isfinite(s) || !(s > 0.0f))
+                throw std::overflow_error("quantize: INT4 scale is not representable");
+            z = int(std::nearbyint(-lo / double(s)));
+            z = std::max(0, std::min(15, z));
+        };
         for_rows(N, count, [&](int n0, int n1) {
         for (int n = n0; n < n1; ++n) {
             const float* in  = src + int64_t(n) * K;
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             for (int g = 0; g < G; ++g) {
-                const int base = g * kInt4Group;
+                const int base = g * GS;
                 // The stored zero point is an integer in [0,15], so zero
                 // must lie inside the represented range. Clamping only the
                 // zero point after using [min,max] collapses one-sided groups.
                 float lo = 0.0f, hi = 0.0f;
-                for (int i = 0; i < kInt4Group; ++i) {
+                for (int i = 0; i < GS; ++i) {
                     lo = std::min(lo, in[base + i]);
                     hi = std::max(hi, in[base + i]);
                 }
-                float s = float((double(hi) - double(lo)) / 15.0);
-                if (!(s > 0.0f)) s = 1.0f;
-                // Round the scale to bf16 *before* choosing the codes, so
-                // the packer quantizes against the value the kernel will
-                // actually see. Skipping this is a classic silent 2x
-                // error amplifier at group boundaries.
-                bf16_t sb = f32_to_bf16(s);
-                if (sb.bits == 0) sb.bits = 1; // smallest positive BF16 scale
-                s = bf16_to_f32(sb);
-                if (!std::isfinite(s) || !(s > 0.0f))
-                    throw std::overflow_error("quantize: INT4 scale is not representable");
-                int z = int(std::nearbyint(-double(lo) / s));
-                z = std::max(0, std::min(15, z));
+                bf16_t sb; float s; int z;
+                pick(lo, hi, sb, s, z);
+                if (rtn_search) {
+                    double best = -1.0;
+                    for (int c = 0; c <= 12; ++c) {
+                        const double f = 1.0 - 0.02 * c;
+                        bf16_t cb; float cs; int cz;
+                        pick(double(lo) * f, double(hi) * f, cb, cs, cz);
+                        double err = 0.0;
+                        for (int i = 0; i < GS; ++i) {
+                            int q = int(std::nearbyint(double(in[base + i]) / cs)) + cz;
+                            q = std::max(0, std::min(15, q));
+                            const double d = double(in[base + i]) - (double(q) - cz) * cs;
+                            err += d * d;
+                        }
+                        if (best < 0.0 || err < best) { best = err; sb = cb; s = cs; z = cz; }
+                    }
+                }
                 sc[int64_t(n) * G + g] = sb;
                 w.zeros[int64_t(n) * G + g] = uint8_t(z);
-                for (int i = 0; i < kInt4Group; ++i) {
+                for (int i = 0; i < GS; ++i) {
                     int q = int(std::nearbyint(double(in[base + i]) / s)) + z;
                     q = std::max(0, std::min(15, q));
                     if (!std::isfinite(float((double(q) - z) * s)))
