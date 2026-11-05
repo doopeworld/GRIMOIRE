@@ -2,8 +2,12 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-05 08:39: RESUMED by Ian, who is away ("do everything alone"). Read [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md)
-first: decisions taken, the queue on the Tower, next steps. v1.10.4 = 35201c2 (CPU-expert pool fix + bf16 two-card exchange),
+**2026-11-05 13:26: PAUSED by Ian ("pause work i need the gpus") -- nothing runs; resume only when he says. v1.10.4 is
+PUBLISHED (315167c) and the five profiles run it. Read the top of [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md) for the
+resume order (B580 CPU-split build + A/B first).**
+
+**2026-11-05 08:39: RESUMED by Ian, who is away ("do everything alone"). Historical, superseded above.
+[HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md): decisions taken, the queue on the Tower, next steps. v1.10.4 = 35201c2 (CPU-expert pool fix + bf16 two-card exchange),
 gate running; MXFP4 small-M verify kernel on branch mxfp4-smallm-1105 (probe: Qwen3.8 verify shapes 13-26% faster). The goal, in
 Ian's words: "grimoire must be the fastest possible tool to do inference on b70 and b60 and b580 for single and dual gpu". GPU1
 and the B580 (0b:00.0) are in use; corrected link errors are not failures. Check git history before proposing any work item.**
