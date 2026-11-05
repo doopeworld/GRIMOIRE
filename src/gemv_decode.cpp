@@ -1481,6 +1481,34 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
         : int4_smallm_impl<1, 128>(q, w, X, Y, M, KS, kc, TPT, deps);
 }
 
+// MXFP4 at M <= 8 (2026-11-05): the same move INT4 made on 2026-10-05 -- the library's
+// MXFP4 small-M kernel (gemm_fast.cpp, 256 registers, KS doubled while tiles * KS < 4096)
+// built here at 128 registers with the INT4 split-K plan, and with nibble pairs (k, k+4)
+// (mxfp4_smallm_k_impl has the numbers: Qwen3.8-27B verify shapes 6-24% faster at M = 7).
+// Same values, only summation order changes.  GRIMOIRE_MX_SMALLM_256=1 = the library's
+// kernel and plan.  GRIMOIRE_MX_SMALLM_KS=<n> (diagnostic) forces n K slices.
+sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                                    float* Y, int M, const std::vector<sycl::event>& deps) {
+    static const bool old = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_256");
+        return e && *e == '1'; }();
+    static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_KS");
+        return (e && *e) ? std::atoi(e) : 0; }();
+    if (old || M > 8) return launch_mxfp4_smallm(q, w, X, Y, M, deps);
+    const int K = w.K;
+    // INT4's rule without its "wide outputs: 4 slices" clause: 256-K slices unless K is long.
+    // MEASURED (mx4rows_probe SWEEP, M = 7 / 4): Qwen3.8-27B gate_up 4 -> 20 slices 195.2 ->
+    // 170.0 / 191.4 -> 168.6 us, lm_head 1228.8 -> 1177.6 / 1205.2 -> 1156.5, Ornith lm_head
+    // 501.1 -> 490.7 / 486.6 -> 474.0; down (K = 17408) stays best at 4 (92.6 vs 102.1 at 28).
+    int KS = K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    if (force_ks > 0) KS = std::min(32, force_ks);
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
+    return mxfp4_smallm_k_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
+}
+
 // FP8 E4M3 at 2..8 rows (speculative verify, batched decode): the DPAS
 // small-M GEMM of int4_smallm.hpp (fp8_smallm_impl) with the M <= 8 INT4
 // split-K plan, from this 128-register build.  Without it FP8 verify went

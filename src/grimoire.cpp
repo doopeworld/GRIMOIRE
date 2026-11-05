@@ -677,6 +677,15 @@ static bool device_can_matrix(const sycl::queue& q) {
     return trust && d.has(sycl::aspect::ext_intel_matrix);
 }
 
+// GGUF native experts grouped across 2..16 rows, so several users share expert reads.  Ornith Q4_K_M:
+// 134 -> 365 tok/s total at 8 users, one user unchanged, answers run alone byte-identical to the
+// ungrouped path (11-02).  GRIMOIRE_MOE_NATIVE_SMALLM=0 = ungrouped.
+static bool moe_native_smallm_enabled() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM");
+        return !(e && *e == '0'); }();
+    return on;
+}
+
 sycl::event launch_rmsnorm_heads(sycl::queue&, float*, const bf16_t*, int, int,
                                  float, bool, const std::vector<sycl::event>&);
 sycl::event launch_scale(sycl::queue&, float*, float, int,
@@ -2434,6 +2443,15 @@ struct Grimoire {
         // prefill receive ring; sp_piece floats per piece; sp_cnt = pieces finished, published in
         // the flag at base+1024+64*rank.  GRIMOIRE_TP_SMALL_BAR=0 = the plain host round trip.
         size_t small_max = 65536, sp_piece = 0; uint64_t sp_cnt = 0;
+        // bf16 small all-reduce (11-04, default; GRIMOIRE_TP_SMALL_BF16=0 = fp32): each rank's partial goes
+        // out as bf16 (half the bytes over the link, which matters with gpu1 at Gen3 x4) and the two are
+        // summed in fp32 in rank order, so both ranks keep identical bits -- the same rounding the prompt
+        // path's pipelined all-reduce already uses.  The CPU-expert fold (host_add) stays fp32.
+        bool small_bf16 = false;
+        // peer partial (11-05, default with bf16; GRIMOIRE_TP_SMALL_PEER=0 = the CPU sum): the CPU writes only the
+        // PEER's bf16 partial into this card's VRAM (half the bytes of the fp32 sum over the link) and a kernel
+        // adds it to this card's own partial, rounded the same way -- the same two fp32 operands, so the same bits.
+        bool small_peer = false;
         uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
     } tshm;
     bool tp_shm_setup(std::string& err);
@@ -2702,6 +2720,8 @@ struct Grimoire {
     const void* kjob_s[4] = {}; void* kjob_d[4] = {}; size_t kjob_b[4] = {};
     bool ksend_on();
     uint64_t ksend(int n, const void* const* src, void* const* dst, const size_t* bytes);
+    // ksend's converting twin for the bf16 small all-reduce: n floats -> n bf16 (round to nearest even)
+    uint64_t ksend_bf16(const float* src, uint16_t* dst, size_t n);
     bool kwait(uint64_t tag, const char* what);
     // the same, M rows at a time (short-prompt prefill), grown on demand
     size_t    px_cap = 0;
@@ -4956,6 +4976,24 @@ bool Grimoire::tp_shm_setup(std::string& err){
             std::printf("  TP small all-reduce (<= %zu floats): pieces of %zu floats, sum written by the CPU"
                         " into this card's VRAM through the BAR (GRIMOIRE_TP_SMALL_BAR=0 = off)\n",
                         tshm.small_max,tshm.sp_piece);
+            // bf16 partials (default since 11-04: two B70s, Qwen3.8-27B-FP8 TP + MTP, code 81.4 -> 83.1 tok/s,
+            // 4 users 95.7 -> 98.0, every coding answer byte-identical), only if BOTH ranks keep them on:
+            // the slots then hold half-size elements.  GRIMOIRE_TP_SMALL_BF16=0 = fp32 partials.
+            const char* be=std::getenv("GRIMOIRE_TP_SMALL_BF16");
+            int b16=(be&&*be=='0')?0:1;
+            if(!tp_agree_min(b16)){err="TP small all-reduce handshake failed";return false;}
+            tshm.small_bf16=b16==1;
+            std::printf("  TP small all-reduce: %s partials, summed in fp32 in rank order "
+                        "(GRIMOIRE_TP_SMALL_BF16=0 = fp32; the CPU-expert fold stays fp32)\n",
+                        tshm.small_bf16?"bf16":"fp32");
+            // 11-05: with bf16 partials, the peer's partial goes into VRAM and the card adds (both ranks agree)
+            const char* pe=std::getenv("GRIMOIRE_TP_SMALL_PEER");
+            int pk=(pe&&*pe=='0')?0:1;
+            if(!tp_agree_min(pk)){err="TP small all-reduce handshake failed";return false;}
+            tshm.small_peer=tshm.small_bf16&&pk==1;
+            if(tshm.small_peer)
+                std::printf("  TP small all-reduce: the peer's bf16 partial through the BAR, added on this card "
+                            "(GRIMOIRE_TP_SMALL_PEER=0 = the CPU writes the sum)\n");
         }
     }
     if(tshm.pipe_piece){
@@ -5282,6 +5320,48 @@ static void tp_bar_sum(float* dst,const float* a,const float* b,size_t n){
             _mm_stream_ps(dst+i+8,x2); _mm_stream_ps(dst+i+12,x3);
         }
     for(;i<n;++i)dst[i]=a[i]+b[i];
+}
+
+// The peer's bf16 partial into the BAR mapping (GRIMOIRE_TP_SMALL_PEER), 64-byte lines of non-temporal
+// stores: half the bytes of tp_bar_sum_bf16's fp32 sum.  The caller fences and reads back once.
+static void tp_bar_copy16(uint16_t* dst,const uint16_t* src,size_t n){
+    size_t i=0;
+    if((reinterpret_cast<uintptr_t>(dst)&15)==0)
+        for(;i+32<=n;i+=32){
+            const __m128i x0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i));
+            const __m128i x1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+8));
+            const __m128i x2=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+16));
+            const __m128i x3=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+24));
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i),x0);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+8),x1);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+16),x2);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+24),x3);
+        }
+    for(;i<n;++i)dst[i]=src[i];
+}
+
+// tp_bar_sum for bf16 partials (GRIMOIRE_TP_SMALL_BF16): each bf16 widened exactly to fp32, then the same
+// fp32 add in rank order, so both ranks write the same bits.
+static void tp_bar_sum_bf16(float* dst,const uint16_t* a,const uint16_t* b,size_t n){
+    size_t i=0;
+    if((reinterpret_cast<uintptr_t>(dst)&15)==0){
+        const __m128i z=_mm_setzero_si128();
+        for(;i+16<=n;i+=16){
+            const __m128i a0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a+i));
+            const __m128i a1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(a+i+8));
+            const __m128i b0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(b+i));
+            const __m128i b1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(b+i+8));
+            _mm_stream_ps(dst+i,   _mm_add_ps(_mm_castsi128_ps(_mm_unpacklo_epi16(z,a0)),_mm_castsi128_ps(_mm_unpacklo_epi16(z,b0))));
+            _mm_stream_ps(dst+i+4, _mm_add_ps(_mm_castsi128_ps(_mm_unpackhi_epi16(z,a0)),_mm_castsi128_ps(_mm_unpackhi_epi16(z,b0))));
+            _mm_stream_ps(dst+i+8, _mm_add_ps(_mm_castsi128_ps(_mm_unpacklo_epi16(z,a1)),_mm_castsi128_ps(_mm_unpacklo_epi16(z,b1))));
+            _mm_stream_ps(dst+i+12,_mm_add_ps(_mm_castsi128_ps(_mm_unpackhi_epi16(z,a1)),_mm_castsi128_ps(_mm_unpackhi_epi16(z,b1))));
+        }
+    }
+    for(;i<n;++i){
+        const uint32_t x=uint32_t(a[i])<<16, y=uint32_t(b[i])<<16;
+        float fx,fy; std::memcpy(&fx,&x,4); std::memcpy(&fy,&y,4);
+        dst[i]=fx+fy;
+    }
 }
 
 // The receive thread (TpShm): every published piece in order -- the peer's
@@ -5697,6 +5777,41 @@ uint64_t Grimoire::ksend(int n, const void* const* src, void* const* dst, const 
     return tag;
 }
 
+// n floats on the device -> n bf16 in pinned RAM (round to nearest even; NaN stays NaN), eight per lane so
+// each lane writes 16 bytes, then the next tag into kflag as ksend does.  Every rank rounds its own partial
+// with this same kernel; the CPU sum reads the two rounded partials, so both ranks get the same bits.
+uint64_t Grimoire::ksend_bf16(const float* src, uint16_t* dst, size_t n) {
+    const uint64_t tag = ++kflag_tag;
+    kjob_tag = 0;                                    // GRIMOIRE_KSEND_CHECK compares plain copies only
+    uint64_t* fl = kflag;
+    const bool v16 = ((uintptr_t(src) | uintptr_t(dst)) & 15) == 0;
+    constexpr int WG = 256;
+    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+        const size_t lid = it.get_local_id(0);
+        auto rne = [](float f) -> uint32_t {
+            uint32_t u = sycl::bit_cast<uint32_t>(f);
+            if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+            return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+        };
+        const size_t n8 = v16 ? n / 8 : 0;
+        const sycl::float4* s = reinterpret_cast<const sycl::float4*>(src);
+        sycl::uint4* d = reinterpret_cast<sycl::uint4*>(dst);
+        for (size_t i = lid; i < n8; i += WG) {
+            const sycl::float4 a = s[2 * i], b = s[2 * i + 1];
+            d[i] = sycl::uint4(rne(a.x()) | (rne(a.y()) << 16), rne(a.z()) | (rne(a.w()) << 16),
+                               rne(b.x()) | (rne(b.y()) << 16), rne(b.z()) | (rne(b.w()) << 16));
+        }
+        for (size_t i = n8 * 8 + lid; i < n; i += WG) dst[i] = uint16_t(rne(src[i]));
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group());
+        if (lid == 0) {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *reinterpret_cast<volatile uint64_t*>(fl) = tag;
+        }
+    });
+    return tag;
+}
+
 bool Grimoire::kwait(uint64_t tag, const char* what) {
     const volatile uint64_t* f = kflag;
     uint64_t spins = 0;
@@ -5762,6 +5877,40 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     double t_peer=0, t_sum=0, t_out=0;
     if(st){t0=clk::now();q.wait();t1=clk::now();}
     const size_t P=tshm.sp_piece, np=(elems+P-1)/P;
+    float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
+    // GRIMOIRE_TP_SMALL_PEER (with bf16 partials): the BAR gets the peer's bf16 partial, not the fp32 sum
+    bool peer16=false;
+    // bf16 partials (GRIMOIRE_TP_SMALL_BF16=1): one converting copy out, then the same pieces, flags and
+    // rank-order sum as the fp32 path below.  The CPU-expert fold (host_add / pre_tag) stays fp32.
+    if(tshm.small_bf16&&!host_add&&!pre_tag&&ksend_on()){
+        peer16=tshm.small_peer;
+        uint16_t* const st16=reinterpret_cast<uint16_t*>(tshm.stage);
+        uint16_t* const mine16=reinterpret_cast<uint16_t*>(slot(tp_rank));
+        const uint16_t* const a16=reinterpret_cast<const uint16_t*>(slot(0));
+        const uint16_t* const b16=reinterpret_cast<const uint16_t*>(slot(1));
+        const uint16_t* const p16=reinterpret_cast<const uint16_t*>(slot(peer));
+        uint16_t* const bar16=reinterpret_cast<uint16_t*>(bar);
+        if(!kwait(ksend_bf16(dev,st16,elems),"TP small all-reduce (bf16)"))return false;
+        if(st){tb=clk::now(); t_out+=std::chrono::duration<double,std::micro>(tb-t1).count();}
+        for(size_t k=0;k<np;++k){
+            const size_t o=k*P, n=std::min(P,elems-o);
+            std::memcpy(mine16+o,st16+o,n*sizeof(uint16_t));
+            const uint64_t c=++tshm.sp_cnt;
+            sflag(tp_rank)->store(c,std::memory_order_release);
+            auto* f=sflag(peer); uint64_t spins=0; const auto tw=clk::now();
+            while(f->load(std::memory_order_acquire)<c){
+                __builtin_ia32_pause();
+                if((++spins&0xFFFFF)==0&&clk::now()-tw>std::chrono::seconds(120)){
+                    std::fprintf(stderr,"TP rank %d: small all-reduce waited 120 s for rank %d -- giving up\n",tp_rank,peer);
+                    return false;
+                }
+            }
+            if(st){ta=clk::now(); t_peer+=std::chrono::duration<double,std::micro>(ta-tw).count();}
+            if(peer16)tp_bar_copy16(bar16+o,p16+o,n);     // timed as "CPU sum"
+            else tp_bar_sum_bf16(bar+o,a16+o,b16+o,n);
+            if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
+        }
+    }else{
     sycl::event ev[64];
     // one piece (decode): the copy out is a kernel + pinned flag (ksend)
     const bool kpath=pre_tag||(np==1&&ksend_on());
@@ -5776,7 +5925,6 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     float* const mine=slot(tp_rank);
     const float* const s0=slot(0);
     const float* const s1=slot(1);
-    float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
     for(size_t k=0;k<np;++k){
         const size_t o=k*P, n=std::min(P,elems-o);
         if(st)ta=clk::now();
@@ -5817,10 +5965,24 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
         tp_bar_sum(bar+o,s0+o,s1+o,n);
         if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
     }
+    }   // fp32 partials
     _mm_sfence();
-    (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
+    if(peer16)(void)*reinterpret_cast<volatile const uint16_t*>(reinterpret_cast<uint16_t*>(bar)+elems-1);
+    else (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
     if(st)ta=clk::now();
-    q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
+    if(peer16){
+        // own partial rounded as ksend_bf16 rounded it for the peer, plus the peer's: the same two fp32
+        // operands on both ranks (fp32 a + b == b + a), so both cards get the same bits ("copy in" in the timer)
+        float* const d=dev;
+        const uint16_t* const pd=reinterpret_cast<const uint16_t*>(tshm.sb_dev+size_t(s&1)*tshm.small_max);
+        q.parallel_for(sycl::range<1>(elems),[=](sycl::id<1> i){
+            const uint32_t u=sycl::bit_cast<uint32_t>(d[i]);
+            const uint32_t r=(u&0x7fffffffu)>0x7f800000u?((u>>16)|0x40u):((u+0x7fffu+((u>>16)&1u))>>16);
+            d[i]=sycl::bit_cast<float>(r<<16)+sycl::bit_cast<float>(uint32_t(pd[i])<<16);
+        });
+    }else{
+        q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
+    }
     if(st){
         q.wait();
         const auto t2=clk::now();
@@ -13965,7 +14127,7 @@ void Grimoire::mtpr_mm(const QuantWeight& w, const float* x, float* y, int M) {
     launch_f32_to_bf16(q, x, mtpr.bf, need);
     if (dnnl) onednn_gemm(q, w, mtpr.bf, y, M, false);
     else if (f8) launch_fp8_smallm(q, w, mtpr.bf, y, M);
-    else if (mx) launch_mxfp4_smallm(q, w, mtpr.bf, y, M);
+    else if (mx) launch_mxfp4_smallm_fast(q, w, mtpr.bf, y, M);
     else if (i4) launch_int4_smallm(q, w, mtpr.bf, y, M);
     else if (nq) launch_native_smallm(q, w, mtpr.bf, y, M);
     else launch_bf16_smallm(q, w, mtpr.bf, y, M);
@@ -15490,7 +15652,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
                 if (w.w.fmt == Fmt::BF16) launch_bf16_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::INT4) launch_int4_smallm(q, w.w, xb, y, M);
                 else if (w.w.fmt == Fmt::FP8_E4M3 || w.w.fmt == Fmt::INT8) launch_fp8_smallm(q, w.w, xb, y, M);
-                else launch_mxfp4_smallm(q, w.w, xb, y, M);
+                else launch_mxfp4_smallm_fast(q, w.w, xb, y, M);
                 return;
             }
             for (int r = 0; r < M; ++r)
@@ -15991,9 +16153,11 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         if (const char* v = std::getenv("GRIMOIRE_EXPERT_VRAM_PER_LAYER")) {
             nv = std::max(0, std::min(Ehalf, std::atoi(v)));
         } else {
+            // Default: all experts if they fit 60% of the card, else 16 GB -- but never more than 60% of
+            // the card (11-04: 16 GB is more than a B580 has; a B70 still gets 16 GB, a B60 14.4 GB)
             const char* g = std::getenv("GRIMOIRE_EXPERT_VRAM_GB");
             const size_t budget = g ? size_t(std::max(0.0, std::atof(g)) * 1073741824.0)
-                                : (all <= dev / 10 * 6 ? all : size_t(16) << 30);
+                                : (all <= dev / 10 * 6 ? all : std::min(size_t(16) << 30, dev / 10 * 6));
             nv = int(std::min<size_t>(size_t(Ehalf), budget / (lay.bytes * size_t(moe_layers))));
         }
         tm_vram_per_layer = nv;
@@ -16125,18 +16289,21 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
                 cpus = b70::hybrid_pool_cpus(ranks, pp_enabled() ? pp_rank : tp_ranked() ? tp_rank : 0);
             const int nt = tn ? std::atoi(tn) : !cpus.empty() ? int(cpus.size()) : ranks > 1 ? share : 0;
             cpu_exp.start(nt, cpus);
-            // The decode thread (the pool's worker 0) is always busy -- it spins on the device
-            // and the peer -- and, left to the scheduler, it ran on the 2.5 GHz low-power cores
-            // or on a pinned worker's CPU half the time (10-27, per-thread samples).  It gets
+            // Two ranks: the decode thread (the pool's worker 0) is always busy -- it spins on the
+            // device and the peer -- and, left to the scheduler, it ran on the 2.5 GHz low-power
+            // cores or on a pinned worker's CPU half the time (10-27, per-thread samples).  It gets
             // cpus[0] for the length of each decode step (forward_qwen4_exp).
-            // GRIMOIRE_CPU_PIN_CALLER=0 = left unpinned.
+            // One rank: left free.  A process stuck on that CPU made Flash-Next 64 tokens 39.5 s,
+            // free 3.7 s, and free costs nothing on a quiet machine, 3.07 s (11-02).
+            // GRIMOIRE_CPU_PIN_CALLER=1 / 0 = pinned / free either way.
             const char* pc = std::getenv("GRIMOIRE_CPU_PIN_CALLER");
-            cx_caller_cpu = !cpus.empty() && !(pc && *pc == '0') ? cpus[0] : -1;
+            const bool pin_caller = pc && *pc ? *pc != '0' : ranks > 1;
+            cx_caller_cpu = !cpus.empty() && pin_caller ? cpus[0] : -1;
             if (!cpus.empty()) {
                 std::string cl;
                 for (size_t c = 1; c < cpus.size() && int(c) < nt; ++c) cl += (cl.empty() ? "" : ",") + std::to_string(cpus[c]);
-                std::printf("  CPU experts: pool threads pinned to CPUs %s, the decode thread to CPU %d during "
-                            "decode steps%s\n", cl.c_str(), cpus[0], cx_caller_cpu < 0 ? " -- off (GRIMOIRE_CPU_PIN_CALLER=0)" : "");
+                std::printf("  CPU experts: pool threads pinned to CPUs %s, the decode thread %s\n", cl.c_str(),
+                            cx_caller_cpu < 0 ? "free" : ("to CPU " + std::to_string(cx_caller_cpu) + " during decode steps").c_str());
             }
             const int K = cfg.top_k;
             cx_route = sycl::malloc_host<int32_t>(size_t(K), lq);
@@ -17878,7 +18045,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     else if(dpas_f8) launch_fp8_smallm(q,w.w,xin,y,M);
                     else if(dpas_nq) launch_native_smallm(q,w.w,xin,y,M);
                     else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
-                    else launch_mxfp4_smallm(q,w.w,xin,y,M);
+                    else launch_mxfp4_smallm_fast(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
                     if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
                         // reference: the decode GEMV, fp32 activations, row by row
@@ -18366,16 +18533,23 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         !std::getenv("GRIMOIRE_BF16_QKV")&&!std::getenv("GRIMOIRE_BF16_DN_QKV")&&
         prefill_layer_begin==0&&prefill_layer_limit==cfg.n_layers&&M>=2*tp_wave_rows+256&&
         tshm.sjobs.empty();
+    // 4-bit FFN weights (MXFP4, INT4 / GPTQ, GGUF native) on the wavefront too (2026-11-05): it was
+    // written and measured for FP8 (10-26) and kept the 4-bit formats on the per-layer path, whose
+    // FFN phase waits for gpu1's x4 link -- two B70s, Qwen3.8-27B GPTQ-Int4, pp4096 1,733 tok/s
+    // against 2,062 on ONE card.  The wavefront dequantizes each FFN weight once per layer
+    // (predq) and applies SwiGLU as its own pass, as for FP8.  GRIMOIRE_TP_WAVE_4BIT=0 = the old rule.
+    static const bool wave_4bit=[]{const char* e=std::getenv("GRIMOIRE_TP_WAVE_4BIT");return !(e&&*e=='0');}();
     size_t wave_ngu=0, wave_ndn=0;
     for(int li=0;tp_wave&&li<cfg.n_layers;++li){
         const LayerDev& d=L[size_t(li)];
         wave_ngu=std::max(wave_ngu,gemm_fast_predq_elems(d.sh_gu.w));
         wave_ndn=std::max(wave_ndn,gemm_fast_predq_elems(d.sh_down.w));
         const int FIc=d.sh_gu.output_rows()/2;
-        const bool ffn_ok=!d.moe_layer&&d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+        const bool fmt_ok=wave_4bit||(d.sh_gu.w.fmt!=Fmt::MXFP4&&d.sh_down.w.fmt!=Fmt::MXFP4&&
+            !gemm_fast_swiglu_supported(d.sh_gu.w,M));
+        const bool ffn_ok=!d.moe_layer&&fmt_ok&&
             !d.sh_gu.has_i4()&&!d.sh_down.has_i4()&&!(a8&&a8s&&xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4)&&
             d.sh_gu.w.N==2*FIc&&d.sh_down.w.K==FIc&&d.sh_down.w.N==H&&
-            !gemm_fast_swiglu_supported(d.sh_gu.w,M)&&
             gemm_fast_predq_supported(d.sh_gu.w,M)&&gemm_fast_predq_supported(d.sh_down.w,M);
         bool mix_ok;
         if(d.kind==LayerKind::LINEAR_ATTN)
@@ -19629,8 +19803,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_tmoe_down(q,tm_view(d),rex,rwt,mh,r0,M,{});
                 }
             }else if(M>1 && M<=16 && device_can_matrix(q) && !tp_enabled() && !exact_verify &&
-                     std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM") &&
-                     std::atoi(std::getenv("GRIMOIRE_MOE_NATIVE_SMALLM"))!=0 &&
+                     moe_native_smallm_enabled() &&
                      !std::getenv("GRIMOIRE_MOE_SMALLM_PLAIN") &&
                      cfg.top_k==8 && cfg.n_experts<=1024 && 2*I<=H &&
                      d.moe.gate_up.N==cfg.n_experts*2*I && d.moe.gate_up.K==H &&

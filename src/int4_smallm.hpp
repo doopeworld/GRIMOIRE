@@ -355,6 +355,137 @@ sycl::event int4_smallm_fdq_impl(sycl::queue& q, const QuantWeight& w, const syc
     });
 }
 
+// MXFP4 (2026-11-05): libgrimoire_gemm.so's mxfp4_smallm_impl (gemm_fast.cpp) with the
+// split-K plan passed in, so gemv_decode.cpp can run it at 128 registers with the INT4
+// plan, as INT4 has since 2026-10-05.  Same values: E2M1 nibble -> fp16 bits (= value
+// * 2^-14) -> fp32 -> bf16, exact; the block's power-of-two scale 2^(e - 127 + 14)
+// multiplies each 32-K DPAS result per column.  The VNNI pairs are nibbles (k, k + 4) of
+// a payload dword, as INT4's fast dequant pairs them: one shift and one AND per pair
+// instead of five ops, and the activation tile is reordered the same way in registers
+// ([x0 x4 x1 x5 x2 x6 x3 x7] per 8 K).  Only rounding: DPAS's own, the order DPAS sums an
+// 8-K block in, and the K-slice sums (the plan).  MEASURED, tools/mx4rows_probe.cpp, M = 7,
+// weights from DRAM, library -> this (us): Qwen3.8-27B gate_up 231.2 -> 195.6, down
+// 111.8 -> 93.6, dn_qkv 73.6 -> 55.9, attn_q 84.0 -> 66.1, z 46.8 -> 36.9, o 46.0 -> 43.1,
+// lm_head 1433.6 -> 1231.7; Ornith z 15.6 -> 11.4, out 15.4 -> 12.2.  Every output within
+// 3e-7 (relative to the row maximum) of the fp32 decode GEMV.
+template <int RBN>
+sycl::event mxfp4_smallm_k_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                                float* Y, int M, int KS, int kc, int TPT,
+                                const std::vector<sycl::event>& deps) {
+    constexpr int CT = 16;
+    const int N = w.N, K = w.K;
+    const int tiles = N / CT;
+    const int groups = (tiles + TPT - 1) / TPT;
+    const uint32_t* payw = reinterpret_cast<const uint32_t*>(w.payload);
+    const uint32_t* sclw = static_cast<const uint32_t*>(w.scales);
+    const unsigned PW = unsigned(K) / 2 - 1, PH = unsigned(N) - 1, PP = unsigned(w.row_bytes) - 1;
+    const unsigned SW = unsigned(K) / 32 - 1, SP = unsigned(w.row_scales) - 1;
+    const unsigned XW = unsigned(K) * 2 - 1, XH = unsigned(M) - 1;
+    const unsigned YW = unsigned(N) * 4 - 1;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * TPT * KS, size_t(TPT) * KS),
+                       [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            es::slm_init<32 * RBN * 128 * 4>();
+            const int lid = int(it.get_local_id(0));
+            const int tw = lid / KS, ks = lid % KS;
+            const int tile = int(it.get_group(0)) * TPT + tw;
+            const bool live = tile < tiles;
+            const int n0 = (live ? tile : 0) * CT;
+            const int kb = ks * kc;
+            const int ke = kb + kc < K ? kb + kc : K;
+            constexpr auto PFH = sycl::ext::oneapi::experimental::properties{
+                es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+            es::simd<float, RBN * 128> acc = 0.0f;
+            if (live) {
+                for (int k = kb; k < ke; k += 128) {
+                    if (k + 128 < ke)
+                        es::prefetch_2d<uint32_t, 16, CT>(payw, PW, PH, PP, (k + 128) / 8, n0, PFH);
+                    es::simd<uint32_t, 8 * CT> tw0 =
+                        es::load_2d<uint32_t, 8, CT, 1, true, false>(payw, PW, PH, PP, k / 8, n0);
+                    es::simd<uint32_t, 8 * CT> tw1 =
+                        es::load_2d<uint32_t, 8, CT, 1, true, false>(payw, PW, PH, PP, k / 8 + 8, n0);
+                    es::simd<uint32_t, CT> sw = es::load_2d<uint32_t, 1, CT>(sclw, SW, PH, SP, k / 128, n0);
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const int kk = k + 32 * b;
+                        es::simd<sycl_bf16, 128> a0[RBN], a1[RBN];
+                        #pragma unroll
+                        for (int rb = 0; rb < RBN; ++rb) {
+                            es::simd<sycl_bf16, 128> n0t = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk, rb * 8);
+                            es::simd<sycl_bf16, 128> n1t = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, kk + 16, rb * 8);
+                            // [x0 x1 .. x7] -> [x0 x4 x1 x5 x2 x6 x3 x7] in every 8-K block
+                            es::simd<uint16_t, 128> s0 = n0t.template bit_cast_view<uint16_t>();
+                            es::simd<uint16_t, 128> s1 = n1t.template bit_cast_view<uint16_t>();
+                            es::simd<uint16_t, 128> d0, d1;
+                            auto sv0 = s0.template bit_cast_view<uint16_t, 16, 8>();
+                            auto sv1 = s1.template bit_cast_view<uint16_t, 16, 8>();
+                            auto dv0 = d0.template bit_cast_view<uint16_t, 16, 8>();
+                            auto dv1 = d1.template bit_cast_view<uint16_t, 16, 8>();
+                            dv0.template select<16, 1, 4, 2>(0, 0) = sv0.template select<16, 1, 4, 1>(0, 0);
+                            dv0.template select<16, 1, 4, 2>(0, 1) = sv0.template select<16, 1, 4, 1>(0, 4);
+                            dv1.template select<16, 1, 4, 2>(0, 0) = sv1.template select<16, 1, 4, 1>(0, 0);
+                            dv1.template select<16, 1, 4, 2>(0, 1) = sv1.template select<16, 1, 4, 1>(0, 4);
+                            a0[rb] = d0.template bit_cast_view<sycl_bf16>().read();
+                            a1[rb] = d1.template bit_cast_view<sycl_bf16>().read();
+                        }
+                        es::simd<uint32_t, 16> ev = (sw >> (8 * b)) & 0xFFu;
+                        es::simd<uint32_t, 16> sbits = (ev + 14u) << 23;
+                        es::simd<float, 16> sc = sbits.template bit_cast_view<float>().read();
+                        es::simd<uint32_t, 128> vb[2];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const int dw = 4 * b + j;
+                            es::simd<uint32_t, 16> wv;
+                            if (dw < 8) wv = tw0.template select<16, 1>(dw * CT);
+                            else        wv = tw1.template select<16, 1>((dw - 8) * CT);
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) {      // nibbles i and i + 4 = K 8j + i, 8j + i + 4
+                                es::simd<uint32_t, 16> u = (i ? (wv >> (4 * i)) : wv) & 0x000F000Fu;
+                                es::simd<uint32_t, 16> hb = ((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12);
+                                es::simd<sycl::half, 32> hv = hb.template bit_cast_view<sycl::half>().read();
+                                es::simd<float, 32> fv = hv;
+                                es::simd<uint32_t, 32> fb = fv.template bit_cast_view<uint32_t>().read();
+                                es::simd<uint16_t, 32> bb = fb >> 16;
+                                const int kp = 4 * j + i;
+                                vb[kp >> 3].template select<16, 1>((kp & 7) * 16) =
+                                    bb.template bit_cast_view<uint32_t>().read();
+                            }
+                        }
+                        #pragma unroll
+                        for (int rb = 0; rb < RBN; ++rb) {
+                            es::simd<float, 128> tmp = 0.0f;
+                            tmp = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                                tmp, vb[0].template bit_cast_view<sycl_bf16>().read(), a0[rb]);
+                            tmp = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                                tmp, vb[1].template bit_cast_view<sycl_bf16>().read(), a1[rb]);
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r)
+                                acc.template select<16, 1>(rb * 128 + 16 * r) +=
+                                    tmp.template select<16, 1>(16 * r) * sc;
+                        }
+                    }
+                }
+            }
+            if (KS > 1) {
+                es::slm_block_store<float, RBN * 128>(lid * RBN * 128 * 4, acc);
+                es::barrier();
+                if (ks != 0 || !live) return;
+                for (int i = 1; i < KS; ++i)
+                    acc += es::slm_block_load<float, RBN * 128>((tw * KS + i) * RBN * 128 * 4);
+            } else if (!live) {
+                return;
+            }
+            #pragma unroll
+            for (int rb = 0; rb < RBN; ++rb)
+                es::store_2d<float, 16, 8>(Y, YW, XH, YW, n0, rb * 8,
+                    es::simd<float, 128>(acc.template select<128, 1>(rb * 128)));
+        });
+    });
+}
+
 // FP8 E4M3 weights with GRIMOIRE's per-output-channel fp32 scale, the same
 // small-M contract and thread design as int4_smallm_impl (16 columns per
 // thread, transposed 2-D payload loads, the bf16 rows of X through DPAS).
