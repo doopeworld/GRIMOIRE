@@ -7,4 +7,4 @@ B=/mnt/storage/isos/grimoire-runs/bench-1022
 cd "$B" || exit 9
 until grep -qE "^V1104B_ALL_(DONE|STOP)" "$B/logs/v1104b-all.out" 2>/dev/null; do sleep 30; done
 until [ -z "$(docker ps -q)" ] && ! ls "$B"/logs/HOLD-* >/dev/null 2>&1; do sleep 10; done
-GTREE=/mnt/storage/isos/grimoire-release-1105 NCPU=26 bash "$B/run_b580_1104.sh" v1104 grimoire grimoire-default sycl vulkan
+GTREE=/mnt/storage/isos/grimoire-release-1105 NCPU=26 bash "$B/run_b580_1104.sh" v1104 grimoire sycl vulkan grimoire-default
