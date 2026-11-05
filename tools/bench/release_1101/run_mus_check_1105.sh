@@ -17,8 +17,15 @@ flock -n 9 || { echo "gpu0.lock held"; exit 75; }
 cd /mnt/storage/isos/grimoire-fuse || exit 9
 SHORT="Explain in two sentences why the sky is blue."
 h() { awk '/norms /{f=1;next} f' "$1" | grep -vE '^\s|^$|prompt=|prompt ids|greedy ids' | md5sum | cut -c1-12; }
+# third variant: the candidate's executables with v1.10.3's libgrimoire_gemm.so (Muse's INT4 prompt GEMMs live there)
+X=/mnt/storage/isos/grimoire-runs/mus-tree-1105
+rm -rf "$X"; mkdir -p "$X/bin"
+cp -P /mnt/storage/isos/grimoire-release-1105/bin/* "$X/bin/"
+cp /mnt/storage/isos/grimoire-release-1101/bin/libgrimoire_gemm.so "$X/bin/libgrimoire_gemm.so"
+cp -a /mnt/storage/isos/grimoire-release-1105/tools "$X/" 2>/dev/null
 for spec in "v1103a /mnt/storage/isos/grimoire-engine-1101" "v1103b /mnt/storage/isos/grimoire-engine-1101" \
-            "candA /mnt/storage/isos/grimoire-release-1105" "candB /mnt/storage/isos/grimoire-release-1105"; do
+            "candA /mnt/storage/isos/grimoire-release-1105" "candB /mnt/storage/isos/grimoire-release-1105" \
+            "candOldLib $X"; do
   set -- $spec
   GRIM_TREE=$2 EXTRA_ENV="" LIM=900 bash tools/g0run.sh "mus-$1" -m /models/Muse-Glimmer-30B-INT4-W4A16 --proj int4 \
     --ctx 8192 -p "$SHORT" -n 64 9>&- > /dev/null
