@@ -3947,7 +3947,19 @@ bool int4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
 sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                     float* Y, int M, const std::vector<sycl::event>& deps) {
     const bool g64 = (1 << w.int4_gshift()) == 64;
-    const SmallmPlan p = smallm_plan(w.N, w.K);
+    SmallmPlan p = smallm_plan(w.N, w.K);
+    // GRIMOIRE_I4_SMALLM16_KS=<n> (diagnostic, 2026-11-05): n K slices past 8 rows (plan sweep)
+    static const int i4_ks16 = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM16_KS");
+        return e && *e ? std::atoi(e) : 0; }();
+    if (M > 8 && i4_ks16 > 0) {
+        const int K = w.K;
+        int ks = std::min(32, i4_ks16), kc = (K + ks - 1) / ks;
+        kc = (kc + 127) / 128 * 128;
+        ks = (K + kc - 1) / kc;
+        int tpt = 1;
+        while (tpt * ks < 8 && tpt * 2 * ks <= 32) tpt *= 2;
+        p = {ks, kc, tpt};
+    }
     if (M <= 8) return g64 ? int4_smallm_impl<1, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
                            : int4_smallm_impl<1, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
     // 9..16 rows: the fast dequant M <= 8 has used since 2026-10-09 (int4_smallm_fdq_impl), two

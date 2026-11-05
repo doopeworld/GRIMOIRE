@@ -1464,6 +1464,11 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
     const int N = w.N, K = w.K, tiles = N / 16;
     // Wide outputs and long K: 4 K slices; otherwise 256-element slices.
     int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    // GRIMOIRE_I4_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices -- MXFP4's sweep found the
+    // "wide outputs: 4 slices" clause 13% slow on gate_up; the same sweep for INT4
+    static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM_KS");
+        return (e && *e) ? std::atoi(e) : 0; }();
+    if (force_ks > 0) KS = std::min(32, force_ks);
     int kc = (K + KS - 1) / KS;
     kc = (kc + 127) / 128 * 128;
     KS = (K + kc - 1) / kc;
