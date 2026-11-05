@@ -11,7 +11,7 @@ T=/mnt/storage/isos/grimoire-release-1105
 cd "$B" || exit 9
 exec >>"$B/logs/after-publish-exp-1105.out" 2>&1
 echo "AFTER_PUBLISH_EXP_START $(date +%T)"
-until [ -z "$(docker ps -q)" ] && ! ls "$B"/logs/HOLD-* >/dev/null 2>&1; do sleep 10; done
+until [ -z "$(docker ps --format "{{.Names}}" | grep -v "^grim-build-")" ] && ! ls "$B"/logs/HOLD-* >/dev/null 2>&1; do sleep 10; done
 if grep -qx I4PROBE_BUILD_PASS logs/build-i4probe-1105.out 2>/dev/null; then
   bash "$B/run_i4_sweep_1105.sh"; tail -1 logs/i4-sweep-1105.out
 fi
