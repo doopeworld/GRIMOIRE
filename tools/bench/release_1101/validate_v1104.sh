@@ -27,12 +27,15 @@ run() { # name tokenizer-dir model proj ctx env tests [benchy args]
     echo "VALIDATE_STOP $name rc=$rc"; exit 9
   fi
 }
+# 11-05: Flash-Next (CPU experts, the only CPU-sensitive row) first; then logs/V1104-CPU-QUIET-DONE lets a
+# CPU-only build start beside the GPU-bound rows.
+run r1104-img-fn        ""     "$F"  bf16   8192  "$FE" pleready,gen,benchy --pp 512 --tg 128 --concurrency 1 --runs 2
+touch logs/V1104-CPU-QUIET-DONE
 run r1104-img-q38       ""     "$Q"  int4   16384 "$S $MTP" code,conc4,benchy $BEN --concurrency 1 4 --runs 2
 run r1104-img-orn       ""     /models/Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE mxfp4 32000 "$S" ctest,conc4,seq4,benchy $BEN --concurrency 1 8 --runs 1
 run r1104-img-qg-mtp    "$QTOK" "$QG" native 16384 "$S $MTP" code,conc4,benchy $BEN --concurrency 1 4 --runs 2
 run r1104-img-og-native "$OTOK" "$OG" native 32000 "$S" ctest,conc4,seq4,benchy $BEN --concurrency 1 8 --runs 1
 run r1104-img-og-mxfp4  "$OTOK" "$OG" mxfp4  32000 "$S" ctest,conc4,seq4,benchy $BEN --concurrency 1 8 --runs 1
-run r1104-img-fn        ""     "$F"  bf16   8192  "$FE" pleready,gen,benchy --pp 512 --tg 128 --concurrency 1 --runs 2
 run r1104-opt-moe-off   "$OTOK" "$OG" native 32000 "$S GRIMOIRE_MOE_NATIVE_SMALLM=0" ctest,benchy $BEN --concurrency 1 8 --runs 1
 echo "VALIDATE_RUNS_DONE $(date +%T)"
 python3 "$B/verify_image_logs_v1104.py" "$B/logs"

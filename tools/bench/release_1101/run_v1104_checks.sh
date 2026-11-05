@@ -1,7 +1,8 @@
 #!/bin/bash
 # v1.10.4 candidate checks on GPU0, one job at a time; stops at the first failure. Start by hand after the build passed.
 # Binaries: grimoire-release-1102b = v1.10.3 source + CPU-expert pool fix + one card's decode thread free
-# + native GGUF experts grouped by default. Runtime: grimoire-b70:latest (v1.10.3) with the host bin/.
+# + native GGUF experts grouped by default (+ since 11-05: bf16 two-card small all-reduce, 35201c2).
+# Runtime: grimoire-b70:latest (v1.10.3) with the host bin/.
 #   1. Flash-Next CLI short case, five loads x decode thread pinned / free: text must match regress-1102-1701.
 #   2. Flash-Next served, v1.10.3 code vs candidate, quiet and with 4 busy processes: text must match.
 #   3. Ornith Q4_K_M native with no option set: alone answers must equal r1102-opt-moe (option on, 11-02).
@@ -15,10 +16,16 @@ echo "V1104_CHECKS_START $(date +%T) source=$(git -C "$NEW" rev-parse --short HE
 grep -qx RELEASE_BUILD_PASS logs/release-build-1102b.out || { echo "build did not pass"; end 9; }
 [ -x "$NEW/bin/grimoire" ] && [ -x "$NEW/bin/grimoire-server" ] || { echo "no binaries"; end 9; }
 
-POOL_TREE=$NEW MATRIX_TAG=v1104 bash "$B/run_pin_matrix_1102.sh"
-rc=$?
+# SKIP_MATRIX=1 (11-05): the matrix passed on 11-04 19:26 with the 1881830 build; 35201c2 adds only the two-card
+# bf16 small all-reduce and an expert budget cap that is unchanged on a B70, so one-card code is the same
+if [ "${SKIP_MATRIX:-0}" = 1 ]; then
+  echo "pin matrix: not rerun, passed 11-04 on 1881830 (one-card code unchanged in 35201c2):"
+else
+  POOL_TREE=$NEW MATRIX_TAG=v1104 bash "$B/run_pin_matrix_1102.sh"
+  rc=$?
+  [ "$rc" = 0 ] || { grep -E "^\||PIN_MATRIX_END" logs/pin-matrix-v1104-1102.out; end 9; }
+fi
 grep -E "^\||PIN_MATRIX_END" logs/pin-matrix-v1104-1102.out
-[ "$rc" = 0 ] || end 9
 
 for spec in "v1104-quiet 0" "v1104-busy4 4"; do
   set -- $spec

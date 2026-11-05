@@ -1,12 +1,12 @@
 #!/bin/bash
-# v1.10.4-rc1 = the v1.10.3 image with the two executables rebuilt from cpu-pool-late-workers-1102 (G31+G21, CPU only).
+# v1.10.4-rc1 = the v1.10.3 image with the two executables rebuilt from tp-small-bf16-1104 (= cpu-pool-late-workers-1102 + bf16 two-card small all-reduce) (G31+G21, CPU only).
 # Run only after RELEASE_BUILD_PASS and the GPU checks. Libraries, oneDNN and runtime stay v1.10.3's, byte for byte.
 set -euo pipefail
 R=/mnt/storage/isos/grimoire-release-1102b
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 C=$B/release-1104-context
 BASE=sha256:3663f7a7c5cc745b7a16ee5de8b57ba7da37f8bace87cc4ad238af3f9b761e45
-SRC=18818301be63fec3b64b49e6adef75df5c99b488
+SRC=35201c20f04edbe07a8cca1fcd04d960bda8242c
 [ "$(docker image inspect grimoire-b70:v1.10.3 --format '{{.Id}}')" = "$BASE" ]
 grep -qx RELEASE_BUILD_PASS "$B/logs/release-build-1102b.out"
 [ "$(git -C "$R" rev-parse HEAD)" = "$SRC" ]

@@ -2,8 +2,10 @@
 # Two B70s with the settings of Ian's two dual profiles, one server at a time; stops at the first failure.
 #   run_dual_1104.sh TAG CONFIG...   CONFIG = qwen (Qwen3.8-27B-FP8 tensor parallel + MTP) | fn (Flash-Next two cards)
 # Binaries: IMG=<image> HOSTBIN=0 = that image's own; HOSTBIN=1 GRIM_TREE=<tree> = a build tree's bin/.
+# DUAL_EXTRA="A=1 B=2" (11-05) is appended to the server environment of every config.
 set -u
 TAG=$1; shift
+X=${DUAL_EXTRA:+ $DUAL_EXTRA}
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 cd "$B" || exit 9
 export LOAD_MAX=${LOAD_MAX:-1500} CLIENT_CPUS=14,15
@@ -21,10 +23,10 @@ run() {
 for c in "$@"; do
   case $c in
     qwen) run "d-$TAG-qwen-tp" TP /models2/Qwen3.8-27B-FP8 fp8 16384 \
-            "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_MTP=1 GRIMOIRE_SEQ_SLOTS=8" \
+            "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_MTP=1 GRIMOIRE_SEQ_SLOTS=8$X" \
             code,conc4,benchy --pp 4096 --tg 128 --concurrency 1 4 --runs 2 ;;
     fn)   run "d-$TAG-fn-tp" TP /models2/Qwen3.8-Flash-Next-NVFP4 bf16 65536 \
-            "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_EXPERT_VRAM_PER_LAYER=170 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits GRIMOIRE_CX_STATS=1" \
+            "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_EXPERT_VRAM_PER_LAYER=170 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits GRIMOIRE_CX_STATS=1$X" \
             pleready,gen,benchy --pp 2048 --tg 128 --concurrency 1 --runs 2 ;;
     *) echo "unknown config $c"; exit 2 ;;
   esac

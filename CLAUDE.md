@@ -2,11 +2,13 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-04 ~20:25: PAUSED by Ian until he says resume; nothing runs. Read [HANDOFF-2026-11-04.md](HANDOFF-2026-11-04.md)
-first: state, branches, exact resume order. v1.10.3 is PUBLISHED; main = engine-integration-1101. The v1.10.4 candidate and the
-bf16 two-card exchange are on their own branches (gate half done). The goal, in Ian's words: "grimoire must be the fastest
-possible tool to do inference on b70 and b60 and b580 for single and dual gpu". GPU1 and the B580 (0b:00.0) are in use; corrected
-link errors are not failures. Check git history before proposing any work item (Ian, 11-04).**
+**2026-11-05 08:39: RESUMED by Ian, who is away ("do everything alone"). Read [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md)
+first: decisions taken, the queue on the Tower, next steps. v1.10.4 = 35201c2 (CPU-expert pool fix + bf16 two-card exchange),
+gate running; MXFP4 small-M verify kernel on branch mxfp4-smallm-1105 (probe: Qwen3.8 verify shapes 13-26% faster). The goal, in
+Ian's words: "grimoire must be the fastest possible tool to do inference on b70 and b60 and b580 for single and dual gpu". GPU1
+and the B580 (0b:00.0) are in use; corrected link errors are not failures. Check git history before proposing any work item.**
+
+**2026-11-04 ~20:25: PAUSED by Ian. Historical; superseded by the entry above. [HANDOFF-2026-11-04.md](HANDOFF-2026-11-04.md).**
 
 **2026-11-04 17:47: RESUMED by Ian. Historical; superseded by the entry above.**
 
