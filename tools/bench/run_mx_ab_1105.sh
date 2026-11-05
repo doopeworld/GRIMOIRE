@@ -55,6 +55,9 @@ if grep -qx MXLIB_BUILD_PASS logs/build-mxlib-1105.out; then
 else
   echo "library build failed: no M > 8 probe"
 fi
+# two cards: 4-bit FFN weights on the TP prompt wavefront (run_wave_ab_1105.sh), same binary
+bash "$B/run_wave_ab_1105.sh" > logs/wave-ab-1105.out 2>&1
+grep -E "^\||^GPTQ|WAVEAB_" logs/wave-ab-1105.out
 # INT4 prompts vs MXFP4 (11-04: Swift 2-13% behind on prompts): dequantize vs GEMM time of the prompt GEMMs,
 # GRIMOIRE_FAST_GEMM_TIMING=1 (waits after each stage: diagnosis only), CLI, the 4K regression prompt, v1.10.4 CLI
 if grep -qx RELEASE_BUILD_PASS logs/release-build-1102b.out; then
