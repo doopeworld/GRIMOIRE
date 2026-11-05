@@ -54,16 +54,19 @@ llama() { # name image
 }
 for e in "$@"; do
   case $e in
-    grimoire) if [ -n "${GTREE:-}" ]; then export GRIM_TREE=$GTREE HOSTBIN=1 IMG=grimoire-b70:latest   # a build tree's bin/
+    grimoire|grimoire-default)
+              if [ -n "${GTREE:-}" ]; then export GRIM_TREE=$GTREE HOSTBIN=1 IMG=grimoire-b70:latest   # a build tree's bin/
               else export HOSTBIN=0 IMG=grimoire-b70:v1.10.3; fi
+              # grimoire-default (11-05): no GRIMOIRE_EXPERT_VRAM_GB, the budget v1.10.4 picks (<= 60% of the card)
+              vr="GRIMOIRE_EXPERT_VRAM_GB=6"; [ "$e" = grimoire-default ] && vr=""
               LOAD_MAX=1500 CLIENT_CPUS=14,15 TOKDIR=$OTOK \
-                bash ./dual_engine_1102.sh "b5-$TAG-grimoire" B5 /models/Ornith-1.5-35B-A3B-NVFP4 mxfp4 8192 \
-                "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_TIERED_MOE=1 GRIMOIRE_EXPERT_VRAM_GB=6 GRIMOIRE_CX_STATS=1" \
-                ctest,benchy $BEN > "logs/b5-$TAG-grimoire.run" 2>&1
+                bash ./dual_engine_1102.sh "b5-$TAG-$e" B5 /models/Ornith-1.5-35B-A3B-NVFP4 mxfp4 8192 \
+                "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_TIERED_MOE=1 $vr GRIMOIRE_CX_STATS=1" \
+                ctest,benchy $BEN > "logs/b5-$TAG-$e.run" 2>&1
               rc=$?
-              grep -E "ready=|answer:|Coherence|pp512|pp2048|tg128|tiered experts|server stopped|LEFT RUNNING|STOP" "logs/b5-$TAG-grimoire.run" | cut -c1-150
-              grep -E "tiered experts|prompt attention|Device|device:" "logs/b5-$TAG-grimoire.server.log" 2>/dev/null | head -6 | cut -c1-160
-              { [ "$rc" = 0 ] && grep -q "server stopped gracefully" "logs/b5-$TAG-grimoire.run"; } || { echo "B580_STOP grimoire rc=$rc"; exit 9; } ;;
+              grep -E "ready=|answer:|Coherence|pp512|pp2048|tg128|tiered experts|server stopped|LEFT RUNNING|STOP" "logs/b5-$TAG-$e.run" | cut -c1-150
+              grep -E "tiered experts|prompt attention|Device|device:" "logs/b5-$TAG-$e.server.log" 2>/dev/null | head -6 | cut -c1-160
+              { [ "$rc" = 0 ] && grep -q "server stopped gracefully" "logs/b5-$TAG-$e.run"; } || { echo "B580_STOP $e rc=$rc"; exit 9; } ;;
     sycl)     llama "b5-$TAG-llama-sycl" ghcr.io/ggml-org/llama.cpp:server-intel ;;
     vulkan)   llama "b5-$TAG-llama-vulkan" ghcr.io/ggml-org/llama.cpp:server-vulkan ;;
     *) echo "unknown engine $e"; exit 2 ;;

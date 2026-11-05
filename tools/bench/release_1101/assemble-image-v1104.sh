@@ -48,7 +48,9 @@ m={'source_commit':output('git','-C',str(r),'rev-parse','HEAD'),
    'cpu_build':{'cpuset':'6-13','gpu_devices':[],'privileged':False},
    'default_changes':['native GGUF experts grouped for 2-16 rows (GRIMOIRE_MOE_NATIVE_SMALLM=0 restores the old path)',
                       'CPU-expert pool no longer waits for workers that did not start a job',
-                      'one card: the decode thread is not pinned (GRIMOIRE_CPU_PIN_CALLER=1 restores the pin)'],
+                      'one card: the decode thread is not pinned (GRIMOIRE_CPU_PIN_CALLER=1 restores the pin)',
+                      'two cards: bf16 partials in the decode / verify all-reduce (GRIMOIRE_TP_SMALL_BF16=0 restores fp32)',
+                      'tiered experts: default VRAM budget at most 60% of the card (a B70 keeps 16 GB)'],
    'options_default_off':['GRIMOIRE_ONEDNN_W8A8','GRIMOIRE_MTP_GPU_DRAFT']}
 (c/'build-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
 MANIFEST
