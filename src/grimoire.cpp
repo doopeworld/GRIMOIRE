@@ -21593,7 +21593,24 @@ void GrimoireScheduler::run() {
         admitted_round.clear();
         // One chunk of the oldest interleaved admission (all of it when
         // nothing is decoding); its first token goes out when it completes.
-        if (!prefilling.empty()) {
+        // GRIMOIRE_INTERLEAVE_SHARE=S (0 = off, the default; Radiance's
+        // --prefill-interleave auto:S): after a chunk that ran beside decoding
+        // sequences, decode-only steps follow for about S x the chunk's time
+        // (running means of both, at most 64; one until a decode step has been
+        // timed; none where a decode step costs more than that share), so a
+        // sequence already decoding is not held to one token group per chunk
+        // while a long prompt prefills.  Radiance (2026-11-05, Flash-Next fp8
+        // TP2, 8 sessions decoding beside 64K prompts): 12.3 -> 40.9 tokens/s a
+        // session at S=1, for ~2x the prompt's time to first token.
+        static const double il_share = [] {
+            const char* v = std::getenv("GRIMOIRE_INTERLEAVE_SHARE");
+            return v && *v ? std::min(4.0, std::max(0.0, std::atof(v))) : 0.0; }();
+        static double il_chunk_ms = 0.0, il_step_ms = 0.0;  // running means
+        static int il_owed = 0;                              // decode-only steps still owed
+        if (prefilling.empty() || active.empty()) il_owed = 0;
+        if (!prefilling.empty() && il_owed > 0) {
+            --il_owed;  // a decode-only step
+        } else if (!prefilling.empty()) {
             auto j = prefilling.front();
             if (cancelled(j)) {
                 prefilling.erase(prefilling.begin());
@@ -21601,6 +21618,8 @@ void GrimoireScheduler::run() {
             } else {
                 try {
                     const size_t total = j->prompt.size();
+                    const bool beside = !active.empty();
+                    const auto il_t0 = std::chrono::steady_clock::now();
                     do {
                         const size_t len = std::min(size_t(il_chunk), total - size_t(j->pos));
                         const std::vector<int32_t> chunk(j->prompt.begin() + j->pos,
@@ -21608,6 +21627,13 @@ void GrimoireScheduler::run() {
                         e.admit_chunk(j->slot, j->pos, chunk);
                         j->pos += int(len);
                     } while (active.empty() && size_t(j->pos) < total);
+                    if (il_share > 0.0 && beside && size_t(j->pos) < total) {
+                        const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - il_t0).count();
+                        il_chunk_ms = il_chunk_ms > 0.0 ? 0.75 * il_chunk_ms + 0.25 * ms : ms;
+                        il_owed = il_step_ms > 0.0
+                            ? std::min(64, int(il_share * il_chunk_ms / il_step_ms)) : 1;
+                    }
                     if (size_t(j->pos) == total) {
                         prefilling.erase(prefilling.begin());
                         e.admit_end(j->slot);
@@ -21704,6 +21730,10 @@ void GrimoireScheduler::run() {
             } catch (const std::exception& ex) { failed = true; err = ex.what(); }
         }
         const auto st_t1 = std::chrono::steady_clock::now();
+        if (il_share > 0.0 && !toks.empty() && !failed) {
+            const double ms = std::chrono::duration<double, std::milli>(st_t1 - st_t0).count();
+            il_step_ms = il_step_ms > 0.0 ? 0.75 * il_step_ms + 0.25 * ms : ms;
+        }
         std::vector<std::shared_ptr<SchedJob>> keep;
         for (size_t k = 0; k < active.size(); ++k) {
             auto& j = active[k];
