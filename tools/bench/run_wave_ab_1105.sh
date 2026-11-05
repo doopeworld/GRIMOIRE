@@ -23,7 +23,10 @@ X=/models2/Qwen3.8-27B-MXFP4-GRIMOIRE-MTPBF16
 run w1105-gptq-wave   "$G" int4 16384 "$Q" code,conc4,benchy --pp 4096 --tg 128 --concurrency 1 4 --runs 2 || exit 9
 run w1105-gptq-layer  "$G" int4 16384 "$Q GRIMOIRE_TP_WAVE_4BIT=0" code,conc4,benchy --pp 4096 --tg 128 --concurrency 1 4 --runs 2 || exit 9
 run w1105-mxfp4-wave  "$X" mxfp4 16384 "$Q" code,benchy --pp 4096 --tg 128 --concurrency 1 --runs 2 || exit 9
-python3 "$B/compare_ab_1105.py" "$B/logs" per-layer=w1105-gptq-layer wavefront=w1105-gptq-wave
+# 2+ users with MTP verify 14+ rows = 71,680+ floats per all-reduce, past the small (BAR) all-reduce's 65,536:
+# they take the prompt path's pipe.  Raise the limit to 64 rows of 5,120 (env only).
+run w1105-gptq-wave-sm "$G" int4 16384 "$Q GRIMOIRE_TP_SHM_CPU_MAX=327680" conc4,benchy --pp 4096 --tg 128 --concurrency 1 2 4 --runs 2 || exit 9
+python3 "$B/compare_ab_1105.py" "$B/logs" per-layer=w1105-gptq-layer wavefront=w1105-gptq-wave wave+small-max=w1105-gptq-wave-sm
 python3 "$B/compare_ab_1105.py" "$B/logs" mxfp4-two-cards=w1105-mxfp4-wave
 python3 - "$B/logs" <<'PY'
 import json, sys
