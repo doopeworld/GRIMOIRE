@@ -1,5 +1,5 @@
 #!/bin/bash
-# v1.10.5-rc1 = the v1.10.4 image with the two executables AND libgrimoire_gemm.so rebuilt from mxfp4-smallm-1105 a3f81a1
+# v1.10.5-rc1 = the v1.10.4 image with the two executables AND libgrimoire_gemm.so rebuilt from mxfp4-smallm-1105 f33c899
 # (run_release_build_v1105b.sh, grimoire-release-1105b, G31+G21, CPU only). libgrimoire_attn.so, oneDNN and the runtime
 # stay v1.10.4's (= v1.10.3's). Run only after RELEASE_BUILD_PASS and the GPU checks.
 set -euo pipefail
@@ -7,7 +7,7 @@ R=/mnt/storage/isos/grimoire-release-1105b
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 C=$B/release-1105-context
 BASE=sha256:e0101d360a04f397cd5b1731321b6cd28e9e5c48cae6d3f3e95caf5cf9fbe3ba
-SRC=a3f81a1d98365127081f22c0dd47f20c46e3d09c
+SRC=f33c899b49dfd11da6a357e9054aaedef0929edb
 [ "$(docker image inspect grimoire-b70:v1.10.4 --format '{{.Id}}')" = "$BASE" ]
 grep -qx RELEASE_BUILD_PASS "$B/logs/release-build-1105b.out"
 [ "$(git -C "$R" rev-parse HEAD)" = "$SRC" ]
@@ -55,7 +55,9 @@ m={'source_commit':output('git','-C',str(r),'rev-parse','HEAD'),
    'default_changes':['tiered experts, one card: the experts kept in system RAM are computed by the CPU pool during '
                       'decode while the GPU runs the VRAM ones (GRIMOIRE_CPU_SPLIT_DECODE=0 restores reading them over PCIe)',
                       'small-M split-K plans from the 11-05 sweeps: INT4 (MTP verify / batched decode, <= 16 rows), '
-                      'native GGUF (<= 8 rows), MXFP4 o_proj / z shapes'],
+                      'native GGUF (<= 8 rows), MXFP4 o_proj / z shapes',
+                      'server: a burst with a prompt of >= 2048 tokens waits up to 100 ms for the rest so it is admitted '
+                      'as one batch (GRIMOIRE_ADMIT_HOLD_LONG_MS=8 restores the 8 ms hold)'],
    'options_default_off':['GRIMOIRE_ONEDNN_W8A8','GRIMOIRE_MTP_GPU_DRAFT']}
 (c/'build-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
 MANIFEST
