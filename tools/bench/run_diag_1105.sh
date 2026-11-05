@@ -27,4 +27,28 @@ for spec in "g0 G0 " "tp TP " "tpar TP GRIMOIRE_TP_SMALL_AR_TIME=1"; do
   grep -E "^spec timing:" "logs/$name.server.log" | cut -c1-230
   grep -E "TP small all-reduce" "logs/$name.server.log" | tail -4 | cut -c1-240
 done
+# the grouped speculative commit (dev-1105c, 1e12ee8: candidate + one replay / rebuild launch per layer for all
+# conversations), one card, the same test as diag1105-g0: answers must equal, the commit time should drop
+if grep -qx DEV_BUILD_PASS logs/dev-build-1105c.out 2>/dev/null; then
+  for spec in "g0-grouped " "tp-grouped TP"; do
+    set -- $spec
+    name=diag1105-$1
+    echo "== $(date +%T) $name"
+    GRIM_TREE=/mnt/storage/isos/grimoire-runs/dev-1105c bash ./dual_engine_1102.sh "$name" "${2:-G0}" "$M" int4 16384 "$G" conc4 \
+      > "logs/$name.run" 2>&1
+    echo "rc=$?"; grep -E "CONC|STOP|refusing|LEFT RUNNING|server stopped" "logs/$name.run" | head -4 | cut -c1-150
+    grep -E "^spec timing:" "logs/$name.server.log" | cut -c1-230
+  done
+  python3 - "$B/logs" <<'PY'
+import json, sys
+d = sys.argv[1]
+for a, b in (('diag1105-g0', 'diag1105-g0-grouped'), ('diag1105-tp', 'diag1105-tp-grouped')):
+    try:
+        A, Bj = (json.load(open(f'{d}/{x}.conc4.json')) for x in (a, b))
+    except Exception as e:
+        print(a, b, 'no conc4 json', e); continue
+    same = sum(A[k]['text'] == Bj.get(k, {}).get('text') for k in A)
+    print(f'{a} vs {b}: identical concurrent answers {same}/{len(A)}')
+PY
+fi
 echo "DIAG_END $(date +%T)"
