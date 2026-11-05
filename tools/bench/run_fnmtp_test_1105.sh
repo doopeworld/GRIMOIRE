@@ -6,7 +6,7 @@
 #   2. speculation, the same placement: base (no MTP) vs GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=3 -- the three fixed answers
 #      compared (a batched verify sums in another order: count differences, read them), tg128 one user
 # Placement: the frozen 10-28 hits file copied to flash-next.hits.ab before every run (never the profile's file);
-# 100 experts a layer in VRAM (one card holds 112 without the head, which takes ~1.5 GB).
+# 90 experts a layer in VRAM (one card holds 112 without the head, which takes ~1.5 GB = ~19 experts a layer).
 set -u
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 T=/mnt/storage/isos/grimoire-runs/fnmtp-1105
@@ -21,7 +21,7 @@ touch logs/HOLD-fnmtp
 trap 'rm -f "$B/logs/HOLD-fnmtp"' EXIT
 export GRIM_TREE=$T HOSTBIN=1 IMG=grimoire-b70:latest LOAD_MAX=1500 CLIENT_CPUS=14,15
 F=/models2/Qwen3.8-Flash-Next-NVFP4
-E="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_EXPERT_VRAM_PER_LAYER=100 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits.ab GRIMOIRE_CX_STATS=1"
+E="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_EXPERT_VRAM_PER_LAYER=90 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits.ab GRIMOIRE_CX_STATS=1"
 run() { # name env tests [benchy]
   local name=$1 env=$2; shift 2
   cp "$PD/flash-next.hits.frozen-1028" "$PD/flash-next.hits.ab"
