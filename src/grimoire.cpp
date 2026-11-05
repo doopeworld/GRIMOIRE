@@ -19540,6 +19540,27 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     // conversation's first row of batch_conv_steps; the commit rebuilds
                     // the ring from that copy and the accepted rows' inputs.  2 launches
                     // per conversation and layer instead of 2 per row.
+                    // 11-05: every conversation in ONE launch (launch_causal_conv1d_split_groups:
+                    // the same arithmetic; it writes the commit's copy of each ring and leaves
+                    // the ring unshifted -- the commit rebuilds it).  The loop below made three
+                    // launches per conversation and layer (copy, conv, shift).
+                    // GRIMOIRE_VERIFY_CONV_GROUPED=0 = the loop.
+                    static const bool conv_grouped=[]{ const char* e=std::getenv("GRIMOIRE_VERIFY_CONV_GROUPED");
+                        return !(e&&*e=='0'); }();
+                    DnGroups cg{};
+                    bool cg_ok=conv_grouped && causal_conv1d_rows_ok(cfg.conv_kernel);
+                    for(int r=0;r<M && cg_ok;){
+                        int n=1;
+                        while(r+n<M && seqb->slot[r+n]==seqb->slot[r] &&
+                              seqb->pos[r+n]==seqb->pos[r+n-1]+1) ++n;
+                        if(cg.n==kMaxRowSlots){ cg_ok=false; break; }
+                        cg.row0[cg.n]=r; cg.nrows[cg.n]=n; cg.slot[cg.n]=seqb->slot[r]; ++cg.n;
+                        r+=n;
+                    }
+                    if(cg_ok)
+                        launch_causal_conv1d_split_groups(q,t0,d.la_conv,d.conv_base,int64_t(d.conv_slot),cg,ch,
+                            t1,t2,t3,qs,vs,batch_conv_steps+spec_coff[li],int64_t(spec_conv_elems));
+                    else
                     for(int r=0;r<M;){
                         int n=1;
                         while(r+n<M && seqb->slot[r+n]==seqb->slot[r] &&

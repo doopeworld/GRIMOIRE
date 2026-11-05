@@ -1143,6 +1143,47 @@ sycl::event launch_causal_conv1d_split_rows(sycl::queue& q, const float* x,
       });});
 }
 
+// Speculative verify, kernel width 4 (11-05): every conversation's rows in ONE launch.  Group g
+// is rows row0[g] .. row0[g] + nrows[g] - 1 of the conversation in slot[g]; its history is its
+// ring (ring_base + slot[g] * ring_stride), copied first to save_base + row0[g] * save_stride for
+// the commit's rebuild.  The ring itself is not shifted: the commit rebuilds it from that copy and
+// the accepted rows' inputs.  The kernel-4 path of launch_causal_conv1d_split_prefill per group
+// (same fma order, same SiLU): bit-identical outputs.  The per-conversation loop it replaces made
+// three launches per conversation and layer (ring copy, conv, ring shift).
+sycl::event launch_causal_conv1d_split_groups(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, const DnGroups& g,
+    int channels, float* qv, float* kv, float* vv, int qk_size, int v_size,
+    float* save_base, int64_t save_stride, const std::vector<sycl::event>& deps){
+    return q.submit([&](sycl::handler& hd){hd.depends_on(deps);
+      const DnGroups gg=g;
+      hd.parallel_for(sycl::range<2>(size_t(g.n),size_t(channels)),[=](sycl::id<2>id){
+        const int gi=int(id[0]),c=int(id[1]),ch=channels;
+        const bf16_t*w=weight+int64_t(c)*4;
+        const float w0=bf16_to_f32(w[0]),w1=bf16_to_f32(w[1]),
+                    w2=bf16_to_f32(w[2]),w3=bf16_to_f32(w[3]);
+        const float*ring=ring_base+int64_t(gg.slot[gi])*ring_stride+int64_t(c)*3;
+        float h0=ring[0],h1=ring[1],h2=ring[2];
+        const int r0=gg.row0[gi],nr=gg.nrows[gi];
+        if(save_base){
+          float*sv=save_base+int64_t(r0)*save_stride+int64_t(c)*3;
+          sv[0]=h0;sv[1]=h1;sv[2]=h2;
+        }
+        for(int t=r0;t<r0+nr;++t){
+          const float xt=x[int64_t(t)*ch+c];
+          float acc=0.0f;
+          acc=sycl::fma(h0,w0,acc);
+          acc=sycl::fma(h1,w1,acc);
+          acc=sycl::fma(h2,w2,acc);
+          acc=sycl::fma(xt,w3,acc);
+          const float y=acc/(1.0f+sycl::exp(-acc));
+          if(c<qk_size)qv[int64_t(t)*qk_size+c]=y;
+          else if(c<2*qk_size)kv[int64_t(t)*qk_size+c-qk_size]=y;
+          else vv[int64_t(t)*v_size+c-2*qk_size]=y;
+          h0=h1;h1=h2;h2=xt;
+        }
+      });});
+}
+
 sycl::event launch_causal_conv1d_split_bf16_prefill(sycl::queue& q,
     const sycl_bf16* x,const bf16_t* weight,float* ring,int channels,int kernel,
     int tokens,sycl_bf16* qv,sycl_bf16* kv,sycl_bf16* vv,int qk_size,int v_size,

@@ -1007,6 +1007,14 @@ struct DnGroups {
 };
 bool deltanet_verify_ok(const DeltaNetParams& p);
 int64_t deltanet_saved_row_floats(const DeltaNetParams& p);
+// Speculative verify, conv kernel width 4: every group's rows in one launch (group g = rows row0[g]
+// .. row0[g]+nrows[g]-1 over the ring ring_base + slot[g] * ring_stride), each ring copied first to
+// save_base + row0[g] * save_stride (null = no copy) and NOT shifted (the commit rebuilds it).
+// launch_causal_conv1d_split_prefill's kernel-4 arithmetic per group: bit-identical outputs.
+sycl::event launch_causal_conv1d_split_groups(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, const DnGroups& g,
+    int channels, float* qv, float* kv, float* vv, int qk_size, int v_size,
+    float* save_base, int64_t save_stride, const std::vector<sycl::event>& deps = {});
 sycl::event launch_deltanet_verify_rows(sycl::queue& q, const DeltaNetParams& p, const DnGroups& g,
                                         int64_t state_stride, float* saved,
                                         const std::vector<sycl::event>& deps = {});
