@@ -152,6 +152,12 @@ struct PackedWeight {
 
 // Quantize a row-major [N][K] fp32 matrix into the requested format.
 PackedWeight quantize(const float* src, int N, int K, Fmt fmt);
+// The same, with the importance of every input channel (K values, e.g. the mean
+// square of the layer's input from a llama.cpp imatrix; nullptr = none).  INT4
+// then picks each group's range by the importance-weighted reconstruction error,
+// which is the expected output error of the group (b70/imatrix.hpp).  Other
+// formats ignore it.
+PackedWeight quantize(const float* src, int N, int K, Fmt fmt, const float* importance);
 
 } // namespace b70
 #endif // B70_WEIGHTS_HPP
