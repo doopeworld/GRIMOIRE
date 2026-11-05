@@ -475,6 +475,11 @@ sycl::event native_smallm_launch_t(sycl::queue& q, const QuantWeight& w, const s
                                    float* Y, int M, const std::vector<sycl::event>& deps) {
     const int K = w.K, tiles = w.N / 16;
     int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    // GRIMOIRE_GGUF_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices -- MXFP4's sweep found this rule's
+    // "wide outputs: 4 slices" clause 13% slow on gate_up at 7 rows
+    static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_GGUF_SMALLM_KS");
+        return (e && *e) ? std::atoi(e) : 0; }();
+    if (force_ks > 0) KS = std::min(32, force_ks);
     int kc = (K + KS - 1) / KS;
     kc = (kc + 255) / 256 * 256;
     KS = (K + kc - 1) / kc;

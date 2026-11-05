@@ -15,6 +15,25 @@ until [ -z "$(docker ps -q)" ] && ! ls "$B"/logs/HOLD-* >/dev/null 2>&1; do slee
 if grep -qx I4PROBE_BUILD_PASS logs/build-i4probe-1105.out 2>/dev/null; then
   bash "$B/run_i4_sweep_1105.sh"; tail -1 logs/i4-sweep-1105.out
 fi
+# GGUF native small-M split plan (tools/bench_native_smallm; M <= 8 is the engine's 128-register kernel, its 9-16
+# rows here are a 128-register copy, not the library's)
+if grep -qx GGUFBENCH_BUILD_PASS logs/build-ggufbench-1105.out 2>/dev/null; then
+  touch "$B/logs/HOLD-gguf"
+  (
+    exec 9>/mnt/storage/isos/grimoire-runs/gpu0.lock
+    flock -n 9 || exit 75
+    cd /mnt/storage/isos/grimoire-fuse || exit 9
+    for ks in 0 1 2 4 8 12 16 20 24; do
+      ex=""; [ "$ks" != 0 ] && ex="GRIMOIRE_GGUF_SMALLM_KS=$ks"
+      echo "== GGUF KS=$ks $(date +%T)"
+      EXTRA_ENV="$ex" GRIM_TREE=/mnt/storage/isos/grimoire-mx-lib-1105 LIM=600 TAILN=100 \
+        bash tools/g0run.sh "gguf-ks$ks" /grimoire/bin/bench_native_smallm 9>&- > /dev/null
+      grep -E "M=(5|8) " "/tmp/grim-gguf-ks$ks.log" | cut -c1-120
+      grep -E "^(OK|FAIL)" "/tmp/grim-gguf-ks$ks.log"
+    done
+  )
+  rm -f "$B/logs/HOLD-gguf"
+fi
 export GRIM_TREE=$T HOSTBIN=1 IMG=grimoire-b70:latest LOAD_MAX=1500 CLIENT_CPUS=14,15
 Q="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_SEQ_SLOTS=4 GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=6 GRIMOIRE_MTP_DRAFT_VOCAB=65536 GRIMOIRE_BATCH_HOST_TIMING=1"
 for spec in "hold8 " "hold100 GRIMOIRE_ADMIT_HOLD_MS=100"; do
