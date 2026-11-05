@@ -45,4 +45,14 @@ for a, b in (('mx1105-o-old', 'mx1105-o-new'),):
         same = sum(A[k]['text'] == Bj.get(k, {}).get('text') for k in A)
         print(f'Ornith {kind}: library vs new kernel, identical answers {same}/{len(A)}')
 PY
+# MXFP4 past 8 rows (build_mxlib_1105.sh rebuilt the library with nibble pairs (k, k+4)): the same probe binary
+# against the v1.10.3 library and against the new one, before the gate gets the GPU
+until grep -qE "^MXLIB_BUILD_(PASS|FAIL)" logs/build-mxlib-1105.out 2>/dev/null; do sleep 15; done
+if grep -qx MXLIB_BUILD_PASS logs/build-mxlib-1105.out; then
+  cp /mnt/storage/isos/grimoire-mx-lib-1105/bin/mx4rows_probe /mnt/storage/isos/grimoire-mx-smallm-1105/bin/mx4rows_probe16
+  TAG=lib-new PROBE_TREE=/mnt/storage/isos/grimoire-mx-lib-1105 bash "$B/run_mx_probe_1105.sh"; tail -1 logs/mx-probe-1105-lib-new.out
+  TAG=lib-old PROBE_BIN=mx4rows_probe16 bash "$B/run_mx_probe_1105.sh"; tail -1 logs/mx-probe-1105-lib-old.out
+else
+  echo "library build failed: no M > 8 probe"
+fi
 echo "MXAB_DONE $(date +%T)"
