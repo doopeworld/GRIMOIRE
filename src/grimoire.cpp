@@ -2448,6 +2448,10 @@ struct Grimoire {
         // summed in fp32 in rank order, so both ranks keep identical bits -- the same rounding the prompt
         // path's pipelined all-reduce already uses.  The CPU-expert fold (host_add) stays fp32.
         bool small_bf16 = false;
+        // peer partial (11-05, default with bf16; GRIMOIRE_TP_SMALL_PEER=0 = the CPU sum): the CPU writes only the
+        // PEER's bf16 partial into this card's VRAM (half the bytes of the fp32 sum over the link) and a kernel
+        // adds it to this card's own partial, rounded the same way -- the same two fp32 operands, so the same bits.
+        bool small_peer = false;
         uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
     } tshm;
     bool tp_shm_setup(std::string& err);
@@ -4982,6 +4986,14 @@ bool Grimoire::tp_shm_setup(std::string& err){
             std::printf("  TP small all-reduce: %s partials, summed in fp32 in rank order "
                         "(GRIMOIRE_TP_SMALL_BF16=0 = fp32; the CPU-expert fold stays fp32)\n",
                         tshm.small_bf16?"bf16":"fp32");
+            // 11-05: with bf16 partials, the peer's partial goes into VRAM and the card adds (both ranks agree)
+            const char* pe=std::getenv("GRIMOIRE_TP_SMALL_PEER");
+            int pk=(pe&&*pe=='0')?0:1;
+            if(!tp_agree_min(pk)){err="TP small all-reduce handshake failed";return false;}
+            tshm.small_peer=tshm.small_bf16&&pk==1;
+            if(tshm.small_peer)
+                std::printf("  TP small all-reduce: the peer's bf16 partial through the BAR, added on this card "
+                            "(GRIMOIRE_TP_SMALL_PEER=0 = the CPU writes the sum)\n");
         }
     }
     if(tshm.pipe_piece){
@@ -5308,6 +5320,24 @@ static void tp_bar_sum(float* dst,const float* a,const float* b,size_t n){
             _mm_stream_ps(dst+i+8,x2); _mm_stream_ps(dst+i+12,x3);
         }
     for(;i<n;++i)dst[i]=a[i]+b[i];
+}
+
+// The peer's bf16 partial into the BAR mapping (GRIMOIRE_TP_SMALL_PEER), 64-byte lines of non-temporal
+// stores: half the bytes of tp_bar_sum_bf16's fp32 sum.  The caller fences and reads back once.
+static void tp_bar_copy16(uint16_t* dst,const uint16_t* src,size_t n){
+    size_t i=0;
+    if((reinterpret_cast<uintptr_t>(dst)&15)==0)
+        for(;i+32<=n;i+=32){
+            const __m128i x0=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i));
+            const __m128i x1=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+8));
+            const __m128i x2=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+16));
+            const __m128i x3=_mm_loadu_si128(reinterpret_cast<const __m128i*>(src+i+24));
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i),x0);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+8),x1);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+16),x2);
+            _mm_stream_si128(reinterpret_cast<__m128i*>(dst+i+24),x3);
+        }
+    for(;i<n;++i)dst[i]=src[i];
 }
 
 // tp_bar_sum for bf16 partials (GRIMOIRE_TP_SMALL_BF16): each bf16 widened exactly to fp32, then the same
@@ -5848,13 +5878,18 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     if(st){t0=clk::now();q.wait();t1=clk::now();}
     const size_t P=tshm.sp_piece, np=(elems+P-1)/P;
     float* const bar=reinterpret_cast<float*>(tshm.sb_cpu)+size_t(s&1)*tshm.small_max;
+    // GRIMOIRE_TP_SMALL_PEER (with bf16 partials): the BAR gets the peer's bf16 partial, not the fp32 sum
+    bool peer16=false;
     // bf16 partials (GRIMOIRE_TP_SMALL_BF16=1): one converting copy out, then the same pieces, flags and
     // rank-order sum as the fp32 path below.  The CPU-expert fold (host_add / pre_tag) stays fp32.
     if(tshm.small_bf16&&!host_add&&!pre_tag&&ksend_on()){
+        peer16=tshm.small_peer;
         uint16_t* const st16=reinterpret_cast<uint16_t*>(tshm.stage);
         uint16_t* const mine16=reinterpret_cast<uint16_t*>(slot(tp_rank));
         const uint16_t* const a16=reinterpret_cast<const uint16_t*>(slot(0));
         const uint16_t* const b16=reinterpret_cast<const uint16_t*>(slot(1));
+        const uint16_t* const p16=reinterpret_cast<const uint16_t*>(slot(peer));
+        uint16_t* const bar16=reinterpret_cast<uint16_t*>(bar);
         if(!kwait(ksend_bf16(dev,st16,elems),"TP small all-reduce (bf16)"))return false;
         if(st){tb=clk::now(); t_out+=std::chrono::duration<double,std::micro>(tb-t1).count();}
         for(size_t k=0;k<np;++k){
@@ -5871,7 +5906,8 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
                 }
             }
             if(st){ta=clk::now(); t_peer+=std::chrono::duration<double,std::micro>(ta-tw).count();}
-            tp_bar_sum_bf16(bar+o,a16+o,b16+o,n);
+            if(peer16)tp_bar_copy16(bar16+o,p16+o,n);     // timed as "CPU sum"
+            else tp_bar_sum_bf16(bar+o,a16+o,b16+o,n);
             if(st){tb=clk::now(); t_sum+=std::chrono::duration<double,std::micro>(tb-ta).count();}
         }
     }else{
@@ -5931,9 +5967,22 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
     }
     }   // fp32 partials
     _mm_sfence();
-    (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
+    if(peer16)(void)*reinterpret_cast<volatile const uint16_t*>(reinterpret_cast<uint16_t*>(bar)+elems-1);
+    else (void)*reinterpret_cast<volatile const float*>(bar+elems-1);   // the posted writes landed
     if(st)ta=clk::now();
-    q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
+    if(peer16){
+        // own partial rounded as ksend_bf16 rounded it for the peer, plus the peer's: the same two fp32
+        // operands on both ranks (fp32 a + b == b + a), so both cards get the same bits ("copy in" in the timer)
+        float* const d=dev;
+        const uint16_t* const pd=reinterpret_cast<const uint16_t*>(tshm.sb_dev+size_t(s&1)*tshm.small_max);
+        q.parallel_for(sycl::range<1>(elems),[=](sycl::id<1> i){
+            const uint32_t u=sycl::bit_cast<uint32_t>(d[i]);
+            const uint32_t r=(u&0x7fffffffu)>0x7f800000u?((u>>16)|0x40u):((u+0x7fffu+((u>>16)&1u))>>16);
+            d[i]=sycl::bit_cast<float>(r<<16)+sycl::bit_cast<float>(uint32_t(pd[i])<<16);
+        });
+    }else{
+        q.memcpy(dev,tshm.sb_dev+size_t(s&1)*tshm.small_max,elems*sizeof(float));
+    }
     if(st){
         q.wait();
         const auto t2=clk::now();
