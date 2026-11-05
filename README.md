@@ -8,9 +8,9 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.3**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.4**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default. Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default; **v1.10.4** (2026-11-05) makes MXFP4 speculative decoding faster (Qwen3.8-27B MXFP4 + MTP: +26% for one user), lets 4-bit models use the overlapped two-GPU prompt path (Qwen3.8-27B GPTQ on two B70s: pp4096 1,733 -> 3,093), halves the two-GPU decode exchange, and keeps Flash-Next fast on a busy machine ([details](#served-image-validation-2026-11-05-v1104)). Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -51,6 +51,17 @@ Prompt = prefill tokens/s; decode = generated tokens/s for one user (llama-bench
 | **Qwen3.8-27B + DFlash2** | FP8 + [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | tensor parallel | -- | 3,334 | 3,232 | **59.3** (126 on code) |
 | **Ornith-1.5-35B-A3B** | FP8 | pipeline 20 / 20 layers | 6,886 | -- | -- | **111** |
 | **Qwen3.8-Flash-Next** | NVFP4; 170 of 512 experts per layer in VRAM on each card | tensor + expert parallel | 1,292 | 1,474 | -- | **44.6** (42.2 after a 4K prompt) |
+
+**4-bit Qwen3.8-27B on two B70s (v1.10.4, measured 2026-11-05)** -- these fit one card, and two cards are
+now faster for a single user and for prompts (tensor parallel, MTP K=6, draft vocabulary 65,536):
+
+| Weights | pp4096 | Decode, 1 user (coding) | Decode, 4 users (total) | One B70 for comparison |
+|---|---:|---:|---:|---|
+| GPTQ-Int4 + MTP | **3,093** | 88.8 (**157.8**) | 138.6 | 2,062 / 61.6 (127.8) / 171.9 |
+| MXFP4 (GRIMOIRE's conversion) + MTP | **3,106** | 81.2 (**160.7**) | -- | 2,065 / 75.8 (122.6 with a 4,155-token prompt) / 157.8 |
+| FP8 + MTP (checkpoint too big for one card) | 3,444 | 55.6 (93.9) | 102.7 | -- |
+
+Four users still decode faster on one card than on two (the two cards exchange data 128 times per step).
 
 On two cards, MTP serves several users at once since 2026-10-28 (it drafts for up to 2 of them;
 with more, the step is a plain batched one): 1 / 2 / 4 / 8 users = 56.5 / 62.9 / 95.0 / 161.9
@@ -108,6 +119,41 @@ about the cost of one).  The BF16 GGUF gives **token-identical** output to the s
 UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (Q8_0 as `--proj int8`: 99.2%
 top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 
+### Served image validation, 2026-11-05 (v1.10.4)
+
+The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128, v1.10.3 -> v1.10.4, same
+machine and test. Concurrent decode is the total across the stated number of users. Qwen uses eight sequence slots,
+MTP K=6 and a draft vocabulary of 65,536; Ornith uses eight slots without MTP.
+
+| Checkpoint and mode | Prompt, 1 user | Decode, 1 user | Concurrent decode, total | Coding decode |
+|---|---:|---:|---:|---:|
+| Qwen3.8-27B GPTQ-Int4 + MTP | 2,062 -> 2,061 | 61.6 -> 74.3 | 171.9 -> 177.2 (4 users) | 127.8 -> 127.9 |
+| Qwen3.8-27B UD-Q4_K_XL, native + MTP | 1,969 -> 1,967 | 56.2 -> 58.1 | 143.8 -> 141.1 (4 users) | 95.5 -> 98.8 |
+| Ornith Q4_K_M, native | 7,130 -> 7,254 | 155.2 -> 155.0 | 133.8 -> **362.7** (8 users) | -- |
+| Ornith Q4_K_M, converted to MXFP4 | 8,525 -> 8,624 | 174.8 -> 175.1 | 377.7 -> 389.2 (8 users) | -- |
+| Ornith safetensors, MXFP4 | 8,633 -> 8,547 | 174.8 -> 175.1 | 377.1 -> 388.4 (8 users) | -- |
+| Qwen3.8-Flash-Next NVFP4 (new row) | pp512 181.1 | 24.35 | -- | -- |
+
+One-user tg128 cells are two-run samples (MTP acceptance varies with the text); the coding probe is the steadier
+measure. Every row passed the coherence check, both Qwen rows passed 2/2 coding and 8/8 concurrent coding answers,
+and Flash-Next's fixed answers equal the same binaries' host run.
+
+**What v1.10.4 changes** (each has a switch back to the v1.10.3 behaviour):
+
+| Change | Measured | Switch |
+|---|---|---|
+| MXFP4 MTP verify and batched decode: a faster exact dequant, a 128-register kernel for up to 8 rows, new split plans | Qwen3.8-27B MXFP4 + MTP, one B70: coding decode 101.6 -> **122.6** tok/s (4K prompt), tg128 one user +26%; kernels 13-30% faster per call | `GRIMOIRE_MX_SMALLM_256=1` (up to 8 rows) |
+| Two GPUs: 4-bit FFN weights (GPTQ / INT4, MXFP4, GGUF) on the overlapped prompt path | Qwen3.8-27B GPTQ + MTP on two B70s: pp4096 1,733 -> **3,093** | `GRIMOIRE_TP_WAVE_4BIT=0` |
+| Two GPUs: bf16 partials in the decode / verify exchange, each card adds its peer's partial | Qwen3.8-27B-FP8 + MTP on two B70s: coding 83.1 -> **93.9** tok/s, 4 users 98.0 -> 102.7, answers identical with the peer step on or off | `GRIMOIRE_TP_SMALL_BF16=0`, `GRIMOIRE_TP_SMALL_PEER=0` |
+| CPU-expert pool no longer waits for workers that are off their core; one card's decode thread stays free | Flash-Next served with 4 busy processes: 2.55 -> **16.81** tok/s, same answers | `GRIMOIRE_CPU_PIN_CALLER=1` (the pin) |
+| Native GGUF experts grouped for 2-16 rows by default (v1.10.3's opt-in) | Ornith Q4_K_M, 8 users: 133.8 -> **361.7** tok/s total | `GRIMOIRE_MOE_NATIVE_SMALLM=0` |
+| Tiered experts: default VRAM budget at most 60% of the card | a 12 GB B580 / 24 GB B60 no longer asks for 16 GB of experts; a B70 keeps 16 GB | `GRIMOIRE_EXPERT_VRAM_GB` |
+
+Speculative decoding now sums in a different order, so a few generated texts change wording where two tokens were
+nearly tied (44-case regression: 38 identical, 6 reworded and still correct). Two-GPU Flash-Next text also depends on the expert placement it has learned
+(`GRIMOIRE_EXPERT_HITS` keeps counting), so it is not reproducible across server starts; from the same placement,
+v1.10.4 with fp32 partials gives v1.10.3's answers exactly. [Detailed results](tools/bench/onednn/RESULTS-2026-11-05.md).
+
 ### Served image validation, 2026-11-02 (v1.10.3)
 
 The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128. Each cell
@@ -148,13 +194,13 @@ answers are not token-identical to the default, so treat it as a throughput opti
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.3/grimoire-b70-v1.10.3.tar.gz
-docker load < grimoire-b70-v1.10.3.tar.gz              # -> grimoire-b70:v1.10.3
-docker tag grimoire-b70:v1.10.3 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.4/grimoire-b70-v1.10.4.tar.gz
+docker load < grimoire-b70-v1.10.4.tar.gz              # -> grimoire-b70:v1.10.4
+docker tag grimoire-b70:v1.10.4 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.10.3 behaves like v1.10.2 by default and adds three opt-in speed modes
-([above](#served-image-validation-2026-11-02-v1103)). Like v1.10.2 it includes native GGUF decode
+v1.10.4 ([above](#served-image-validation-2026-11-05-v1104)) keeps v1.10.3's three opt-in speed modes
+([v1.10.3 table](#served-image-validation-2026-11-02-v1103)); native GGUF expert grouping is now on by default. Like v1.10.2 it includes native GGUF decode
 and prompt speed-ups and MTP from the GGUF file's own head, runs on the Arc Pro B70 and the Arc Pro
 B60 / Arc B580, serves MTP to several users on two GPUs, reads GGUF files, runs the FP8 checkpoint
 as fast INT8 (`--proj int8`), and ships oneAPI 2026.2, GPU driver 26.35 and oneDNN 3.14 (see the
