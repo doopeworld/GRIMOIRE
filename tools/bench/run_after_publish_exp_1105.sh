@@ -27,6 +27,17 @@ for spec in "hold8 " "hold100 GRIMOIRE_ADMIT_HOLD_MS=100"; do
   grep -c "scheduler admit batch" "logs/$name.server.log" 2>/dev/null
   grep "scheduler admit batch" "logs/$name.server.log" 2>/dev/null | head -8 | cut -c1-140
 done
+# where a speculative step's time goes now (draft / verify / commit, host wall time per step), one card, coding
+for spec in "mxfp4 /models2/Qwen3.8-27B-MXFP4-GRIMOIRE-MTPBF16 mxfp4" "swift /models2/Swift-1.5-Qwen3.8-27b-GPTQ-Int4-baked-v1-embed-int8 int4"; do
+  set -- $spec
+  name=exp1105-spect-$1
+  echo "== $(date +%T) $name"
+  CODE_LENGTHS=4000 CODE_REPEATS=1 bash ./dual_engine_1102.sh "$name" G0 "$2" "$3" 36864 \
+    "GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_SEQ_SLOTS=4 GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=6 GRIMOIRE_MTP_DRAFT_VOCAB=65536 GRIMOIRE_SPEC_TIMING=1" \
+    code > "logs/$name.run" 2>&1
+  grep -E "code\]  " "logs/$name.run" | cut -c1-150
+  grep -iE "spec.*(draft|verify)" "logs/$name.server.log" | tail -3 | cut -c1-220
+done
 G="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_SEQ_SLOTS=8 GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=6 GRIMOIRE_MTP_DRAFT_VOCAB=65536"
 for spec in "sm64k " "sm16rows GRIMOIRE_TP_SHM_CPU_MAX=81920"; do
   set -- $spec
