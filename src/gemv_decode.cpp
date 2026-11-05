@@ -1462,10 +1462,14 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
         return e && *e == '1'; }();
     if (old || M > 8) return launch_int4_smallm_wide(q, w, X, Y, M, deps);
     const int N = w.N, K = w.K, tiles = N / 16;
-    // Wide outputs and long K: 4 K slices; otherwise 256-element slices.
-    int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
-    // GRIMOIRE_I4_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices -- MXFP4's sweep found the
-    // "wide outputs: 4 slices" clause 13% slow on gate_up; the same sweep for INT4
+    // Long K: 4 K slices; ~6K-wide outputs (o / z of Qwen3.8-27B): 2; otherwise 256-element slices.
+    // MEASURED 2026-11-05, tools/i4sweep_probe.cpp (engine kernel, GPTQ-style group 128, M = 7, us,
+    // the old rule -> this): gate_up 183.6 -> 167.3 (the old "wide outputs: 4 slices" clause),
+    // o 38.5 -> 35.0, z 35.2 -> 32.9, lm_head 1191.0 -> 1165.0; down / q / dn_qkv / k-v unchanged.
+    int KS = K >= 12288 ? 4
+           : (tiles >= 256 && tiles < 600 && K >= 4096) ? 2
+           : std::min(32, std::max(1, K / 256));
+    // GRIMOIRE_I4_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM_KS");
         return (e && *e) ? std::atoi(e) : 0; }();
     if (force_ks > 0) KS = std::min(32, force_ks);
@@ -1504,7 +1508,11 @@ sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const
     // MEASURED (mx4rows_probe SWEEP, M = 7 / 4): Qwen3.8-27B gate_up 4 -> 20 slices 195.2 ->
     // 170.0 / 191.4 -> 168.6 us, lm_head 1228.8 -> 1177.6 / 1205.2 -> 1156.5, Ornith lm_head
     // 501.1 -> 490.7 / 486.6 -> 474.0; down (K = 17408) stays best at 4 (92.6 vs 102.1 at 28).
-    int KS = K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    // ~6K-wide outputs (o / z): 2 slices, o 40.3 -> 37.0 us at M = 7 (11-05 sweep, as INT4).
+    const int tiles = w.N / 16;
+    int KS = K >= 12288 ? 4
+           : (tiles >= 256 && tiles < 600 && K >= 4096) ? 2
+           : std::min(32, std::max(1, K / 256));
     if (force_ks > 0) KS = std::min(32, force_ks);
     int kc = (K + KS - 1) / KS;
     kc = (kc + 127) / 128 * 128;

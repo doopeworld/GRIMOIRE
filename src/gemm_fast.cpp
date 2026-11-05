@@ -3948,6 +3948,24 @@ sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const 
                                     float* Y, int M, const std::vector<sycl::event>& deps) {
     const bool g64 = (1 << w.int4_gshift()) == 64;
     SmallmPlan p = smallm_plan(w.N, w.K);
+    // 9..16 rows (2026-11-05): MXFP4's rule (mxfp4_smallm_impl) -- 4 K slices for the wide outputs, 2 for the
+    // ~6K-wide ones. MEASURED, tools/i4sweep_probe.cpp, M = 14 (us, smallm_plan -> this): gate_up 188.3 -> 177.2,
+    // lm_head 1259.1 -> 1194.4, dn_qkv 64.3 -> 62.0, attn_q 74.1 -> 71.8, o 42.4 -> 35.2, z 41.8 -> 35.1;
+    // down (K = 17408), k / v and K < 4096 keep smallm_plan.
+    if (M > 8) {
+        const int tiles = w.N / 16, K = w.K;
+        int ks = 0;
+        if (tiles >= 600 && K >= 4096 && K < 12288) ks = 4;
+        else if (tiles >= 256 && K >= 4096 && K < 12288) ks = 2;
+        if (ks > 0) {
+            int kc = (K + ks - 1) / ks;
+            kc = (kc + 127) / 128 * 128;
+            ks = (K + kc - 1) / kc;
+            int tpt = 1;
+            while (tpt * ks < 8 && tpt * 2 * ks <= 32) tpt *= 2;
+            p = {ks, kc, tpt};
+        }
+    }
     // GRIMOIRE_I4_SMALLM16_KS=<n> (diagnostic, 2026-11-05): n K slices past 8 rows (plan sweep)
     static const int i4_ks16 = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM16_KS");
         return e && *e ? std::atoi(e) : 0; }();

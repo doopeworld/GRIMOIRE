@@ -474,9 +474,14 @@ template <Fmt F, int RBN>
 sycl::event native_smallm_launch_t(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                    float* Y, int M, const std::vector<sycl::event>& deps) {
     const int K = w.K, tiles = w.N / 16;
-    int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
-    // GRIMOIRE_GGUF_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices -- MXFP4's sweep found this rule's
-    // "wide outputs: 4 slices" clause 13% slow on gate_up at 7 rows
+    // 2026-11-05: 256-K slices for wide outputs too, 1024-K slices for long K (was 4 for both).  MEASURED,
+    // tools/bench_native_smallm.cpp, M = 5 / 8 (us, old rule -> this): gate_up Q4_K 189.3 -> 171.1, Q5_K 236.6
+    // -> 210.2, IQ4_XS 217.6 -> 204.0; down (K = 17408) Q5_K 120.5 -> 111.8, IQ4_NL 116.4 -> 111.8, Q6_K
+    // 141.1 -> 132.5; qkv and Q8_0 ssm_out keep 256-K slices (already best).  9-16 rows (RBN 2, the library)
+    // were not measured with the shipping kernel: unchanged.
+    int KS = RBN == 1 ? (K >= 12288 ? std::max(1, K / 1024) : std::min(32, std::max(1, K / 256)))
+                      : (tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256)));
+    // GRIMOIRE_GGUF_SMALLM_KS=<n> (diagnostic): n K slices
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_GGUF_SMALLM_KS");
         return (e && *e) ? std::atoi(e) : 0; }();
     if (force_ks > 0) KS = std::min(32, force_ks);
