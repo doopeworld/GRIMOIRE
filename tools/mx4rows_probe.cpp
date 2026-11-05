@@ -271,6 +271,17 @@ int main(int argc, char** argv) {
         };
         for (int m = 0; m < MR; ++m) launch_gemv(q, ws[0], x + size_t(m) * K, yr + size_t(m) * N);
         q.wait();
+        if (std::getenv("ONLY_LIB16")) {   // the library past 8 rows only (plan sweeps: GRIMOIRE_MX_SMALLM16_KS)
+            launch_mxfp4_smallm(q, ws[0], xb, y, MR); check("library M=16 vs gemv", y, yr, MR);
+            for (int M : {12, 14, 16}) {
+                char nm[64];
+                std::snprintf(nm, sizeof nm, "library (256 GRF) M=%d", M);
+                timeit(nm, [&](const QuantWeight& w) { launch_mxfp4_smallm(q, w, xb, y, M); });
+            }
+            for (void* p : allocs) sycl::free(p, q);
+            sycl::free(x, q); sycl::free(xb, q); sycl::free(y, q); sycl::free(y2, q); sycl::free(yr, q);
+            continue;
+        }
         timeit("gemv M=1 (engine decode)", [&](const QuantWeight& w) { launch_gemv(q, w, x, y); });
         launch_mxfp4_smallm(q, ws[0], xb, y, 8); check("library M=8 vs gemv", y, yr, 8);
         launch_mxfp4_smallm(q, ws[0], xb, y, MR); check("library M=16 vs gemv", y, yr, MR);

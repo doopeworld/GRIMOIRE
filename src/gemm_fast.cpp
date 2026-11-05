@@ -3370,7 +3370,18 @@ sycl::event mxfp4_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_b
                               float* Y, int M, const std::vector<sycl::event>& deps) {
     constexpr int CT = 16;
     const int N = w.N, K = w.K;
-    const SmallmPlan p = smallm_plan(N, K);
+    SmallmPlan p = smallm_plan(N, K);
+    // GRIMOIRE_MX_SMALLM16_KS=<n> (diagnostic, 2026-11-05): n K slices (sweeps the plan of this kernel)
+    static const int mx_ks = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM16_KS");
+        return e && *e ? std::atoi(e) : 0; }();
+    if (mx_ks > 0) {
+        int ks = std::min(32, mx_ks), kc = (K + ks - 1) / ks;
+        kc = (kc + 127) / 128 * 128;
+        ks = (K + kc - 1) / kc;
+        int tpt = 1;
+        while (tpt * ks < 8 && tpt * 2 * ks <= 32) tpt *= 2;
+        p = {ks, kc, tpt};
+    }
     const int KS = p.KS, kc = p.kc, TPT = p.TPT;
     const int tiles = N / CT;
     const int groups = (tiles + TPT - 1) / TPT;
