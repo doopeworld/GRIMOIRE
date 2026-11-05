@@ -1014,6 +1014,11 @@ sycl::event launch_deltanet_verify_rows(sycl::queue& q, const DeltaNetParams& p,
 // the same arithmetic again, so the state equals the per-row loop's after those n rows.
 sycl::event launch_deltanet_replay(sycl::queue& q, const DeltaNetParams& p, const float* saved, int n,
                                    const std::vector<sycl::event>& deps = {});
+// launch_deltanet_replay for every group in one launch: group g advances p.state + slot[g] *
+// state_stride by the nrows[g] rows saved at saved + row0[g] * deltanet_saved_row_floats(p).
+sycl::event launch_deltanet_replay_groups(sycl::queue& q, const DeltaNetParams& p, const DnGroups& g,
+                                          int64_t state_stride, const float* saved,
+                                          const std::vector<sycl::event>& deps = {});
 // launch_causal_conv1d_split_prefill(tokens = 1) for `rows` rows in one
 // launch, kernel width 4 only: row r convolves x[r] over its own ring
 // (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.

@@ -10144,16 +10144,70 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     replies.assign(size_t(n),{}); consumed.assign(size_t(n),0);
     const size_t dn_n=size_t(cfg.lin_v_heads)*cfg.lin_v_dim*cfg.lin_k_dim;
     ++g_spec_batch_steps; g_spec_batch_sequences+=n;
+    std::vector<int> acc_n(size_t(n),1);
     for(int row=0;row<n;++row) {
         const int first=begin[size_t(row)], count=lengths[size_t(row)];
         int accepted=1;
         while(accepted<count && candidates[size_t(first+accepted)]==verified[size_t(first+accepted-1)])
             ++accepted;
         g_spec_batch_proposals+=count-1; g_spec_batch_accepted+=accepted-1;
+        acc_n[size_t(row)]=accepted;
+    }
+    // Several conversations (11-05): every conversation's DeltaNet replay in one launch per layer
+    // (launch_deltanet_replay_groups) and every conv ring rebuilt in one more -- the same arithmetic
+    // as the per-conversation launches below, which four users paid 96 launches each per step for.
+    // GRIMOIRE_COMMIT_GROUPED=0 = one replay and one rebuild per conversation and layer.
+    static const bool commit_grouped=[]{ const char* e=std::getenv("GRIMOIRE_COMMIT_GROUPED");
+        return !(e&&*e=='0'); }();
+    bool grouped=commit_grouped && dn_verify_fused && n>=2 && n<=kMaxRowSlots;
+    for(const auto& layer:L)
+        if((layer.dn_state&&!layer.dn_base)||(layer.conv_ring&&!layer.conv_base)) grouped=false;
+    if(grouped) {
+        DnGroups g{};
+        for(int row=0;row<n;++row) {
+            g.row0[g.n]=begin[size_t(row)]; g.nrows[g.n]=acc_n[size_t(row)]; g.slot[g.n]=slots[size_t(row)]; ++g.n;
+        }
+        size_t doff=0,coff=0,xoff=0;
+        for(auto& layer:L) {
+            if(layer.dn_state) {
+                DeltaNetParams dp{};
+                dp.state=layer.dn_base; dp.n_heads=cfg.lin_v_heads; dp.k_dim=cfg.lin_k_dim;
+                dp.v_dim=cfg.lin_v_dim; dp.n_k_heads=cfg.lin_k_heads;
+                launch_deltanet_replay_groups(q,dp,g,int64_t(layer.dn_slot),
+                    spec_dn_inputs+(doff/dn_n)*kSpecBatch*spec_dn_row_floats);
+                doff+=dn_n;
+            }
+            if(layer.conv_ring) {
+                // the per-conversation rebuild below, for every group at once
+                const int channels=2*cfg.lin_k_heads*cfg.lin_k_dim+cfg.lin_v_heads*cfg.lin_v_dim;
+                const int hist=cfg.conv_kernel-1;
+                const DnGroups gg=g;
+                float* const rbase=layer.conv_base; const size_t rslot=layer.conv_slot;
+                const float* const steps=batch_conv_steps+coff; const size_t celems=spec_conv_elems;
+                const float* const inputs0=spec_conv_inputs+xoff;
+                q.parallel_for(sycl::range<2>(size_t(g.n),size_t(channels)*hist),[=](sycl::id<2> id){
+                    const int gi=int(id[0]);
+                    const int c=int(id[1])/hist, j=int(id[1])%hist;
+                    const int first=gg.row0[gi], cnt=gg.nrows[gi];
+                    float* dst=rbase+size_t(gg.slot[gi])*rslot;
+                    const float* base=steps+size_t(first)*celems;
+                    const float* inputs=inputs0+size_t(first)*channels;
+                    if(cnt>=hist) dst[int64_t(c)*hist+j]=inputs[int64_t(cnt-hist+j)*channels+c];
+                    else if(j<hist-cnt) dst[int64_t(c)*hist+j]=base[int64_t(c)*hist+j+cnt];
+                    else dst[int64_t(c)*hist+j]=inputs[int64_t(j-(hist-cnt))*channels+c];
+                });
+                xoff+=size_t(kSpecBatch)*channels;
+                coff+=layer.conv_slot;
+            }
+        }
+    }
+    for(int row=0;row<n;++row) {
+        const int first=begin[size_t(row)];
+        const int accepted=acc_n[size_t(row)];
         bind_seq_slot(slots[size_t(row)]);
         const int last=first+accepted-1;
         size_t doff=0,coff=0,xoff=0;
-        for(auto& layer:L) {
+        if(!grouped) for(auto& layer:L) {
             if(layer.dn_state) {
                 if(dn_verify_fused) {
                     // replay this conversation's accepted rows on its (untouched) state
