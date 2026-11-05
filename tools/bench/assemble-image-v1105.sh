@@ -1,5 +1,5 @@
 #!/bin/bash
-# v1.10.5-rc1 = the v1.10.4 image with the two executables AND libgrimoire_gemm.so rebuilt from mxfp4-smallm-1105 f33c899
+# v1.10.5-rc1 = the v1.10.4 image with the two executables AND libgrimoire_gemm.so rebuilt from mxfp4-smallm-1105 9a2e424
 # (run_release_build_v1105b.sh, grimoire-release-1105b, G31+G21, CPU only). libgrimoire_attn.so, oneDNN and the runtime
 # stay v1.10.4's (= v1.10.3's). Run only after RELEASE_BUILD_PASS and the GPU checks.
 set -euo pipefail
@@ -7,7 +7,7 @@ R=/mnt/storage/isos/grimoire-release-1105b
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 C=$B/release-1105-context
 BASE=sha256:e0101d360a04f397cd5b1731321b6cd28e9e5c48cae6d3f3e95caf5cf9fbe3ba
-SRC=f33c899b49dfd11da6a357e9054aaedef0929edb
+SRC=9a2e424229a6f3034af818b9ab29444dd7f17c77
 [ "$(docker image inspect grimoire-b70:v1.10.4 --format '{{.Id}}')" = "$BASE" ]
 grep -qx RELEASE_BUILD_PASS "$B/logs/release-build-1105b.out"
 [ "$(git -C "$R" rev-parse HEAD)" = "$SRC" ]
