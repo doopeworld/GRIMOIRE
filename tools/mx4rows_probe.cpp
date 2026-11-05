@@ -282,8 +282,9 @@ int main(int argc, char** argv) {
             std::snprintf(nm, sizeof nm, "fast (128 GRF, INT4 plan) M=%d", M);
             timeit(nm, [&](const QuantWeight& w) { launch_mxfp4_smallm_fast(q, w, xb, y, M); });
         }
-        // y holds the last timed call: fast at M = 8 (every copy holds the same bytes)
-        mx_local<1>(q, ws[0], xb, y2, MR, 0); check("local DEC1 vs fast", y2, y, MR);
+        // y holds the last timed call: fast at M = 8 (every copy holds the same bytes); since
+        // 2026-11-05 the engine's fast kernel IS DEC 2
+        mx_local<2>(q, ws[0], xb, y2, MR, 0); check("local DEC2 vs fast (expect 0)", y2, y, MR);
         mx_local<2>(q, ws[0], xb, y, MR, 0); check("local DEC2 vs gemv", y, yr, MR);
         mx_local<3>(q, ws[0], xb, y, MR, 0); check("local DEC3 vs gemv", y, yr, MR);
         for (int dec = 0; dec <= 3; ++dec) {
@@ -304,10 +305,10 @@ int main(int argc, char** argv) {
                 if (pl.KS == last) continue;
                 last = pl.KS;
                 char nm[64];
-                std::snprintf(nm, sizeof nm, "DEC1 M=7 KS=%d kc=%d TPT=%d", pl.KS, pl.kc, pl.TPT);
-                timeit(nm, [&](const QuantWeight& w) { mx_local<1>(q, w, xb, y, 7, ks); });
-                std::snprintf(nm, sizeof nm, "DEC3 M=7 KS=%d kc=%d TPT=%d", pl.KS, pl.kc, pl.TPT);
-                timeit(nm, [&](const QuantWeight& w) { mx_local<3>(q, w, xb, y, 7, ks); });
+                std::snprintf(nm, sizeof nm, "DEC2 M=7 KS=%d kc=%d TPT=%d", pl.KS, pl.kc, pl.TPT);
+                timeit(nm, [&](const QuantWeight& w) { mx_local<2>(q, w, xb, y, 7, ks); });
+                std::snprintf(nm, sizeof nm, "DEC2 M=4 KS=%d kc=%d TPT=%d", pl.KS, pl.kc, pl.TPT);
+                timeit(nm, [&](const QuantWeight& w) { mx_local<2>(q, w, xb, y, 4, ks); });
             }
         }
         for (void* p : allocs) sycl::free(p, q);

@@ -1483,9 +1483,10 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 
 // MXFP4 at M <= 8 (2026-11-05): the same move INT4 made on 2026-10-05 -- the library's
 // MXFP4 small-M kernel (gemm_fast.cpp, 256 registers, KS doubled while tiles * KS < 4096)
-// built here at 128 registers with the INT4 split-K plan.  Same math, so only the order
-// of the K-slice sums changes.  GRIMOIRE_MX_SMALLM_256=1 = the library's kernel and plan.
-// GRIMOIRE_MX_SMALLM_KS=<n> (diagnostic) forces n K slices.
+// built here at 128 registers with the INT4 split-K plan, and with nibble pairs (k, k+4)
+// (mxfp4_smallm_k_impl has the numbers: Qwen3.8-27B verify shapes 6-24% faster at M = 7).
+// Same values, only summation order changes.  GRIMOIRE_MX_SMALLM_256=1 = the library's
+// kernel and plan.  GRIMOIRE_MX_SMALLM_KS=<n> (diagnostic) forces n K slices.
 sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                     float* Y, int M, const std::vector<sycl::event>& deps) {
     static const bool old = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_256");
