@@ -2,9 +2,12 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-05 13:26: PAUSED by Ian ("pause work i need the gpus") -- nothing runs; resume only when he says. v1.10.4 is
-PUBLISHED (315167c) and the five profiles run it. Read the top of [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md) for the
-resume order (B580 CPU-split build + A/B first).**
+**2026-11-05 17:15: RESUMED by Ian. 17:17 Ian: THE ARC B580 (0b:00.0, renderD131) IS ONLY FOR COMFYUI -- never run
+anything on it; GRIMOIRE work uses the two B70s only (small-card code paths are checked on gpu0 with a small expert
+budget). Queue on the Tower and next steps: top of [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md). v1.10.4 is PUBLISHED
+(315167c) and the five profiles run it.**
+
+**2026-11-05 13:26: PAUSED by Ian ("pause work i need the gpus"). Historical, superseded above.**
 
 **2026-11-05 08:39: RESUMED by Ian, who is away ("do everything alone"). Historical, superseded above.
 [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md): decisions taken, the queue on the Tower, next steps. v1.10.4 = 35201c2 (CPU-expert pool fix + bf16 two-card exchange),
