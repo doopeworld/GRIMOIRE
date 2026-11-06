@@ -54,7 +54,12 @@ static bool read_trace(const char* path, std::vector<Rec>& out) {
     return true;
 }
 
-struct Result { double ram_per_tl = 0; double swaps_per_tok = 0; long tl = 0; std::vector<long> hist; };
+struct Result {
+    double ram_per_tl = 0; double swaps_per_tok = 0; long tl = 0; std::vector<long> hist;
+    // small-M calls (kind 1: verify rows / short prompts): distinct RAM experts per layer call -- what
+    // CpuExperts::ffn_rows reads -- and the rows they served
+    double sm_union = 0; double sm_rows = 0; long sm_calls = 0;
+};
 
 // One layer's VRAM set: in[e] = resident now; pend = admitted, copy not yet committed.
 struct LayerState {
@@ -168,6 +173,7 @@ int main(int argc, char** argv) {
                 }
                 if (r.kind == 2) { ram += n; ++res.tl; ++res.hist[size_t(std::min(n, 10))]; }
             }
+            if (r.kind == 1) { res.sm_union += double(miss.size()); res.sm_rows += r.rows; ++res.sm_calls; }
             // history
             const double ci = double(s.calls++);
             for (int32_t e : r.ids) if (e >= 0 && e < E) { s.last[size_t(e)] = ci; }
@@ -213,6 +219,9 @@ int main(int argc, char** argv) {
         std::printf("%-22s RAM experts / decode token-layer %.3f  swaps / token %.1f  (%ld token-layers)  hist",
                     name, r.ram_per_tl, r.swaps_per_tok, r.tl);
         for (size_t i = 0; i < r.hist.size(); ++i) std::printf(" %ld", r.hist[i]);
+        if (r.sm_calls)
+            std::printf("  | small-M: %.2f distinct RAM experts / layer call (%.1f rows, %ld calls)",
+                        r.sm_union / double(r.sm_calls), r.sm_rows / double(r.sm_calls), r.sm_calls);
         std::printf("\n");
     };
     std::printf("NV %d, token %.1f ms, copy %.3f ms an expert\n", NV, tok_ms, copy_ms);
