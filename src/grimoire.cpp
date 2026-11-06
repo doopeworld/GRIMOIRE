@@ -1826,7 +1826,10 @@ static DevQuant upload_packed(sycl::queue& q, const PackedWeight& p) {
     d.w.payload = d.payload;
     d.w.scales  = d.scales;
     d.w.zeros   = d.zeros;
+    // od.create() plans groups of kInt4Group: a symmetric GPTQ g64 weight
+    // (int4_group_ok) or GRIMOIRE_INT4_RTN_GROUP=64 stays on our kernels.
     if (p.fmt == Fmt::INT4 && p.row_scales > 0 && !p.scales_raw.empty() &&
+        p.row_scales * kInt4Group == p.view().K &&
         p.zeros.size() == size_t(N) * p.row_scales &&
         std::all_of(p.zeros.begin(), p.zeros.end(), [](uint8_t z){ return z == 8; })) {
         std::vector<bf16_t> tr(size_t(N) * p.row_scales);
@@ -2191,6 +2194,7 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     d.w.scales  = d.scales;
     d.w.zeros   = d.zeros;
     if (p.fmt == Fmt::INT4 && p.row_scales > 0 && !p.scales_raw.empty() &&
+        p.row_scales * kInt4Group == p.view().K &&   // od.create() plans kInt4Group
         p.zeros.size() == size_t(N) * p.row_scales &&
         std::all_of(p.zeros.begin(), p.zeros.end(), [](uint8_t z){ return z == 8; })) {
         std::vector<bf16_t> tr(size_t(N) * p.row_scales);
