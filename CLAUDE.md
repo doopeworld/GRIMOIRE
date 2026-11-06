@@ -3,9 +3,9 @@
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
 **2026-11-06 02:52: the Tower has been unreachable on the LAN since 11-05 23:12. Work since then is committed LOCALLY on
-the Mac (mxfp4-smallm-1105 28d19e8 / 065aa38 / 5d92ddd / 642c037 / 9f4c4d6) and must be pushed through the Tower when
+the Mac (mxfp4-smallm-1105 28d19e8 / 065aa38 / 5d92ddd / 642c037 / 9f4c4d6 / 782cd83) and must be pushed through the Tower when
 it is back: INT4 from BF16 by a llama.cpp imatrix (+ input-norm fold, exact in bf16 since 642c037; 5d92ddd alone does
-not compile), Radiance's interleave share, a oneDNN INT4 group guard. Build 9f4c4d6. Top of
+not compile), Radiance's interleave share, a oneDNN INT4 group guard, an AutoRound accuracy variant. Build 782cd83. Top of
 [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md) has the files to copy and the two scripts to run.**
 
 **2026-11-05 17:15: RESUMED by Ian. 17:17 Ian: THE ARC B580 (0b:00.0, renderD131) IS ONLY FOR COMFYUI -- never run
