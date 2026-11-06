@@ -130,6 +130,86 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Radiance's heat engine (core/place/heat.h): every layer's heat decays by `decay` each time its
+    // routing is credited (a prompt call's credit scaled down to 512 selections); after each step, up to
+    // S swaps over the whole model: the hottest non-resident expert of ANY layer replaces the coldest
+    // resident one (so a layer may hold more or fewer than NV), only when hot >= cold * 1.25 + 1.5.
+    // The swap's copy runs on the copy engine; the expert is resident from the first call after it lands.
+    auto run_heat = [&](int S, double decay) {
+        Result res;
+        res.hist.assign(11, 0);
+        std::vector<std::vector<char>> in = stat;
+        std::vector<std::vector<double>> heat(size_t(nl), std::vector<double>(size_t(E), 0.0));
+        struct Pend { int l, e; double t; };
+        std::vector<Pend> pend;
+        double now = 0.0, copy_free = 0.0;
+        long swaps = 0, ram = 0, tokens = 0;
+        int prev_layer = 1 << 30;
+        auto heat_step = [&](double t) {
+            // candidates: non-resident, not pending; victims: resident
+            std::vector<std::pair<double, std::pair<int, int>>> hot, cold;
+            for (int l = 0; l < nl; ++l)
+                for (int e = 0; e < E; ++e) {
+                    if (in[size_t(l)][size_t(e)]) cold.push_back({heat[size_t(l)][size_t(e)], {l, e}});
+                    else if (heat[size_t(l)][size_t(e)] > 0) hot.push_back({heat[size_t(l)][size_t(e)], {l, e}});
+                }
+            for (const auto& p : pend) {
+                auto it = std::find_if(hot.begin(), hot.end(), [&](const auto& h) {
+                    return h.second.first == p.l && h.second.second == p.e; });
+                if (it != hot.end()) hot.erase(it);
+            }
+            const size_t nh = std::min<size_t>(size_t(S), hot.size()), nc = std::min<size_t>(size_t(S), cold.size());
+            std::partial_sort(hot.begin(), hot.begin() + long(nh), hot.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::partial_sort(cold.begin(), cold.begin() + long(nc), cold.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (size_t i = 0; i < nh && i < nc; ++i) {
+                if (!(hot[i].first >= cold[i].first * 1.25 + 1.5)) break;
+                in[size_t(cold[i].second.first)][size_t(cold[i].second.second)] = 0;
+                const double start = std::max(copy_free, t);
+                copy_free = start + copy_ms;
+                pend.push_back({hot[i].second.first, hot[i].second.second, copy_free});
+                ++swaps;
+            }
+        };
+        for (const auto& r : recs) {
+            if (r.layer < 0) continue;
+            if (r.layer <= prev_layer) {
+                if (prev_layer != (1 << 30)) heat_step(now + tok_ms);
+                now += tok_ms;
+                if (r.kind == 2) ++tokens;
+            }
+            prev_layer = r.layer;
+            const double t_call = now + tok_ms * r.layer / nl;
+            for (size_t j = 0; j < pend.size();) {
+                if (pend[j].t <= t_call) { in[size_t(pend[j].l)][size_t(pend[j].e)] = 1; pend.erase(pend.begin() + long(j)); }
+                else ++j;
+            }
+            auto& s_in = in[size_t(r.layer)];
+            std::vector<int> miss;
+            for (int row = 0; row < r.rows; ++row) {
+                int n = 0;
+                for (int k = 0; k < r.k; ++k) {
+                    const int e = r.ids[size_t(row) * r.k + k];
+                    if (e < 0 || e >= E || s_in[size_t(e)]) continue;
+                    ++n;
+                    if (std::find(miss.begin(), miss.end(), e) == miss.end()) miss.push_back(e);
+                }
+                if (r.kind == 2) { ram += n; ++res.tl; ++res.hist[size_t(std::min(n, 10))]; }
+            }
+            if (r.kind == 1) { res.sm_union += double(miss.size()); res.sm_rows += r.rows; ++res.sm_calls; }
+            // credit: decay the layer's plane, add this call's selections (capped at 512 in total)
+            auto& h = heat[size_t(r.layer)];
+            for (double& x : h) x *= decay;
+            const double total = double(r.ids.size());
+            const double w = total > 512.0 ? 512.0 / total : 1.0;
+            for (int32_t e : r.ids) if (e >= 0 && e < E) h[size_t(e)] += w;
+        }
+        res.ram_per_tl = res.tl ? double(ram) / double(res.tl) : 0.0;
+        res.swaps_per_tok = tokens ? double(swaps) / double(tokens) : 0.0;
+        return res;
+    };
+
     // policy: 0 static, 1 oracle, 2 lru, 3 lfu
     auto run = [&](int pol, int B, double g) {
         Result res;
@@ -236,6 +316,11 @@ int main(int argc, char** argv) {
         char n[64];
         std::snprintf(n, sizeof n, "lfu B=%d g=%.3f", B, g);
         show(n, run(3, B, g));
+    }
+    for (int S : {16, 32, 64}) {
+        char n[64];
+        std::snprintf(n, sizeof n, "heat S=%d (Radiance)", S);
+        show(n, run_heat(S, 0.95));
     }
     return 0;
 }
