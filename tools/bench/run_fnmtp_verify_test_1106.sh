@@ -12,6 +12,10 @@
 #   6. k3-dv      + GRIMOIRE_MTP_DRAFT_VOCAB=65536                 gen + benchy
 #   7. k3-cx0     + GRIMOIRE_CX_ROWS=0 (a pool call per row)      benchy
 # Placement: the frozen 10-28 hits file copied to flash-next.hits.ab before every run (never the profile's file).
+# Runs 1 and 2 also write GRIMOIRE_ROUTE_TRACE (every MoE call's expert ids, ~1 KB a token) to
+# $PD/route-fnv1106-{base,k3}.bin; bin/route_sim replays them at the end: RAM experts per decode token and layer
+# for today's placement (the frozen hits, 120 a layer), the hindsight placement and caches that follow the
+# routing (NInfer-Offload v0.4.0: +41-57% decode on Flash-Next from such a cache) -- before writing one.
 set -u
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 T=/mnt/storage/isos/grimoire-runs/fnmtp-verify-1106
@@ -57,12 +61,22 @@ for k in b:
 PY
 }
 BENCHY="benchy --pp 512 --tg 128 --concurrency 1 --runs 2"
-run fnv1106-base "" pleready,gen,$BENCHY
-run fnv1106-k3 "$K3" pleready,gen,$BENCHY; cmp_gen fnv1106-k3
+rm -f "$PD"/route-fnv1106-base.bin "$PD"/route-fnv1106-k3.bin
+run fnv1106-base "GRIMOIRE_ROUTE_TRACE=/models/grimoire-ple/route-fnv1106-base.bin" pleready,gen,$BENCHY
+run fnv1106-k3 "$K3 GRIMOIRE_ROUTE_TRACE=/models/grimoire-ple/route-fnv1106-k3.bin" pleready,gen,$BENCHY
+cmp_gen fnv1106-k3
 run fnv1106-k3-time "$K3 GRIMOIRE_SPEC_TIME=1" pleready,gen; cmp_gen fnv1106-k3-time
 run fnv1106-k3-old "$K3 GRIMOIRE_SPEC_TIME=1 GRIMOIRE_Q4_VERIFY_SMALLM=0" pleready,gen; cmp_gen fnv1106-k3-old
 run fnv1106-k3-q4t "$K3 GRIMOIRE_SPEC_TIME=1 GRIMOIRE_Q4_TIMING=1" pleready,gen
 run fnv1106-k3-dv "$K3 GRIMOIRE_MTP_DRAFT_VOCAB=65536" pleready,gen,$BENCHY; cmp_gen fnv1106-k3-dv
 run fnv1106-k3-cx0 "$K3 GRIMOIRE_CX_ROWS=0" pleready,$BENCHY
 cp "$PD/flash-next.hits.frozen-1028" "$PD/flash-next.hits.ab"
+echo "== $(date +%T) expert placement replay (CPU only)"
+for n in base k3; do
+  [ -s "$PD/route-fnv1106-$n.bin" ] || { echo "  no trace for $n"; continue; }
+  docker run --rm --name grim-routesim-1106 --network none --cpuset-cpus 6-13 -e N="$n" -v "$T":/grimoire \
+    -v "$PD":/ple:ro -w /grimoire grimoire-dev:latest bash -lc '
+      set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+      ./bin/route_sim "/ple/route-fnv1106-$N.bin" 120 /ple/flash-next.hits.frozen-1028 22' 2>&1 | sed "s/^/  $n: /"
+done
 echo "FNV_TEST_END $(date +%T)"

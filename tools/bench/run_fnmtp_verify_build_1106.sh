@@ -26,6 +26,7 @@ docker run --rm --name grim-build-fnv-1106 --cpuset-cpus "$CPUS" -v "$X":/grimoi
     icpx -fsycl -O2 -std=c++20 -I include tools/test_cpu_ffn_rows.cpp src/cpu_experts.cpp -lpthread \
       -o bin/test_cpu_ffn_rows
     ./bin/test_cpu_ffn_rows 6 5
+    icpx -O2 -std=c++17 tools/route_sim.cpp -o bin/route_sim
     icpx -fsycl -fsycl-targets=intel_gpu_bmg_g31 -O3 -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno \
       -fsycl-device-code-split=off -Wmisleading-indentation -I include -I src \
       tools/grimoire_server.cpp src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp \

@@ -3868,6 +3868,9 @@ struct Grimoire {
     bool tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int32_t* rex,
                              const float* rwt, float* mh, float* out, int M,
                              const std::function<void()>& gpu_more = {});
+    // GRIMOIRE_ROUTE_TRACE=<file>: append one MoE call's routes (kind 0 prompt, 1 small-M
+    // prompt / verify, 2 decode) for offline placement studies; nothing when unset.
+    void route_trace(const LayerDev& d, int kind, const int32_t* ids, int M);
     // PLE from the file: rows for positions [p0, p0+M) into ple_stage.
     bool ple_fetch_rows(const LayerDev& d, int p0, int M);
     TieredMoeView tm_view(const LayerDev& d) const {
@@ -12887,6 +12890,25 @@ void Grimoire::tm_save_hits() {
     ::close(fd);
 }
 
+// GRIMOIRE_ROUTE_TRACE=<file> (diagnosis): every tiered MoE call whose routes reach the host
+// appends int32 {layer index (-1 = not a backbone layer), rows, top_k, kind} and rows x top_k
+// int32 expert ids -- the order in which the experts were asked for, which the hits file
+// (counts only) cannot give.  Megatron TP ranks route alike: rank 0 writes.  Flushed once per
+// decode token (at the last layer) and after every prompt call.
+void Grimoire::route_trace(const LayerDev& d, int kind, const int32_t* ids, int M) {
+    static FILE* f = [] {
+        const char* p = std::getenv("GRIMOIRE_ROUTE_TRACE");
+        return p && *p ? std::fopen(p, "ab") : nullptr;
+    }();
+    if (!f || M <= 0 || (tp_ranked() && tp_rank != 0)) return;
+    const auto a = reinterpret_cast<uintptr_t>(&d), b = reinterpret_cast<uintptr_t>(L.data());
+    const int li = a >= b && a < b + L.size() * sizeof(LayerDev) ? int((a - b) / sizeof(LayerDev)) : -1;
+    const int32_t hdr[4] = {li, M, cfg.top_k, kind};
+    std::fwrite(hdr, sizeof(hdr), 1, f);
+    std::fwrite(ids, sizeof(int32_t), size_t(M) * size_t(cfg.top_k), f);
+    if (kind != 2 || li == int(L.size()) - 1) std::fflush(f);
+}
+
 const float* Grimoire::forward_qwen4_exp(int token) {
     const b70::ScopedCpuPin cx_pin(cx_caller_cpu);      // see the CPU experts' start
     power_gov_tick();
@@ -13414,6 +13436,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                 tld(i, ".arsend");
                 if (cx_tag) { if (!kwait(cx_tag, "CPU experts route")) return nullptr; }
                 else cx_ready.wait();
+                route_trace(d, 2, cx_route, 1);
                 const auto t0 = std::chrono::steady_clock::now();
                 const uint8_t* blk[64]; float wt[64]; int n = 0;
                 for (int k = 0; k < cfg.top_k && n < 64; ++k) {
@@ -16931,6 +16954,7 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
     std::vector<int32_t> hex(R), hp(R), hi(R);
     std::vector<int> count(size_t(E), 0), off(size_t(E), 0);
     q.memcpy(hex.data(), rex, R * sizeof(int32_t)).wait();
+    route_trace(d, 0, hex.data(), M);
     for (size_t r = 0; r < R; ++r) {
         const int e = hex[r];
         if (e < 0 || e >= E) { std::fprintf(stderr, "tiered MoE: bad route %d\n", e); return false; }
@@ -17133,6 +17157,7 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
     // queued here as a decode step queues it), landing in `out` before their partial
     if (gpu_more) gpu_more();
     ready.wait();
+    route_trace(d, 1, px_route, M);
     const auto t0 = std::chrono::steady_clock::now();
     // 11-06: every row's RAM experts in ONE pool call (CpuExperts::ffn_rows, the same sums
     // bit for bit; an expert two rows share is read once).  GRIMOIRE_CX_ROWS=0 = a call per row.
