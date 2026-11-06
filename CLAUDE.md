@@ -2,7 +2,13 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-11-06 04:40: the Tower has been unreachable on the LAN since 11-05 23:12. Work since then is committed LOCALLY on
+**2026-11-06 20:50 (Mac): Radiance port on branch radiance-heat-1106 (f2a98b7, GitHub): heat engine on by default on
+one card (+17.6% Flash-Next decode, interleaved pairs), expert fill (free VRAM -> more experts; 180/layer + heat 58.0
+tok/s vs 44.9 at the profile's shape), GQA DFlash2 drafter attention (identical drafts, draft 9.3 -> 8.2 ms). Release
+candidate v1.10.5-rc2 building on the Tower; gate = run_v1106_all.sh. Top of [HANDOFF-2026-11-05.md](HANDOFF-2026-11-05.md).
+The B580 is ComfyUI's only; gpu1 at Gen3 x4 (corrected errors are not failures).**
+
+**2026-11-06 04:40 (historical): the Tower has been unreachable on the LAN since 11-05 23:12. Work since then is committed LOCALLY on
 the Mac (mxfp4-smallm-1105 28d19e8 / 065aa38 / 5d92ddd / 642c037 / 9f4c4d6 / 782cd83 / 437bbff / ff77f2b) and must be pushed through the Tower when
 it is back: INT4 from BF16 by a llama.cpp imatrix (+ input-norm fold, exact in bf16 since 642c037; 5d92ddd alone does
 not compile), Radiance's interleave share, a oneDNN INT4 group guard, an AutoRound accuracy variant, a one-card MTP-vs-DFlash2 A/B, a Flash-Next expert-imbalance measurement. Build ff77f2b. Top of
