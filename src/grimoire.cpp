@@ -3896,6 +3896,7 @@ struct Grimoire {
     // the heat engine (members above tm_heat): set up after the last tiered layer, credit one call's
     // routes, move at a step boundary, give everything back before the pools go
     size_t tm_heat_init();                      // -> the VRAM it took
+    bool heat_allowed() const;                  // one rank, or GRIMOIRE_EXPERT_HEAT_TP=1
     void tm_heat_credit(const LayerDev& d, const int32_t* ids, size_t n);
     void tm_heat_issue(int n);
     void tm_heat_step();
@@ -16822,7 +16823,8 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         {
             const char* hv = std::getenv("GRIMOIRE_EXPERT_HEAT");
             const size_t dup_need = size_t(Eown) * lay.bytes * size_t(moe_layers);
-            tm_dup = hv && std::atoi(hv) > 0 && nv > 0 && nv < Eown && dup_need + (size_t(8) << 30) <= avail;
+            tm_dup = hv && std::atoi(hv) > 0 && heat_allowed() && nv > 0 && nv < Eown &&
+                     dup_need + (size_t(8) << 30) <= avail;
             if (tm_dup) host_need = dup_need;
         }
         std::printf("  tiered experts: %d layers x %d%s, %.2f MB each -- %d/layer in VRAM "
@@ -17276,10 +17278,25 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
 //     held up every small device -> host transfer of the decode step: decode 42 -> 39 tok/s, at S = 8 49.
 // Copies are issued a few at a time as the step's routed layers run (tm_heat_per_call per call), never all
 // at once at its start, so a copy queue never holds more than ~a layer's time of work.
+// Several ranks: off unless GRIMOIRE_EXPERT_HEAT_TP=1.  MEASURED 11-06 (two B70s, Megatron TP, Flash-Next INT8,
+// 170 a layer, gpu1 at Gen3 x4): S=8 halved the CPU experts (14.4 -> 7.2 calls a token) yet decode fell 52.9 ->
+// 43.1 tok/s and MTP 41.6 -> 38.1 -- two cards already find ~94% of routes in VRAM, and the expert copies share
+// the host -> device direction with the all-reduce's writes into VRAM (~0.8 ms a copy over a Gen3 x4 link).
+bool Grimoire::heat_allowed() const {
+    if (!tp_ranked() && !pp_enabled()) return true;
+    const char* f = std::getenv("GRIMOIRE_EXPERT_HEAT_TP");
+    return f && *f == '1';
+}
+
 size_t Grimoire::tm_heat_init() {
     const char* v = std::getenv("GRIMOIRE_EXPERT_HEAT");
     const int S = v && *v ? std::max(0, std::atoi(v)) : 0;
     if (S <= 0 || !tm_any || !cpu_moe || tm_heat_moves > 0) return 0;
+    if (!heat_allowed()) {
+        std::printf("  expert heat engine: off with several ranks (11-06, two B70s: decode 52.9 -> 43.1 tok/s with it; "
+                    "GRIMOIRE_EXPERT_HEAT_TP=1 forces it)\n");
+        return 0;
+    }
     int routed_layers = 0;
     bool any_host = false;
     for (const auto& d : L) {
@@ -17702,6 +17719,21 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         if (vsm && hc_fused_env && hc.down.w.fmt == Fmt::BF16 && hc.up.w.fmt == Fmt::BF16 &&
             hc.down.w.payload && hc.up.w.payload && LR % 8 == 0 && WIDE % 8 == 0 &&
             (!want_inj || (hc.inject.w.fmt == Fmt::BF16 && hc.inject.w.payload))) {
+            // 11-06: the three kernels over all the rows at once -- each mix weight read once, not once a
+            // row (~13 MB a mix, 96 mixes), 3 launches instead of 3 x MR; every row bit for bit as below.
+            // GRIMOIRE_HC_ROWS=0 = row by row.
+            static const bool hc_rows_env = [] { const char* e = std::getenv("GRIMOIRE_HC_ROWS");
+                return !(e && *e == '0'); }();
+            if (hc_rows_env && MR > 1 && MR <= 8) {
+                launch_hc_combine_norm_rows(q, HY, pblk, pblk && pin ? pin : nullptr, hc.norm, normed,
+                                            MR, HC, H, eps, none);
+                launch_hc_down_inject_rows(q, reinterpret_cast<const bf16_t*>(hc.down.w.payload),
+                    want_inj ? reinterpret_cast<const bf16_t*>(hc.inject.w.payload) : nullptr,
+                    normed, lora, want_inj ? inj_out : nullptr, MR, LR, HC, WIDE, none);
+                launch_hc_up_mean_rows(q, reinterpret_cast<const bf16_t*>(hc.up.w.payload), lora, normed,
+                                       block_out, MR, HC, H, LR, none);
+                return;
+            }
             for (int r = 0; r < MR; ++r) {
                 float* nr = normed + size_t(r) * WIDE;
                 float* lr = lora + size_t(r) * LR;

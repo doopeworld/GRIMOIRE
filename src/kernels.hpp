@@ -621,6 +621,18 @@ sycl::event launch_hc_down_inject1(sycl::queue& q, const bf16_t* down, const bf1
 sycl::event launch_hc_up_mean1(sycl::queue& q, const bf16_t* up, const float* lora,
     const float* normed, float* block, int hc_count, int hidden, int lowrank,
     const std::vector<sycl::event>& deps = {});
+// The same three over `rows` tokens at once (an MTP verify's rows): each weight row read once for all of
+// them, 3 launches instead of 3 x rows; a row's result is bit for bit the one-token kernels'.  More than 8
+// rows (or GRIMOIRE_HC_SGROW) run the one-token kernels row by row.
+sycl::event launch_hc_combine_norm_rows(sycl::queue& q, float* hyper, const float* pend,
+    const float* pinj, const bf16_t* w, float* normed, int rows, int hc_count, int hidden,
+    float eps, const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_down_inject_rows(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+    const float* normed, float* lora, float* inj, int rows, int lowrank, int hc_count, int wide,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_up_mean_rows(sycl::queue& q, const bf16_t* up, const float* lora,
+    const float* normed, float* block, int rows, int hc_count, int hidden, int lowrank,
+    const std::vector<sycl::event>& deps = {});
 // The kernels B and C were before 10-27 (one sub-group per output row, one
 // dot at a time): GRIMOIRE_HC_SGROW=1 selects them, GRIMOIRE_HC_CHECK=1
 // compares the two.

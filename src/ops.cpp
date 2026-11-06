@@ -2656,6 +2656,248 @@ sycl::event launch_hc_up_mean1_sg(sycl::queue& q, const bf16_t* up, const float*
     });
 }
 
+// ---------------------------------------------------------------------
+// The fused mix over `rows` tokens at once (an MTP verify's candidate rows, 11-06): A, B and C above with a row
+// dimension.  A row's arithmetic is the one-token kernels' exactly -- the same lane walks the same k in the same
+// order into its own accumulator, the same group reductions -- so each row gets bit for bit what launch_hc_*1
+// gives it.  What changes: B and C read every weight row ONCE for all rows (a mix's down + up weights are ~13 MB
+// in BF16, so a 4-row verify step re-read ~5 GB of them row by row), and 3 launches replace 3 x rows (1,152 a
+// Flash-Next verify step at 4 rows).  Rows beyond kHcRowsMax fall back to the one-token kernels row by row.
+// ---------------------------------------------------------------------
+namespace {
+constexpr int kHcRowsMax = 8;
+}
+
+// A over rows: one work-group per (row, stream).
+sycl::event launch_hc_combine_norm_rows(sycl::queue& q, float* hyper, const float* pend, const float* pinj,
+                                        const bf16_t* w, float* normed, int rows, int hc_count, int hidden,
+                                        float eps, const std::vector<sycl::event>& deps) {
+    constexpr int WG = 256;
+    constexpr int MAXE = 16;
+    static const bool regs_env = [] { const char* e = std::getenv("GRIMOIRE_HC_NORM_REGS");
+        return !(e && *e == '0'); }();
+    const int64_t wide = int64_t(hc_count) * hidden;
+    if (regs_env && hidden % WG == 0 && hidden / WG <= MAXE) {
+        const int per = hidden / WG;
+        return q.submit([&](sycl::handler& h) {
+            h.depends_on(deps);
+            h.parallel_for(sycl::nd_range<1>(size_t(rows) * hc_count * WG, WG), [=](sycl::nd_item<1> it) {
+                const int g = int(it.get_group(0)), lane = int(it.get_local_id(0));
+                const int row = g / hc_count, c = g % hc_count;
+                float* x = hyper + row * wide + int64_t(c) * hidden;
+                const float* pe = pend ? pend + int64_t(row) * hidden : nullptr;
+                const float* pi = pend && pinj ? pinj + int64_t(row) * hc_count : nullptr;
+                float z = 0.0f;
+                if (pe) z = pi ? 2.0f / (1.0f + sycl::exp(-(pi[c] / float(hc_count)))) : 1.0f;
+                float v[MAXE];
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) v[j] = x[lane + j * WG];
+                if (pe) {
+                    float p[MAXE];
+                    #pragma unroll
+                    for (int j = 0; j < MAXE; ++j) if (j < per) p[j] = pe[lane + j * WG];
+                    #pragma unroll
+                    for (int j = 0; j < MAXE; ++j) if (j < per) { v[j] += p[j] * z; x[lane + j * WG] = v[j]; }
+                }
+                float acc = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) acc += v[j] * v[j];
+                acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                const float inv = sycl::rsqrt(acc / float(hidden) + eps);
+                const bf16_t* ws = w + int64_t(c) * hidden;
+                float* o = normed + row * wide + int64_t(c) * hidden;
+                float wv[MAXE];
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) wv[j] = bf16_to_f32(ws[lane + j * WG]);
+                #pragma unroll
+                for (int j = 0; j < MAXE; ++j) if (j < per) o[lane + j * WG] = v[j] * inv * (1.0f + wv[j]);
+            });
+        });
+    }
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * hc_count * WG, WG), [=](sycl::nd_item<1> it) {
+            const int g = int(it.get_group(0)), lane = int(it.get_local_id(0));
+            const int row = g / hc_count, c = g % hc_count;
+            float* x = hyper + row * wide + int64_t(c) * hidden;
+            const float* pe = pend ? pend + int64_t(row) * hidden : nullptr;
+            const float* pi = pend && pinj ? pinj + int64_t(row) * hc_count : nullptr;
+            float z = 0.0f;
+            if (pe) z = pi ? 2.0f / (1.0f + sycl::exp(-(pi[c] / float(hc_count)))) : 1.0f;
+            float acc = 0.0f;
+            for (int i = lane; i < hidden; i += WG) {
+                float v = x[i];
+                if (pe) { v += pe[i] * z; x[i] = v; }
+                acc += v * v;
+            }
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            const float inv = sycl::rsqrt(acc / float(hidden) + eps);
+            const bf16_t* ws = w + int64_t(c) * hidden;
+            float* o = normed + row * wide + int64_t(c) * hidden;
+            for (int i = lane; i < hidden; i += WG)
+                o[i] = x[i] * inv * (1.0f + bf16_to_f32(ws[i]));
+        });
+    });
+}
+
+// B over rows: one work-group per output row; each weight row is read once and dotted with every row's normed.
+sycl::event launch_hc_down_inject_rows(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+                                       const float* normed, float* lora, float* inj, int rows,
+                                       int lowrank, int hc_count, int wide,
+                                       const std::vector<sycl::event>& deps) {
+    static const bool sgrow = std::getenv("GRIMOIRE_HC_SGROW") != nullptr;
+    if (sgrow || rows > kHcRowsMax) {
+        sycl::event e;
+        for (int m = 0; m < rows; ++m)
+            e = launch_hc_down_inject1(q, down, inj_w, normed + int64_t(m) * wide, lora + int64_t(m) * lowrank,
+                                       inj ? inj + int64_t(m) * hc_count : nullptr, lowrank, hc_count, wide,
+                                       m == 0 ? deps : std::vector<sycl::event>{});
+        return e;
+    }
+    const int nout = lowrank + (inj_w ? hc_count : 0);
+    constexpr int WG = WG_SUBGROUPS * SG_SIZE, STEP = WG * 8;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(nout) * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int r = int(it.get_group(0)), lid = int(it.get_local_id(0));
+                const bool is_inj = r >= lowrank;
+                const bf16_t* row = is_inj ? inj_w + int64_t(r - lowrank) * wide
+                                           : down + int64_t(r) * wide;
+                auto dot8 = [&](const sycl::uint4 v, const float* nm, int k, float acc) {
+                    const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(nm + k);
+                    const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(nm + k + 4);
+                    const float xv[8] = {x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]};
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint32_t u = v[j];
+                        acc = sycl::fma(sycl::bit_cast<float>(u << 16), xv[2 * j], acc);
+                        acc = sycl::fma(sycl::bit_cast<float>(u & 0xFFFF0000u), xv[2 * j + 1], acc);
+                    }
+                    return acc;
+                };
+                float a0[kHcRowsMax], a1[kHcRowsMax];
+                #pragma unroll
+                for (int m = 0; m < kHcRowsMax; ++m) { a0[m] = 0.0f; a1[m] = 0.0f; }
+                int k = lid * 8;
+                for (; k + STEP < wide; k += 2 * STEP) {
+                    const sycl::uint4 v0 = *reinterpret_cast<const sycl::uint4*>(row + k);
+                    const sycl::uint4 v1 = *reinterpret_cast<const sycl::uint4*>(row + k + STEP);
+                    #pragma unroll
+                    for (int m = 0; m < kHcRowsMax; ++m) {
+                        if (m < rows) {
+                            const float* nm = normed + int64_t(m) * wide;
+                            a0[m] = dot8(v0, nm, k, a0[m]);
+                            a1[m] = dot8(v1, nm, k + STEP, a1[m]);
+                        }
+                    }
+                }
+                if (k < wide) {
+                    const sycl::uint4 v0 = *reinterpret_cast<const sycl::uint4*>(row + k);
+                    #pragma unroll
+                    for (int m = 0; m < kHcRowsMax; ++m)
+                        if (m < rows) a0[m] = dot8(v0, normed + int64_t(m) * wide, k, a0[m]);
+                }
+                #pragma unroll
+                for (int m = 0; m < kHcRowsMax; ++m) {
+                    if (m < rows) {
+                        const float d = sycl::reduce_over_group(it.get_group(), a0[m] + a1[m], sycl::plus<float>());
+                        if (lid == 0) {
+                            if (is_inj) inj[int64_t(m) * hc_count + (r - lowrank)] = d;
+                            else {
+                                const float v = d / float(hc_count);
+                                lora[int64_t(m) * lowrank + r] = v / (1.0f + sycl::exp(-v));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// C over rows: one sub-group per h; every row's lora in SLM; the hc_count up rows of h are read once for all rows.
+namespace {
+template <int HCN>
+sycl::event hc_up_mean_rows_t(sycl::queue& q, const bf16_t* up, const float* lora, const float* normed,
+                              float* block, int rows, int hidden, int lowrank,
+                              const std::vector<sycl::event>& deps) {
+    const int groups = (hidden + WG_SUBGROUPS - 1) / WG_SUBGROUPS;
+    const int64_t wide = int64_t(HCN) * hidden;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> sl(size_t(rows) * size_t(lowrank), h);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * WG_SUBGROUPS * SG_SIZE,
+                                         size_t(WG_SUBGROUPS) * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int lid = int(it.get_local_id(0));
+                for (int i = lid; i < rows * lowrank; i += WG_SUBGROUPS * SG_SIZE) sl[i] = lora[i];
+                sycl::group_barrier(it.get_group());
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int hh = int(it.get_group(0)) * WG_SUBGROUPS + int(sg.get_group_id()[0]);
+                if (hh >= hidden) return;
+                const float* ls = sl.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float acc[kHcRowsMax][HCN];
+                #pragma unroll
+                for (int m = 0; m < kHcRowsMax; ++m) {
+                    #pragma unroll
+                    for (int c = 0; c < HCN; ++c) acc[m][c] = 0.0f;
+                }
+                for (int k = lane * 8; k < lowrank; k += SG_SIZE * 8) {
+                    sycl::uint4 v[HCN];
+                    #pragma unroll
+                    for (int c = 0; c < HCN; ++c)
+                        v[c] = *reinterpret_cast<const sycl::uint4*>(
+                            up + (int64_t(c) * hidden + hh) * lowrank + k);
+                    #pragma unroll
+                    for (int m = 0; m < kHcRowsMax; ++m) {
+                        if (m < rows) {
+                            const float* lm = ls + int64_t(m) * lowrank;
+                            #pragma unroll
+                            for (int c = 0; c < HCN; ++c) {
+                                #pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    const uint32_t u = v[c][j];
+                                    acc[m][c] = sycl::fma(sycl::bit_cast<float>(u << 16), lm[k + 2 * j], acc[m][c]);
+                                    acc[m][c] = sycl::fma(sycl::bit_cast<float>(u & 0xFFFF0000u), lm[k + 2 * j + 1],
+                                                          acc[m][c]);
+                                }
+                            }
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int m = 0; m < kHcRowsMax; ++m) {
+                    if (m < rows) {
+                        float out = 0.0f;
+                        #pragma unroll
+                        for (int c = 0; c < HCN; ++c) {
+                            const float g = sycl::reduce_over_group(sg, acc[m][c], sycl::plus<float>());
+                            out += normed[int64_t(m) * wide + int64_t(c) * hidden + hh] / (1.0f + sycl::exp(-g));
+                        }
+                        if (lane == 0) block[int64_t(m) * hidden + hh] = out / float(HCN);
+                    }
+                }
+            });
+    });
+}
+} // namespace
+
+sycl::event launch_hc_up_mean_rows(sycl::queue& q, const bf16_t* up, const float* lora, const float* normed,
+                                   float* block, int rows, int hc_count, int hidden, int lowrank,
+                                   const std::vector<sycl::event>& deps) {
+    static const bool sgrow = std::getenv("GRIMOIRE_HC_SGROW") != nullptr;
+    if (!sgrow && hc_count == 4 && rows <= kHcRowsMax)
+        return hc_up_mean_rows_t<4>(q, up, lora, normed, block, rows, hidden, lowrank, deps);
+    sycl::event e;
+    const int64_t wide = int64_t(hc_count) * hidden;
+    for (int m = 0; m < rows; ++m)
+        e = launch_hc_up_mean1(q, up, lora + int64_t(m) * lowrank, normed + int64_t(m) * wide,
+                               block + int64_t(m) * hidden, hc_count, hidden, lowrank,
+                               m == 0 ? deps : std::vector<sycl::event>{});
+    return e;
+}
+
 // The injection projection of a prompt: inj[r][c] = inject[c] . normed[r]
 // (hc_count outputs a row, BF16 weights, wide % 8 == 0).  One work-group
 // per row reads its normed row once; the hc_count weight rows stay in
