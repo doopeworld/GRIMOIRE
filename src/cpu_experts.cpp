@@ -286,5 +286,81 @@ void CpuExperts::ffn(const NvExpertLayout& L, const uint8_t* const* blocks, cons
     });
 }
 
+// One call for several rows (11-06, the Flash-Next MTP verify: tiered_moe_cpu_rows called ffn()
+// once per candidate row, each call two pool jobs, and re-read from RAM every expert two rows share).
+// Pass 1 walks the DISTINCT experts: each gate / up row is dotted with the input of every row that
+// routes to that expert while it is in cache.  Pass 2 walks the outputs: for a chunk of 32, every row,
+// its experts in its own order -- ffn()'s sum for that row, operation for operation.
+void CpuExperts::ffn_rows(const NvExpertLayout& L, int rows, const uint8_t* const* blocks,
+                          const float* w, const int* off, const float* x, float* y) {
+    const int H = L.H, I = L.I;
+    if (rows <= 0) return;
+    const int total = off[rows];
+    if (total <= 0 || nthreads_ <= 0) { std::fill(y, y + size_t(rows) * H, 0.0f); return; }
+    fr_.resize(size_t(total));
+    ui_.resize(size_t(total));
+    ub_.clear();
+    for (int r = 0; r < rows; ++r)
+        for (int f = off[r]; f < off[r + 1]; ++f) {
+            fr_[size_t(f)] = r;
+            int u = 0;
+            while (u < int(ub_.size()) && ub_[size_t(u)] != blocks[f]) ++u;
+            if (u == int(ub_.size())) ub_.push_back(blocks[f]);
+            ui_[size_t(f)] = u;
+        }
+    const int nu = int(ub_.size());
+    uo_.assign(size_t(nu) + 1, 0);              // each distinct expert's slots, in slot order
+    for (int f = 0; f < total; ++f) ++uo_[size_t(ui_[size_t(f)]) + 1];
+    for (int u = 0; u < nu; ++u) uo_[size_t(u) + 1] += uo_[size_t(u)];
+    ul_.resize(size_t(total));
+    {
+        std::vector<int> at(uo_.begin(), uo_.end() - 1);
+        for (int f = 0; f < total; ++f) ul_[size_t(at[size_t(ui_[size_t(f)])]++)] = f;
+    }
+    h_.resize(size_t(total) * I);
+    float* hb = h_.data();
+    const int* fr = fr_.data(); const int* uo = uo_.data(); const int* ul = ul_.data();
+    const uint8_t* const* ub = ub_.data();
+    constexpr int P1 = 16, P2 = 32;
+    const int per_e = I / P1, n1 = nu * per_e, n2 = (H + P2 - 1) / P2;
+    std::atomic<int> next{0};
+    run([&](int) {
+        for (int c; (c = next.fetch_add(1, std::memory_order_relaxed)) < n1;) {
+            const int u = c / per_e, i0 = (c % per_e) * P1;
+            const uint8_t* b = ub[u];
+            const float* g3 = reinterpret_cast<const float*>(b + L.gsc);
+            for (int i = i0; i < i0 + P1; ++i)
+                for (int s = uo[u]; s < uo[u + 1]; ++s) {
+                    const int f = ul[s];
+                    const float* xr = x + size_t(fr[f]) * H;
+                    const float gv = g3[0] * cpu_nvfp4_dot(b + L.gu_p + size_t(i) * (H / 2),
+                                                           b + L.gu_s + size_t(i) * (H / 16), xr, H);
+                    const float uv = g3[1] * cpu_nvfp4_dot(b + L.gu_p + size_t(I + i) * (H / 2),
+                                                           b + L.gu_s + size_t(I + i) * (H / 16), xr, H);
+                    hb[size_t(f) * I + i] = gv / (1.0f + std::exp(-gv)) * uv;
+                }
+        }
+    });
+    next.store(0, std::memory_order_relaxed);
+    run([&](int) {
+        for (int c; (c = next.fetch_add(1, std::memory_order_relaxed)) < n2;) {
+            const int o0 = c * P2, o1 = std::min(H, o0 + P2);
+            for (int r = 0; r < rows; ++r) {
+                float acc[P2] = {};
+                for (int j = off[r]; j < off[r + 1]; ++j) {
+                    const uint8_t* b = blocks[j];
+                    const float f = w[j] * reinterpret_cast<const float*>(b + L.gsc)[2];
+                    const float* hj = hb + size_t(j) * I;
+                    for (int o = o0; o < o1; ++o)
+                        acc[o - o0] += f * cpu_nvfp4_dot(b + L.dn_p + size_t(o) * (I / 2),
+                                                         b + L.dn_s + size_t(o) * (I / 16), hj, I);
+                }
+                float* yr = y + size_t(r) * H;
+                for (int o = o0; o < o1; ++o) yr[o] = acc[o - o0];
+            }
+        }
+    });
+}
+
 } // namespace b70
 #endif // !__SYCL_DEVICE_ONLY__

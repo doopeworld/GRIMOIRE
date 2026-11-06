@@ -61,6 +61,12 @@ public:
     // in blocks[] (host memory).  x is H floats.  Overwrites y.
     void ffn(const NvExpertLayout& L, const uint8_t* const* blocks, const float* w,
              int n, const float* x, float* y);
+    // ffn() for `rows` rows in one call (a speculative verify's candidates): row r's experts are
+    // blocks[off[r] .. off[r + 1]) with weights w[same], its input x + r * H, its output y + r * H
+    // (overwritten).  Each row's sum is ffn()'s arithmetic in ffn()'s order (bit-identical); an
+    // expert several rows route to is read from RAM once.  off has rows + 1 entries.
+    void ffn_rows(const NvExpertLayout& L, int rows, const uint8_t* const* blocks, const float* w,
+                  const int* off, const float* x, float* y);
 
 private:
     void run(const std::function<void(int)>& job);   // the caller and the workers that reach it in time
@@ -73,6 +79,8 @@ private:
     const std::function<void(int)>* job_ = nullptr;
     double wait_us_ = 0.0;
     std::vector<float> gu_, h_;          // per-call scratch
+    std::vector<const uint8_t*> ub_;     // ffn_rows: the distinct experts,
+    std::vector<int> fr_, ui_, uo_, ul_; // each slot's row and expert, each expert's slots
 };
 
 // Keeps the calling thread on one CPU while it lives (a decode step), then
