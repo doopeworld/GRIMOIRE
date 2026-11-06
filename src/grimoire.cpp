@@ -2733,6 +2733,10 @@ struct Grimoire {
     float*    cx_x = nullptr;      float* cx_y = nullptr;
     float*    cx_dy = nullptr;     int32_t* cx_vexp = nullptr;
     double    cx_ms = 0.0;         long cx_calls = 0;   long cx_nexp = 0;   // + RAM experts computed
+    // GRIMOIRE_Q4_TIMING (fenced, diagnosis only): tiered_moe_cpu_rows split into [0] the routes to the host + the
+    // GPU's VRAM experts, [1] the shared expert (gpu_more), [2] the host's wait for the routes, [3] the RAM
+    // experts on the CPU, [4] their partial back and added; rxs_n calls, rxs_e distinct RAM experts in them
+    double    rxs_ms[5] = {0, 0, 0, 0, 0};  long rxs_n = 0;  long rxs_e = 0;
     // decode-only (GRIMOIRE_CX_STATS, no syncs added): calls with RAM experts, their time, the
     // one-expert calls alone, and a histogram of call times <50, <100, ... <3200, more us
     double    cxd_ms = 0.0, cxd1_ms = 0.0, cxd_wait_us = 0.0;   // + the caller's wait for the last worker
@@ -17205,9 +17209,32 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
         px_cap = (px_route && px_wt && px_x && px_y && px_dy && px_vexp) ? size_t(M) : 0;
         if (!px_cap) return false;
     }
-    q.memcpy(px_route, rex, R * sizeof(int32_t));
-    q.memcpy(px_wt, rwt, R * sizeof(float));
-    sycl::event ready = q.memcpy(px_x, x, size_t(M) * H * sizeof(float));
+    // GRIMOIRE_Q4_TIMING: fenced sub-stages (rxs_ms); off = nothing added
+    static const bool rxt = std::getenv("GRIMOIRE_Q4_TIMING") != nullptr;
+    auto rx_t = std::chrono::steady_clock::now();
+    auto rx_lap = [&](int k) {
+        if (!rxt) return;
+        q.wait();
+        const auto n = std::chrono::steady_clock::now();
+        rxs_ms[k] += std::chrono::duration<double, std::milli>(n - rx_t).count();
+        rx_t = n;
+    };
+    if (rxt) { q.wait(); rx_t = std::chrono::steady_clock::now(); ++rxs_n; }
+    // the routes, weights and rows to the host: one kernel and a pinned flag (ksend, as a decode step sends
+    // them) instead of three copies and an event.  GRIMOIRE_VERIFY_KSEND=0 = the copies.
+    static const bool vks = [] { const char* e = std::getenv("GRIMOIRE_VERIFY_KSEND"); return !(e && *e == '0'); }();
+    uint64_t rtag = 0;
+    sycl::event ready;
+    if (vks && ksend_on()) {
+        const void* sp[3] = {rex, rwt, x};
+        void* dp[3] = {px_route, px_wt, px_x};
+        const size_t nb[3] = {R * sizeof(int32_t), R * sizeof(float), size_t(M) * H * sizeof(float)};
+        rtag = ksend(3, sp, dp, nb);
+    } else {
+        q.memcpy(px_route, rex, R * sizeof(int32_t));
+        q.memcpy(px_wt, rwt, R * sizeof(float));
+        ready = q.memcpy(px_x, x, size_t(M) * H * sizeof(float));
+    }
     {
         const uint8_t* tier = d.tm_tier_d; int32_t* ve = px_vexp;
         q.parallel_for(sycl::range<1>(R), [=](sycl::id<1> i) {
@@ -17217,12 +17244,16 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
     }
     launch_tmoe_gate_up(q, tm_view(d), px_vexp, x, mh, M, {});
     launch_tmoe_down(q, tm_view(d), px_vexp, rwt, mh, out, M, {});
+    rx_lap(0);
     // more GPU work for the time the host spends on the RAM experts (the verify's shared expert,
     // queued here as a decode step queues it), landing in `out` before their partial
     if (gpu_more) gpu_more();
-    ready.wait();
+    rx_lap(1);
+    if (rtag) { if (!kwait(rtag, "small-M rows' routes")) return false; }
+    else ready.wait();
     route_trace(d, 1, px_route, M);
     tm_heat_credit(d, px_route, R);
+    rx_lap(2);
     const auto t0 = std::chrono::steady_clock::now();
     // 11-06: every row's RAM experts in ONE pool call (CpuExperts::ffn_rows, the same sums
     // bit for bit; an expert two rows share is read once).  GRIMOIRE_CX_ROWS=0 = a call per row.
@@ -17243,6 +17274,11 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
             }
         }
         off[size_t(M)] = int(blk.size());
+        if (rxt) {
+            std::vector<const uint8_t*> u(blk);
+            std::sort(u.begin(), u.end());
+            rxs_e += long(std::unique(u.begin(), u.end()) - u.begin());
+        }
         cpu_exp.ffn_rows(tm_lay, M, blk.data(), wt.data(), off.data(), px_x, px_y);
     } else
     for (int t = 0; t < M; ++t) {
@@ -17258,12 +17294,14 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
     }
     cx_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     cx_calls += M;
+    rx_lap(3);
     if (tm_heat_moves > 0) {
         launch_add(q, out, px_y, int(size_t(M) * H), {});    // heat engine: no copy behind its expert copies
     } else {
         q.memcpy(px_dy, px_y, size_t(M) * H * sizeof(float));
         launch_add(q, out, px_dy, int(size_t(M) * H), {});
     }
+    rx_lap(4);
     return true;
 }
 
@@ -17648,8 +17686,19 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                     return;
                 }
             }
-            // the shapes none of them take (the shared-expert gate's N = 1, a down projection whose K
-            // is not a multiple of 512, ...) and the exact verify: decode's GEMV, row by row
+            // a narrow BF16 weight (N <= 8: the shared-expert gate's N = 1, ...): every row in one launch
+            // (the prompt's injection kernel: each work-group reads its row once, the N weight rows stay
+            // in cache) instead of a GEMV a row.  GRIMOIRE_VERIFY_NARROW=0 = row by row.
+            static const bool vnarrow = [] { const char* e = std::getenv("GRIMOIRE_VERIFY_NARROW");
+                return !(e && *e == '0'); }();
+            if (vnarrow && !vexact && w.w.fmt == Fmt::BF16 && w.w.payload && !w.has_i4() && w.w.N >= 1 &&
+                w.w.N <= 8 && w.w.K % 8 == 0) {
+                launch_hc_inject_rows(q, reinterpret_cast<const bf16_t*>(w.w.payload), x, y, MR, int(w.w.N),
+                                      int(w.w.K), none);
+                return;
+            }
+            // the shapes none of them take (a down projection whose K is not a multiple of 512, ...) and
+            // the exact verify: decode's GEMV, row by row
             for (int r = 0; r < MR; ++r)
                 gemv_any(w, x + size_t(r) * w.w.K, y + size_t(r) * w.w.N, none);
             return;
@@ -17793,6 +17842,15 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     // Perturbs the pipeline -- diagnosis only.
     const bool q4t = std::getenv("GRIMOIRE_Q4_TIMING") != nullptr;
     double q4ms[5] = {0, 0, 0, 0, 0};    // ple, hc, linear attn, full attn, moe
+    // and (fenced) the mixer's all-reduce, the MoE's all-reduce, the router + top-k
+    double q4x[3] = {0, 0, 0};
+    auto q4xclk = std::chrono::steady_clock::now();
+    auto q4xstart = [&]() { if (!q4t) return; q.wait(); q4xclk = std::chrono::steady_clock::now(); };
+    auto q4xlap = [&](int k) {
+        if (!q4t) return;
+        q.wait();
+        q4x[k] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q4xclk).count();
+    };
     double qsams[6] = {0, 0, 0, 0, 0, 0}; // prep, dense flash, logits, topk, expand, sparse attn
     auto qsaclk = std::chrono::steady_clock::now();
     auto qsalap = [&](int k) {
@@ -18104,7 +18162,9 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         }
         if (!ok) break;
         // Megatron TP: this rank's heads -> the block output
+        q4xstart();
         if (tp_mega && !tp_block_reduce(PE, size_t(MR) * H)) { ok = false; break; }
+        q4xlap(0);
 
         q4lap(d.kind == LayerKind::LINEAR_ATTN ? 2 : 3);
         hc_mix(d.hc_mlp, PE, IJ, PIJ, BI);
@@ -18112,10 +18172,12 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         q4lap(1);
 
         if (d.moe_layer) {
+            q4xstart();
             mm(d.router, BI, rlog);
             if (!ok) break;
             launch_router_topk_batched(q, rlog, MR, cfg.n_experts, cfg.top_k,
                                        RX, RW, true, none);
+            q4xlap(2);
             bool sh_done = false;           // the shared expert already added (verify, below)
             if (moe_full) {
                 // the routed experts run below, once over every row
@@ -18168,7 +18230,9 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
             if (!ok) break;
         }
         // Megatron TP: this rank's experts and half of the shared expert
+        q4xstart();
         if (tp_mega && !tp_block_reduce(pend, size_t(M) * H)) { ok = false; break; }
+        q4xlap(1);
         // the next layer's first RAM experts cross PCIe while its mixer runs
         if (moe_full && i + 1 < (pp_enabled() ? pp_end : cfg.n_layers))
             tm_prefetch(L[size_t(i + 1)], M);
@@ -18176,10 +18240,17 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
         q4lap(4);
     }
     R0 = 0; MR = M; HY = hyper;             // the whole call again (seqb tail)
-    if (q4t)
+    if (q4t) {
         std::fprintf(stderr, "  qwen4_exp prefill M=%d (sub-chunks of %d): PLE %.1f  HC %.1f  DeltaNet %.1f  "
                      "full-attn %.1f  MoE %.1f ms  (PLE rows read %ld in %.1f ms)\n",
                      M, SUB, q4ms[0], q4ms[1], q4ms[2], q4ms[3], q4ms[4], ple_read_rows, ple_read_ms);
+        std::fprintf(stderr, "  qwen4_exp prefill M=%d MoE detail (fenced): router+topk %.1f  routes+VRAM experts %.1f  "
+                     "shared %.1f  host %.1f  CPU experts %.1f (%.2f distinct a call)  partial add %.1f  |  "
+                     "all-reduce: mixer %.1f  MoE %.1f ms\n", M, q4x[2], rxs_ms[0], rxs_ms[1], rxs_ms[2],
+                     rxs_ms[3], rxs_n ? double(rxs_e) / double(rxs_n) : 0.0, rxs_ms[4], q4x[0], q4x[1]);
+        for (double& v : rxs_ms) v = 0.0;
+        rxs_n = rxs_e = 0;
+    }
     if (hct)
         std::fprintf(stderr, "  qwen4_exp prefill HC M=%d: combine %.1f  norm %.1f  down %.1f  silu %.1f  "
                      "up %.1f  mean %.1f  inject %.1f ms\n", M, hcms[0], hcms[1], hcms[2], hcms[3],
