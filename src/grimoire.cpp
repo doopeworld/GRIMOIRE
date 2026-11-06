@@ -2703,8 +2703,8 @@ struct Grimoire {
     const void* tm_pref_d = nullptr;      // the LayerDev those positions belong to
     int tm_pref_n = 0;
     int32_t   *tm_ptoken = nullptr, *tm_pinv = nullptr;
-    // Radiance's heat engine (GRIMOIRE_EXPERT_HEAT=<swaps a step>; unset / 0 = the load's placement for
-    // good): b70::ExpertHeat ranks every (layer, expert) by its decayed routing and proposes swaps over the
+    // Radiance's heat engine (GRIMOIRE_EXPERT_HEAT=<swaps a step>; 0 = the load's placement for good; unset =
+    // 8 on one rank when every expert's pinned home fits, heat_swaps): b70::ExpertHeat ranks every (layer, expert) by its decayed routing and proposes swaps over the
     // whole model; tm_heat_step() moves them.  A swap copies the promoted expert's block into a spare VRAM
     // slot (tm_h2d) and the demoted one's into a spare pinned slot (tm_d2h) while both keep serving from
     // where they are; the next step's start flips both table entries (host mirrors + one device kernel)
@@ -3905,6 +3905,7 @@ struct Grimoire {
     // routes, move at a step boundary, give everything back before the pools go
     size_t tm_heat_init();                      // -> the VRAM it took
     bool heat_allowed() const;                  // one rank, or GRIMOIRE_EXPERT_HEAT_TP=1
+    int heat_swaps() const;                     // GRIMOIRE_EXPERT_HEAT, or the one-rank default
     void tm_heat_credit(const LayerDev& d, const int32_t* ids, size_t n);
     void tm_heat_issue(int n);
     void tm_heat_step();
@@ -16844,9 +16845,8 @@ bool Grimoire::upload_tiered_experts(sycl::queue& lq, const Qwen35Layer& src,
         // device -> host copies of demoted experts, 88 MB a step at 32 swaps, held up every small
         // device -> host transfer of the decode step behind them -- decode 42 -> 39 tok/s.)
         {
-            const char* hv = std::getenv("GRIMOIRE_EXPERT_HEAT");
             const size_t dup_need = size_t(Eown) * lay.bytes * size_t(moe_layers);
-            tm_dup = hv && std::atoi(hv) > 0 && heat_allowed() && nv > 0 && nv < Eown &&
+            tm_dup = heat_swaps() > 0 && heat_allowed() && nv > 0 && nv < Eown &&
                      dup_need + (size_t(8) << 30) <= avail;
             if (tm_dup) host_need = dup_need;
         }
@@ -17345,13 +17345,32 @@ bool Grimoire::heat_allowed() const {
     return f && *f == '1';
 }
 
+// Unset: 8 swaps a step on one rank -- MEASURED 11-06 (one B70, Flash-Next NVFP4 experts, INT4 dense part, 120 a
+// layer, llama-benchy tg128, interleaved off / on pairs): see run_heat_ab4_1106.sh.  The default only runs with every
+// expert's pinned home (tm_dup, decided at load, needs RAM for all of them + 8 GB); without it the engine stays off
+// unless asked for.  Several ranks: off (heat_allowed).  0 = off.
+int Grimoire::heat_swaps() const {
+    const char* v = std::getenv("GRIMOIRE_EXPERT_HEAT");
+    if (v && *v) return std::max(0, std::atoi(v));
+    return heat_allowed() ? 8 : 0;
+}
+
 size_t Grimoire::tm_heat_init() {
     const char* v = std::getenv("GRIMOIRE_EXPERT_HEAT");
-    const int S = v && *v ? std::max(0, std::atoi(v)) : 0;
+    const bool asked = v && *v;
+    const int S = heat_swaps();
     if (S <= 0 || !tm_any || !cpu_moe || tm_heat_moves > 0) return 0;
     if (!heat_allowed()) {
         std::printf("  expert heat engine: off with several ranks (11-06, two B70s: decode 52.9 -> 43.1 tok/s with it; "
                     "GRIMOIRE_EXPERT_HEAT_TP=1 forces it)\n");
+        return 0;
+    }
+    if (!asked && !tm_dup) {
+        bool any_host = false;
+        for (const auto& d : L) any_host = any_host || (d.tiered && d.tm_nhost > 0);
+        if (any_host)
+            std::printf("  expert heat engine: off -- not enough RAM for every expert's pinned home "
+                        "(GRIMOIRE_EXPERT_HEAT=8 moves them with copies back instead)\n");
         return 0;
     }
     int routed_layers = 0;
