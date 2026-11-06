@@ -20,6 +20,8 @@
 // Copies: one at a time on a copy engine (2.76 MB at 12.4 GB/s = 0.223 ms, measured 09-26); an
 // admitted expert counts as a VRAM hit only from the first call of its layer that starts after
 // its copy ends (the victim leaves VRAM at once -- its RAM copy stays valid, experts never change).
+#include "b70/expert_heat.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -139,36 +141,30 @@ int main(int argc, char** argv) {
         Result res;
         res.hist.assign(11, 0);
         std::vector<std::vector<char>> in = stat;
-        std::vector<std::vector<double>> heat(size_t(nl), std::vector<double>(size_t(E), 0.0));
+        b70::ExpertHeatParams hp;
+        hp.decay = float(decay);
+        hp.moves_per_step = S;
+        b70::ExpertHeat heat;               // the engine's policy (include/b70/expert_heat.hpp)
+        heat.init(nl, E, hp);
         struct Pend { int l, e; double t; };
         std::vector<Pend> pend;
         double now = 0.0, copy_free = 0.0;
         long swaps = 0, ram = 0, tokens = 0;
         int prev_layer = 1 << 30;
+        std::vector<b70::ExpertSwap> sw;
         auto heat_step = [&](double t) {
-            // candidates: non-resident, not pending; victims: resident
-            std::vector<std::pair<double, std::pair<int, int>>> hot, cold;
-            for (int l = 0; l < nl; ++l)
-                for (int e = 0; e < E; ++e) {
-                    if (in[size_t(l)][size_t(e)]) cold.push_back({heat[size_t(l)][size_t(e)], {l, e}});
-                    else if (heat[size_t(l)][size_t(e)] > 0) hot.push_back({heat[size_t(l)][size_t(e)], {l, e}});
-                }
-            for (const auto& p : pend) {
-                auto it = std::find_if(hot.begin(), hot.end(), [&](const auto& h) {
-                    return h.second.first == p.l && h.second.second == p.e; });
-                if (it != hot.end()) hot.erase(it);
-            }
-            const size_t nh = std::min<size_t>(size_t(S), hot.size()), nc = std::min<size_t>(size_t(S), cold.size());
-            std::partial_sort(hot.begin(), hot.begin() + long(nh), hot.end(),
-                              [](const auto& a, const auto& b) { return a.first > b.first; });
-            std::partial_sort(cold.begin(), cold.begin() + long(nc), cold.end(),
-                              [](const auto& a, const auto& b) { return a.first < b.first; });
-            for (size_t i = 0; i < nh && i < nc; ++i) {
-                if (!(hot[i].first >= cold[i].first * 1.25 + 1.5)) break;
-                in[size_t(cold[i].second.first)][size_t(cold[i].second.second)] = 0;
+            auto resident = [&](int l, int e) { return in[size_t(l)][size_t(e)] != 0; };
+            auto movable = [&](int l, int e) {
+                for (const auto& p : pend) if (p.l == l && p.e == e) return false;
+                return true;
+            };
+            sw.clear();
+            heat.propose(resident, movable, sw);
+            for (const auto& s : sw) {
+                in[size_t(s.demote_layer)][size_t(s.demote_expert)] = 0;
                 const double start = std::max(copy_free, t);
                 copy_free = start + copy_ms;
-                pend.push_back({hot[i].second.first, hot[i].second.second, copy_free});
+                pend.push_back({s.promote_layer, s.promote_expert, copy_free});
                 ++swaps;
             }
         };
@@ -199,11 +195,7 @@ int main(int argc, char** argv) {
             }
             if (r.kind == 1) { res.sm_union += double(miss.size()); res.sm_rows += r.rows; ++res.sm_calls; }
             // credit: decay the layer's plane, add this call's selections (capped at 512 in total)
-            auto& h = heat[size_t(r.layer)];
-            for (double& x : h) x *= decay;
-            const double total = double(r.ids.size());
-            const double w = total > 512.0 ? 512.0 / total : 1.0;
-            for (int32_t e : r.ids) if (e >= 0 && e < E) h[size_t(e)] += w;
+            heat.credit(r.layer, r.ids.data(), r.ids.size());
         }
         res.ram_per_tl = res.tl ? double(ram) / double(res.tl) : 0.0;
         res.swaps_per_tok = tokens ? double(swaps) / double(tokens) : 0.0;
