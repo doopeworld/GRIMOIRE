@@ -17,7 +17,7 @@ echo "HEAT_BUILD_START=$(date -Iseconds) source=$(git -C "$X" rev-parse --short 
 [ -f "$LIB/libgrimoire_gemm.so" ] || { echo "HEAT_BUILD_FAIL no $LIB/libgrimoire_gemm.so"; exit 1; }
 mkdir -p "$X/bin"
 cp -P "$LIB"/lib* "$X/bin/"
-docker run --rm --name grim-build-heat-1106 --cpuset-cpus "$CPUS" -v "$X":/grimoire -w /grimoire grimoire-dev:latest bash -lc '
+docker run --rm --name grim-build-heat-1106 --cpuset-cpus "$CPUS" --cpu-shares 64 -v "$X":/grimoire -w /grimoire grimoire-dev:latest bash -lc '
     set -e
     export OCL_ICD_FILENAMES=
     set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true; set -u
