@@ -51,6 +51,7 @@
 #include "b70/nvfp4.hpp"
 #include "b70/tiered_moe.hpp"
 #include "b70/cpu_experts.hpp"
+#include "b70/expert_heat.hpp"
 #include "b70/tensor_layout.hpp"
 #include "b70/gptq.hpp"
 #include "b70/kld.hpp"
@@ -2702,6 +2703,24 @@ struct Grimoire {
     const void* tm_pref_d = nullptr;      // the LayerDev those positions belong to
     int tm_pref_n = 0;
     int32_t   *tm_ptoken = nullptr, *tm_pinv = nullptr;
+    // Radiance's heat engine (GRIMOIRE_EXPERT_HEAT=<swaps a step>; unset / 0 = the load's placement for
+    // good): b70::ExpertHeat ranks every (layer, expert) by its decayed routing and proposes swaps over the
+    // whole model; tm_heat_step() moves them.  A swap copies the promoted expert's block into a spare VRAM
+    // slot (tm_h2d) and the demoted one's into a spare pinned slot (tm_d2h) while both keep serving from
+    // where they are; the next step's start flips both table entries (host mirrors + one device kernel)
+    // after the copies landed -- so placement changes only between steps, the same way on every run.
+    b70::ExpertHeat tm_heat;
+    int       tm_heat_moves = 0;                    // swaps a step; 0 = off
+    uint8_t   *tm_spare_v = nullptr, *tm_spare_h = nullptr;   // the extra slots' allocations
+    std::vector<uint8_t*> tm_free_v, tm_free_h;     // slots no table entry names
+    std::unique_ptr<sycl::queue> tm_h2d, tm_d2h;
+    struct HeatMove { int l_in, e_in, l_out, e_out; uint8_t* v; uint8_t* h; sycl::event up, down; };
+    std::vector<HeatMove> tm_moves;                 // issued, not yet in the tables
+    struct HeatUpd { const uint8_t** eptr; uint8_t* tier; const uint8_t* p; int32_t e; int32_t t; };
+    HeatUpd*  tm_upd[2] = {nullptr, nullptr};       // pinned, alternating: one step's table writes
+    int       tm_upd_cap = 0, tm_upd_flip = 0;
+    uint64_t  tm_heat_n_steps = 0, tm_heat_n_moved = 0, tm_heat_n_waits = 0;
+    double    tm_heat_ms = 0;                       // host time in tm_heat_step
     // Decode: RAM-resident experts computed on the host CPU (b70/cpu_experts.hpp)
     // while the GPU runs the VRAM-resident ones.  Pinned staging for the
     // route, the block input and the CPU's partial sum.
@@ -3871,6 +3890,16 @@ struct Grimoire {
     // GRIMOIRE_ROUTE_TRACE=<file>: append one MoE call's routes (kind 0 prompt, 1 small-M
     // prompt / verify, 2 decode) for offline placement studies; nothing when unset.
     void route_trace(const LayerDev& d, int kind, const int32_t* ids, int M);
+    // the heat engine (members above tm_heat): set up after the last tiered layer, credit one call's
+    // routes, move at a step boundary, give everything back before the pools go
+    size_t tm_heat_init();                      // -> the VRAM it took
+    void tm_heat_credit(const LayerDev& d, const int32_t* ids, size_t n);
+    void tm_heat_step();
+    void tm_heat_release();
+    int  layer_index(const LayerDev& d) const {
+        const auto a = reinterpret_cast<uintptr_t>(&d), b = reinterpret_cast<uintptr_t>(L.data());
+        return a >= b && a < b + L.size() * sizeof(LayerDev) ? int((a - b) / sizeof(LayerDev)) : -1;
+    }
     // PLE from the file: rows for positions [p0, p0+M) into ple_stage.
     bool ple_fetch_rows(const LayerDev& d, int p0, int M);
     TieredMoeView tm_view(const LayerDev& d) const {
@@ -9424,6 +9453,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     }
 
     power_gov_init();
+    acct(tm_heat_init());                 // GRIMOIRE_EXPERT_HEAT: spare expert slots
     std::printf("  zeroing recurrent state ... ");
     std::fflush(stdout);
     // EVERY slot, not just the bound one.  reset() clears the sequence
@@ -11205,6 +11235,7 @@ void Grimoire::release() {
             tm_save_hits();
         }
     }
+    tm_heat_release();      // copies in flight land before the pools they read or write are freed
     for (auto& d : L) {
         d.la_qkv.release(q); d.la_z.release(q); d.la_out.release(q); d.la_all.release(q);
         d.q_proj.release(q); d.k_proj.release(q);
@@ -12912,6 +12943,7 @@ void Grimoire::route_trace(const LayerDev& d, int kind, const int32_t* ids, int 
 const float* Grimoire::forward_qwen4_exp(int token) {
     const b70::ScopedCpuPin cx_pin(cx_caller_cpu);      // see the CPU experts' start
     power_gov_tick();
+    tm_heat_step();                                     // GRIMOIRE_EXPERT_HEAT: a step boundary
     // MTP head (mtp4): its caches at the previous position -- that token's backbone state
     // (kept at the end of the step that produced it) and this token
     if (mtp4.ok && pos > 0 && !pp_enabled()) {
@@ -13437,6 +13469,7 @@ const float* Grimoire::forward_qwen4_exp(int token) {
                 if (cx_tag) { if (!kwait(cx_tag, "CPU experts route")) return nullptr; }
                 else cx_ready.wait();
                 route_trace(d, 2, cx_route, 1);
+                tm_heat_credit(d, cx_route, size_t(cfg.top_k));
                 const auto t0 = std::chrono::steady_clock::now();
                 const uint8_t* blk[64]; float wt[64]; int n = 0;
                 for (int k = 0; k < cfg.top_k && n < 64; ++k) {
@@ -16955,6 +16988,7 @@ bool Grimoire::tiered_moe_prefill(const LayerDev& d, const float* x, const int32
     std::vector<int> count(size_t(E), 0), off(size_t(E), 0);
     q.memcpy(hex.data(), rex, R * sizeof(int32_t)).wait();
     route_trace(d, 0, hex.data(), M);
+    tm_heat_credit(d, hex.data(), R);
     for (size_t r = 0; r < R; ++r) {
         const int e = hex[r];
         if (e < 0 || e >= E) { std::fprintf(stderr, "tiered MoE: bad route %d\n", e); return false; }
@@ -17158,6 +17192,7 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
     if (gpu_more) gpu_more();
     ready.wait();
     route_trace(d, 1, px_route, M);
+    tm_heat_credit(d, px_route, R);
     const auto t0 = std::chrono::steady_clock::now();
     // 11-06: every row's RAM experts in ONE pool call (CpuExperts::ffn_rows, the same sums
     // bit for bit; an expert two rows share is read once).  GRIMOIRE_CX_ROWS=0 = a call per row.
@@ -17198,6 +17233,133 @@ bool Grimoire::tiered_moe_cpu_rows(const LayerDev& d, const float* x, const int3
     return true;
 }
 
+// ---- the heat engine: Radiance's runtime expert placement (core/place/heat.h + mover.cpp) ----------------
+// GRIMOIRE_EXPERT_HEAT=<S>: up to S swaps a step (Radiance: 64 over PCIe Gen5 x16; a B70 moves a 2.76 MB
+// block in ~0.23 ms each way over Gen4 x8, so S = 32 is ~7 ms a step in each direction, under a ~20 ms decode
+// step).  GRIMOIRE_EXPERT_HEAT_DECAY (default 0.95).  Needs the CPU-expert path (RAM experts are computed
+// where they are) and S spare slots on each side, so no expert is ever in two places for long and the
+// pinned pool does not grow -- a 64 GB host or a 24 GB card runs it as the static placement would.
+size_t Grimoire::tm_heat_init() {
+    const char* v = std::getenv("GRIMOIRE_EXPERT_HEAT");
+    const int S = v && *v ? std::max(0, std::atoi(v)) : 0;
+    if (S <= 0 || !tm_any || !cpu_moe || tm_heat_moves > 0) return 0;
+    bool any_host = false;
+    for (const auto& d : L) any_host = any_host || (d.tiered && d.tm_nhost > 0);
+    if (!any_host) return 0;
+    const size_t B = tm_lay.bytes;
+    tm_spare_v = sycl::malloc_device<uint8_t>(size_t(S) * B, q);
+    tm_spare_h = sycl::malloc_host<uint8_t>(size_t(S) * B, q);
+    tm_upd_cap = 2 * S;
+    for (auto& u : tm_upd) u = sycl::malloc_host<HeatUpd>(size_t(tm_upd_cap), q);
+    if (!tm_spare_v || !tm_spare_h || !tm_upd[0] || !tm_upd[1]) {
+        std::printf("  expert heat engine: spare slot allocation failed -- off (the load's placement)\n");
+        tm_heat_release();
+        return 0;
+    }
+    tm_free_v.clear(); tm_free_h.clear();
+    for (int i = 0; i < S; ++i) {
+        tm_free_v.push_back(tm_spare_v + size_t(i) * B);
+        tm_free_h.push_back(tm_spare_h + size_t(i) * B);
+    }
+    tm_h2d = std::make_unique<sycl::queue>(q.get_context(), q.get_device(), sycl::property::queue::in_order{});
+    tm_d2h = std::make_unique<sycl::queue>(q.get_context(), q.get_device(), sycl::property::queue::in_order{});
+    b70::ExpertHeatParams p;
+    p.moves_per_step = S;
+    if (const char* dv = std::getenv("GRIMOIRE_EXPERT_HEAT_DECAY")) p.decay = float(std::atof(dv));
+    tm_heat.init(int(L.size()), cfg.n_experts, p);
+    tm_heat_moves = S;
+    std::printf("  expert heat engine: on -- up to %d swaps a step (decay %.3f, guard x%.2f + %.1f, a prompt call "
+                "credits at most %.0f), %d spare slots in VRAM and in pinned RAM (%.0f MB each)\n",
+                S, p.decay, p.hysteresis, p.min_gain, p.credit_cap, S, double(S) * double(B) / 1048576.0);
+    return size_t(S) * B;
+}
+
+void Grimoire::tm_heat_credit(const LayerDev& d, const int32_t* ids, size_t n) {
+    if (tm_heat_moves <= 0 || !d.tiered) return;
+    tm_heat.credit(layer_index(d), ids, n);
+}
+
+// At a step boundary (before a decode step, a verify or a prompt call touches any layer): the previous
+// step's swaps go into the tables -- waiting for a copy that has not landed, so the placement never depends
+// on how fast one was -- then this step's are chosen from the heats so far and their copies issued.  An
+// issued swap is invisible until the next boundary: the promoted expert is still read from pinned RAM by
+// the CPU pool, the demoted one from VRAM by the GPU, and the copies only read those.
+void Grimoire::tm_heat_step() {
+    if (tm_heat_moves <= 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    ++tm_heat_n_steps;
+    if (!tm_moves.empty()) {
+        q.wait();                        // the slots these free are read by nothing in flight
+        HeatUpd* u = tm_upd[tm_upd_flip];
+        tm_upd_flip ^= 1;
+        int nu = 0;
+        for (auto& m : tm_moves) {
+            const auto done = sycl::info::event_command_status::complete;
+            if (m.up.get_info<sycl::info::event::command_execution_status>() != done ||
+                m.down.get_info<sycl::info::event::command_execution_status>() != done) ++tm_heat_n_waits;
+            m.up.wait();
+            m.down.wait();
+            LayerDev& di = L[size_t(m.l_in)];
+            LayerDev& dd = L[size_t(m.l_out)];
+            tm_free_h.push_back(const_cast<uint8_t*>(di.tm_hptr[size_t(m.e_in)]));    // its pinned slot
+            tm_free_v.push_back(const_cast<uint8_t*>(dd.tm_hptr[size_t(m.e_out)]));   // its VRAM slot
+            di.tm_hptr[size_t(m.e_in)] = m.v;   di.tm_tier_h[size_t(m.e_in)] = 0;
+            dd.tm_hptr[size_t(m.e_out)] = m.h;  dd.tm_tier_h[size_t(m.e_out)] = 1;
+            ++di.tm_nvram; --di.tm_nhost;
+            --dd.tm_nvram; ++dd.tm_nhost;
+            u[nu++] = HeatUpd{di.tm_eptr, di.tm_tier_d, m.v, m.e_in, 0};
+            u[nu++] = HeatUpd{dd.tm_eptr, dd.tm_tier_d, m.h, m.e_out, 1};
+        }
+        tm_heat_n_moved += tm_moves.size();
+        tm_moves.clear();
+        // one kernel for every table entry that changed, ahead of this step's kernels on the in-order queue
+        q.parallel_for(sycl::range<1>(size_t(nu)), [=](sycl::id<1> i) {
+            const HeatUpd x = u[i];
+            x.eptr[x.e] = x.p;
+            x.tier[x.e] = uint8_t(x.t);
+        });
+    }
+    std::vector<b70::ExpertSwap> sw;
+    auto movable = [&](int l, int e) {
+        const LayerDev& d = L[size_t(l)];
+        return d.tiered && size_t(e) < d.tm_tier_h.size() && d.tm_tier_h[size_t(e)] != 2;
+    };
+    auto resident = [&](int l, int e) { return L[size_t(l)].tm_tier_h[size_t(e)] == 0; };
+    tm_heat.propose(resident, movable, sw);
+    const size_t B = tm_lay.bytes;
+    for (const auto& s : sw) {
+        if (tm_free_v.empty() || tm_free_h.empty()) break;
+        HeatMove m{s.promote_layer, s.promote_expert, s.demote_layer, s.demote_expert,
+                   tm_free_v.back(), tm_free_h.back(), {}, {}};
+        tm_free_v.pop_back();
+        tm_free_h.pop_back();
+        m.up = tm_h2d->memcpy(m.v, L[size_t(m.l_in)].tm_hptr[size_t(m.e_in)], B);
+        m.down = tm_d2h->memcpy(m.h, L[size_t(m.l_out)].tm_hptr[size_t(m.e_out)], B);
+        tm_moves.push_back(m);
+    }
+    tm_heat_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (tm_heat_n_steps % 1024 == 0)
+        std::printf("  expert heat engine: %llu steps, %llu experts moved (%.2f a step), %llu commits waited "
+                    "for a copy, %.3f ms of host time a step\n", (unsigned long long)tm_heat_n_steps,
+                    (unsigned long long)tm_heat_n_moved, double(tm_heat_n_moved) / double(tm_heat_n_steps),
+                    (unsigned long long)tm_heat_n_waits, tm_heat_ms / double(tm_heat_n_steps));
+}
+
+void Grimoire::tm_heat_release() {
+    for (auto& m : tm_moves) { m.up.wait(); m.down.wait(); }
+    tm_moves.clear();
+    if (tm_h2d) tm_h2d->wait();
+    if (tm_d2h) tm_d2h->wait();
+    q.wait();
+    for (void* p : {(void*)tm_spare_v, (void*)tm_spare_h, (void*)tm_upd[0], (void*)tm_upd[1]})
+        if (p) sycl::free(p, q);
+    tm_spare_v = tm_spare_h = nullptr;
+    tm_upd[0] = tm_upd[1] = nullptr;
+    tm_free_v.clear(); tm_free_h.clear();
+    tm_h2d.reset(); tm_d2h.reset();
+    tm_heat_moves = 0;
+}
+
 bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
                                  std::vector<int32_t>* next_tokens, const SeqBatch* seqb) {
     const int M = int(tokens.size());
@@ -17216,6 +17378,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     // Megatron TP: each rank runs its heads, its experts and half of the
     // shared expert; two all-reduces per layer (as the decode step).
     if ((tp_ranked() && (!tp_mega || seqb)) || (pp_enabled() && seqb)) return false;
+    tm_heat_step();                      // GRIMOIRE_EXPERT_HEAT: a step boundary (prompt, verify, batch step)
     const bool pp_later = pp_enabled() && pp_rank > 0;
     const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
     const int start_pos = pos;
