@@ -25,11 +25,11 @@ until [ -z "$(docker ps --format "{{.Names}}" | grep -v "^grim-build-")" ] && ! 
 touch logs/HOLD-imxacc
 trap 'rm -f "$B/logs/HOLD-imxacc"' EXIT
 cd /mnt/storage/isos/grimoire-fuse || exit 9
-run() {  # name proj extra-env (one K=V per line)
+run() {  # name proj extra-env (one K=V per line) [model dir, default $M]
   echo "== $(date +%T) score $1"
   EXTRA_ENV="GRIMOIRE_POWER_LIMIT_W=0
 $3" GRIM_TREE=$X LIM=1500 TAILN=6 \
-    flock /mnt/storage/isos/grimoire-runs/gpu0.lock bash tools/g0run.sh "imx-$1" /grimoire/bin/grimoire -m "$M" --proj "$2" \
+    flock /mnt/storage/isos/grimoire-runs/gpu0.lock bash tools/g0run.sh "imx-$1" /grimoire/bin/grimoire -m "${4:-$M}" --proj "$2" \
       --ctx 1024 --score-ids /models/grimoire-acc/sherlock.ids --score-out "/models/grimoire-acc/q27-$1.bin"
   grep -h "imatrix" "/tmp/grim-imx-$1.log" 2>/dev/null | sed 's/^/   /'
   ls -la "$A/q27-$1.bin" 2>&1 | cut -c1-120
@@ -47,8 +47,12 @@ GRIMOIRE_INT4_RTN_GROUP=64"
 run int8          int8 ""
 run int8-fold     int8 "$IM
 GRIMOIRE_IMATRIX_FOLD=0.2"
+# CySpiegel/Qwen3.8-27B-Int4-AutoRound (AutoRound 0.15: sym, groups of 128, 200 iters on pile-10k, GPTQ packing;
+# lm_head / MTP / DeltaNet a,b in BF16; get_autoround_1106.sh): GRIMOIRE's GPTQ path takes it as stored -- the
+# symmetric g128 layout the oneDNN prompt path runs.  10-29: the QWEN3.8 container's GPTQ file 85.9% top-1.
+[ -d /mnt/models/Qwen3.8-27B-Int4-AutoRound ] && run autoround int4 "" /models2/Qwen3.8-27B-Int4-AutoRound
 cd "$B"
-for n in int4 int4-imx int4-imx-g64 int4-fold int4-fold-g64 int8 int8-fold; do
+for n in int4 int4-imx int4-imx-g64 int4-fold int4-fold-g64 int8 int8-fold autoround; do
   [ -s "$A/q27-$n.bin" ] && docker run --rm --network none --cpuset-cpus 6-13 -v "$A":/acc grimoire-ref:cpu \
     python3 /acc/cmp_logits.py /acc/ref-bf16.bin "/acc/q27-$n.bin" 248320 "Qwen3.8-27B $n"
 done
