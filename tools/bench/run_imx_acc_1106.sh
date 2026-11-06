@@ -6,7 +6,9 @@
 # Unsloth's imatrix for this model (imatrix_unsloth.gguf, 1.15M calibration tokens) is copied to
 # $A/imatrix-qwen38-27b.gguf first.  10-29: --proj int4 88.3% top-1, --proj int8 98.4%, UD-Q4_K_XL native 94.5%.
 #   runs: int4 (same-binary baseline), + GRIMOIRE_IMATRIX, + groups of 64, + the input-norm fold (alpha 0.4),
-#         + both; int8 and int8 + fold.  Holds HOLD-imxacc; gpu0 lock.
+#         + both; int8 and int8 + fold (alpha 0.2: per-row INT8 wants a gentler fold -- offline, layers 10-14,
+#         the input projections' error 0.26-0.62 of plain INT8 at 0.2, while 0.4 made in_proj_z 1.3x WORSE).
+#         Holds HOLD-imxacc; gpu0 lock.
 set -u
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 X=/mnt/storage/isos/grimoire-runs/dev-1106
@@ -44,7 +46,7 @@ GRIMOIRE_IMATRIX_FOLD=0.4
 GRIMOIRE_INT4_RTN_GROUP=64"
 run int8          int8 ""
 run int8-fold     int8 "$IM
-GRIMOIRE_IMATRIX_FOLD=0.4"
+GRIMOIRE_IMATRIX_FOLD=0.2"
 cd "$B"
 for n in int4 int4-imx int4-imx-g64 int4-fold int4-fold-g64 int8 int8-fold; do
   [ -s "$A/q27-$n.bin" ] && docker run --rm --network none --cpuset-cpus 6-13 -v "$A":/acc grimoire-ref:cpu \
