@@ -3268,6 +3268,10 @@ struct Grimoire {
         bf16_t  *draft_embed=nullptr;
         int32_t *draft_vocab_map=nullptr;  // draft id -> target id (from d2t)
         int      draft_vocab_rows=0;
+        // GRIMOIRE_DFLASH_DRAFT_VOCAB=<n> (the target's head, no head of the drafter's own): draft from the
+        // first n token ids only -- the drafter's head pass reads n rows of the 248K (2.2 of a 9.3 ms draft
+        // on two cards, 11-06); the verify still decides every token.  0 = the whole vocabulary.
+        int      draft_trunc=0;
         int32_t *block_table=nullptr, *cu_q=nullptr, *cu_k=nullptr;
         int32_t *seqused_k=nullptr;
         // DFlash2 dynamic grouped convolution.  Geometry is derived from the
@@ -8935,11 +8939,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
                                        dflash2.conv_groups);
                 dflash2.conv_scratch=dfd(size_t(DM)*DH);
             }
+            // the same conditions the draft checks (trunc_used): the logits buffer is sized from it
+            if(!dflash2.draft_head_rows&&!dflash2.draft_vocab_rows&&!dflash2.draft_lm_head_i4.has_i4()&&
+               !cfg.is_muse&&!lm_head.tp_sharded()&&!lm_head.has_i4()&&lm_head.w.payload){
+                const char* dv=std::getenv("GRIMOIRE_DFLASH_DRAFT_VOCAB");
+                const int n=dv&&*dv?std::atoi(dv):0;
+                if(n>0&&n<cfg.vocab)dflash2.draft_trunc=n;
+            }
             const int draft_vocab=dflash2.draft_head_rows?
                 dflash2.draft_head_rows:
                 (dflash2.draft_vocab_rows?dflash2.draft_vocab_rows:
                  (dflash2.draft_lm_head_i4.has_i4()?
-                     dflash2.draft_lm_head_i4.w.N:cfg.vocab));
+                     dflash2.draft_lm_head_i4.w.N:
+                     (dflash2.draft_trunc?dflash2.draft_trunc:cfg.vocab)));
             dflash2.draft_logits_stride=draft_vocab;
             dflash2.logits=dfd(size_t(DM-1)*dflash2.draft_logits_stride);
             if(cfg.is_muse){
@@ -15603,6 +15615,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     }else if(cfg.is_muse){
         mm(dflash2.shared_lm_head_f16,dflash2.normed+H,
            dflash2.logits,M-1);
+    }else if(dflash2.draft_trunc){
+        // GRIMOIRE_DFLASH_DRAFT_VOCAB: the first draft_trunc rows of the target's head (every format keeps
+        // whole rows together, b70/weights.hpp), one pass over the draft rows
+        DevQuant head=lm_head;
+        head.w.N=dflash2.draft_trunc;
+        mm(head,dflash2.normed+H,dflash2.logits,M-1);
     }else if(tp_enabled()&&lm_head.tp_sharded()){
         // Under TP the target's lm_head is row-sharded over the vocabulary,
         // so lm_head.w.N is THIS rank's slice.  Both wide paths below write
@@ -15648,8 +15666,9 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         gemv_any(lm_head,dflash2.normed+int64_t(r)*H,
                  dflash2.logits+int64_t(r-1)*cfg.vocab,{});
     draft_mark("lm head");
+    const bool trunc_used=dflash2.draft_trunc!=0;     // set at load only where the head above takes it
     const int draft_vocab=dflash2.draft_head_rows?dflash2.draft_head_rows:
-        (dflash2.draft_vocab_rows?dflash2.draft_vocab_rows:cfg.vocab);
+        (dflash2.draft_vocab_rows?dflash2.draft_vocab_rows:(trunc_used?dflash2.draft_trunc:cfg.vocab));
     const int draft_stride=dflash2.draft_logits_stride?
         dflash2.draft_logits_stride:draft_vocab;
     // Either head can emit ids in its own reduced vocabulary: the NInfer
