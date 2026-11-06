@@ -2727,6 +2727,8 @@ struct Grimoire {
     int       tm_upd_cap = 0, tm_upd_flip = 0;
     uint64_t  tm_heat_n_steps = 0, tm_heat_n_moved = 0, tm_heat_n_waits = 0;
     double    tm_heat_ms = 0;                       // host time in tm_heat_step
+    std::vector<uint8_t*> tm_fill_pools;            // tm_fill: VRAM slots past the load's budget
+    long      tm_fill_n = 0;
     // Decode: RAM-resident experts computed on the host CPU (b70/cpu_experts.hpp)
     // while the GPU runs the VRAM-resident ones.  Pinned staging for the
     // route, the block input and the CPU's partial sum.
@@ -3908,6 +3910,7 @@ struct Grimoire {
     // the heat engine (members above tm_heat): set up after the last tiered layer, credit one call's
     // routes, move at a step boundary, give everything back before the pools go
     size_t tm_heat_init();                      // -> the VRAM it took
+    size_t tm_fill();                           // GRIMOIRE_EXPERT_FILL -> the VRAM it took
     bool heat_allowed() const;                  // one rank, or GRIMOIRE_EXPERT_HEAT_TP=1
     int heat_swaps() const;                     // GRIMOIRE_EXPERT_HEAT, or the one-rank default
     void tm_heat_credit(const LayerDev& d, const int32_t* ids, size_t n);
@@ -17413,7 +17416,97 @@ size_t Grimoire::tm_heat_init() {
                 S, tm_heat_per_call, p.decay, p.hysteresis, p.min_gain, p.credit_cap,
                 tm_dup ? "demotions are pointer flips (every expert has a pinned home)"
                        : "demotions copy back into spare pinned slots", S, double(S) * double(B) / 1048576.0);
-    return size_t(S) * B;
+    return size_t(S) * B + tm_fill();
+}
+
+// GRIMOIRE_EXPERT_FILL (Qwen4-Exp, one rank, with the heat engine's pinned homes; =0 off): the VRAM the load left
+// holds more experts.  Kept free: what a prompt call of GRIMOIRE_Q4_SPAN rows (8192, at most --ctx) needs in one piece
+// by q4_prefill_split()'s per-row figures, its 1 GiB margin, the prompt ring if not made yet, and
+// GRIMOIRE_EXPERT_FILL_RESERVE_GB more (default 0.5).  The RAM tier's most-routed experts over the whole model
+// (GRIMOIRE_EXPERT_HITS; without it, spread evenly over the layers) are copied up from their pinned homes here; the
+// heat engine then swaps among all of them.  -> the VRAM it took.
+size_t Grimoire::tm_fill() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_EXPERT_FILL"); return !(e && *e == '0'); }();
+    if (!on || !tm_dup || !cfg.is_qwen4_exp || tp_ranked() || pp_enabled()) return 0;
+    const auto dev = q.get_device();
+    if (!dev.has(sycl::aspect::ext_intel_free_memory)) return 0;
+    double free_b = 0;
+    try { free_b = double(dev.get_info<sycl::ext::intel::info::device::free_memory>()); } catch (...) { return 0; }
+    q4_prefill_split();                                  // sets the per-row figures of a prompt call
+    static const int span = [] { const char* v = std::getenv("GRIMOIRE_Q4_SPAN");
+        return v && *v ? std::max(256, std::atoi(v)) : 8192; }();
+    const double rows = double(std::min(span, max_seq));
+    const double whole = q4_per_full + q4_per_sub + double(std::max(1, cfg.top_k)) * q4_per_route;
+    const char* rv = std::getenv("GRIMOIRE_EXPERT_FILL_RESERVE_GB");
+    const double gib = 1073741824.0, B = double(tm_lay.bytes);
+    const double keep = rows * whole + (1.0 + (rv && *rv ? std::max(0.0, std::atof(rv)) : 0.5)) * gib +
+                        (tm_ring ? 0.0 : double(tm_ring_want()) * B);
+    // every RAM-tier expert of every tiered layer, the most routed first; k = its place in its layer's RAM tier
+    struct Cand { uint64_t hits; int k, l, e; };
+    std::vector<Cand> cand;
+    int routed_layers = 0;
+    const char* hf = std::getenv("GRIMOIRE_EXPERT_HITS");
+    FILE* f = hf ? std::fopen(hf, "rb") : nullptr;
+    for (int l = 0; l < int(L.size()); ++l) {
+        const LayerDev& d = L[size_t(l)];
+        if (!d.tiered) continue;
+        ++routed_layers;
+        const int E = int(d.tm_tier_h.size());
+        std::vector<uint64_t> hits(static_cast<size_t>(E), 0);
+        if (f && d.tm_moe_idx >= 0 &&
+            (std::fseek(f, long(size_t(d.tm_moe_idx) * size_t(E) * sizeof(uint64_t)), SEEK_SET) != 0 ||
+             std::fread(hits.data(), sizeof(uint64_t), hits.size(), f) != hits.size()))
+            std::fill(hits.begin(), hits.end(), uint64_t(0));
+        int k = 0;
+        for (int e = 0; e < E; ++e)
+            if (d.tm_tier_h[size_t(e)] == 1 && d.tm_hhome[size_t(e)]) cand.push_back({hits[size_t(e)], k++, l, e});
+    }
+    const bool from_hits = f != nullptr;
+    if (f) std::fclose(f);
+    std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) {
+        if (a.hits != b.hits) return a.hits > b.hits;
+        if (a.k != b.k) return a.k < b.k;
+        return a.l != b.l ? a.l < b.l : a.e < b.e; });
+    long want = free_b > keep ? long((free_b - keep) / B) : 0;
+    want = std::min<long>(want, long(cand.size()));
+    if (want < long(std::max(1, routed_layers))) {
+        std::printf("  expert fill: none (%.2f GiB free, %.2f GiB kept for prompt chunks of %.0f rows)\n",
+                    free_b / gib, keep / gib, rows);
+        return 0;
+    }
+    // slots in pieces of at most 256 experts (~0.7 GB): one allocation of several GB can fail where pieces fit
+    std::vector<uint8_t*> slots;
+    for (long got = 0; got < want;) {
+        const long n = std::min<long>(256, want - got);
+        uint8_t* p = sycl::malloc_device<uint8_t>(size_t(n) * tm_lay.bytes, q);
+        if (!p) break;
+        tm_fill_pools.push_back(p);
+        for (long i = 0; i < n; ++i) slots.push_back(p + size_t(i) * tm_lay.bytes);
+        got += n;
+    }
+    std::vector<char> touched(L.size(), 0);
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const Cand& c = cand[i];
+        LayerDev& d = L[size_t(c.l)];
+        q.memcpy(slots[i], d.tm_hhome[size_t(c.e)], tm_lay.bytes);
+        d.tm_hptr[size_t(c.e)] = slots[i];
+        d.tm_tier_h[size_t(c.e)] = 0;
+        ++d.tm_nvram; --d.tm_nhost;
+        touched[size_t(c.l)] = 1;
+    }
+    for (size_t l = 0; l < L.size(); ++l) {
+        if (!touched[l]) continue;
+        LayerDev& d = L[l];
+        q.memcpy(d.tm_eptr, d.tm_hptr.data(), d.tm_hptr.size() * sizeof(const uint8_t*));
+        q.memcpy(d.tm_tier_d, d.tm_tier_h.data(), d.tm_tier_h.size());
+    }
+    q.wait();
+    tm_fill_n = long(slots.size());
+    std::printf("  expert fill: %ld more experts in VRAM (%.1f GB, %.1f a layer on average: the RAM tier's %s), "
+                "%.2f GiB kept for prompt chunks of %.0f rows (GRIMOIRE_EXPERT_FILL=0 = the load's budget only)\n",
+                tm_fill_n, double(tm_fill_n) * B / 1e9, double(tm_fill_n) / double(std::max(1, routed_layers)),
+                from_hits ? "most routed by the hits file" : "first of every layer", keep / gib, rows);
+    return size_t(tm_fill_n) * tm_lay.bytes;
 }
 
 // Issue up to n of the step's swaps not yet issued (their copies only read where the experts are now).
@@ -17510,6 +17603,8 @@ void Grimoire::tm_heat_release() {
     q.wait();
     for (void* p : {(void*)tm_spare_v, (void*)tm_spare_h, (void*)tm_upd[0], (void*)tm_upd[1]})
         if (p) sycl::free(p, q);
+    for (uint8_t* p : tm_fill_pools) sycl::free(p, q);
+    tm_fill_pools.clear(); tm_fill_n = 0;
     tm_spare_v = tm_spare_h = nullptr;
     tm_upd[0] = tm_upd[1] = nullptr;
     tm_free_v.clear(); tm_free_h.clear();
