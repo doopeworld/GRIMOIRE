@@ -1,0 +1,9 @@
+# v1.10.5-rc2 (11-06): the two executables and libgrimoire_gemm.so rebuilt from radiance-heat-1106 (G31/G21, CPU only)
+# over the unchanged v1.10.4 runtime. assemble-image-v1106.sh checks the exact base image and that the attention library
+# and oneDNN equal v1.10.4's, and puts the source commit in for @SRC@.
+FROM grimoire-b70:v1.10.4
+LABEL org.opencontainers.image.source="https://github.com/doopeworld/GRIMOIRE" \
+      org.opencontainers.image.revision="@SRC@" \
+      org.opencontainers.image.version="v1.10.5-rc2"
+COPY --chmod=0755 bin/grimoire bin/grimoire-server bin/libgrimoire_gemm.so /grimoire/bin/
+COPY build-manifest.json /usr/share/doc/grimoire/build-manifest.json
