@@ -2045,7 +2045,17 @@ static sycl::event launch_dflash2_block_attention_split(
     int sliding_window, bool causal, float softmax_scale, int splits,
     float* pacc, float* pm, float* pl, const std::vector<sycl::event>& deps) {
     constexpr int QT=16, KT=16, WG=QT*SG_SIZE;
-    const int qtiles=(tokens+QT-1)/QT;
+    // 11-06: a work-group's 16 query rows are (token, head) pairs of ONE KV head's group, not one head's tokens:
+    // the K / V tile it converts into SLM then serves every query head that reads it (Qwen3.8-27B's drafter: a
+    // tile was loaded and FP8-decoded once per query head, and a 7-8 row draft left half of each 16-row tile
+    // idle -- 2.3 of a 9.3 ms draft on two cards).  A row's keys, tiles and arithmetic are unchanged, so every
+    // row is bit for bit what it was.  GRIMOIRE_DFLASH_ATTN_GQA=0 = one query head a work-group.
+    static const bool gqa_env=[]{const char* e=std::getenv("GRIMOIRE_DFLASH_ATTN_GQA");return !(e&&*e=='0');}();
+    const bool gqa=gqa_env&&num_kv_heads>0&&num_heads%num_kv_heads==0&&num_heads>num_kv_heads;
+    const int hpg=gqa?num_heads/num_kv_heads:1;                 // query heads a KV head serves
+    const int qrows=gqa?tokens*hpg:tokens;                       // rows a work-group column covers
+    const int qtiles=(qrows+QT-1)/QT;
+    const int heads_dim=gqa?num_kv_heads:num_heads;              // the grid's head dimension
     const int end=context_len+tokens;
     const int begin=(causal&&sliding_window>0)
         ? std::max(0,context_len+1-sliding_window)
@@ -2056,7 +2066,7 @@ static sycl::event launch_dflash2_block_attention_split(
         sycl::local_accessor<float,1> ks(size_t(head_dim)*KT,h);
         sycl::local_accessor<float,1> vs(size_t(KT)*head_dim,h);
         h.parallel_for(
-            sycl::nd_range<1>(size_t(qtiles)*num_heads*splits*WG,WG),
+            sycl::nd_range<1>(size_t(qtiles)*heads_dim*splits*WG,WG),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 const auto sg=it.get_sub_group();
                 const int lane=int(sg.get_local_id()[0]);
@@ -2064,9 +2074,12 @@ static sycl::event launch_dflash2_block_attention_split(
                 const int lid=int(it.get_local_id(0));
                 const int g=int(it.get_group(0));
                 const int sp=g%splits,rest=g/splits;
-                const int qt=rest/num_heads,qh0=rest%num_heads;
-                const int t=qt*QT+qslot;
-                const int kvh=qh0/(num_heads/num_kv_heads);
+                const int qt=rest/heads_dim,hd=rest%heads_dim;
+                // gqa: hd is the KV head, the row a (token, head-in-group) pair; else hd is the query head
+                const int r=qt*QT+qslot;
+                const int t=gqa?(r<qrows?r/hpg:tokens):r;
+                const int qh0=gqa?hd*hpg+(r<qrows?r%hpg:0):hd;
+                const int kvh=gqa?hd:qh0/(num_heads/num_kv_heads);
                 const uint8_t* kh=k_cache+int64_t(kvh)*head_dim*seq_cap;
                 const uint8_t* vh=v_cache+int64_t(kvh)*seq_cap*head_dim;
                 float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
