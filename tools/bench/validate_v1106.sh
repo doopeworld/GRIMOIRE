@@ -8,7 +8,7 @@ set -u
 B=/mnt/storage/isos/grimoire-runs/bench-1022
 PD=/mnt/storage/Models/grimoire-ple
 cd "$B" || exit 9
-export IMG=${IMG:-grimoire-b70:v1.10.5-rc2} HOSTBIN=0 LOAD_MAX=1500 CLIENT_CPUS=14,15
+export IMG=${VALIDATE_IMG:-grimoire-b70:v1.10.5-rc2} HOSTBIN=0 LOAD_MAX=1500 CLIENT_CPUS=14,15
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "VALIDATE_STOP no image $IMG"; exit 9; }
 S="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_SEQ_SLOTS=8"
 MTP="GRIMOIRE_MTP=1 GRIMOIRE_MTP_K=6 GRIMOIRE_MTP_DRAFT_VOCAB=65536"

@@ -22,7 +22,7 @@ touch logs/HOLD-fnpp
 trap 'rm -f "$B/logs/HOLD-fnpp"; cp "$PD/flash-next.hits.frozen-1028" "$PD/flash-next.hits.ab"' EXIT
 export GRIM_TREE=$T HOSTBIN=1 IMG=grimoire-b70:latest LOAD_MAX=1500 CLIENT_CPUS=14,15
 F=/models2/Qwen3.8-Flash-Next-NVFP4
-E="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits.ab GRIMOIRE_CX_STATS=1"
+E="GRIMOIRE_POWER_LIMIT_W=0 GRIMOIRE_PP_LAYERS=24,24 GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits.ab GRIMOIRE_CX_STATS=1"
 run() { # name env
   local name=$1 env=$2
   cp "$PD/flash-next.hits.frozen-1028" "$PD/flash-next.hits.ab"

@@ -32,7 +32,7 @@ def server_checks(stem, label, allow_answer_fail, own_binaries=True):
     needed = ['Coherence test PASSED', 'server stopped gracefully', 'gpu0 path correctable=0',
               'uncorrectable(all ports)=0']
     if own_binaries:
-        needed.append("the image's own binaries")
+        needed.append("image grimoire-b70:v1.10.5-rc2, the image's own binaries")
     for n in needed:
         assert n in run, f'{label}: missing {n!r}'
     text = run
