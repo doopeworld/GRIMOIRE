@@ -97,6 +97,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <sys/mman.h>
 #include <sys/file.h>
 #include "b70/peer_copy.hpp"
+#include "b70/host_history_budget.hpp"
 #include <dirent.h>
 
 namespace b70 {
@@ -110,10 +111,7 @@ static void* allocate_dflash_taps(sycl::queue& q, size_t bytes, bool host) {
     if(fd<0) throw std::runtime_error("DFlash host tap allocation lock failed");
     struct Guard { int fd; ~Guard(){::flock(fd,LOCK_UN);::close(fd);} } guard{fd};
     if(::flock(fd,LOCK_EX)<0) throw std::runtime_error("DFlash host tap lock failed");
-    std::ifstream mem("/proc/meminfo"); std::string line; uint64_t available=0;
-    while(std::getline(mem,line)) if(line.rfind("MemAvailable:",0)==0) {
-        std::istringstream in(line.substr(13)); in>>available; available*=1024; break;
-    }
+    const uint64_t available=host_history_available_ram();
     constexpr uint64_t reserve=uint64_t(8)<<30;
     if(available<reserve || bytes>available-reserve)
         throw std::runtime_error("DFlash host taps need more available system RAM (8 GiB reserve)");
@@ -9479,6 +9477,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     std::printf("ok\n");                    // closes the "scratch buffers ..." line
     {
         const double gib = 1073741824.0;
+        // Distributed DFlash currently serves one request at a time and
+        // cannot retain prefix slots. Do not reserve unused pinned histories.
+        if(dflash2.target_aux_host && n_seq_slots>1 &&
+           (tp_ranked() || pp_enabled()) && !speculative_batch()) {
+            std::printf("  DFlash host history: distributed drafter serves one request at a time -> 1 slot (requested %d)\n",
+                        n_seq_slots);
+            n_seq_slots=1;
+        }
         size_t kv_slot_bytes = 0;            // this rank's attention layers, one slot
         for (const auto& d : L) kv_slot_bytes += 2 * d.kv_slot;
         // what the closing reset() adds for every slot past the first
@@ -9512,6 +9518,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         const double more = std::max(1.0, double(kv_slot_bytes + draft_slot_bytes));
         const int want = n_seq_slots;
         int fit = room < first ? 0 : int(std::min(double(want), 1.0 + (room - first) / more));
+        if(dflash2.target_aux_host && dflash2.target_aux) {
+            const uint64_t history=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
+            const unsigned ranks=unsigned(tp_ranked()?tp_world:(pp_enabled()?pp_world:1));
+            const int host_fit=host_history_slot_limit(host_history_available_ram(),uint64_t(8)<<30,
+                                                       history,ranks,want);
+            if(host_fit<want) {
+                std::printf("  DFlash host RAM: at most %d conversation slots fit across %u ranks (8 GiB reserve)\n",
+                            host_fit,ranks);
+                if(pp_enabled()) {
+                    err="DFlash host histories exceed system RAM; lower GRIMOIRE_SEQ_SLOTS to "+std::to_string(host_fit);
+                    return false;
+                }
+                fit=std::min(fit,host_fit);
+            }
+        }
         // Every rank must hold the same slots: a batched request names slot numbers.
         if (tp_ranked() && !tp_agree_min(fit)) { err = "TP slot-count agreement failed"; return false; }
         const char* fv = std::getenv("GRIMOIRE_SLOTS_FIT");

@@ -32,7 +32,9 @@ class PeerCopy {
         decltype(&zeCommandListAppendMemoryCopy) copy = nullptr;
         decltype(&zeCommandListHostSynchronize) sync = nullptr;
         decltype(&zeCommandListDestroy) destroy = nullptr;
-        Api() {
+        // Leave the default host path free of new loader activity.
+        void load() {
+            if(library) return;
             library = ::dlopen("libze_loader.so.1", RTLD_NOW | RTLD_LOCAL);
             if (!library) return;
 #define B70_PEER_SYMBOL(member, symbol) member = reinterpret_cast<decltype(member)>(::dlsym(library, #symbol))
@@ -107,6 +109,7 @@ public:
         if (const char* e = std::getenv("GRIMOIRE_P2P_CHUNK_MB"))
             own.bytes = size_t(std::clamp(std::atoi(e), 1, 64)) << 20;
         try {
+            if(mode>0) api.load();
             if (mode > 0 && api.ready() && q.get_backend() == sycl::backend::ext_oneapi_level_zero) {
                 context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
                 device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());

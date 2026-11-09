@@ -54,8 +54,12 @@ The FP8 target KV cache and DFlash's own caches are separate allocations.
 Host allocation checks available system RAM, keeps an 8 GiB reserve, and first
 touches the buffer while holding a local-worker allocation lock. Additional
 sequence slots get independent histories. Host bytes are excluded from GPU
-memory accounting. Automatic multi-slot host-budget fitting is still under
-review; initial long-context validation uses one slot.
+memory accounting. Automatic slot fitting also limits the total histories
+across local ranks to available system RAM and container memory headroom.
+Distributed DFlash currently serves one request at a time, so host-history mode
+reserves one slot there rather than allocating unused copies. Single-device
+speculative batching can retain independent histories. Initial long-context
+validation uses one slot.
 
 This retains a full history in system RAM. It does not implement windowed
 history eviction. Long-context cache allocation alone is not proof that a
