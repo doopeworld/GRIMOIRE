@@ -1533,12 +1533,15 @@ static const float* int4_importance(const TensorRef& r, int K, Fmt use) {
 // W (x / s) * s = W x exactly, but a loud channel's weights now span more INT4
 // steps.  The INT4 search weighs the scaled matrix's error by m_k / s_k^2, which
 // is the original output error again.  Measured offline (2026-11-06, Qwen3.8-27B
-// BF16 layers 10-11, Unsloth imatrix, output error vs plain INT4 g128): q 0.20,
+// BF16 layers 10-14, Unsloth imatrix, output error vs plain INT4 g128): q 0.20,
 // k 0.18, v 0.24, DeltaNet qkv / z 0.33 at alpha 0.30-0.45 (rounding by the
-// imatrix alone: 0.32 / 0.58 / 0.71 / 0.62 / 0.56); INT8: q 0.41, k 0.25, v 0.20,
-// DeltaNet 0.56-0.62.  The scales are set per layer before its weights upload.
+// imatrix alone: 0.32 / 0.58 / 0.71 / 0.62 / 0.56).  Per-row INT8 wants a gentler
+// fold -- a loud column raises its whole row's step: at alpha 0.2 q 0.34, k 0.31,
+// v 0.26, DeltaNet qkv 0.45-0.53, z 0.52-0.62 of plain INT8, while at 0.4 in_proj_z
+// came out 1.3x WORSE.  The scales are set per layer before its weights upload.
 struct InFold {
     std::vector<float> s;                        // empty = this layer is not folded
+    std::vector<bf16_t> norm;                    // the folded norm, as the kernels read it
     std::unordered_map<std::string, int> names;  // the projections reading the norm
 };
 static InFold in_fold;
@@ -1573,7 +1576,7 @@ static const float* folded_importance(const float* imp, const std::vector<float>
     for (int k = 0; k < K; ++k) buf[size_t(k)] = imp[k] / ((*fs)[size_t(k)] * (*fs)[size_t(k)]);
     return buf.data();
 }
-static int fold_layers = 0, fold_skipped = 0;  // reported by build()
+static int fold_layers = 0, fold_skipped = 0, fold_kept = 0;  // reported by build()
 // Plans one layer's input-norm fold: fills in_fold, or leaves it empty where the
 // layer cannot take it -- another architecture, a format it is not measured for,
 // a pre-quantized source (its stored precision stays authoritative), no imatrix
@@ -1606,35 +1609,50 @@ static void plan_in_fold(const Qwen35Model& ck, const Qwen35Config& cfg,
     }
     const float* m = ok ? im->find(grp[0]->t.name, K, false) : nullptr;
     if (!m) { ++fold_skipped; return; }
-    std::vector<float> s(size_t(K));
+    std::vector<float> w(static_cast<size_t>(K));
+    std::string err;
+    if (!read_matrix_f32(ck, src.input_norm, w.data(), err)) {
+        std::printf("\n  GRIMOIRE_IMATRIX_FOLD: input_layernorm read failed (%s) -- layer not folded\n",
+                    err.c_str());
+        ++fold_skipped; return;
+    }
+    std::vector<double> want(static_cast<size_t>(K));
     double mx = 0.0, mn = 1e300;
     for (int k = 0; k < K; ++k) {
         const double v = std::pow(std::max(double(m[k]), 1e-12), alpha / 2.0);
-        s[size_t(k)] = float(v); mx = std::max(mx, v); mn = std::min(mn, v);
+        want[size_t(k)] = v; mx = std::max(mx, v); mn = std::min(mn, v);
     }
     const double c = std::sqrt(mx * mn);
-    for (auto& v : s) v = float(double(v) / c);
-    in_fold.s = std::move(s);
+    // The kernels read the norm as (off + w') with w' in bf16 -- off is the
+    // model's convention, 1 for Qwen3.5's zero-centred (1 + w), 0 for a plain w.
+    // w' = (off + w) / s - off rounds by up to half a bf16 step, and near
+    // w' = -1 (a loud channel: (1 + w) / s small) that is percents of (1 + w'):
+    // a per-channel scale error as large as INT8's own.  So each column takes
+    // its scale from the STORED value, s = (off + w) / (off + w'), which keeps
+    // the fold exact; a channel whose stored value lands far from the planned
+    // scale is left as it was (s = 1, w as the plain upload stores it).
+    const double off = double(cfg.norm_weight_offset());
+    in_fold.s.resize(size_t(K));
+    in_fold.norm.resize(size_t(K));
+    for (int k = 0; k < K; ++k) {
+        const double plan = want[size_t(k)] / c;
+        const double base = off + double(w[size_t(k)]);
+        bf16_t h = f32_to_bf16(float(base / plan - off));
+        const double stored = off + double(bf16_to_f32(h));
+        double s = base == 0.0 ? plan : stored != 0.0 ? base / stored : 0.0;
+        if (!(s >= 0.5 * plan && s <= 2.0 * plan)) {   // also 0 and NaN
+            h = f32_to_bf16(w[size_t(k)]);
+            s = 1.0;
+            ++fold_kept;
+        }
+        in_fold.s[size_t(k)] = float(s);
+        in_fold.norm[size_t(k)] = h;
+    }
     for (const TensorRef* r : grp) in_fold.names[r->t.name] = 1;
     ++fold_layers;
 }
-// The input norm of a folded layer: its output channel k divided by s_k, i.e.
-// (off + w') = (off + w) / s_k with off the model's convention (1 for Qwen3.5's
-// zero-centred (1 + w), 0 for a plain w).
-static bf16_t* upload_folded_norm(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
-                                  const std::vector<float>& s, float off, const char* what, bool* ok) {
-    if (!r.ok() || size_t(r.t.numel()) != s.size()) {
-        std::printf("\n  %s: cannot fold (missing or not %zu wide)\n", what, s.size());
-        *ok = false; return nullptr;
-    }
-    std::vector<float> w(s.size());
-    std::string err;
-    if (!read_matrix_f32(ck, r, w.data(), err)) {
-        std::printf("\n  %s: read failed: %s\n", what, err.c_str());
-        *ok = false; return nullptr;
-    }
-    std::vector<bf16_t> h(s.size());
-    for (size_t k = 0; k < s.size(); ++k) h[k] = f32_to_bf16((w[k] + off) / s[k] - off);
+// The input norm of a folded layer, as plan_in_fold computed it.
+static bf16_t* upload_folded_norm(sycl::queue& q, const std::vector<bf16_t>& h, bool* ok) {
     bf16_t* d = dev_copy<bf16_t>(q, h.data(), h.size() * sizeof(bf16_t));
     if (!d) *ok = false;
     return d;
@@ -7171,8 +7189,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
             plan_in_fold(ck, cfg, src, PF);
             d.in_norm   = in_fold.s.empty()
                 ? dev_copy_t<bf16_t>(lq, ck, src.input_norm, "input_layernorm", &ok)
-                : upload_folded_norm(lq, ck, src.input_norm, in_fold.s, cfg.norm_weight_offset(),
-                                     "input_layernorm", &ok);
+                : upload_folded_norm(lq, in_fold.norm, &ok);
             d.post_norm = dev_copy_t<bf16_t>(lq, ck, src.post_attn_norm, "post_attention_layernorm", &ok);
         }
         if(cfg.is_muse){
@@ -9841,9 +9858,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
             std::printf("  imatrix: %d INT4 weights rounded by their output error, %d without an entry\n",
                         im->hits.load(), im->misses.load());
     if (fold_layers || fold_skipped)
-        std::printf("  imatrix fold (alpha %.2f): %d layers' input norms folded into their projections, "
-                    "%d left as they were (no entry or a pre-quantized source)\n",
-                    fold_alpha(), fold_layers, fold_skipped);
+        std::printf("  imatrix fold (alpha %.2f): %d layers' input norms folded into their projections "
+                    "(%d channels kept their scale), %d left as they were (no entry or a "
+                    "pre-quantized source)\n",
+                    fold_alpha(), fold_layers, fold_kept, fold_skipped);
     in_fold = InFold{};
 
     // ---- capability matrix ----------------------------------------
