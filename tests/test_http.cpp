@@ -37,7 +37,13 @@ int main(){
     bad([]{parse_completion_request(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]})",true);});
     bad([]{parse_completion_request(R"({"prompt":"x","max_tokens":1e50})",false);});
     bad([]{parse_completion_request(R"({"prompt":"x","max_tokens":-2})",false);});
-    bad([]{parse_completion_request(R"({"prompt":"x","temperature":1})",false);});
+    const auto sampled=parse_completion_request(R"({"prompt":"x","temperature":0.7,"top_p":0.95,"top_k":20,"seed":42})",false);
+    assert(sampled.sampling.enabled()&&sampled.sampling.top_k==20&&sampled.sampling.seed==42);
+    bad([]{parse_completion_request(R"({"prompt":"x","temperature":-1})",false);});
+    bad([]{parse_completion_request(R"({"prompt":"x","temperature":1,"top_p":0})",false);});
+    bad([]{parse_completion_request(R"({"prompt":"x","temperature":1,"top_k":65})",false);});
+    bad([]{parse_completion_request(R"({"prompt":"x","temperature":1,"top_k":1.5})",false);});
+    bad([]{parse_completion_request(R"({"prompt":"x","seed":-1})",false);});
     Tokens tk;
     std::string content,reason;
     auto emit=[&](const std::string& p,bool r){(r?reason:content)+=p;return true;};

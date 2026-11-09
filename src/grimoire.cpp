@@ -40,6 +40,7 @@
 //  memcpy'd straight from the mmapped shard to VRAM.
 // =====================================================================
 #include "kernels.hpp"
+#include "sample_logits.hpp"
 #include "attn_verify.hpp"
 #include "b70/engine.hpp"
 #include "b70/grimoire_api.hpp"
@@ -4312,6 +4313,20 @@ struct Grimoire {
     // is read as accepted-per-step, and labelling every run "depth 15"
     // when GRIMOIRE_DFLASH_M=4 drafts three makes that unreadable.
     int          dflash_block_rows() const;
+    SamplingOptions current_sampling;
+    std::array<SamplingOptions,64> slot_sampling{};
+    SamplingWorkspace sampling_workspace;
+    sycl::event target_choice(const float* logits,int n,int32_t* token,float* value,
+                             int slot,int position,const std::vector<sycl::event>& deps={}) {
+        const auto& options=slot>=0?slot_sampling.at(size_t(slot)):current_sampling;
+        // Rank zero samples the replicated target head. Existing token-control
+        // messages carry its choice to every TP worker before acceptance or a
+        // subsequent forward pass. Draft proposals keep their greedy policy.
+        if(options.enabled()&&(!tp_ranked()||tp_rank==0))
+            return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
+                                        options,uint64_t(position),deps);
+        return launch_argmax(q,logits,n,token,value,deps);
+    }
     int          argmax_token();
     void release();
 };
@@ -10610,6 +10625,7 @@ bool Grimoire::solo_ok() const {
 int Grimoire::decode_solo(int32_t tok, int slot, int position) {
     sync();
     bind_seq_slot(slot);
+    current_sampling=slot_sampling.at(size_t(slot));
     pos = position;
     check_token(tok);
     set_cursor(pos);
@@ -11502,6 +11518,8 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
 }
 
 void Grimoire::release() {
+    q.wait();
+    sampling_workspace.release(q);
     if(!draft_slots.empty()) {
         q.wait();
         bind_seq_slot(0);
@@ -15309,8 +15327,8 @@ int Grimoire::argmax_token() {
     if (dag) {
         std::vector<sycl::event> ready = dag_tail;
         ready.push_back(dag_logits);
-        sycl::event e_arg = launch_argmax(
-            q, s.logits, cfg.vocab, s.d_tok, s.d_val, ready);
+        sycl::event e_arg = target_choice(
+            s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, ready);
         int32_t tok = 0;
         sycl::event e_copy = q.submit([&](sycl::handler& h) {
             h.depends_on(e_arg);
@@ -15337,7 +15355,7 @@ int Grimoire::argmax_token() {
         mtp4_shadow(int(out));
         return int(out);
     }
-    launch_argmax(q, s.logits, cfg.vocab, s.d_tok, s.d_val, none);
+    target_choice(s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, none);
     // ONE blocking round trip per token, not two. The logit value is only
     // ever printed under debug, and each `.wait()` here is a full device
     // round trip on the critical path between one token and the next.
@@ -21894,7 +21912,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             const int last = runs[r].row0 + runs[r].count - 1;
             float* row = batch_logits + int64_t(r) * cfg.vocab;
             gemv_any(lm_head, bn + int64_t(last) * H, row, {});
-            launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
+            target_choice(row,cfg.vocab,s.d_tok,s.d_val,
+                seqb?seqb->slot[spans_mode?runs[r].row0:r]:-1,
+                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{});
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
             static const bool adm_dbg = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
             if (adm_dbg) {
@@ -21945,7 +21965,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             float* row = batch_logits + int64_t(r) * cfg.vocab;
             if (!tp_enabled() && !lm_head.has_i4() && !lm_batched)
                 launch_gemv(q, lm_head.w, bn + int64_t(r) * H, row, {});
-            launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
+            target_choice(row,cfg.vocab,s.d_tok,s.d_val,
+                seqb?seqb->slot[spans_mode?runs[r].row0:r]:-1,
+                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{});
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
         }
       } else {
@@ -22766,6 +22788,7 @@ int grimoire_serve_generate_batch(Grimoire& e,
 // =====================================================================
 namespace {
 struct SchedJob {
+    SamplingOptions sampling;
     // Set by the submitting thread, read by the scheduler.
     std::vector<int32_t> prompt;
     int budget = 0, eos = -1, eot = -1;
@@ -22949,7 +22972,7 @@ void GrimoireScheduler::run() {
         static const int il_chunk = [] {
             const char* v = std::getenv("GRIMOIRE_INTERLEAVE_CHUNK");
             return v && *v ? std::max(0, std::atoi(v)) : 1024; }();
-        if (il_chunk > 0 && batchable && e.interleave_ok() && (!active.empty() || !prefilling.empty())) {
+        if (il_chunk > 0 && batchable && std::none_of(taking.begin(),taking.end(),[](const auto& j){return j->sampling.enabled();}) && e.interleave_ok() && (!active.empty() || !prefilling.empty())) {
             std::vector<std::shared_ptr<SchedJob>> rest;
             for (auto& j : taking) {
                 if (int(j->prompt.size()) <= il_chunk || cancelled(j) ||
@@ -22960,6 +22983,7 @@ void GrimoireScheduler::run() {
                     int done = 0;
                     j->slot = e.admit_begin(j->prompt, slot_busy, done);
                     j->pos = done;
+                    e.slot_sampling.at(size_t(j->slot))=j->sampling;
                     slot_busy[size_t(j->slot)] = true;
                     prefilling.push_back(j);
                 } catch (const std::exception& ex) {
@@ -22969,7 +22993,8 @@ void GrimoireScheduler::run() {
             taking.swap(rest);
         }
         std::vector<std::shared_ptr<SchedJob>> admitted_round;
-        const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2) ? [&] {
+        const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2 &&
+            std::none_of(taking.begin(),taking.end(),[](const auto& j){return j->sampling.enabled();})) ? [&] {
             const int b = e.prefill_token_budget();
             return b > 0 ? std::min(admit_batch_tokens, b) : admit_batch_tokens; }() : 0;
         while (batchable && admit_cap > 0 && taking.size() >= 2) {
@@ -22986,7 +23011,10 @@ void GrimoireScheduler::run() {
             std::vector<int> bslots; std::vector<int32_t> bfirst;
             const auto bt0 = std::chrono::steady_clock::now();
             bool batched = false;
-            try { batched = e.admit_batch(prompts, slot_busy, bslots, bfirst); }
+            try {
+                for(size_t i=0;i<slot_busy.size();++i)if(!slot_busy[i])e.slot_sampling[i]={};
+                batched = e.admit_batch(prompts, slot_busy, bslots, bfirst);
+            }
             catch (const std::exception& ex) {
                 std::fprintf(stderr, "    batched admission skipped: %s\n", ex.what());
                 batched = false;
@@ -23000,6 +23028,7 @@ void GrimoireScheduler::run() {
             for (size_t k = 0; k < group.size(); ++k) {
                 auto& j = group[k];
                 j->slot = bslots[k];
+                e.slot_sampling.at(size_t(j->slot))=j->sampling;
                 j->pos  = int(j->prompt.size());
                 j->next = bfirst[k];
                 slot_busy[size_t(j->slot)] = true;
@@ -23027,6 +23056,7 @@ void GrimoireScheduler::run() {
                 continue;
             }
             try {
+                e.current_sampling=j->sampling;
                 if (!batchable) {
                     // One at a time, by the ordinary path.  Speculation,
                     // the prefix cache and the graph all still apply --
@@ -23097,6 +23127,7 @@ void GrimoireScheduler::run() {
                                  active.size());
                 j->slot = slot;
                 j->pos  = e.pos;
+                e.slot_sampling.at(size_t(slot))=j->sampling;
                 j->next = e.argmax_token();
                 static const bool adm_dbg1 = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
                 if (adm_dbg1) {
@@ -23165,6 +23196,7 @@ void GrimoireScheduler::run() {
                     if (size_t(j->pos) == total) {
                         prefilling.erase(prefilling.begin());
                         e.admit_end(j->slot);
+                        e.current_sampling=j->sampling;
                         j->next = e.argmax_token();
                         const bool stop = (j->eos >= 0 && j->next == j->eos) ||
                                           (j->eot >= 0 && j->next == j->eot);
@@ -23339,9 +23371,21 @@ void grimoire_scheduler_delete(GrimoireScheduler* sc) {
 int grimoire_scheduler_generate(GrimoireScheduler& sc,
         const std::vector<int32_t>& prompt, int n_predict, int eos_id,
         int eot_id, std::vector<int32_t>& out,
-        const std::function<bool(int32_t)>& on_token, FinishReason* finish) {
+        const std::function<bool(int32_t)>& on_token, FinishReason* finish,
+        const SamplingOptions& sampling) {
+    sampling.validate();
+    if(sampling.enabled()&&(sc.e.pp_enabled()||sc.e.tp_head_split||sc.e.dag||
+                            sc.e.cfg.is_qwen4_exp||sc.e.cfg.is_muse||sc.e.cfg.is_k2||
+                            sc.e.cfg.is_gemma4||sc.e.cfg.is_moe()||sc.e.cfg.lin_v_heads<=0))
+        throw std::invalid_argument("sampled decoding currently supports the Qwen3.5-family dense target on one GPU or Megatron TP");
     out.clear();
     auto j = std::make_shared<SchedJob>();
+    j->sampling=sampling;
+    if(j->sampling.enabled()&&!j->sampling.seeded) {
+        std::random_device rd;
+        j->sampling.seed=(uint64_t(rd())<<32)^uint64_t(rd());
+        j->sampling.seeded=true;
+    }
     j->prompt = prompt;
     // Thrown HERE, on the caller's thread, so a bad request is a 400 from
     // the handler that made it rather than a scheduler error with no

@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
     });
     svr.Get("/v1/models",[&](const httplib::Request&,httplib::Response& res) {
         res.set_content("{\"object\":\"list\",\"data\":[{\"id\":\""+json_escape(model_dir)+
-            "\",\"object\":\"model\"}],\"grimoire\":{\"decoding\":\"greedy\",\"concurrency\":"+
+            "\",\"object\":\"model\"}],\"grimoire\":{\"decoding\":\"greedy,top_k,top_p,temperature\",\"concurrency\":"+
             std::to_string(b70::grimoire_scheduler_width(*sched))+"}}","application/json");
     });
     auto handle=[&](const httplib::Request& req,httplib::Response& res,bool chat) {
@@ -262,11 +262,12 @@ int main(int argc, char** argv) {
         const std::vector<b70::Json> tools=request.tools;
         const auto ids=tk.encode(prompt,true);
         const int budget=b70::generation_budget(ids,request.max_tokens,max_seq,int(tk.vocab_size()));
+        const auto sampling=request.sampling;
         const std::string model=json_escape(model_dir);
         const auto request_id=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         if(request.stream) {
             res.set_chunked_content_provider("text/event-stream",
-                [&,ids,budget,chat,model,request_id,think,tools](size_t,httplib::DataSink& sink) {
+                [&,ids,budget,chat,model,request_id,think,tools,sampling](size_t,httplib::DataSink& sink) {
                     auto send=[&](const std::string& payload) {
                         const auto line="data: "+payload+"\n\n";return sink.write(line.data(),line.size());
                     };
@@ -286,7 +287,7 @@ int main(int argc, char** argv) {
                         std::vector<int32_t> out;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
                             tk.eos(),tk.eos2(),out,
-                            [&](int32_t t){return decoder.push(t,emit);},&finish);
+                            [&](int32_t t){return decoder.push(t,emit);},&finish,sampling);
                         if(connected)connected=decoder.finish(emit);
                         std::string reason=b70::finish_reason_name(finish);
                         if(connected && !decoder.tool_call_text().empty()) {
@@ -314,7 +315,7 @@ int main(int argc, char** argv) {
             b70::FinishReason finish;
             std::vector<int32_t> out;
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.eos2(),out,{},&finish);
+                tk.eos2(),out,{},&finish,sampling);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
             if(chat&&!tools.empty())decoder.enable_tools();

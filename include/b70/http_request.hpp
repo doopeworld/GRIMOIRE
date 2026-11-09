@@ -18,6 +18,7 @@
 
 #pragma once
 #include "b70/json.hpp"
+#include "b70/sampling.hpp"
 #include <algorithm>
 #include <cctype>
 #include "b70/tokenizer.hpp"
@@ -29,6 +30,7 @@ struct CompletionRequest {
     int max_tokens=4096;
     bool stream=false;
     std::vector<Json> tools;   // OpenAI function tools, kept for argument typing
+    SamplingOptions sampling;
     ChatOptions chat;          // template inputs: tools (tojson), thinking, effort
 };
 // A message's text: a string, an array of text parts, or null.
@@ -73,14 +75,26 @@ inline CompletionRequest parse_completion_request(const std::string& body, bool 
     else r.max_tokens=j.int_or("max_tokens",4096);
     if(r.max_tokens<=0)throw std::invalid_argument("max_tokens must be positive");
     if(j.int_or("n",1)!=1)throw std::invalid_argument("only n=1 is supported");
-    // The engine implements greedy target verification. Do not silently
-    // accept sampling parameters which would change that distribution.
-    for(auto field:{"temperature","top_p","presence_penalty","frequency_penalty"}) {
-        const auto* v=j.find(field); if(!v)continue;
-        const double allowed=std::string(field)=="top_p"?1:0;
-        if(v->kind!=Json::Kind::Number || v->number!=allowed)
-            throw std::invalid_argument(std::string("greedy decoding requires ")+field+"="+std::to_string(allowed));
+    auto number=[&](const char* name,double fallback) {
+        const auto* v=j.find(name);if(!v)return fallback;
+        if(v->kind!=Json::Kind::Number||!std::isfinite(v->number))
+            throw std::invalid_argument(std::string(name)+" must be a finite number");
+        return v->number;
+    };
+    r.sampling.temperature=float(number("temperature",0));
+    r.sampling.top_p=float(number("top_p",1));
+    const double k=number("top_k",20);
+    if(k!=std::floor(k)||k<-1||k>INT32_MAX)throw std::invalid_argument("top_k must be an integer");
+    r.sampling.top_k=int(k);
+    if(const auto* seed=j.find("seed");seed&&seed->kind!=Json::Kind::Null) {
+        const double v=number("seed",0);
+        if(v!=std::floor(v)||v<0||v>9007199254740991.0)
+            throw std::invalid_argument("seed must be an integer in [0,2^53-1]");
+        r.sampling.seed=uint64_t(v);r.sampling.seeded=true;
     }
+    r.sampling.validate();
+    for(auto field:{"presence_penalty","frequency_penalty"})
+        if(number(field,0)!=0)throw std::invalid_argument(std::string("unsupported nonzero ")+field);
     for(auto field:{"stop","logprobs","response_format"}) {
         const auto* v=j.find(field);
         if(v && v->kind!=Json::Kind::Null && !(v->kind==Json::Kind::Boolean&&!v->boolean))
