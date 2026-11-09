@@ -86,6 +86,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <atomic>
 #include <tuple>
 #include <fstream>
+#include <sstream>
 #include <iomanip>
 #include <limits>
 #include <sys/socket.h>
@@ -94,9 +95,36 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/file.h>
+#include "b70/peer_copy.hpp"
 #include <dirent.h>
 
 namespace b70 {
+
+// Opt-in lossless DFlash tap storage in pinned system RAM. Serialize the
+// availability check and first touch across local workers so two ranks cannot
+// both reserve the same free RAM. Leave at least 8 GiB for the host/driver.
+static void* allocate_dflash_taps(sycl::queue& q, size_t bytes, bool host) {
+    if (!host) return sycl::malloc_device(bytes, q);
+    int fd=::open("/tmp/grimoire-dflash-taps.lock",O_CREAT|O_RDWR|O_CLOEXEC,0600);
+    if(fd<0) throw std::runtime_error("DFlash host tap allocation lock failed");
+    struct Guard { int fd; ~Guard(){::flock(fd,LOCK_UN);::close(fd);} } guard{fd};
+    if(::flock(fd,LOCK_EX)<0) throw std::runtime_error("DFlash host tap lock failed");
+    std::ifstream mem("/proc/meminfo"); std::string line; uint64_t available=0;
+    while(std::getline(mem,line)) if(line.rfind("MemAvailable:",0)==0) {
+        std::istringstream in(line.substr(13)); in>>available; available*=1024; break;
+    }
+    constexpr uint64_t reserve=uint64_t(8)<<30;
+    if(available<reserve || bytes>available-reserve)
+        throw std::runtime_error("DFlash host taps need more available system RAM (8 GiB reserve)");
+    void* ptr=sycl::malloc_host(bytes,q);
+    if(ptr) std::memset(ptr,0,bytes);
+    return ptr;
+}
+static bool dflash_host_taps_requested() {
+    const char* e=std::getenv("GRIMOIRE_DFLASH_TAPS_HOST");
+    return e && std::strcmp(e,"1")==0;
+}
 
 // The standalone native profile must never load a framework-backed bridge.
 // Generic SYCL/XMX kernels remain available when bridges are disabled.
@@ -2241,6 +2269,8 @@ struct Grimoire {
     int pp_begin = 0, pp_end = 0;
     int pp_prev_fd = -1, pp_next_fd = -1;
     std::vector<int> tp_peer_fd;
+    PeerCopy tp_peer_copy, pp_prev_copy, pp_next_copy;
+    bool peer_copy_setup(std::string& err);
     std::string pp_socket;
     bool pp_enabled() const { return pp_rank >= 0; }
     // Two tensor-parallel algorithms share the rank plumbing (sockets, the
@@ -2503,6 +2533,7 @@ struct Grimoire {
     // A no-op on one GPU and under the legacy algorithm.
     bool tp_block_reduce(float* dev, size_t elems) {
         if (!tp_mega) return true;
+        if(tp_peer_copy.active()) return tp_peer_copy.allreduce(q,dev,elems,tp_rank,false);
         return tshm.base ? tp_shm_allreduce(dev, elems) : tp_allreduce_sum(dev, int(elems));
     }
     int  tp_sync_token(int token);
@@ -3238,6 +3269,9 @@ struct Grimoire {
         // Token-major [max_seq,n_taps,H]. The draft fc consumes one
         // contiguous concatenated target-feature row per verified token.
         float *target_aux=nullptr;
+        bool target_aux_host=false;
+        float *tap_stage=nullptr; // bounded device input to the context projection
+
         // Persistent original-DFlash scratch. Fixed addresses are also the
         // foundation for capturing the 16-query draft in a reusable graph.
         float *ctx=nullptr, *h=nullptr, *resid=nullptr, *normed=nullptr;
@@ -4289,7 +4323,38 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
     return pp_send_request(r);
 }
 
+// Only the GPU payload uses IPC. Token/control messages keep their existing
+// ordered Unix stream. Setup runs before receiver threads can read that stream.
+bool Grimoire::peer_copy_setup(std::string& err) {
+    const int mode=PeerCopy::requested_mode();
+    if(tp_ranked()) {
+        if(!tp_mega || tp_world!=2) {
+            if(mode<0 || mode==2) { err="P2P requires Megatron TP with two ranks, or pipeline parallel"; return false; }
+            if(mode) std::printf("  P2P: host fallback (requires two Megatron ranks)\n");
+            return true;
+        }
+        std::string why;
+        if(!tp_peer_copy.setup(q,tp_peer_fd[tp_rank==0?1:0],tp_rank==0,why)) {
+            err="TP P2P: "+why; return false;
+        }
+        if(mode) std::printf("  TP P2P: %s%s; FP32 payloads\n",
+                             tp_peer_copy.active()?"":"host fallback: ",why.c_str());
+    } else if(pp_enabled()) {
+        std::string why;
+        if(pp_prev_fd>=0) {
+            if(!pp_prev_copy.setup(q,pp_prev_fd,false,why)) {err="PP P2P: "+why;return false;}
+            if(mode) std::printf("  PP previous P2P: %s%s\n",pp_prev_copy.active()?"":"host fallback: ",why.c_str());
+        }
+        if(pp_next_fd>=0) {
+            if(!pp_next_copy.setup(q,pp_next_fd,true,why)) {err="PP P2P: "+why;return false;}
+            if(mode) std::printf("  PP next P2P: %s%s\n",pp_next_copy.active()?"":"host fallback: ",why.c_str());
+        }
+    }
+    return true;
+}
+
 bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
+    if(pp_next_copy.active()) return pp_next_copy.send(q,dev,elems);
     // The socket write blocked until the next stage READ the message, and the
     // next stage reads only when it starts its next chunk: MEASURED 2026-10-01
     // (PP=2, Ornith 5987 tokens, chunk 2048) rank 0 sat 6 / 14 / 20 ms in
@@ -4341,6 +4406,7 @@ bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
 }
 
 bool Grimoire::pp_recv_hidden(float* dev, size_t elems) {
+    if(pp_prev_copy.active()) { pp_next_rows=0; return pp_prev_copy.recv(q,dev,elems); }
     // GRIMOIRE_PP_RECV_PREFETCH=0 = always read synchronously.  Off when DFlash
     // taps share the socket (their messages interleave with the hidden rows).
     static const bool prefetch = [] { const char* e = std::getenv("GRIMOIRE_PP_RECV_PREFETCH");
@@ -4617,6 +4683,7 @@ bool Grimoire::tp_allgather_multi(const std::vector<std::pair<float*,int>>& spec
 }
 
 bool Grimoire::tp_allreduce_sum(float* dev,int elems){
+    if(tp_peer_copy.active()) return elems>=0 && tp_peer_copy.allreduce(q,dev,size_t(elems),tp_rank,false);
     if(!tp_ranked()||tp_peer_fd.empty())return false;
     const size_t n=size_t(elems);
     if(n>pipe_host_elems){if(pipe_host)sycl::free(pipe_host,q);pipe_host=sycl::malloc_host<float>(n,q);pipe_host_elems=pipe_host?n:0;}
@@ -5729,6 +5796,7 @@ bool Grimoire::tp_stream_drain(){
 }
 
 bool Grimoire::tp_shm_allreduce(float* dev,size_t elems){
+    if(tp_peer_copy.active()) return tp_peer_copy.allreduce(q,dev,elems,tp_rank,false);
     const int W=tp_world;
     auto flag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+64*size_t(r));};
     auto slot=[&](int r,uint64_t s){
@@ -5954,6 +6022,7 @@ bool Grimoire::kwait(uint64_t tag, const char* what) {
 // instead of a host->device copy, a device add and the copy out, all after the CPU.  0 = this
 // all-reduce does not go that way (GRIMOIRE_CX_FOLD=0, no BAR sum, more than one piece).
 uint64_t Grimoire::tp_small_ar_send(float* dev, size_t elems) {
+    if(tp_peer_copy.active()) return 1;
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_CX_FOLD"); return !(e && *e == '0'); }();
     if (!on || !tp_mega || tp_world != 2 || !tshm.base || !tshm.sb_cpu || elems > tshm.small_max) return 0;
     if (tshm.sp_piece == 0 || elems > tshm.sp_piece || !ksend_on()) return 0;
@@ -5962,6 +6031,7 @@ uint64_t Grimoire::tp_small_ar_send(float* dev, size_t elems) {
 }
 
 bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const float* host_add){
+    if(tp_peer_copy.active()) return tp_peer_copy.allreduce(q,dev,elems,tp_rank,false,host_add);
     const int peer=1-tp_rank;
     auto sflag=[&](int r){return reinterpret_cast<std::atomic<uint64_t>*>(tshm.base+1024+64*size_t(r));};
     const uint64_t s=++tshm.seq;
@@ -8250,8 +8320,9 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
             return false;
         }
         const size_t NTAP=dflash2.target_layers.size();
-        dflash2.target_aux=sycl::malloc_device<float>(
-            size_t(max_seq)*NTAP*cfg.hidden,q);
+        dflash2.target_aux_host=dflash_host_taps_requested();
+        dflash2.target_aux=static_cast<float*>(allocate_dflash_taps(q,
+            size_t(max_seq)*NTAP*cfg.hidden*sizeof(float),dflash2.target_aux_host));
         if(!dflash2.target_aux){
             err="DFlash tap buffer allocation failed on PP stage "+
                 std::to_string(pp_rank);
@@ -8886,10 +8957,13 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
                 }
             }
         }
-        dflash2.target_aux=sycl::malloc_device<float>(
-            size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden,q);
+        dflash2.target_aux_host=dflash_host_taps_requested();
+        const size_t tap_bytes=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
+        dflash2.target_aux=static_cast<float*>(allocate_dflash_taps(q,tap_bytes,dflash2.target_aux_host));
         if(!dflash2.target_aux)dok=false;
-        db+=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
+        if(!dflash2.target_aux_host) db+=tap_bytes;
+        else std::printf("  DFlash taps: %.2f GiB pinned system RAM per rank; bounded device staging\n",
+                         double(tap_bytes)/(1ull<<30));
         // v2 was skipped here entirely, so a DFlash2 checkpoint loaded its
         // weights and then had no scratch to run in. The draft geometry is the
         // same for both versions; v2 only adds the convolution buffers below.
@@ -8917,6 +8991,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
             }
             const int DMC=std::max(DM,dflash2.ctx_chunk);
             dflash2.ctx=dfd(size_t(DMC)*DH);
+            if(dflash2.target_aux_host) {
+                dflash2.tap_stage=dfd(size_t(DMC)*dflash2.target_layers.size()*cfg.hidden);
+                if(!dflash2.tap_stage)dok=false;
+            }
             if(cfg.is_muse){
                 const size_t all_kv=size_t(dflash2.layers.size())*DMC*DKV;
                 dflash2.context_kv_all=dfd(2*all_kv);
@@ -9379,7 +9457,8 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         if (!pipe_host) { err = "multiprocess host staging allocation failed"; return false; }
         pipe_host_elems = size_t(H);
         if (!pp_connect(err)) return false;
-        if (!tp_shm_setup(err)) return false;
+        if (!peer_copy_setup(err)) return false;
+        if (!tp_peer_copy.active() && !tp_shm_setup(err)) return false;
     }
 
     // ---- KV caches, fitted to the card ----------------------------------
@@ -9406,7 +9485,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         // (init_draft_slots): the MTP head's KV, a DFlash drafter's caches and taps
         size_t draft_slot_bytes = size_t(cfg.hidden) * sizeof(float);
         if (mtp.ok) draft_slot_bytes += 2 * size_t(mtp.L.kv_heads) * mtp.L.head_dim * max_seq;
-        if (dflash2.target_aux)
+        if (dflash2.target_aux && !dflash2.target_aux_host)
             draft_slot_bytes += size_t(max_seq) * dflash2.target_layers.size() * cfg.hidden * sizeof(float);
         for (const auto& dl : dflash2.layers) {
             const size_t dk = size_t(dflash2.kv_heads) * dflash2.head_dim * max_seq;
@@ -10624,8 +10703,15 @@ void Grimoire::init_draft_slots() {
                 slot.mk=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.k_cache;
                 slot.mv=j?static_cast<uint8_t*>(allocate(mkbytes)):mtp.L.v_cache;
             }
-            if(dflash2.target_aux) slot.aux=j?static_cast<float*>(allocate(
-                size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float))):dflash2.target_aux;
+            if(dflash2.target_aux) {
+                const size_t bytes=size_t(max_seq)*dflash2.target_layers.size()*cfg.hidden*sizeof(float);
+                slot.aux=dflash2.target_aux;
+                if(j && dflash2.target_aux_host) {
+                    slot.aux=static_cast<float*>(allocate_dflash_taps(q,bytes,true));
+                    if(!slot.aux) throw std::bad_alloc();
+                    slot.owned.push_back(slot.aux);
+                } else if(j) slot.aux=static_cast<float*>(allocate(bytes));
+            }
             for(auto& layer:dflash2.layers) {
                 slot.k.push_back(layer.k_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.k_cache):nullptr);
                 slot.v.push_back(layer.v_cache?(j?static_cast<uint8_t*>(allocate(dkbytes)):layer.v_cache):nullptr);
@@ -11186,6 +11272,7 @@ void Grimoire::release() {
                      (void**)&muse_zero_f16})
         if (*p) { sycl::free(*p, q); *p = nullptr; }
     pp_send_wait();
+    tp_peer_copy.reset(); pp_prev_copy.reset(); pp_next_copy.reset();
     if(pp_prev_fd>=0)::shutdown(pp_prev_fd,SHUT_RDWR);   // unblock a pending prefetch
     pp_recv_wait();
     if(pp_prev_fd>=0){::close(pp_prev_fd);pp_prev_fd=-1;}
@@ -11445,7 +11532,7 @@ void Grimoire::release() {
     for (void* p : {(void*)dflash2.hidden_norm, (void*)dflash2.norm,
                     (void*)dflash2.hidden_norm_f16, (void*)dflash2.norm_f16,
                     (void*)dflash2.predecessor, (void*)dflash2.successor,
-                    (void*)dflash2.target_aux, (void*)dflash2.ctx,
+                    (void*)dflash2.target_aux, (void*)dflash2.tap_stage, (void*)dflash2.ctx,
                     (void*)dflash2.context_kv_all,
                     (void*)dflash2.h, (void*)dflash2.resid,
                     (void*)dflash2.normed, (void*)dflash2.q,
@@ -15319,7 +15406,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         const int rows=std::min(std::max(M,dflash2.ctx_chunk),position-start);
         dump_f32("01_aux_"+std::to_string(start),
                  dflash2.target_aux+int64_t(start)*NT*H,size_t(rows)*NT*H);
-        fc_mm(dflash2.target_aux+int64_t(start)*NT*H,dflash2.ctx,rows);
+        const float* aux=dflash2.target_aux+int64_t(start)*NT*H;
+        if(dflash2.target_aux_host) {
+            q.memcpy(dflash2.tap_stage,aux,size_t(rows)*NT*H*sizeof(float));
+            aux=dflash2.tap_stage;
+        }
+        fc_mm(aux,dflash2.ctx,rows);
         norm(dflash2.ctx,nullptr,dflash2.hidden_norm,dflash2.hidden_norm_f16,
              dflash2.normed,rows);
         dump_f32("02_fc_"+std::to_string(start),dflash2.ctx,size_t(rows)*H);
