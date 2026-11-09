@@ -17,7 +17,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "b70/generation.hpp"
+#include "b70/sampling.hpp"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <iostream>
 
@@ -143,6 +145,30 @@ struct DeferredEngine : Engine {
         return true;
     }
 };
+// A seeded stochastic Markov target. Each verifier row draws from the
+// same target distribution at that absolute position; deterministic drafts
+// may be accepted or rejected. Exact arithmetic isolates protocol/RNG
+// correctness from real GEMM/GEMV rounding differences.
+struct SampledEngine : Engine {
+    uint64_t seed=0;
+    static std::array<float,4> probability(int previous) {
+        return previous%4==0?std::array<float,4>{.65f,.15f,.15f,.05f}:
+                             std::array<float,4>{.10f,.50f,.30f,.10f};
+    }
+    int argmax_token(){
+        const auto p=probability(history.back());
+        const float u=b70::sampling_uniform_f32(seed,uint64_t(pos));
+        float sum=0;for(int i=0;i<4;++i){sum+=p[i];if(u<sum)return i;}return 3;
+    }
+    bool prefill(const std::vector<int32_t>& ids,std::vector<int32_t>* next=nullptr){
+        for(int t:ids){forward(t);if(next)next->push_back(argmax_token());}
+        return true;
+    }
+    int mtp_draft(int token,int,bool){
+        ++draft_calls;const auto p=probability(token);
+        return int(std::max_element(p.begin(),p.end())-p.begin());
+    }
+};
 template<class F> void throws(F f){bool did=false;try{f();}catch(const std::exception&){did=true;}assert(did);}
 int main(){
     using namespace b70;
@@ -184,6 +210,27 @@ int main(){
         GenerationOptions o{count,-1,-1,15,false,true,false};
         const int n=generate_tokens(e,prompt,o,out,{},reason);
         assert(n==std::min(count,capacity-4));assert(e.pos<=capacity);
+    }
+    {   // Sampling must preserve the target law for every seeded path,
+        // not merely produce plausible text. Check every width and both
+        // proposal styles, including many partial acceptance prefixes.
+        long accepted=0,rejected=0;
+        for(uint64_t seed=0;seed<256;++seed){
+            SampledEngine target;target.seed=seed;
+            GenerationOptions plain{40,-1,-1,0,false,false,false};
+            std::vector<int32_t> reference;
+            generate_tokens(target,prompt,plain,reference,{},reason);
+            for(bool df:{false,true})for(int depth=1;depth<=15;++depth){
+                SampledEngine spec;spec.seed=seed;SpecStats stats;
+                GenerationOptions options{40,-1,-1,depth,df,!df,false,&stats};
+                std::vector<int32_t> sampled;
+                generate_tokens(spec,prompt,options,sampled,{},reason);
+                assert(sampled==reference);
+                accepted+=stats.accepted;rejected+=stats.drafted-stats.accepted;
+            }
+        }
+        assert(accepted>0&&rejected>0);
+        std::cout<<"sampled generation: 7680 seeded speculative paths preserve target draws PASS\n";
     }
     Engine e;GenerationOptions o{5,-1,-1,3,false,true,false};
     generate_tokens(e,prompt,o,out,[](int){return false;},reason);
