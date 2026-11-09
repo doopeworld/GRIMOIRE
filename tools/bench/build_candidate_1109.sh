@@ -15,13 +15,10 @@ icpx -O2 -std=c++17 -I include tools/test_int4_rtn.cpp src/quantize.cpp -o bin/t
 ./bin/test_int4_rtn plain | tee /tmp/rtn-plain.txt
 GRIMOIRE_INT4_RTN_GROUP=64 ./bin/test_int4_rtn g64 | tee /tmp/rtn-g64.txt
 GRIMOIRE_INT4_RTN_GROUP=64 GRIMOIRE_INT4_RTN_SEARCH=1 ./bin/test_int4_rtn g64-search | tee /tmp/rtn-g64-search.txt
-python3 - <<'PY'
-import re
-from pathlib import Path
-v=[float(re.search(r'MSE ([0-9.]+)',Path('/tmp/rtn-'+x+'.txt').read_text())[1]) for x in ['plain','g64','g64-search']]
-assert v[1]<.9*v[0] and v[2]<v[1],v
-print('RTN_COMPARISON_PASS',v)
-PY
+awk '/MSE/ {v[++n]=$6} END {
+ if(n!=3 || v[2]>=.9*v[1] || v[3]>=v[2]) exit 1;
+ print "RTN_COMPARISON_PASS",v[1],v[2],v[3]
+}' /tmp/rtn-plain.txt /tmp/rtn-g64.txt /tmp/rtn-g64-search.txt
 icpx -O2 -std=c++17 -I include tools/test_ipc_socket.cpp -o bin/test_ipc_socket
 ./bin/test_ipc_socket
 icpx -O2 -std=c++17 -I include tools/test_host_history_budget.cpp -o bin/test_host_history_budget
