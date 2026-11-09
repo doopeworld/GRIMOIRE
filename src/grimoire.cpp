@@ -4316,15 +4316,43 @@ struct Grimoire {
     SamplingOptions current_sampling;
     std::array<SamplingOptions,64> slot_sampling{};
     SamplingWorkspace sampling_workspace;
+    CoupledSamplingStore coupled_sampling_store;
+    bool sampling_uses_slots=false;
+    std::array<uint64_t,64> sampling_epoch{};
+    static bool coupled_sampling_enabled() {
+        static const bool on=[] { const char* e=std::getenv("GRIMOIRE_SAMPLE_COUPLED_MTP");
+            return e&&*e&&std::atoi(e)!=0; }();
+        return on;
+    }
+    sycl::event proposal_choice(const float* logits,int n,int32_t* token,float* value,
+                               int slot,int position,bool from_draft,
+                               const std::vector<sycl::event>& deps={}) {
+        const auto& options=sampling_uses_slots?slot_sampling.at(size_t(slot)):current_sampling;
+        if(coupled_sampling_enabled()&&options.enabled()&&(!tp_ranked()||tp_rank==0)) {
+            coupled_sampling_store.ensure(q);
+            if(!from_draft)++sampling_epoch.at(size_t(slot));
+            auto proposal_options=options;proposal_options.seed^=kProposalStream;
+            return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
+                proposal_options,uint64_t(position),deps,
+                coupled_sampling_store.record(slot,uint64_t(position)),nullptr,
+                sampling_epoch.at(size_t(slot)));
+        }
+        return launch_argmax(q,logits,n,token,value,deps);
+    }
     sycl::event target_choice(const float* logits,int n,int32_t* token,float* value,
                              int slot,int position,const std::vector<sycl::event>& deps={}) {
         const auto& options=slot>=0?slot_sampling.at(size_t(slot)):current_sampling;
         // Rank zero samples the replicated target head. Existing token-control
         // messages carry its choice to every TP worker before acceptance or a
         // subsequent forward pass. Draft proposals keep their greedy policy.
-        if(options.enabled()&&(!tp_ranked()||tp_rank==0))
+        if(options.enabled()&&(!tp_ranked()||tp_rank==0)) {
+            const int actual_slot=slot>=0?slot:seq_slot;
+            const auto* proposal=coupled_sampling_enabled()&&mtp.ok&&!dflash2.ok?
+                coupled_sampling_store.record(actual_slot,uint64_t(position)):nullptr;
             return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
-                                        options,uint64_t(position),deps);
+                options,uint64_t(position),deps,nullptr,proposal,
+                sampling_epoch.at(size_t(actual_slot)));
+        }
         return launch_argmax(q,logits,n,token,value,deps);
     }
     int          argmax_token();
@@ -11520,6 +11548,7 @@ void Grimoire::commit_spec_prefix(int saved_pos, int accepted) {
 void Grimoire::release() {
     q.wait();
     sampling_workspace.release(q);
+    coupled_sampling_store.release(q);
     if(!draft_slots.empty()) {
         q.wait();
         bind_seq_slot(0);
@@ -14866,7 +14895,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         launch_gemv(q, head, mtp.h2, s.logits, none);
     } else
         gemv_any(lm_head, mtp.h2, s.logits, none);
-    launch_argmax(q, s.logits, dv, s.d_tok, s.d_val, none);
+    proposal_choice(s.logits,dv,s.d_tok,s.d_val,seq_slot,position+1,from_mtp_hidden,none);
     int32_t tok = 0;
     q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
     return pp_enabled() ? pp_sync_token(int(tok)) : tp_sync_token(int(tok));
@@ -15102,7 +15131,8 @@ bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, con
     // those IDs in place; ordinary batches need no intermediate device copies.
     int32_t* proposals=device_out?device_out:mtpr.dtok;
     for (int r = 0; r < n; ++r)
-        launch_argmax(q, row(mtpr.lg, r, dv), dv, proposals + r, mtpr.val + r, none);
+        proposal_choice(row(mtpr.lg,r,dv),dv,proposals+r,mtpr.val+r,
+                        slot[r],position[r]+1,chained,none);
     if(device_out)return true;
     q.memcpy(mtpr.tok, mtpr.dtok, size_t(n) * sizeof(int32_t)).wait();
     std::vector<int32_t> t(mtpr.tok, mtpr.tok + n);
@@ -22817,7 +22847,9 @@ struct GrimoireScheduler {
     std::thread th;
 
     GrimoireScheduler(Grimoire& eng, int w)
-        : e(eng), width(w), batchable(eng.batch_unsupported_reason().empty()) {}
+        : e(eng), width(w), batchable(eng.batch_unsupported_reason().empty()) {
+        e.sampling_uses_slots=batchable;
+    }
 
     void submit(const std::shared_ptr<SchedJob>& j) {
         { std::lock_guard<std::mutex> l(m); pending.push_back(j); }
@@ -22984,6 +23016,7 @@ void GrimoireScheduler::run() {
                     j->slot = e.admit_begin(j->prompt, slot_busy, done);
                     j->pos = done;
                     e.slot_sampling.at(size_t(j->slot))=j->sampling;
+                    ++e.sampling_epoch.at(size_t(j->slot));
                     slot_busy[size_t(j->slot)] = true;
                     prefilling.push_back(j);
                 } catch (const std::exception& ex) {
@@ -23029,6 +23062,7 @@ void GrimoireScheduler::run() {
                 auto& j = group[k];
                 j->slot = bslots[k];
                 e.slot_sampling.at(size_t(j->slot))=j->sampling;
+                ++e.sampling_epoch.at(size_t(j->slot));
                 j->pos  = int(j->prompt.size());
                 j->next = bfirst[k];
                 slot_busy[size_t(j->slot)] = true;
@@ -23058,6 +23092,7 @@ void GrimoireScheduler::run() {
             try {
                 e.current_sampling=j->sampling;
                 if (!batchable) {
+                    for(auto& epoch:e.sampling_epoch)++epoch;
                     // One at a time, by the ordinary path.  Speculation,
                     // the prefix cache and the graph all still apply --
                     // this is the server exactly as it was.
@@ -23128,6 +23163,7 @@ void GrimoireScheduler::run() {
                 j->slot = slot;
                 j->pos  = e.pos;
                 e.slot_sampling.at(size_t(slot))=j->sampling;
+                ++e.sampling_epoch.at(size_t(slot));
                 j->next = e.argmax_token();
                 static const bool adm_dbg1 = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
                 if (adm_dbg1) {

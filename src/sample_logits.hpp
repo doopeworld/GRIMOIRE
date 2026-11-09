@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "b70/sampling.hpp"
+#include "b70/speculative_sampling.hpp"
 #include <sycl/sycl.hpp>
 #include <limits>
 namespace b70 {
@@ -23,10 +24,27 @@ struct SamplingWorkspace {
         values=nullptr;indices=nullptr;
     }
 };
+struct CoupledSamplingStore {
+    static constexpr int slots=64,ring=16;
+    SparseSamplingDistribution* records=nullptr;
+    void ensure(sycl::queue& q) {
+        if(records)return;
+        records=sycl::malloc_device<SparseSamplingDistribution>(slots*ring,q);
+        if(!records)throw std::bad_alloc();
+        q.memset(records,0,slots*ring*sizeof(SparseSamplingDistribution));
+    }
+    SparseSamplingDistribution* record(int slot,uint64_t position) const {
+        return records?records+size_t(slot)*ring+position%ring:nullptr;
+    }
+    void release(sycl::queue& q){if(records)sycl::free(records,q);records=nullptr;}
+};
 inline sycl::event launch_sample_logits(sycl::queue& q,const float* logits,int n,
     int32_t* output,float* output_value,SamplingWorkspace& workspace,
     SamplingOptions options,uint64_t position,
-    const std::vector<sycl::event>& deps={}) {
+    const std::vector<sycl::event>& deps={},
+    SparseSamplingDistribution* save=nullptr,
+    const SparseSamplingDistribution* reference=nullptr,uint64_t epoch=0,
+    int32_t* acceptance=nullptr) {
     options.validate();workspace.ensure(q);
     constexpr int G=SamplingWorkspace::groups,W=SamplingWorkspace::width;
     float* pv=workspace.values;int32_t* pi=workspace.indices;
@@ -81,11 +99,35 @@ inline sycl::event launch_sample_logits(sycl::queue& q,const float* logits,int n
                 if(!(total>0)){*output=-1;return;}
                 float mass=0;int keep=0;
                 do{mass+=scores[keep++];}while(keep<k&&mass<options.top_p*total);
-                const float draw=sampling_uniform_f32(options.seed,position)*mass;
-                float cumulative=0;int chosen=keep-1;
-                for(int j=0;j<keep;++j){cumulative+=scores[j];if(draw<cumulative){chosen=j;break;}}
-                *output=ids[chosen];
-                if(output_value)*output_value=logits[ids[chosen]];
+                int token=-1;
+                if(!save&&!reference) {
+                    const float draw=sampling_uniform_f32(options.seed,position)*mass;
+                    float cumulative=0;int chosen=keep-1;
+                    for(int j=0;j<keep;++j){cumulative+=scores[j];if(draw<cumulative){chosen=j;break;}}
+                    token=ids[chosen];if(acceptance)*acceptance=0;
+                } else {
+                    for(int j=0;j<keep;++j)scores[j]/=mass;
+                    const SamplingDistributionView target{keep,
+                        ids.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        scores.get_multi_ptr<sycl::access::decorated::no>().get()};
+
+                    bool accepted=false;
+                    if(reference&&reference->count>0&&reference->epoch==epoch&&
+                       reference->position==position&&reference->seed==(options.seed^kProposalStream)) {
+                        token=coupled_sample(target,*reference,
+                            sampling_uniform_f32(options.seed^kAcceptanceStream,position),
+                            sampling_uniform_f32(options.seed^kResidualStream,position),accepted);
+                    } else token=sparse_draw(target,sampling_uniform_f32(options.seed,position));
+                    if(acceptance)*acceptance=accepted?1:0;
+                    if(save) {
+                        save->count=keep;save->proposal=token;save->position=position;
+                        save->seed=options.seed;save->epoch=epoch;
+                        for(int j=0;j<keep;++j){save->ids[j]=ids[j];save->probability[j]=scores[j];}
+                    }
+
+                }
+                *output=token;
+                if(output_value)*output_value=token>=0?logits[token]:-std::numeric_limits<float>::infinity();
             }
         });
     });
