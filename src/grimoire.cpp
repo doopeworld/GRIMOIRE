@@ -4340,14 +4340,15 @@ struct Grimoire {
         return launch_argmax(q,logits,n,token,value,deps);
     }
     sycl::event target_choice(const float* logits,int n,int32_t* token,float* value,
-                             int slot,int position,const std::vector<sycl::event>& deps={}) {
+                             int slot,int position,const std::vector<sycl::event>& deps={},
+                             bool allow_coupling=true) {
         const auto& options=slot>=0?slot_sampling.at(size_t(slot)):current_sampling;
         // Rank zero samples the replicated target head. Existing token-control
         // messages carry its choice to every TP worker before acceptance or a
         // subsequent forward pass. Draft proposals keep their greedy policy.
         if(options.enabled()&&(!tp_ranked()||tp_rank==0)) {
             const int actual_slot=slot>=0?slot:seq_slot;
-            const auto* proposal=coupled_sampling_enabled()&&mtp.ok&&!dflash2.ok?
+            const auto* proposal=allow_coupling&&coupled_sampling_enabled()&&mtp.ok&&!dflash2.ok?
                 coupled_sampling_store.record(actual_slot,uint64_t(position)):nullptr;
             return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
                 options,uint64_t(position),deps,nullptr,proposal,
@@ -10695,6 +10696,8 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     if(n==0 || n>kSpecBatch || slots.size()!=tokens.size() ||
        positions.size()!=tokens.size() || remaining.size()!=tokens.size())
         throw std::invalid_argument("invalid speculative batch shape");
+    if(coupled_sampling_enabled())
+        for(int slot:slots)++sampling_epoch.at(size_t(slot));
     using spec_clock=std::chrono::steady_clock;
     spec_clock::time_point st0,st1,st2;
     if(g_spec_timing) { sync(); st0=spec_clock::now(); }
@@ -15358,7 +15361,7 @@ int Grimoire::argmax_token() {
         std::vector<sycl::event> ready = dag_tail;
         ready.push_back(dag_logits);
         sycl::event e_arg = target_choice(
-            s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, ready);
+            s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, ready, false);
         int32_t tok = 0;
         sycl::event e_copy = q.submit([&](sycl::handler& h) {
             h.depends_on(e_arg);
@@ -15385,7 +15388,7 @@ int Grimoire::argmax_token() {
         mtp4_shadow(int(out));
         return int(out);
     }
-    target_choice(s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, none);
+    target_choice(s.logits, cfg.vocab, s.d_tok, s.d_val, -1, pos, none, false);
     // ONE blocking round trip per token, not two. The logit value is only
     // ever printed under debug, and each `.wait()` here is a full device
     // round trip on the critical path between one token and the next.
@@ -21944,7 +21947,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             gemv_any(lm_head, bn + int64_t(last) * H, row, {});
             target_choice(row,cfg.vocab,s.d_tok,s.d_val,
                 seqb?seqb->slot[spans_mode?runs[r].row0:r]:-1,
-                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{});
+                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{},
+                !seqb||seqb->verify);
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
             static const bool adm_dbg = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
             if (adm_dbg) {
@@ -21997,7 +22001,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_gemv(q, lm_head.w, bn + int64_t(r) * H, row, {});
             target_choice(row,cfg.vocab,s.d_tok,s.d_val,
                 seqb?seqb->slot[spans_mode?runs[r].row0:r]:-1,
-                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{});
+                seqb?seqb->pos[spans_mode?runs[r].row0+runs[r].count-1:r]+1:start_pos+r+1,{},
+                !seqb||seqb->verify);
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
         }
       } else {

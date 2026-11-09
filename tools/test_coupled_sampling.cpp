@@ -32,6 +32,8 @@ int main(){
         launch_sample_logits(q,p,3,output+i,nullptr,work,options,N-1,{},nullptr,stored,10,accepted+i);
     }
     q.wait_and_throw();for(int i=0;i<64;++i)assert(accepted[i]==0&&output[i]==output[0]);
+    launch_sample_logits(q,p,3,output,nullptr,work,options,N,{},nullptr,stored,9,accepted).wait();
+    assert(accepted[0]==0);
     auto different_seed=options;different_seed.seed=124;
     launch_sample_logits(q,p,3,output,nullptr,work,different_seed,N-1,{},nullptr,stored,9,accepted).wait();
     assert(accepted[0]==0);
