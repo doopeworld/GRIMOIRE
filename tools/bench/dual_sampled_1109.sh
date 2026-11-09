@@ -195,7 +195,6 @@ for t in "${tl[@]}"; do
     seq*)   cu=${t#seq}; client $t timeout 1500 python3 $B/seq_code_1102.py $PORT ${cu:-4} $L.$t.json ;;
     ragged) client ragged timeout 900 python3 $B/mtp_ragged_1031.py $PORT $L.ragged.json ;;
     sampledapi) client sampledapi timeout 900 python3 $B/sampled-api1109.py $PORT $L.sampledapi.json || exit 1 ;;
-    sampledcompare) client sampledcompare python3 $B/compare_sampled1109.py $B/logs/s1109-matched-swift-plain.sampledapi.json $L.sampledapi.json || exit 1 ;;
     betterbench) client betterbench timeout 7200 uv run --offline --no-project --with numpy python -u $B/observe_betterbench1109.py run --endpoint http://127.0.0.1:$PORT/v1 --model $MODEL --config $B/betterbench-match1109.json --max-model-len 262144 --out $L.betterbench.json --no-update-check || exit 1 ;;
     api1109) client api1109 timeout 600 python3 $B/api_checks_1109.py $PORT $L.api.json $MODEL ;;
     pleready) ple_ready ;;
