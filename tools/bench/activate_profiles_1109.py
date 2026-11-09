@@ -23,6 +23,7 @@ def counts():
                 if f.exists():
                     for line in f.read_text().splitlines():
                         if line.startswith('TOTAL_ERR_'):result[(part,kind)]=int(line.split()[1])
+    assert result, "No GPU-path PCIe AER counters found"
     return result
 results=[]
 for profile in profiles:
@@ -58,7 +59,7 @@ for profile in profiles:
     with urllib.request.urlopen(req,timeout=120) as response:answer=json.load(response)
     assert answer['model']==model and 'Paris' in answer['choices'][0]['message']['content']
     with syslog.open('rb') as f:f.seek(offset);new=f.read().decode(errors='replace')
-    bad=[s for s in new.splitlines() if re.search(r'xe 0000:(03:00\.0|07:00\.0)',s) and re.search(r'reset|wedged|fault|error|fail|timedout|lost',s,re.I)]
+    bad=[s for s in new.splitlines() if re.search(r'xe 0000:(03:00\.0|07:00\.0)',s) and re.search(r'\b(?:reset\w*|wedged|fault\w*|error\w*|fail\w*|timedout|lost)\b',s,re.I)]
     assert counts()==before and not bad,bad
     final=name=='GRIMOIRE-DUAL-QWEN3.8'
     results.append({**profile,'healthy':True,'answer':answer['choices'][0]['message']['content'],'running':final})
