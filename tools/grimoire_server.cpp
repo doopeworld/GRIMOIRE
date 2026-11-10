@@ -100,11 +100,14 @@ static void start_stop_signal_thread() {
         g_stop.store(true);
         std::fprintf(stderr, "signal %d: stopping gracefully -- no new requests, live generations end at their "
                              "next token, GPU queues drain before memory is freed\n", sig);
-        // httplib's stop() is a no-op until listen() is running, so repeat it
-        // until main has left listen() (or never reached it).
+        // Call httplib's stop() EXACTLY ONCE, and only once listen() is running:
+        // before that it does nothing, and a second call while listen() is still
+        // draining a live request trips its assert(svr_sock_ != INVALID_SOCKET)
+        // -> abort() with GPU work in flight (MEASURED 11-10 20:21: gpu0 CCS reset).
         while (!g_main_done.load()) {
-            if (httplib::Server* p = g_svr.load()) p->stop();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            httplib::Server* p = g_svr.load();
+            if (p && p->is_running()) { p->stop(); break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }).detach();
 }
