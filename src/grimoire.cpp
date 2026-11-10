@@ -5315,9 +5315,13 @@ bool Grimoire::tp_shm_setup(std::string& err){
             tshm.s_zc=sz&&*sz&&*sz!='0';
             const char* bb=std::getenv("GRIMOIRE_TP_AR_BAR");
             const char* rx=std::getenv("GRIMOIRE_TP_STREAM_RX");
-            // BAR receive by default since 10-24 (Ian: yes): pp4096 2,002 -> 2,568, answers
-            // bit-identical; it falls back to the copy engine if the mapping fails.
-            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&!(bb&&*bb=='0');
+            // BAR receive (the CPU writes the peer's all-reduce pieces straight into this card's VRAM)
+            // is OFF by default since 11-10: gpu1 dropped off the bus twice (11-09, 11-10) at the same
+            // point of a two-card prefill sweep, ~70 s into sustained long prompts, on two different
+            // docks, while ComfyUI runs the same card at 320 W without a drop.  This path is the only
+            // Grimoire-specific heavy traffic in that phase.  Opt in with GRIMOIRE_TP_AR_BAR=1
+            // (pp4096 2,002 -> 2,568 on 10-24); the copy engine receives otherwise.
+            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&bb&&*bb&&*bb!='0';
             tshm.s_rxt=tp_ffn_chunk&&!tshm.s_zc&&(tshm.s_bar||(rx&&*rx&&*rx!='0'));
             if(tshm.s_rxt)tshm.pipe_slots=8;                  // slack for the receiver's lag
         }
