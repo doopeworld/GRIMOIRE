@@ -11575,6 +11575,21 @@ void Grimoire::release() {
     // path (grimoire_delete) and an exception escaping there would take
     // the process down in a worse way than the leak it is reporting.
     try { q.wait(); if (q1) q1->wait(); q_aux.wait(); } catch (...) {}
+    // 11-10: the TP receive thread submits adds on q and the streamed all-reduce
+    // copies run on their own queues (qd2h / qh2d).  Stop the thread and drain
+    // those queues HERE, before the first sycl::free below -- they used to be
+    // stopped / waited only after pipe_host, tp_scratch and the TP staging
+    // buffers had already been freed.
+    if (tshm.s_rx.joinable()) {
+        { std::lock_guard<std::mutex> l(tshm.s_mu); tshm.s_stop.store(true); }
+        tshm.s_cv.notify_all();
+        tshm.s_rx.join();
+    }
+    try {
+        if (tshm.qd2h) tshm.qd2h->wait();
+        if (tshm.qh2d) tshm.qh2d->wait();
+        q.wait();
+    } catch (...) {}
     if(dflash2.fc_plan){
         auto od=load_onednn_bf16();
         if(od)od.destroy(dflash2.fc_plan);

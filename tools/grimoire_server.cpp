@@ -58,7 +58,56 @@
 #include <memory>
 #include <random>
 #include <cctype>
+#include <csignal>
+#include <pthread.h>
+#include <thread>
 using b70::json_escape;
+
+// ---------------------------------------------------------------------
+// GRACEFUL STOP (2026-11-10).  This server used to install no handler for
+// SIGTERM / SIGINT, so `docker stop` (and the `multi` entrypoint, which
+// forwards TERM to every rank) killed each rank process on the spot: GPU
+// work still queued, device memory torn down by the kernel instead of by
+// Grimoire::release().  The xe driver then had to reset the engines --
+// MEASURED: gpu0 CCS x2 + BCS "Timedout job" at a T0 stop on 11-10 19:53,
+// both B70s at a TP2 stop on 11-09 13:52.  Killing a process with GPU work
+// in flight is the one thing this project must never do to a card.
+//
+// Now the stop signals are blocked in every thread (the mask is set before
+// the SYCL / Level Zero runtime starts any) and one thread takes them with
+// sigwait().  Rank 0 then stops accepting HTTP, ends every live generation
+// at its next token, lets the scheduler finish the step it is in, sends
+// the TP / PP workers their shutdown message, and frees the engine through
+// grimoire_delete() -> release(), which drains every queue before it frees
+// anything.  A worker rank just keeps following rank 0 until that shutdown
+// message (or rank 0's closed pipe) and then takes the same release() path.
+// A second signal is ignored on purpose: Docker's own --stop-timeout is the
+// backstop, never a kill from inside while the card is busy.
+static std::atomic<bool> g_stop{false};
+static std::atomic<bool> g_main_done{false};
+static std::atomic<httplib::Server*> g_svr{nullptr};
+
+static void block_stop_signals() {
+    sigset_t s; sigemptyset(&s); sigaddset(&s, SIGTERM); sigaddset(&s, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &s, nullptr);
+}
+
+static void start_stop_signal_thread() {
+    std::thread([] {
+        sigset_t s; sigemptyset(&s); sigaddset(&s, SIGTERM); sigaddset(&s, SIGINT);
+        int sig = 0;
+        if (sigwait(&s, &sig) != 0) return;
+        g_stop.store(true);
+        std::fprintf(stderr, "signal %d: stopping gracefully -- no new requests, live generations end at their "
+                             "next token, GPU queues drain before memory is freed\n", sig);
+        // httplib's stop() is a no-op until listen() is running, so repeat it
+        // until main has left listen() (or never reached it).
+        while (!g_main_done.load()) {
+            if (httplib::Server* p = g_svr.load()) p->stop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }).detach();
+}
 
 // OpenAI tool_calls array; streaming deltas also carry each call's index.
 static std::string tool_calls_json(const std::vector<b70::ParsedToolCall>& calls, bool with_index) {
@@ -79,6 +128,11 @@ int main(int argc, char** argv) {
     // full buffering held the engine's printf lines (GRIMOIRE_SPEC_TIME, spec
     // stats) until exit -- and a stopped container never flushed them.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    // Before ANY thread exists (the SYCL / Level Zero runtime starts its own
+    // in grimoire_load): every later thread inherits the blocked mask, so a
+    // stop signal can only ever be taken by the stop thread below.
+    block_stop_signals();
+    start_stop_signal_thread();
     // Level Zero sysman reports the card's free VRAM, which sizes prefill
     // chunks (Grimoire::prefill_token_budget); it must be on before SYCL starts.
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
@@ -195,9 +249,20 @@ int main(int argc, char** argv) {
                              "serving nothing, following rank 0\n",
                      pp ? "pipeline" : "tensor-parallel",
                      std::atoi(pp ? pp : (tp ? tp : "0")));
+        // Returns on rank 0's shutdown message or its closed pipe; the engine is
+        // then freed by `owner` -> grimoire_delete() -> release(), queues drained.
         b70::grimoire_pp_worker_loop(*e);
+        g_main_done.store(true);
         return 0;
     }
+    // A stop that arrived while the model was loading: no warm-up, no listen.
+    auto stop_before_serving = [&] {
+        std::fprintf(stderr, "stopped before serving: workers told to shut down, engine released\n");
+        b70::grimoire_pp_shutdown(*e);
+        g_main_done.store(true);
+        return 0;
+    };
+    if (g_stop.load()) return stop_before_serving();
     // oneDNN (on unless GRIMOIRE_ONEDNN=0) compiles its kernels the first time a
     // weight meets a new row class (src/onednn_gemm.cpp): the first request
     // after a start paid ~0.45 s for it (MEASURED 2026-10-25, Qwen3.8-27B-FP8 on
@@ -214,7 +279,7 @@ int main(int argc, char** argv) {
                 tk.encode("The quick brown fox jumps over the lazy dog while the band plays. ");
             int done = 0;
             for (const int len : {73, 333, 777, 2153}) {
-                if (unit.empty() || len + 2 >= max_seq) break;
+                if (unit.empty() || len + 2 >= max_seq || g_stop.load()) break;
                 std::vector<int32_t> ids;
                 while (int(ids.size()) < len) ids.insert(ids.end(), unit.begin(), unit.end());
                 ids.resize(size_t(len));
@@ -232,6 +297,7 @@ int main(int argc, char** argv) {
     // what the KV cache was allocated for (GRIMOIRE_SEQ_SLOTS) and at its
     // own row limit, so asking for more than the box can hold is not an
     // error, just a smaller number.
+    if (g_stop.load()) return stop_before_serving();
     const char* bw = std::getenv("GRIMOIRE_MAX_BATCH");
     std::unique_ptr<b70::GrimoireScheduler,void(*)(b70::GrimoireScheduler*)>
         sched(b70::grimoire_scheduler_new(*e, bw && *bw ? std::atoi(bw) : 8),
@@ -287,7 +353,7 @@ int main(int argc, char** argv) {
                         std::vector<int32_t> out;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
                             tk.eos(),tk.eos2(),out,
-                            [&](int32_t t){return decoder.push(t,emit);},&finish,sampling);
+                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling);
                         if(connected)connected=decoder.finish(emit);
                         std::string reason=b70::finish_reason_name(finish);
                         if(connected && !decoder.tool_call_text().empty()) {
@@ -314,8 +380,9 @@ int main(int argc, char** argv) {
         } else {
             b70::FinishReason finish;
             std::vector<int32_t> out;
+            // a stop ends this request at its next token (the scheduler then cancels the job)
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.eos2(),out,{},&finish,sampling);
+                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
             if(chat&&!tools.empty())decoder.enable_tools();
@@ -344,6 +411,23 @@ int main(int argc, char** argv) {
     };
     svr.Post("/v1/chat/completions",[&](const httplib::Request& req,httplib::Response& res){handle(req,res,true);});
     svr.Post("/v1/completions",[&](const httplib::Request& req,httplib::Response& res){handle(req,res,false);});
-    if(!svr.listen(host,port)){std::fprintf(stderr,"could not listen on %s:%d\n",host.c_str(),port);return 1;}
+    g_svr.store(&svr);
+    // the stop thread may have fired between the check above and this point
+    const bool listened = g_stop.load() ? true : svr.listen(host,port);
+    g_svr.store(nullptr);
+    if(!listened && !g_stop.load()){
+        std::fprintf(stderr,"could not listen on %s:%d\n",host.c_str(),port);
+        sched.reset(); b70::grimoire_pp_shutdown(*e); g_main_done.store(true);
+        return 1;
+    }
+    // listen() returned: every connection thread has finished (live generations
+    // were cut at their next token).  Ordered teardown, the same as the engine's
+    // own tests: the scheduler finishes its step and stops, the TP / PP workers
+    // get their shutdown message, then `owner` -> grimoire_delete() -> release()
+    // drains every GPU queue before freeing device memory.
+    sched.reset();
+    b70::grimoire_pp_shutdown(*e);
+    std::fprintf(stderr,"scheduler stopped, workers told to shut down; releasing the engine\n");
+    g_main_done.store(true);
     return 0;
 }
