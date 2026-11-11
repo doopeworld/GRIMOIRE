@@ -17,6 +17,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "b70/generation.hpp"
+#include "b70/generation_control.hpp"
+#include <future>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "b70/sampling.hpp"
 #include <algorithm>
 #include <array>
@@ -170,7 +174,75 @@ struct SampledEngine : Engine {
     }
 };
 template<class F> void throws(F f){bool did=false;try{f();}catch(const std::exception&){did=true;}assert(did);}
+// Actual Unix control streams plus the production generation loop: cancellation
+// inside accepted MTP blocks must leave every rank at the next request header.
+static void ranked_cancel_tests() {
+    using namespace b70;
+    auto read_all=[](int fd,void* p,size_t n) {
+        auto* b=static_cast<char*>(p);
+        while(n) { const auto k=::read(fd,b,n); if(k<=0)return false; b+=k;n-=size_t(k); }
+        return true;
+    };
+    auto write_all=[](int fd,const void* p,size_t n) {
+        auto* b=static_cast<const char*>(p);
+        while(n) { const auto k=::write(fd,b,n); if(k<=0)return false; b+=k;n-=size_t(k); }
+        return true;
+    };
+    for(bool chain:{false,true}) for(int depth:{0,1,6}) for(int stop_after:{1,3,10}) {
+        constexpr int ranks=3;
+        std::array<int,ranks> up{-1,-1,-1};
+        std::array<std::vector<int>,ranks> down;
+        std::vector<int> fds;
+        for(int r=1;r<ranks;++r) {
+            int pair[2]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0);
+            timeval timeout{3,0};
+            for(int fd:pair) {
+                assert(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof timeout)==0);
+                assert(setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof timeout)==0);
+                fds.push_back(fd);
+            }
+            down[chain?r-1:0].push_back(pair[0]); up[r]=pair[1];
+        }
+        std::array<std::vector<int32_t>,ranks> cancelled_out,next_out;
+        std::vector<std::future<void>> workers;
+        for(int rank=0;rank<ranks;++rank) workers.push_back(std::async(std::launch::async,[&,rank] {
+            Engine e;e.recurrent=true;e.snap_enabled=true;
+            for(int request=0;request<2;++request) {
+                // A fresh header after cancellation must not be consumed as
+                // a continuation word (nor have a leftover word before it).
+                uint32_t header=0x12340000u+uint32_t(request);
+                if(up[rank]>=0) { uint32_t got=0;assert(read_all(up[rank],&got,sizeof got));assert(got==header); }
+                for(int fd:down[rank])assert(write_all(fd,&header,sizeof header));
+                GenerationOptions o{40,-1,-1,depth,false,depth>0,false};
+                if(request==1)o.max_tokens=12;
+                FinishReason reason;int seen=0;
+                auto& out=request==0?cancelled_out[rank]:next_out[rank];
+                generate_tokens(e,{3,4,5,6},o,out,[&](int32_t) {
+                    ++seen;
+                    bool keep=rank!=0 || request!=0 || seen<stop_after;
+                    return b70::generation_continue(keep,up[rank],down[rank],read_all,write_all);
+                },reason);
+                assert(out.size()==size_t(request==0?stop_after:12));
+                assert(reason==(request==0?FinishReason::Cancelled:FinishReason::Length));
+            }
+        }));
+        for(auto& w:workers)w.get();
+        for(int rank=1;rank<ranks;++rank) {
+            assert(cancelled_out[rank]==cancelled_out[0]); assert(next_out[rank]==next_out[0]);
+        }
+        for(int fd:fds)::close(fd);
+    }
+    // Invalid protocol phase must fail rather than turn a header into a bool.
+    bool threw=false;
+    try {
+        b70::generation_continue(true,0,{},[](int,void* p,size_t){*static_cast<uint32_t*>(p)=42;return true;},write_all);
+    } catch(const std::runtime_error&) {threw=true;}
+    assert(threw);
+    std::cout<<"ranked cancellation: TP/PP streams, speculative blocks, next request PASS\n";
+}
+
 int main(){
+    ranked_cancel_tests();
     using namespace b70;
     std::vector<int32_t> out;FinishReason reason;
     const std::vector<int32_t> prompt{3,4,5,6};

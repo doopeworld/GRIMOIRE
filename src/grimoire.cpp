@@ -45,6 +45,7 @@
 #include "b70/engine.hpp"
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
+#include "b70/generation_control.hpp"
 #include "b70/qwen35.hpp"
 #include "b70/gguf_qwen35.hpp"
 #include "b70/dflash_config.hpp"
@@ -22633,7 +22634,30 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     if(spec_time && o.stats) stats.fence=[&e]{ e.sync(); };
     FinishReason reason=FinishReason::Length;
     try {
-        const int n=generate_tokens(e,prompt_ids,o,out_ids,on_token,reason);
+        // Every rank executes emit() at the same token boundary. Broadcast
+        // rank zero's callback answer there, including tokens inside an
+        // accepted speculative block. Never stop just one rank or inject a
+        // new request header while a worker still expects token data.
+        const bool ranked=e.pp_enabled() || e.tp_ranked();
+        int upstream=-1;
+        std::vector<int> downstream;
+        if(e.tp_ranked()) {
+            if(e.tp_rank==0) {
+                for(int r=1;r<e.tp_world;++r) downstream.push_back(e.tp_peer_fd.at(size_t(r)));
+            } else upstream=e.tp_peer_fd.at(0);
+        } else if(e.pp_enabled()) {
+            upstream=e.pp_prev_fd;
+            if(e.pp_next_fd>=0) downstream.push_back(e.pp_next_fd);
+        }
+        const auto emit=[&](int32_t t) {
+            const bool keep=on_token ? on_token(t) : true;
+            if(!ranked) return keep;
+            if(e.pp_enabled()) e.pp_send_wait();
+            return generation_continue(keep,upstream,downstream,
+                [](int fd,void* p,size_t n){return fd_read_all(fd,p,n);},
+                [](int fd,const void* p,size_t n){return fd_write_all(fd,p,n);});
+        };
+        const int n=generate_tokens(e,prompt_ids,o,out_ids,emit,reason);
         if(finish)*finish=reason;
         if(o.stats && stats.steps)
             std::printf("  spec: %s depth %d -- %.2f accepted/step "
@@ -23135,44 +23159,12 @@ void GrimoireScheduler::run() {
                     }
                     std::vector<int32_t> out;
                     FinishReason r = FinishReason::Length;
-                    // UNDER PP, RANK 0 MUST NOT STOP EARLY (external
-                    // audit F2, 2026-09-21).  Every rank runs this same
-                    // generate_tokens() loop in lockstep -- every step
-                    // is a forward()/argmax_token() round trip over the
-                    // PP sockets, matched call for call across ranks --
-                    // and that lockstep IS the whole protocol.  A
-                    // disconnected streaming client is known only to
-                    // rank 0; the other ranks have no channel to learn
-                    // "stop here too" mid-flight, so if rank 0's own
-                    // emit() returns false on cancellation and breaks
-                    // its loop early, the other ranks keep decoding
-                    // toward the ORIGINAL budget/EOS.  Rank 0 then moves
-                    // on to the NEXT request and broadcasts a fresh
-                    // PPRequest header down a pipe whose other end is
-                    // still mid-token-exchange for this one -- the
-                    // header lands in the wrong protocol phase and can
-                    // be read as model data, block, or corrupt the next
-                    // request.
-                    //
-                    // So under PP, ignore push()'s "keep going" answer
-                    // for the purpose of continuing this loop -- EOS and
-                    // budget exhaustion are unaffected (they are
-                    // identical on every rank by construction, since
-                    // every rank was broadcast the same request) and
-                    // still stop the loop normally, in lockstep, exactly
-                    // where every other rank also stops. push() itself
-                    // is still called and still suppresses delivery once
-                    // j->cancelled is set -- the disconnected client
-                    // receives nothing further -- this only keeps rank
-                    // 0's STEP COUNT matched to its peers. Off PP,
-                    // cancellation still frees the card immediately,
-                    // which is correct and unchanged there.
-                    const bool pp = e.pp_enabled() || e.tp_ranked();
+                    // grimoire_serve_generate broadcasts this callback's
+                    // cancellation answer to every rank at emit boundaries.
+                    // Workers leave the same request before another header
+                    // can enter the control stream.
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
-                        j->eot, [&](int32_t t){
-                            const bool kept = push(j, t);
-                            return pp ? true : kept;
-                        }, &r);
+                        j->eot, [&](int32_t t){ return push(j,t); }, &r);
                     finish(j, r);
                     continue;
                 }
