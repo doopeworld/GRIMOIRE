@@ -1469,6 +1469,19 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
     int KS = K >= 12288 ? 4
            : (tiles >= 256 && tiles < 600 && K >= 4096) ? 2
            : std::min(32, std::max(1, K / 256));
+    // Opt-in Swift group128 TP2/K6 plans, measured on the actual half-width
+    // shapes (tools/tp_int4_probe1111.cpp), warm128 launches + median3 trials.
+    // down 56.3 -> 49.6us; z 21.6 -> 19.0us; out 21.6 -> 18.7us on G31.
+    // Gate/up already has the best warm plan: retain it. Restrict to the
+    // tested seven-row verification shape; other models/widths keep the rule.
+    static const bool tp_verify_plan = [] {
+        const char* e=std::getenv("GRIMOIRE_I4_TP_VERIFY_PLAN");
+        return e && *e=='1';
+    }();
+    if(tp_verify_plan && M==7 && (1 << w.int4_gshift())==128) {
+        if(N==5120 && K==8704) KS=24;       // normalized to23 slices of384
+        else if((N==3072 && K==5120) || (N==5120 && K==3072)) KS=2;
+    }
     // GRIMOIRE_I4_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM_KS");
         return (e && *e) ? std::atoi(e) : 0; }();
