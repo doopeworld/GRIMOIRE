@@ -22654,8 +22654,8 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
             if(!ranked) return keep;
             if(e.pp_enabled()) e.pp_send_wait();
             return generation_continue(keep,upstream,downstream,
-                [](int fd,void* p,size_t n){return fd_read_all(fd,p,n);},
-                [](int fd,const void* p,size_t n){return fd_write_all(fd,p,n);});
+                [](int fd,void* p,size_t n){return Grimoire::fd_read_all(fd,p,n);},
+                [](int fd,const void* p,size_t n){return Grimoire::fd_write_all(fd,p,n);});
         };
         const int n=generate_tokens(e,prompt_ids,o,out_ids,emit,reason);
         if(finish)*finish=reason;
