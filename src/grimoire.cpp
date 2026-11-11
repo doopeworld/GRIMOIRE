@@ -3652,7 +3652,9 @@ struct Grimoire {
     bool   spec_hidden_valid = false;
     size_t spec_dn_elems = 0, spec_conv_elems = 0;
     size_t spec_conv_input_elems = 0;
-    static constexpr int kSpecBatch = 16;
+    // 32 since 2026-11-11 (was 16): MTP depth is min(K, kSpecBatch/n - 1), so 16 rows gave 4 users
+    // depth 3 and 8 users depth 1.  INT4 verify GEMMs take 17..32 rows in one pass (int4_smallm_ok).
+    static constexpr int kSpecBatch = 32;
     // Read EVERY time, not captured in a static.  A static answers with
     // whatever the environment was at the FIRST call in the process,
     // which is a different engine's answer -- and the call sites are all
@@ -19731,7 +19733,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // only other INT4 engines here are the SIMT GEMVs, whose FMAs grow with
         // M: Qwen3.8-27B-W4A16 served 19.9 / 18.3 / 19.5 / 19.5 tok/s at 1 / 2 /
         // 4 / 8 users through them (2026-10-04).
-        const bool dpas_i4 = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+        const bool dpas_i4 = smallm_dpas && M>=2 && M<=32 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && int4_smallm_ok(w.w,M,nullptr,y);
         // FP8 E4M3 (2026-10-06): before this it took launch_gemv_batch below,
         // the SIMT GEMV at ~50 GB/s -- Qwen3.8-27B FP8 + MTP on two B70s 4.1
@@ -22043,7 +22045,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     batch_logits, lm_head.w.N, lm_head.w.K, M, {});
             }
         } else if ((lm_head.w.fmt == Fmt::MXFP4 ||
-                    (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+                    (lm_head.w.fmt == Fmt::INT4 && M <= 32 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
                     ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
                      fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
                     (!exact_verify && native_smallm_ok(lm_head.w, M, nullptr, nullptr)))
@@ -22055,7 +22057,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             mm(lm_head, bn, batch_logits);
         }
         const bool lm_batched = lm_head.w.fmt == Fmt::MXFP4 ||
-            (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
+            (lm_head.w.fmt == Fmt::INT4 && M <= 32 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
             ((lm_head.w.fmt == Fmt::FP8_E4M3 || lm_head.w.fmt == Fmt::INT8) &&
              fp8_smallm_ok(lm_head.w, M, nullptr, nullptr)) ||
             // GGUF native heads (2026-10-29): the Qwen3.8-27B Q6_K head row by row was 5 x 1.8 ms
@@ -23347,9 +23349,16 @@ void GrimoireScheduler::run() {
                 // tok/s: 4 users speculating 88.9, plain steps 95.0 (plain without MTP
                 // 97.0); 2 users speculating 62.9 -- there every draft is a pass with
                 // two all-reduces.
-                static const int spec_max_seqs = [this] {
+                // 2026-11-11: default 8 everywhere (was TP 2 / one card 4).  Both measurements
+                // above predate batched drafting (10-29), the replicated INT4 MTP head under TP
+                // (a draft is ~0.7 ms, no all-reduce) and kSpecBatch 32: 8 users now get depth 3
+                // (32 rows), 4 users depth 6 (28 rows), where 16 rows gave them 1 and 3.  With the
+                // old TP default, 4 and 8 users never speculated: BetterBench Swift INT4 TP2
+                // 11-10, c2 / c4 / c8 = 142.4 / 142.3 / 139.3 tok/s -- flat past 2 users.
+                // NOT YET MEASURED on this build; A/B with GRIMOIRE_SPEC_MAX_SEQS=2 before release.
+                static const int spec_max_seqs = [] {
                     const char* v = std::getenv("GRIMOIRE_SPEC_MAX_SEQS");
-                    return v && *v ? std::max(1, std::atoi(v)) : (e.tp_ranked() ? 2 : 4); }();
+                    return v && *v ? std::max(1, std::atoi(v)) : 8; }();
                 const bool spec_now = e.speculative_batch() &&
                     (e.dflash2.ok || int(toks.size()) <= spec_max_seqs);
                 std::vector<int> remaining;

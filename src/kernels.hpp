@@ -995,7 +995,9 @@ sycl::event launch_deltanet_step(sycl::queue& q, const DeltaNetParams& p,
 // Batched decode: row r of one launch is one token of the conversation in
 // sequence slot slot[r].  Passed BY VALUE as a kernel argument: no upload,
 // no host sync.  Batches above kMaxRowSlots keep the per-row loops.
-constexpr int kMaxRowSlots = 16;
+// 32 since 2026-11-11 (was 16): a verify of several conversations has up to kSpecBatch = 32 rows;
+// past this the rope / conv / DeltaNet row launches fall back to one launch per row.
+constexpr int kMaxRowSlots = 32;
 struct RowSlots { int32_t slot[kMaxRowSlots]; int32_t pos[kMaxRowSlots]; };
 // launch_deltanet_step for `rows` rows in one launch.  p.q/k/v/a/beta/out
 // point at row 0 (row strides: n_k_heads*k_dim, n_heads*v_dim, n_heads);

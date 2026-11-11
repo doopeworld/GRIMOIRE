@@ -3934,7 +3934,9 @@ sycl::event launch_bf16_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 
 // INT4 groups of 64 or 128 with contiguous [N][K/GS] scale and zero rows.
 bool int4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
-    if (w.fmt != Fmt::INT4 || !w.payload || !w.scales || !w.zeros || M < 1 || M > 16) return false;
+    // 17..32 rows (2026-11-11): several conversations' verify blocks in one pass (kSpecBatch 32),
+    // int4_smallm_fdq_impl<4, GS> -- the weights are read once for all 32 rows.
+    if (w.fmt != Fmt::INT4 || !w.payload || !w.scales || !w.zeros || M < 1 || M > 32) return false;
     const int gs = 1 << w.int4_gshift();
     return (gs == 64 || gs == 128) && int64_t(w.row_scales) * gs == w.K && w.K % 512 == 0 &&
            w.N % 16 == 0 && w.row_bytes >= int64_t(w.K / 2) && w.row_bytes % 16 == 0 &&
@@ -3986,6 +3988,27 @@ sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const 
     // at K=6 with MORE tokens a step (5.70 vs 5.40).  GRIMOIRE_I4_WIDE_FDQ=0 = the old dequant.
     static const bool fdq = [] { const char* e = std::getenv("GRIMOIRE_I4_WIDE_FDQ");
         return !(e && *e == '0'); }();
+    // 17..32 rows (2026-11-11): four 8-row blocks in one thread, so a verify of several
+    // conversations (e.g. 4 users x 7 rows, 8 users x 4 rows) reads every weight ONCE instead of
+    // once per 16 rows.  Registers: ~170 of 256 (acc/tmp/tsx/a0/a1 = 32 GRF per block); SLM
+    // 32 threads x 4 x 128 floats = 64 KiB.  Same arithmetic per row as <2, GS>.
+    // A device with less than 64 KiB of SLM per work-group, or GRIMOIRE_I4_SMALLM32=0: two 16-row
+    // launches (rows 0..15, then 16..M-1; both offsets stay 64-byte aligned since K % 512 == 0 and
+    // N % 16 == 0) -- the weights are read twice, the arithmetic is the same.
+    if (M > 16) {
+        static const bool rb4_env = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM32");
+            return !(e && *e == '0'); }();
+        const bool rb4 = rb4_env &&
+            q.get_device().get_info<sycl::info::device::local_mem_size>() >= size_t(32 * 4 * 128 * 4);
+        if (rb4) return g64 ? int4_smallm_fdq_impl<4, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
+                            : int4_smallm_fdq_impl<4, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
+        sycl::event e0 = g64 ? int4_smallm_fdq_impl<2, 64>(q, w, X, Y, 16, p.KS, p.kc, p.TPT, deps)
+                             : int4_smallm_fdq_impl<2, 128>(q, w, X, Y, 16, p.KS, p.kc, p.TPT, deps);
+        const sycl_bf16* X1 = X + size_t(16) * size_t(w.K);
+        float* Y1 = Y + size_t(16) * size_t(w.N);
+        return g64 ? int4_smallm_fdq_impl<2, 64>(q, w, X1, Y1, M - 16, p.KS, p.kc, p.TPT, {e0})
+                   : int4_smallm_fdq_impl<2, 128>(q, w, X1, Y1, M - 16, p.KS, p.kc, p.TPT, {e0});
+    }
     if (fdq) return g64 ? int4_smallm_fdq_impl<2, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)
                         : int4_smallm_fdq_impl<2, 128>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps);
     return g64 ? int4_smallm_impl<2, 64>(q, w, X, Y, M, p.KS, p.kc, p.TPT, deps)

@@ -339,11 +339,20 @@ sycl::event int4_smallm_fdq_impl(sycl::queue& q, const QuantWeight& w, const syc
                 }
             }
             if (KS > 1) {
-                es::slm_block_store<float, RBN * 128>(lid * RBN * 128 * 4, acc);
+                // RBN 4 (17..32 rows, 2026-11-11): the partials move through SLM in 256-float
+                // pieces; RBN 1 / 2 keep their single block op (SL == RBN * 128, one iteration).
+                constexpr int SL = RBN * 128 <= 256 ? RBN * 128 : 256;
+                #pragma unroll
+                for (int c = 0; c < RBN * 128; c += SL)
+                    es::slm_block_store<float, SL>((lid * RBN * 128 + c) * 4,
+                                                   es::simd<float, SL>(acc.template select<SL, 1>(c)));
                 es::barrier();
                 if (ks != 0 || !live) return;
                 for (int i = 1; i < KS; ++i)
-                    acc += es::slm_block_load<float, RBN * 128>((tw * KS + i) * RBN * 128 * 4);
+                    #pragma unroll
+                    for (int c = 0; c < RBN * 128; c += SL)
+                        acc.template select<SL, 1>(c) +=
+                            es::slm_block_load<float, SL>(((tw * KS + i) * RBN * 128 + c) * 4);
             } else if (!live) {
                 return;
             }
