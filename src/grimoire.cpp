@@ -15643,6 +15643,10 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // behaviour is exactly as before.  The row loop is the same math the
     // single-token decode path already runs.
     static const bool no_matrix = !device_can_matrix(q);
+    static const bool draft_i4_smallm=[] {
+        const char* e=std::getenv("GRIMOIRE_DFLASH_INT4_SMALLM");
+        return e && *e=='1' && !std::getenv("GRIMOIRE_SMALLM_GEMV");
+    }();
     auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
         if(cfg.is_muse&&w.fp16){
             const sycl::half* out=mm_f16_raw(w,x,rows);
@@ -15660,10 +15664,6 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         // w4a16 kernel and existing scratch; proposal arithmetic may change
         // acceptance, so keep opt-in until real-model validation. Target
         // logits and target sampling are unaffected by this switch.
-        static const bool draft_i4_smallm=[] {
-            const char* e=std::getenv("GRIMOIRE_DFLASH_INT4_SMALLM");
-            return e && *e=='1' && !std::getenv("GRIMOIRE_SMALLM_GEMV");
-        }();
         if(draft_i4_smallm && rows>=2 && rows<=16 && !w.has_i4() &&
            int4_smallm_ok(w.w,rows,nullptr,y)) {
             launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
@@ -16097,6 +16097,11 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                                   M-1,H,{});
         w4(&q,dflash2.a8,lm_head.i4,lm_head.i4s,dflash2.a8s,dflash2.logits,
            M-1,lm_head.w.N,lm_head.w.K);
+    }else if(draft_i4_smallm && !lm_head.tp_sharded() && !lm_head.has_i4() &&
+             int4_smallm_ok(lm_head.w,M-1,nullptr,dflash2.logits)){
+        // Full vocabulary needs the same batched INT4 route as a reduced
+        // head. Otherwise each proposal row streams the entire head again.
+        mm(lm_head,dflash2.normed+H,dflash2.logits,M-1);
     }else if(lm_head.w.fmt==Fmt::MXFP4&&lm_head.w.payload){
         // Project all draft rows together.  The old per-row GEMV streamed the
         // full vocabulary matrix fifteen times per speculative step.
