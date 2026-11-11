@@ -152,6 +152,7 @@ private:
     // read from the checkpoint's chat template (chat_template.jinja or
     // tokenizer_config.json), see apply_chat_template
     bool tmpl_xml_tools_ = false;      // the Qwen3.5-family tool block
+    std::string tmpl_default_effort_ = "xhigh";
     bool tmpl_effort_ = false;         // Qwen3.8: reasoning-effort system text
     bool tmpl_think_split_ = false;    // Ornith: reasoning recovered from content
 

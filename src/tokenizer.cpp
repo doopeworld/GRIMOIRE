@@ -20,6 +20,7 @@
 //  tokenizer.cpp
 // =====================================================================
 #include "b70/tokenizer.hpp"
+#include "b70/json.hpp"
 #include "b70/unicode_marks.hpp"
 #include "b70/unicode_nfc.hpp"
 #include "b70/gguf.hpp"
@@ -31,6 +32,7 @@
 #include <ctime>
 #include <stdexcept>
 #include <limits>
+#include <regex>
 
 namespace b70 {
 namespace {
@@ -113,6 +115,17 @@ void Tokenizer::set_chat_family(const std::string& tmpl) {
                       tmpl.find("multi_step_tool=true") != std::string::npos;
     tmpl_effort_ = tmpl_xml_tools_ && tmpl.find("Reasoning effort is set to xhigh.") != std::string::npos;
     tmpl_think_split_ = tmpl_xml_tools_ && tmpl.find("content.split('</think>')") != std::string::npos;
+    // This renderer supports the known Qwen XML template, including its
+    // declared reasoning default. Swift's derivative changes that default
+    // to low; hardcoding xhigh changes the actual prompt sent to the model.
+    tmpl_default_effort_ = "xhigh";
+    if(tmpl_effort_){
+        static const std::regex declared_default(
+            R"(\breasoning_effort\s*\|\s*default\s*\(\s*(['"])(xhigh|medium|low)\1)");
+        std::smatch match;
+        if(std::regex_search(tmpl,match,declared_default))
+            tmpl_default_effort_ = match[2].str();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -285,7 +298,16 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
     // block differently and keeps its own (legacy) rendering here.
     {
         std::string tmpl = read_file(root + "/chat_template.jinja");
-        if (tmpl.empty()) tmpl = read_file(root + "/tokenizer_config.json");
+        if (tmpl.empty()) {
+            tmpl = read_file(root + "/tokenizer_config.json");
+            // Decode the JSON string before inspecting template expressions;
+            // quoted defaults otherwise retain their JSON escape characters.
+            try {
+                const Json config = Json::parse(tmpl);
+                if(const Json* chat=config.find("chat_template");
+                   chat && chat->kind==Json::Kind::String) tmpl=chat->string;
+            } catch(const std::exception&) { /* retain the legacy raw fallback */ }
+        }
         set_chat_family(tmpl);
     }
 
@@ -2004,7 +2026,7 @@ std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messa
     if (messages.empty()) throw std::invalid_argument("No messages provided.");
     std::string ri;
     if (tmpl_effort_ && opt.enable_thinking) {
-        std::string effort = opt.reasoning_effort.empty() ? "xhigh" : opt.reasoning_effort;
+        std::string effort = opt.reasoning_effort.empty() ? tmpl_default_effort_ : opt.reasoning_effort;
         if (effort == "high") effort = "xhigh";
         if (effort != "xhigh" && effort != "medium" && effort != "low")
             throw std::invalid_argument("Unexpected reasoning effort " + effort +

@@ -154,6 +154,10 @@ bin/test_qwen4_exp_config: tests/test_qwen4_exp_config.cpp $(HOST_MODEL_SRC) $(w
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
+bin/test_chat_effort: tests/test_chat_effort.cpp src/tokenizer.cpp src/gguf.cpp include/b70/tokenizer.hpp include/b70/json.hpp
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
+
 bin/test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o $@
