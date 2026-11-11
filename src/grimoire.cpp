@@ -20041,12 +20041,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(noxmx_gemm){ launch_gemm_batched(q,w.w,x,y,M); return; }
         launch_gemm_xmx(q,w.w,x_bf,y,M);
     };
+    // Small-M native INT4 consumers already round their input to BF16.
+    // Let existing norm/gate kernels write that input directly, eliminating
+    // the intervening FP32 buffer and conversion launch. Keep opt-in until
+    // both numerical and real-model gates have passed.
+    static const bool verify_bf16_intermediates=[] {
+        const char* e=std::getenv("GRIMOIRE_VERIFY_BF16_INTERMEDIATES");
+        return e && *e=='1';
+    }();
+    auto i4_bf16_input_ok=[&](const DevQuant& w) {
+        return verify_bf16_intermediates && verify_rows && smallm_dpas &&
+            !exact_verify && !smallm_gemv && !w.has_i4() &&
+            int4_smallm_ok(w.w,M,nullptr,nullptr);
+    };
     // bf16-activation twins of mm().  Several fast paths call the dense MXFP4
     // GEMM directly instead of going through mm(), and a converted weight has
     // no MXFP4 payload left -- touching it is a DEVICE_LOST, which is exactly
     // how o_proj took the device down.
     auto mmb=[&](const DevQuant& w,const sycl_bf16* x_bf,float* y){
         a8_cached_src=nullptr;
+        if(i4_bf16_input_ok(w)) {
+            launch_int4_smallm(q,w.w,x_bf,y,M);
+            return;
+        }
         if(w.has_i4() && xe2_w4a8_f32 && a8 && a8s){
             if(a8_cached_bf!=x_bf){
                 launch_quantize_rows_int8_bf16(q,x_bf,a8,a8s,M,w.w.K,{});
@@ -20781,6 +20798,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_gguf_ssm_out_gather(q,xb,gguf_v_bf,M,Hk,Hv,Dv);
                     mmb(d.la_out,gguf_v_bf,r0);
                 }else mmb(d.la_out,xb,r0);
+            }else if(i4_bf16_input_ok(d.la_out)){
+                launch_rmsnorm_gate_silu_bf16_out(q,t0,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
+                mmb(d.la_out,xb,r0);
             }else if(dense_pure && !d.la_out.has_i4()){
                 launch_rmsnorm_gate_silu_bf16_out(q,t0,z_in,d.la_norm,xb,M*Hv,Dv,cfg.rms_eps);
                 const sycl_bf16* out_x=xb;
@@ -21921,7 +21941,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // or f32->bf16 pass (110 + ~45 ms of a 4088-token Qwen
                 // prefill).  Same values as the three-step path below.
                 // GRIMOIRE_NO_FUSED_SWIGLU=1 restores it.
-                if(!tp_enabled() && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                if(i4_bf16_input_ok(d.sh_down)){
+                    mm(d.sh_gu,bn,t0); pp_mark("  FFN gate_up");
+                    launch_swiglu_bf16_out(q,t0,xb,M,d.sh_gu.output_rows()/2);
+                    pp_mark("  FFN swiglu");
+                    mmb(d.sh_down,xb,r0);
+                }else if(!tp_enabled() && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
                    gemm_fast_swiglu_supported(d.sh_gu.w,M) &&
                    gemm_fast_supported(d.sh_down.w,M)){
                     launch_gemm_fast_swiglu(q,d.sh_gu.w,bn_bf,xb,M);
