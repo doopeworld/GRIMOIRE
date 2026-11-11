@@ -15654,6 +15654,22 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
         }
+        // INT4 DFlash2 inherited the target's format but not its small-M
+        // matrix route: it fell through to the SIMT batched GEMV. On Swift
+        // this made an eight-row draft ~35ms. Reuse the target's proven
+        // w4a16 kernel and existing scratch; proposal arithmetic may change
+        // acceptance, so keep opt-in until real-model validation. Target
+        // logits and target sampling are unaffected by this switch.
+        static const bool draft_i4_smallm=[] {
+            const char* e=std::getenv("GRIMOIRE_DFLASH_INT4_SMALLM");
+            return e && *e=='1' && !std::getenv("GRIMOIRE_SMALLM_GEMV");
+        }();
+        if(draft_i4_smallm && rows>=2 && rows<=16 && !w.has_i4() &&
+           int4_smallm_ok(w.w,rows,nullptr,y)) {
+            launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
+            launch_int4_smallm(q,w.w,dflash2.bf,y,rows);
+            return;
+        }
         // A draft block is 15-16 rows.  launch_gemm_xmx only has a fast
         // path from 32 rows up (gemm_fast_supported); below that it falls
         // to gemm_flt, whose 512-row tile turns every drafter projection
