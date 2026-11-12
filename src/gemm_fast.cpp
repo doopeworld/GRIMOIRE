@@ -49,10 +49,15 @@
 #include "b70/native_qk_tile.hpp"
 #include "native_dequant.hpp"
 #include "native_smallm.hpp"
+#include "hadamard128.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <set>
+#include <tuple>
 #include <vector>
 #include <cmath>
 #include <cstdio>
@@ -642,6 +647,8 @@ bool stage_timing() { static const bool on = std::getenv("GRIMOIRE_FAST_GEMM_TIM
 
 struct Scratch {
     sycl_bf16* w = nullptr; size_t w_cap = 0;   // dequantized weight, VNNI
+    int8_t* w8 = nullptr; size_t w8_cap = 0;    // i4a8: rotated int8 weight [N][K]
+    float* y8 = nullptr; size_t y8_cap = 0;     // i4a8: gate|up rows before SwiGLU
 };
 
 template <class T>
@@ -3158,6 +3165,293 @@ sycl::event launch_deltanet_prefill_xmx(sycl::queue& q, const DeltaNetPrefillPar
     return e3;
 }
 
+// =====================================================================
+//  Short INT4 prompts in 32-row pieces -- GRIMOIRE_I4_PIECES_MAX=<rows> (2026-11-12)
+//
+//  gemm_fast_run dequantizes the WHOLE weight to bf16 on every call, then streams the bf16 copy:
+//  ~2.5 bytes moved per weight before the GEMM reads 2 more, whatever M is (the 384 dequants of a
+//  prompt: 159 ms, MEASURED 2026-10-05).  A chat turn of 50 tokens therefore costs about as much
+//  weight traffic as a 2,000-token prompt -- served TTFT 287 ms at 1 user, and admissions queue
+//  behind each other (4 users 1.15 s, 8 users 2.28 s; one B70, 2026-11-12).  The verify kernel
+//  (launch_int4_smallm_wide, 1..32 rows) reads the INT4 weight once per 32 rows, ~0.5 byte a
+//  weight.  Up to GRIMOIRE_I4_PIECES_MAX rows (0 = off) the prompt GEMM runs as those pieces;
+//  SwiGLU / the residual add are applied after, from an f32 buffer.  Same per-row arithmetic as
+//  speculative verify (bf16 x, fp32 accumulate), not bit-identical to the bf16-scratch GEMM.
+// =====================================================================
+namespace {
+
+sycl::event swiglu_rows(sycl::queue& q, const float* y, sycl_bf16* hout, int R, int FI,
+                        const std::vector<sycl::event>& deps) {
+    // h[r][j] = silu(y[r][j]) * y[r][FI + j], rounded as the SwiGLU GEMM epilogue rounds.
+    return q.parallel_for(sycl::range<1>(size_t(R) * FI), deps, [=](sycl::id<1> id) {
+        const size_t i = id[0], r = i / size_t(FI), j = i % size_t(FI);
+        const float g = y[r * 2 * size_t(FI) + j], u = y[r * 2 * size_t(FI) + FI + j];
+        hout[i] = bf16_rne(sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u);
+    });
+}
+
+int i4_pieces_max() {
+    static const int v = [] {
+        const char* e = std::getenv("GRIMOIRE_I4_PIECES_MAX");
+        return e && *e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+}
+
+bool i4_pieces_ok(const QuantWeight& w, int M, const void* x, const void* out) {
+    return M <= i4_pieces_max() && w.fmt == Fmt::INT4 && int4_smallm_ok(w, 32, x, out);
+}
+
+template <int EPI>
+sycl::event i4_pieces_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, void* out, int M,
+                          const std::vector<sycl::event>& deps) {
+    const int N = w.N, K = w.K;
+    float* y = static_cast<float*>(out);
+    if constexpr (EPI != 0) {
+        Scratch& s = scratch_for(q);
+        y = grow(q, s.y8, s.y8_cap, size_t(M) * N);
+        if (!y) throw std::runtime_error("i4 pieces: scratch allocation failed");
+    }
+    std::vector<sycl::event> d = deps;
+    sycl::event e;
+    for (int r0 = 0; r0 < M; r0 += 32) {
+        const int rows = std::min(32, M - r0);
+        e = launch_int4_smallm_wide(q, w, x + size_t(r0) * K, y + size_t(r0) * N, rows, d);
+        d = {e};
+    }
+    if constexpr (EPI == 1) {
+        e = swiglu_rows(q, y, static_cast<sycl_bf16*>(out), M, N / 2, d);
+    } else if constexpr (EPI == 2) {
+        float* h = static_cast<float*>(out);
+        const float* t = y;
+        e = q.parallel_for(sycl::range<1>(size_t(M) * N), d, [=](sycl::id<1> i) { h[i] += t[i]; });
+    }
+    return e;
+}
+
+} // namespace
+
+// =====================================================================
+//  INT4 weights x INT8 activations for prompts -- GRIMOIRE_I4A8=1 (opt-in, 2026-11-12)
+//
+//  The INT4 prompt GEMM dequantizes W to bf16 and runs bf16 DPAS (~110 TFLOP/s).  The B70's
+//  int8 DPAS runs twice that (oneDNN s8 x s8 273 TOPS, 2026-10-25).  A plain per-row int8 scale
+//  on the activations is lossy (oneDNN W8A8 mode 1 on Qwen3.8-27B INT8: top-1 98.4 -> 93.8%,
+//  2026-11-01) because a few channels carry outliers.  So both operands go through the same
+//  128-point Hadamard transform first (hadamard128.hpp): x W^T = (x H)(W H)^T / 128.  The
+//  rotation spreads an outlier over its block, and exl3xpu measured int8 prompt linears in that
+//  domain at 1.89x the fp16 time with NLL +0.17% on one B70.
+//    1. once per weight: ws[n] = max |W_n H| / (127 * 128)            (i4a8_scales, cached)
+//    2. per call: W8 = rint(W H / (128 ws)), int8 [N][K]              (i4a8_weight; 1.5 bytes a
+//       weight moved, the bf16 dequant it replaces moved 2.5)
+//    3. oneDNN s8 x s8: x rotated + one int8 scale per row (onednn_gemm_a8rot), f32 out;
+//       SwiGLU (EPI 1) in 1024-row pieces through a f32 buffer, residual (EPI 2) as a sum post-op.
+//  Prompts only: M >= GRIMOIRE_I4A8_MIN_M (128); decode and verify keep their kernels.
+//  GRIMOIRE_I4A8_CHECK=1: once per shape, the first 64 rows against the bf16 path (stderr).
+// =====================================================================
+#ifdef GRIMOIRE_WITH_ONEDNN
+namespace {
+
+bool i4a8_on() {
+    static const bool v = [] { const char* e = std::getenv("GRIMOIRE_I4A8"); return e && *e == '1'; }();
+    return v;
+}
+int i4a8_min_m() {
+    static const int v = [] {
+        const char* e = std::getenv("GRIMOIRE_I4A8_MIN_M");
+        const int m = e ? std::atoi(e) : 128;
+        return m >= 32 ? m : 32;
+    }();
+    return v;
+}
+std::atomic<bool>& i4a8_dead() { static std::atomic<bool> d{false}; return d; }
+
+// The 8 values lane `lane` holds of block kb of row n: int4_pair_bf16's decode in fp32
+// (zero 0xff = signed nibble, else (q - zero) * scale).  Nibble t of the lane's 4 bytes is
+// element kb*128 + lane*8 + t.  A group is >= 64 wide, so the 8 share one scale.
+inline void i4a8_load(const uint8_t* pay, int64_t row_bytes, const bf16_t* scl, const uint8_t* zer,
+                      int row_scales, int gsh, int n, int kb, int lane, float (&v)[8]) {
+    const uint32_t bits = *reinterpret_cast<const uint32_t*>(pay + int64_t(n) * row_bytes + kb * 64 + lane * 4);
+    const int64_t gi = int64_t(n) * row_scales + ((kb * 128 + lane * 8) >> gsh);
+    const float sc = bf16_to_f32(scl[gi]);
+    const uint32_t zero = zer ? uint32_t(zer[gi]) : 0u;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t q4 = (bits >> (4 * t)) & 0xFu;
+        v[t] = zero == 0xffu ? float(q4 & 8u ? int(q4) - 16 : int(q4)) * sc
+                             : (float(q4) - float(zero)) * sc;
+    }
+}
+
+// ws[n] = max over the row of |W_n H| / (127 * 128); 0 for an all-zero row.
+sycl::event i4a8_scales(sycl::queue& q, const QuantWeight& w, float* ws) {
+    const int N = w.N, KB = w.K / 128, gsh = w.int4_gshift(), rs = w.row_scales;
+    const int64_t rb = w.row_bytes;
+    const uint8_t* pay = w.payload;
+    const bf16_t* scl = static_cast<const bf16_t*>(w.scales);
+    const uint8_t* zer = w.zeros;
+    sycl::event e = q.memset(ws, 0, size_t(N) * sizeof(float));
+    e = q.submit([&](sycl::handler& h) {
+        h.depends_on(e);
+        h.parallel_for(sycl::nd_range<1>(size_t(N) * KB * 16, 256),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]);
+            const int64_t g = int64_t(it.get_global_id(0)) / 16;
+            const int n = int(g / KB), kb = int(g % KB);
+            float v[8];
+            i4a8_load(pay, rb, scl, zer, rs, gsh, n, kb, lane, v);
+            hadamard128_sg(sg, lane, v);
+            float m = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) m = sycl::fmax(m, sycl::fabs(v[t]));
+            m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+            if (lane == 0) {   // non-negative floats order like their bit patterns
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space>
+                    a(*reinterpret_cast<uint32_t*>(ws + n));
+                a.fetch_max(sycl::bit_cast<uint32_t>(m));
+            }
+        });
+    });
+    return q.parallel_for(sycl::range<1>(size_t(N)), e, [=](sycl::id<1> i) {
+        ws[i] = ws[i] / (127.f * 128.f);
+    });
+}
+
+// W8 [N][K] = rint(W H / (128 ws)): 127 at each row's largest rotated value.
+sycl::event i4a8_weight(sycl::queue& q, const QuantWeight& w, const float* ws, int8_t* dst,
+                        const std::vector<sycl::event>& deps) {
+    const int N = w.N, K = w.K, KB = K / 128, gsh = w.int4_gshift(), rs = w.row_scales;
+    const int64_t rb = w.row_bytes;
+    const uint8_t* pay = w.payload;
+    const bf16_t* scl = static_cast<const bf16_t*>(w.scales);
+    const uint8_t* zer = w.zeros;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(N) * KB * 16, 256),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]);
+            const int64_t g = int64_t(it.get_global_id(0)) / 16;
+            const int n = int(g / KB), kb = int(g % KB);
+            float v[8];
+            i4a8_load(pay, rb, scl, zer, rs, gsh, n, kb, lane, v);
+            hadamard128_sg(sg, lane, v);
+            const float s = ws[n];
+            const float inv = s > 0.f ? 1.f / (s * 128.f) : 0.f;
+            uint32_t lo = 0, hi = 0;
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const int q8 = int(sycl::clamp(sycl::rint(v[t] * inv), -127.f, 127.f));
+                const uint32_t b = uint32_t(q8) & 0xFFu;
+                if (t < 4) lo |= b << (8 * t); else hi |= b << (8 * (t - 4));
+            }
+            *reinterpret_cast<sycl::uint2*>(dst + int64_t(n) * K + kb * 128 + lane * 8) =
+                sycl::uint2(lo, hi);
+        });
+    });
+}
+
+const float* i4a8_scales_for(sycl::queue& q, const QuantWeight& w) {
+    static std::mutex mu;
+    static std::map<std::tuple<const sycl::queue*, const void*, int, int>, float*> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto key = std::make_tuple(&q, static_cast<const void*>(w.payload), w.N, w.K);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    float* ws = sycl::malloc_device<float>(size_t(w.N), q);
+    if (!ws) throw std::runtime_error("i4a8: row scale allocation failed");
+    i4a8_scales(q, w, ws).wait();   // once per weight, at its first prompt
+    cache.emplace(key, ws);
+    return ws;
+}
+
+QuantWeight i4a8_view(const QuantWeight& w, const int8_t* w8, const float* ws) {
+    QuantWeight v;
+    v.fmt = Fmt::INT8; v.N = w.N; v.K = w.K;
+    v.payload = reinterpret_cast<const uint8_t*>(w8); v.scales = ws;
+    v.row_bytes = w.K; v.row_scales = 1;
+    return v;
+}
+
+bool i4a8_ok(const QuantWeight& w, int M) {
+    if (!i4a8_on() || i4a8_dead().load() || M < i4a8_min_m() || !int4_stream_ok(w)) return false;
+    return onednn_gemm_ok(i4a8_view(w, reinterpret_cast<const int8_t*>(w.payload),
+                                    static_cast<const float*>(w.scales)), M);
+}
+
+// GRIMOIRE_I4A8_CHECK=1: the first rows of x W^T both ways, once per (N, K).  Waits: diagnosis only.
+void i4a8_check(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, int M, const QuantWeight& v,
+                Scratch& s) {
+    static const bool on = std::getenv("GRIMOIRE_I4A8_CHECK") != nullptr;
+    static std::set<std::pair<int, int>> seen;
+    if (!on || !seen.insert({w.N, w.K}).second) return;
+    const int R = std::min(M, 64), N = w.N, K = w.K;
+    const int Np = (N + NC2 - 1) / NC2 * NC2;
+    q.wait();
+    sycl_bf16* wb = sycl::malloc_device<sycl_bf16>(size_t(Np) * K, q);
+    float* ref = sycl::malloc_device<float>(size_t(R) * N, q);
+    float* got = sycl::malloc_device<float>(size_t(R) * N, q);
+    if (wb && ref && got) {
+        sycl::event e = Np != N ? q.memset(wb, 0, size_t(Np) * K * sizeof(sycl_bf16)) : sycl::event{};
+        e = dequant_any(q, w, wb, {e}, Np != N ? Np : 0);
+        gemm_bf16_vnni<0>(q, x, wb, ref, R, N, K, {e}, Np).wait();
+        onednn_gemm_a8rot(q, v, x, got, R, false, {}).wait();
+        std::vector<float> a(size_t(R) * N), b(size_t(R) * N);
+        q.memcpy(a.data(), ref, a.size() * sizeof(float)).wait();
+        q.memcpy(b.data(), got, b.size() * sizeof(float)).wait();
+        double mx = 0, md = 0, se = 0, sr = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double d = double(b[i]) - a[i];
+            mx = std::max(mx, std::fabs(double(a[i]))); md = std::max(md, std::fabs(d));
+            se += d * d; sr += double(a[i]) * a[i];
+        }
+        std::fprintf(stderr, "  i4a8 check N=%d K=%d rows=%d: max|diff|/max|ref| %.2e  rms rel %.2e\n",
+                     N, K, R, mx > 0 ? md / mx : 0.0, sr > 0 ? std::sqrt(se / sr) : 0.0);
+    }
+    if (wb) sycl::free(wb, q);
+    if (ref) sycl::free(ref, q);
+    if (got) sycl::free(got, q);
+    (void)s;
+}
+
+template <int EPI>
+sycl::event i4a8_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, void* out, int M,
+                     const std::vector<sycl::event>& deps) {
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "  i4a8: INT4 prompt GEMMs as int8 x int8 in the Hadamard-128 domain "
+                             "(M >= %d)\n", i4a8_min_m());
+    }
+    const int N = w.N, K = w.K;
+    Scratch& s = scratch_for(q);
+    const float* ws = i4a8_scales_for(q, w);
+    int8_t* w8 = grow(q, s.w8, s.w8_cap, size_t(N) * K);
+    if (!w8) throw std::runtime_error("i4a8: weight scratch allocation failed");
+    sycl::event e = i4a8_weight(q, w, ws, w8, deps);
+    const QuantWeight v = i4a8_view(w, w8, ws);
+    i4a8_check(q, w, x, M, v, s);
+    if constexpr (EPI != 1) {
+        return onednn_gemm_a8rot(q, v, x, static_cast<float*>(out), M, EPI == 2, {e});
+    } else {
+        const int FI = N / 2;
+        constexpr int R = 1024;
+        float* yt = grow(q, s.y8, s.y8_cap, size_t(std::min(M, R)) * N);
+        if (!yt) throw std::runtime_error("i4a8: SwiGLU scratch allocation failed");
+        for (int r0 = 0; r0 < M; r0 += R) {
+            const int rows = std::min(R, M - r0);
+            e = onednn_gemm_a8rot(q, v, x + size_t(r0) * K, yt, rows, false, {e});
+            e = swiglu_rows(q, yt, static_cast<sycl_bf16*>(out) + size_t(r0) * FI, rows, FI, {e});
+        }
+        return e;
+    }
+}
+
+} // namespace
+#endif
+
 bool gemm_fast_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FAST_GEMM") != nullptr;
     const size_t np = size_t(w.N + NC2 - 1) / NC2 * NC2;
@@ -3182,6 +3476,27 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     };
     if (timed) q.wait();             // earlier work must not count here
     auto t0 = now();
+    // short INT4 prompts: the verify kernel in 32-row pieces (GRIMOIRE_I4_PIECES_MAX, see above)
+    if (i4_pieces_ok(w, M, x, out)) {
+        sycl::event e = i4_pieces_run<EPI>(q, w, x, out, M, deps);
+        if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
+        return e;
+    }
+#ifdef GRIMOIRE_WITH_ONEDNN
+    // INT4 prompts as int8 x int8 (GRIMOIRE_I4A8=1, see i4a8 above).  A refusal (oneDNN offers
+    // only its reference kernel, an allocation fails) turns it off for the process, once, loudly.
+    if (i4a8_ok(w, M)) {
+        try {
+            sycl::event e = i4a8_run<EPI>(q, w, x, out, M, deps);
+            if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
+            return e;
+        } catch (const std::exception& ex) {
+            i4a8_dead().store(true);
+            std::fprintf(stderr, "  i4a8 OFF for this process (%s); back to the bf16 prompt GEMM\n",
+                         ex.what());
+        }
+    }
+#endif
     if (EPI != 2 && fused_mxfp4_ok(w)) {     // N % NC2 == 0 checked there
         sycl::event e = gemm_mxfp4_fused<EPI>(q, w, x, out, M, deps);
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }

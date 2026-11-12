@@ -48,6 +48,7 @@
 // e4m3 * row_scale to bf16 before the GEMM; oneDNN multiplies the exact e4m3
 // value (it fits bf16) and applies the scale to the fp32 sum.
 #include "onednn_gemm.hpp"
+#include "hadamard128.hpp"
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <sycl/ext/intel/math.hpp>
@@ -89,9 +90,10 @@ bool exact_m() {
 }
 
 struct Key {
-    int fmt, M, N, K, acc, a8;
+    int fmt, M, N, K, acc, a8, rot;
     bool operator<(const Key& o) const {
-        return std::tie(fmt, M, N, K, acc, a8) < std::tie(o.fmt, o.M, o.N, o.K, o.acc, o.a8);
+        return std::tie(fmt, M, N, K, acc, a8, rot) <
+               std::tie(o.fmt, o.M, o.N, o.K, o.acc, o.a8, o.rot);
     }
 };
 
@@ -99,6 +101,7 @@ struct Prim {
     dnnl::matmul       prim;
     dnnl::memory::desc src, wei, dst, scr, scl, ascl;
     bool a8=false;
+    bool rot=false;   // a8 source in the 128-point Hadamard domain (onednn_gemm_a8rot)
 };
 
 struct Ctx {
@@ -142,7 +145,8 @@ void grow(sycl::queue& q, T*& p, size_t& cap, size_t need, const char* what) {
     if (!p) throw std::runtime_error(std::string("oneDNN matmul: ") + what + " allocation failed");
 }
 
-const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool acc) {
+const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool acc,
+                     bool rot = false) {
     static const int requested=[] {
         const char* e=std::getenv("GRIMOIRE_ONEDNN_W8A8");return e?std::atoi(e):0;
     }();
@@ -150,8 +154,10 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
     // further excludes narrow outputs fed by unnormalized FFN activations.
     const bool selected=requested==1 || (requested==2 && (w.N>=32768 || w.K>=16384)) ||
                         (requested==3 && w.N>=32768);
-    const bool a8=selected&&w.fmt==Fmt::INT8&&M>=32&&w.N>=256&&w.K%64==0;
-    const Key k{int(w.fmt), M, w.N, w.K, acc ? 1 : 0, a8?1:0};
+    // rot: the caller (gemm_fast.cpp, INT4 prompts) rebuilt W as rotated int8 and wants the
+    // source rotated the same way -- always int8 x int8.
+    const bool a8=rot || (selected&&w.fmt==Fmt::INT8&&M>=32&&w.N>=256&&w.K%64==0);
+    const Key k{int(w.fmt), M, w.N, w.K, acc ? 1 : 0, a8?1:0, rot?1:0};
     auto it = c.prims.find(k);
     if (it != c.prims.end()) return it->second;
     const auto t0 = std::chrono::steady_clock::now();
@@ -163,6 +169,7 @@ const Prim& prim_for(sycl::queue& q, Ctx& c, const QuantWeight& w, int M, bool a
     const bool s8 = w.fmt == Fmt::INT8;
     Prim p;
     p.a8=a8;
+    p.rot=rot;
     p.src = dnnl::memory::desc({M, w.K}, a8?dt::s8:dt::bf16, tag::ab);
     // W is [N][K] row-major: oneDNN's [K][N] weights in the transposed tag.
     p.wei = dnnl::memory::desc({w.K, w.N}, fp8 ? dt::f8_e4m3 : s8 ? dt::s8 : dt::bf16, tag::ba);
@@ -212,6 +219,50 @@ sycl::event exec(sycl::queue& q,Ctx& c, const Prim& p, const QuantWeight& w, con
         grow(q,c.as,c.as_cap,size_t(M),"activation scales");
         int8_t* out=c.x8;float* scales=c.as;
         constexpr size_t WG=256;
+        if(p.rot){
+            // Each 128-wide block of a row through the unnormalised 128-point Sylvester
+            // Hadamard transform (gemm_fast.cpp rotated the weight rows the same way and
+            // folded the 1/128), then one int8 scale per row.  The rotation spreads an outlier
+            // channel over its block, which is what makes a per-row int8 scale accurate
+            // (exl3xpu's int8 prompt linears: NLL +0.17%).  A sub-group owns a block, a lane 8
+            // consecutive values; two passes so the values never leave registers.
+            const auto quant=q.submit([&](sycl::handler& h){
+                h.depends_on(ready);
+                h.parallel_for(sycl::nd_range<1>(size_t(M)*WG,WG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                    auto sg=it.get_sub_group();
+                    const int row=int(it.get_group(0));
+                    const int lane=int(sg.get_local_id()[0]),sgid=int(sg.get_group_id()[0]);
+                    const int nsg=int(sg.get_group_range()[0]),nb=K/128;
+                    const sycl_bf16* xr=x+size_t(row)*K;
+                    auto block=[&](int b,float (&v)[8]){
+                        const sycl_bf16* s=xr+b*128+lane*8;
+                        #pragma unroll
+                        for(int t=0;t<8;++t)v[t]=float(s[t]);
+                        hadamard128_sg(sg,lane,v);
+                    };
+                    float local=0.f;
+                    for(int b=sgid;b<nb;b+=nsg){
+                        float v[8];block(b,v);
+                        #pragma unroll
+                        for(int t=0;t<8;++t)local=sycl::fmax(local,sycl::fabs(v[t]));
+                    }
+                    const float maximum=sycl::reduce_over_group(it.get_group(),local,sycl::maximum<float>());
+                    const float scale=maximum>0.f?sycl::ext::intel::math::fdiv_rn(maximum,127.f):1.f;
+                    const float inverse=sycl::ext::intel::math::fdiv_rn(1.f,scale);
+                    if(it.get_local_id(0)==0)scales[row]=scale;
+                    for(int b=sgid;b<nb;b+=nsg){
+                        float v[8];block(b,v);
+                        int8_t* o=out+size_t(row)*K+b*128+lane*8;
+                        #pragma unroll
+                        for(int t=0;t<8;++t)
+                            o[t]=int8_t(sycl::clamp(sycl::rint(v[t]*inverse),-127.f,127.f));
+                    }
+                });
+            });
+            ready={quant};source=c.x8;
+            args[DNNL_ARG_ATTR_SCALES|DNNL_ARG_SRC]=make_memory(p.ascl,c.eng,memory_kind::usm,c.as);
+        }else{
         const auto quant=q.submit([&](sycl::handler& h){
             h.depends_on(ready);
             h.parallel_for(sycl::nd_range<1>(size_t(M)*WG,WG),[=](sycl::nd_item<1> it){
@@ -230,6 +281,7 @@ sycl::event exec(sycl::queue& q,Ctx& c, const Prim& p, const QuantWeight& w, con
         });
         ready={quant};source=c.x8;
         args[DNNL_ARG_ATTR_SCALES|DNNL_ARG_SRC]=make_memory(p.ascl,c.eng,memory_kind::usm,c.as);
+        }
     }
     args[DNNL_ARG_SRC]     = make_memory(p.src, c.eng, memory_kind::usm,source);
     args[DNNL_ARG_WEIGHTS] = make_memory(p.wei, c.eng, memory_kind::usm,
@@ -254,19 +306,39 @@ bool onednn_gemm_ok(const QuantWeight& w, int M) {
     return false;
 }
 
+namespace {
+sycl::event gemm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
+                      int M, bool accumulate, const std::vector<sycl::event>& deps, bool rot);
+}
+
 sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
                         int M, bool accumulate, const std::vector<sycl::event>& deps) {
+    return gemm_impl(q, w, x, y, M, accumulate, deps, false);
+}
+
+// w: int8 [N][K] rows already in the 128-point Hadamard domain, f32 scale per row with the
+// transform's 1/128 folded in (gemm_fast.cpp i4a8).  x is rotated + quantized here.
+sycl::event onednn_gemm_a8rot(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
+                              int M, bool accumulate, const std::vector<sycl::event>& deps) {
+    if (w.fmt != Fmt::INT8 || w.K % 128 != 0 || !onednn_gemm_ok(w, M))
+        throw std::runtime_error("onednn_gemm_a8rot: needs INT8 [N][K] with per-row scales, K % 128 == 0");
+    return gemm_impl(q, w, x, y, M, accumulate, deps, true);
+}
+
+namespace {
+sycl::event gemm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y,
+                      int M, bool accumulate, const std::vector<sycl::event>& deps, bool rot) {
     std::lock_guard<std::mutex> lk(mu());
     Ctx& c = ctx_for(q);
     if (exact_m() || w.N < kWideN || M < kPieceMinM)
-        return exec(q,c, prim_for(q, c, w, M, accumulate), w, x, y, deps);
+        return exec(q,c, prim_for(q, c, w, M, accumulate, rot), w, x, y, deps);
     const size_t K = size_t(w.K), N = size_t(w.N);
     std::vector<sycl::event> d = deps;
     sycl::event e;
     int r0 = 0;
     for (const int P : kPieces) {
         while (M - r0 >= P) {            // after the 1024s at most one of each smaller piece
-            const Prim& p = prim_for(q, c, w, P, accumulate);
+            const Prim& p = prim_for(q, c, w, P, accumulate, rot);
             e = exec(q,c, p, w, x + size_t(r0) * K, y + size_t(r0) * N, d);
             d = {e};
             r0 += P;
@@ -279,7 +351,7 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
         // rows are never read, and a GEMM row depends on its own input row only.
         int T = kTails[2];
         for (const int t : kTails) if (rem <= t) { T = t; break; }
-        const Prim& p = prim_for(q, c, w, T, accumulate);
+        const Prim& p = prim_for(q, c, w, T, accumulate, rot);
         if (size_t(T) * K > c.xs_cap) {
             grow(q, c.xs, c.xs_cap, size_t(T) * K, "staging");
             q.memset(c.xs, 0, c.xs_cap * sizeof(sycl_bf16)).wait();
@@ -293,5 +365,6 @@ sycl::event onednn_gemm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x
     }
     return e;
 }
+} // namespace
 
 } // namespace b70
