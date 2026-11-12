@@ -17,7 +17,7 @@ PROMPTS = {
 
 def one(prompt, sampled, tag):
     body = {'model': MODEL, 'stream': True, 'max_tokens': 512,
-            'messages': [{'role': 'user', 'content': f'[{tag} {time.time_ns()}] ' + prompt}]}
+            'messages': [{'role': 'user', 'content': (f'[{tag} {time.time_ns()}] ' if sampled else f'[{tag}] ') + prompt}]}
     if sampled:
         body.update(temperature=0.7, top_p=0.95, top_k=20)
     else:
