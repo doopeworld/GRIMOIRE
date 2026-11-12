@@ -24,7 +24,7 @@ def one(prompt, sampled, tag):
         body.update(temperature=0)
     req = urllib.request.Request(EP + '/chat/completions', data=json.dumps(body).encode(),
                                  headers={'Content-Type': 'application/json'})
-    t0 = time.monotonic(); first = last = None; usage = {}; stamps = []
+    t0 = time.monotonic(); first = last = None; usage = {}; stamps = []; parts = []
     with urllib.request.urlopen(req, timeout=600) as r:
         for line in r:
             if not line.startswith(b'data: ') or b'[DONE]' in line:
@@ -36,9 +36,10 @@ def one(prompt, sampled, tag):
                 dl = c.get('delta') or {}
                 if (dl.get('content') or '') + (dl.get('reasoning_content') or ''):
                     now = time.monotonic(); first = first or now; last = now; stamps.append(now)
+                    parts.append((dl.get('reasoning_content') or '') + (dl.get('content') or ''))
     n = usage.get('completion_tokens', 0)
     gaps = [1000 * (b - a) for a, b in zip(stamps, stamps[1:])]
-    return {'tag': tag, 'sampled': sampled, 'tokens': n, 'ttft_ms': 1000 * (first - t0) if first else None,
+    return {'tag': tag, 'sampled': sampled, 'tokens': n, 'text': ''.join(parts), 'ttft_ms': 1000 * (first - t0) if first else None,
             'decode_tps': (n - 1) / (last - first) if first and last and last > first else None,
             'gap_p50_ms': st.median(gaps) if gaps else None,
             'gap_p99_ms': sorted(gaps)[int(0.99 * (len(gaps) - 1))] if gaps else None}

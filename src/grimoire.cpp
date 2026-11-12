@@ -2765,6 +2765,14 @@ struct Grimoire {
     bool tp_head_split = false;
     int  head_v0 = 0, head_valid = 0;
     bool tp_head_pick(const float* val, const int32_t* idx, int n, int32_t* out);
+    // the same merge for rows [v0, v0 + n) of any head slice (draft split)
+    bool tp_head_pick_at(const float* val, const int32_t* idx, int n, int32_t* out, int v0);
+    // Megatron TP draft-head split (2026-11-12): every rank drafts from its half of the draft rows
+    // [draft_v0, draft_v0 + draft_vn) of the replicated lm_head (a view, no copy), the ranks merge
+    // their best (value, index) per row (tp_head_pick_at).  Decided once, by both ranks together.
+    int draft_split_state = -1, draft_split_dv = 0, draft_v0 = 0, draft_vn = 0;
+    bool draft_split_ready(int dv);
+    QuantWeight draft_rows_view() const;
     // Megatron TP prefill chunk cap: every rank's LIVE budget (real free
     // VRAM after load), agreed to the smallest once at load, so no rank ever
     // sizes a chunk past what its own card actually has, and all ranks cut
@@ -5234,6 +5242,43 @@ int Grimoire::tp_sync_token(int token){
 // lowest vocabulary index, which is launch_argmax's own rule over the whole vocabulary.  An
 // index of INT_MAX (no candidate: every logit -inf or NaN) stays INT_MAX, as it would whole.
 bool Grimoire::tp_head_pick(const float* val, const int32_t* idx, int n, int32_t* out){
+    return tp_head_pick_at(val,idx,n,out,head_v0);
+}
+bool Grimoire::draft_split_ready(int dv){
+    if(draft_split_state>=0)return draft_split_state==1&&dv==draft_split_dv;
+    static const bool env_on=[]{ const char* e=std::getenv("GRIMOIRE_TP_DRAFT_SPLIT"); return !(e&&*e=='0'); }();
+    const QuantWeight& w=lm_head.w;
+    int ok=env_on&&tp_mega&&tp_world==2&&!tp_enabled()&&!pp_enabled()&&!dflash2.ok&&
+           !coupled_sampling_enabled()&&!tp_head_split&&w.payload&&!lm_head.has_i4()&&!lm_head.tp_sharded()&&
+           (w.fmt==Fmt::INT4||w.fmt==Fmt::BF16||w.fmt==Fmt::MXFP4)&&dv>=64&&dv<=w.N&&
+           int(tp_peer_fd.size())==tp_world;
+    // a collective: both ranks reach the first draft together and must take the same path
+    if(!tp_agree_min(ok))ok=0;
+    draft_split_state=ok?1:0; draft_split_dv=dv;
+    if(ok){
+        const int cut=(dv/2)/16*16;                 // a multiple of 16 rows: the small-M kernels' tile
+        draft_v0=tp_rank==0?0:cut; draft_vn=tp_rank==0?cut:dv-cut;
+        std::printf("  MTP draft head split over the ranks: rows [%d,%d) of the %d draft rows on this rank "
+                    "(GRIMOIRE_TP_DRAFT_SPLIT=0 = every rank reads them all)\n",draft_v0,draft_v0+draft_vn,dv);
+        std::fflush(stdout);
+    }
+    return ok==1;
+}
+// Rows [draft_v0, draft_v0 + draft_vn) of lm_head as their own weight: every format allowed above keeps
+// a row's payload, scales and zeros together ([N][...], b70/weights.hpp), so the slice is an offset.
+QuantWeight Grimoire::draft_rows_view() const {
+    QuantWeight v=lm_head.w;
+    const int64_t b=draft_v0;
+    v.payload=lm_head.w.payload+b*lm_head.w.row_bytes;
+    if(lm_head.w.scales){
+        const size_t eb=lm_head.w.fmt==Fmt::INT4?2:1;   // bf16 per group / e8m0 per block
+        v.scales=static_cast<const uint8_t*>(lm_head.w.scales)+size_t(b)*size_t(lm_head.w.row_scales)*eb;
+    }
+    if(lm_head.w.zeros)v.zeros=lm_head.w.zeros+size_t(b)*size_t(lm_head.w.row_scales);
+    v.N=draft_vn;
+    return v;
+}
+bool Grimoire::tp_head_pick_at(const float* val, const int32_t* idx, int n, int32_t* out, int v0){
     if(n<=0)return true;
     if(int(tp_peer_fd.size())!=tp_world){
         std::fprintf(stderr,"TP: split-head token exchange before the ranks connected\n");return false;
@@ -5242,7 +5287,7 @@ bool Grimoire::tp_head_pick(const float* val, const int32_t* idx, int n, int32_t
     std::vector<Cand> mine(static_cast<size_t>(n)), all(static_cast<size_t>(n)*size_t(tp_world));
     const int32_t none=0x7fffffff;   // launch_argmax's INT_MAX
     for(int r=0;r<n;++r)
-        mine[size_t(r)]={val[r],idx[r]==none?none:idx[r]+head_v0};
+        mine[size_t(r)]={val[r],idx[r]==none?none:idx[r]+v0};
     const size_t nb=size_t(n)*sizeof(Cand);
     std::memcpy(all.data()+size_t(tp_rank)*size_t(n),mine.data(),nb);
     if(tp_rank==0){
@@ -14910,6 +14955,17 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
         return v && *v ? std::atoi(v) : 0;
     }();
     const int dv = draft_vocab > 0 ? std::min(draft_vocab, cfg.vocab) : cfg.vocab;
+    // Megatron TP (2026-11-12): each rank reads half of the draft rows, the ranks merge their best.
+    if (!pp_enabled() && draft_split_ready(dv)) {
+        launch_gemv(q, draft_rows_view(), mtp.h2, s.logits, none);
+        proposal_choice(s.logits,draft_vn,s.d_tok,s.d_val,seq_slot,position+1,from_mtp_hidden,none);
+        int32_t tok = 0; float val = 0.0f;
+        q.memcpy(&val, s.d_val, sizeof(float));
+        q.memcpy(&tok, s.d_tok, sizeof(int32_t)).wait();
+        int32_t out = -1;
+        if (!tp_head_pick_at(&val, &tok, 1, &out, draft_v0)) return -1;
+        return int(out);
+    }
     // The reduced-vocabulary shortcut writes s.logits directly and so
     // skips the all-gather gemv_any would have done: under TP that
     // leaves every rank holding only its own slice of the draft logits
@@ -15147,6 +15203,22 @@ bool Grimoire::mtp_draft_rows(int n, const int32_t* tok_in, const int* slot, con
         launch_rmsnorm_residual(q, row(mtpr.x, r, H), row(mtpr.y, r, H), mtp.norm, row(mtpr.out, r, H),
                                 H, eps, none);
     const int dv = mtpr.dv;
+    // Megatron TP (2026-11-12): each rank's half of the draft rows, merged per row (draft_split_ready)
+    if (!device_out && draft_split_ready(dv)) {
+        const int dvh = draft_vn;
+        mtpr_mm(draft_rows_view(), mtpr.out, mtpr.lg, n);
+        for (int r = 0; r < n; ++r)
+            proposal_choice(row(mtpr.lg,r,dvh),dvh,mtpr.dtok+r,mtpr.val+r,
+                            slot[r],position[r]+1,chained,none);
+        std::vector<float> hv(static_cast<size_t>(n));
+        q.memcpy(hv.data(), mtpr.val, size_t(n) * sizeof(float));
+        q.memcpy(mtpr.tok, mtpr.dtok, size_t(n) * sizeof(int32_t)).wait();
+        std::vector<int32_t> loc(mtpr.tok, mtpr.tok + n), got(static_cast<size_t>(n), -1);
+        if (!tp_head_pick_at(hv.data(), loc.data(), n, got.data(), draft_v0))
+            throw std::runtime_error("MTP batched draft: split-head pick failed");
+        for (int r = 0; r < n; ++r) tok_out[r] = got[size_t(r)];
+        return true;
+    }
     if (!lm_head.has_i4() && !lm_head.tp_sharded() && lm_head.w.payload) {
         QuantWeight hw = lm_head.w;       // whole rows together (b70/weights.hpp): first dv rows
         hw.N = dv;
