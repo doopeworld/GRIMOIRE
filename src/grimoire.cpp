@@ -5318,13 +5318,14 @@ bool Grimoire::tp_shm_setup(std::string& err){
             tshm.s_zc=sz&&*sz&&*sz!='0';
             const char* bb=std::getenv("GRIMOIRE_TP_AR_BAR");
             const char* rx=std::getenv("GRIMOIRE_TP_STREAM_RX");
-            // BAR receive (the CPU writes the peer's all-reduce pieces straight into this card's VRAM)
-            // is OFF by default since 11-10: gpu1 dropped off the bus twice (11-09, 11-10) at the same
-            // point of a two-card prefill sweep, ~70 s into sustained long prompts, on two different
-            // docks, while ComfyUI runs the same card at 320 W without a drop.  This path is the only
-            // Grimoire-specific heavy traffic in that phase.  Opt in with GRIMOIRE_TP_AR_BAR=1
-            // (pp4096 2,002 -> 2,568 on 10-24); the copy engine receives otherwise.
-            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&bb&&*bb&&*bb!='0';
+            // BAR receive (the CPU writes the peer's all-reduce pieces straight into this card's VRAM):
+            // ON again by default since 2026-11-12.  It was turned off on 11-10 after gpu1 dropped off
+            // the bus during two-card prefill sweeps; the cause was gpu1's 550 W PSU (vLLM dropped it
+            // too, and so did ComfyUI; nothing dropped after the swap to a 750 W PSU).  MEASURED 11-12,
+            // two B70s, Swift INT4 TP2, BetterBench prefill: 2K / 8K / 16K / 32K / 64K tok/s copy engine
+            // 1,559 / 1,729 / 1,714 / 1,635 / 1,491 -> BAR 1,515 / 2,959 / 2,836 / 2,550 / 2,094,
+            // no AER on gpu1's path.  GRIMOIRE_TP_AR_BAR=0 = the copy engine receives.
+            tshm.s_bar=tp_ffn_chunk&&!tshm.s_zc&&!(bb&&*bb=='0');
             tshm.s_rxt=tp_ffn_chunk&&!tshm.s_zc&&(tshm.s_bar||(rx&&*rx&&*rx!='0'));
             if(tshm.s_rxt)tshm.pipe_slots=8;                  // slack for the receiver's lag
         }

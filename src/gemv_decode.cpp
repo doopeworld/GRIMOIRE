@@ -1474,13 +1474,18 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
     // down 56.3 -> 49.6us; z 21.6 -> 19.0us; out 21.6 -> 18.7us on G31.
     // Gate/up already has the best warm plan: retain it. Restrict to the
     // tested seven-row verification shape; other models/widths keep the rule.
+    // Default since 2026-11-12 (GRIMOIRE_I4_TP_VERIFY_PLAN=0 = off): re-measured with tools/i4sweep_probe.cpp
+    // (engine kernel, weights from DRAM, M = 7, max rel 1e-6 vs the decode GEMV): TP down 56.1 -> 49.9 us,
+    // z 21.6 -> 19.1, out/o 22.3 -> 18.8, k/v 7.3 -> 4.0 (N = 512), one-card k/v 7.7 -> 5.4 (N = 1024).
     static const bool tp_verify_plan = [] {
         const char* e=std::getenv("GRIMOIRE_I4_TP_VERIFY_PLAN");
-        return e && *e=='1';
+        return !(e && *e=='0');
     }();
     if(tp_verify_plan && M==7 && (1 << w.int4_gshift())==128) {
         if(N==5120 && K==8704) KS=24;       // normalized to23 slices of384
         else if((N==3072 && K==5120) || (N==5120 && K==3072)) KS=2;
+        else if(N==512 && K==5120) KS=16;
+        else if(N==1024 && K==5120) KS=12;
     }
     // GRIMOIRE_I4_SMALLM_KS=<n> (diagnostic, 2026-11-05): n K slices
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM_KS");

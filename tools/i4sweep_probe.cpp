@@ -37,7 +37,11 @@ int main(int argc, char** argv) {
     const std::vector<Shape> shapes = {
         {"q38 gate_up", 34816, 5120}, {"q38 down", 5120, 17408}, {"q38 dn_qkv", 10240, 5120},
         {"q38 z", 6144, 5120}, {"q38 out/o", 5120, 6144}, {"q38 attn_q", 12288, 5120},
-        {"q38 kv", 1024, 5120}, {"q38 lm_head", 248320, 5120}};
+        {"q38 kv", 1024, 5120}, {"q38 lm_head", 248320, 5120},
+        // 2026-11-12: one TP2 rank's halves (Megatron: column halves of gate_up / qkv / z / q / kv,
+        // K halves of down / out / o)
+        {"tp gate_up", 17408, 5120}, {"tp down", 5120, 8704}, {"tp dn_qkv", 5120, 5120},
+        {"tp z", 3072, 5120}, {"tp out/o", 5120, 3072}, {"tp attn_q", 6144, 5120}, {"tp kv", 512, 5120}};
     const int only = argc > 1 ? std::atoi(argv[1]) : -1;
     std::mt19937 rng(13);
     for (int si = 0; si < int(shapes.size()); ++si) {
@@ -99,7 +103,7 @@ int main(int argc, char** argv) {
         q.wait();
         launch_int4_smallm(q, ws[0], xb, y, 8); check("engine M=8", 8);
         launch_int4_smallm(q, ws[0], xb, y, MR); check("engine M=16", MR);
-        for (int M : {4, 7, 14, 16}) {
+        for (int M : {7, 16}) {
             char nm[64];
             std::snprintf(nm, sizeof nm, "engine M=%d", M);
             timeit(nm, [&](const QuantWeight& w) { launch_int4_smallm(q, w, xb, y, M); });
