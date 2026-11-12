@@ -5246,7 +5246,10 @@ bool Grimoire::tp_head_pick(const float* val, const int32_t* idx, int n, int32_t
 }
 bool Grimoire::draft_split_ready(int dv){
     if(draft_split_state>=0)return draft_split_state==1&&dv==draft_split_dv;
-    static const bool env_on=[]{ const char* e=std::getenv("GRIMOIRE_TP_DRAFT_SPLIT"); return !(e&&*e=='0'); }();
+    // OFF by default: MEASURED 2026-11-12, two B70s, Swift INT4 TP2 + MTP K6, one user: draft 3.9-4.1 ms
+    // (whole rows) -> 4.3-4.4 ms (split): the per-depth socket exchange costs more than the 84 MB a rank
+    // no longer reads; greedy texts 9/9 identical.  GRIMOIRE_TP_DRAFT_SPLIT=1 = on.
+    static const bool env_on=[]{ const char* e=std::getenv("GRIMOIRE_TP_DRAFT_SPLIT"); return e&&*e=='1'; }();
     const QuantWeight& w=lm_head.w;
     int ok=env_on&&tp_mega&&tp_world==2&&!tp_enabled()&&!pp_enabled()&&!dflash2.ok&&
            !coupled_sampling_enabled()&&!tp_head_split&&w.payload&&!lm_head.has_i4()&&!lm_head.tp_sharded()&&
@@ -5259,7 +5262,7 @@ bool Grimoire::draft_split_ready(int dv){
         const int cut=(dv/2)/16*16;                 // a multiple of 16 rows: the small-M kernels' tile
         draft_v0=tp_rank==0?0:cut; draft_vn=tp_rank==0?cut:dv-cut;
         std::printf("  MTP draft head split over the ranks: rows [%d,%d) of the %d draft rows on this rank "
-                    "(GRIMOIRE_TP_DRAFT_SPLIT=0 = every rank reads them all)\n",draft_v0,draft_v0+draft_vn,dv);
+                    "(opt-in, GRIMOIRE_TP_DRAFT_SPLIT=1)\n",draft_v0,draft_v0+draft_vn,dv);
         std::fflush(stdout);
     }
     return ok==1;
