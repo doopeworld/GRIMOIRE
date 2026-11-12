@@ -10714,7 +10714,14 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     const char* configured=std::getenv("GRIMOIRE_MTP_K");
     const int requested=dflash2.ok?dflash_block_rows()-1:
         std::clamp(configured?std::atoi(configured):kMtpDefaultDepth,0,15);
-    const int max_depth=std::max(0,std::min(requested,kSpecBatch/n-1));
+    // Rows per verify: GRIMOIRE_SPEC_ROWS (default 16, at most kSpecBatch).  MEASURED 2026-11-12, one
+    // B70, Swift INT4 + MTP K6, sampled, total tok/s: 4 users depth 3 / 4 / 6 (16 / 20 / 28 rows)
+    // 178.6 / 137.5 / 128.4; 8 users depth 1 / 2 / 3 (16 / 24 / 32 rows) 249.8 / 195.7 / 236.3 --
+    // a verify past 16 rows costs more than its extra drafts return.  kSpecBatch 32 stays the buffer
+    // size, so GRIMOIRE_SPEC_ROWS=32 is the 0786428 behaviour.
+    static const int spec_rows=[] { const char* e=std::getenv("GRIMOIRE_SPEC_ROWS");
+        const int v=e&&*e?std::atoi(e):16; return std::clamp(v,2,kSpecBatch); }();
+    const int max_depth=std::max(0,std::min(requested,spec_rows/n-1));
     // Batched drafting (mtp_draft_rows): every row's depth first, then ONE pass of the head
     // per depth over the rows that still draft.  The row loop below drafts only when the
     // head cannot be batched (an MoE head, DFlash, GRIMOIRE_MTP_BATCH_DRAFT=0) or n == 1.

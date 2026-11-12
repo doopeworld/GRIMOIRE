@@ -3190,10 +3190,13 @@ sycl::event swiglu_rows(sycl::queue& q, const float* y, sycl_bf16* hout, int R, 
     });
 }
 
+// Default 160 rows.  MEASURED 2026-11-12, one B70, Swift INT4 + MTP, ~60-token prompts admitted
+// together, TTFT pieces vs bf16-scratch GEMM: 1 prompt (~60 rows) 145 vs 288 ms, 2 (~120) 266 vs
+// 381, 4 (~240) 414 vs 398 -- the crossover is near 200 rows.  0 = off.
 int i4_pieces_max() {
     static const int v = [] {
         const char* e = std::getenv("GRIMOIRE_I4_PIECES_MAX");
-        return e && *e ? std::max(0, std::atoi(e)) : 0;
+        return e && *e ? std::max(0, std::atoi(e)) : 160;
     }();
     return v;
 }

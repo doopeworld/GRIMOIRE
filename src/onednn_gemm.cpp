@@ -330,7 +330,11 @@ sycl::event gemm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, 
                       int M, bool accumulate, const std::vector<sycl::event>& deps, bool rot) {
     std::lock_guard<std::mutex> lk(mu());
     Ctx& c = ctx_for(q);
-    if (exact_m() || w.N < kWideN || M < kPieceMinM)
+    // rot (INT4 prompts as int8, gemm_fast.cpp): EVERY M through the fixed pieces and the staged
+    // tails, so a prompt length never seen before builds no primitive.  Exact-M primitives cost a
+    // build per new length and shape: one B70, 8 users' ~60-token prompts admitted together
+    // (~480 rows), TTFT 555 ms with them against 486 on the bf16 path (2026-11-12).
+    if (!rot && (exact_m() || w.N < kWideN || M < kPieceMinM))
         return exec(q,c, prim_for(q, c, w, M, accumulate, rot), w, x, y, deps);
     const size_t K = size_t(w.K), N = size_t(w.N);
     std::vector<sycl::event> d = deps;
