@@ -19618,7 +19618,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // normed copy, r1's per-layer zeroing and its re-read, and let the norm /
     // gate before an output projection write that GEMM's bf16 input directly.
     // GRIMOIRE_NO_DENSE_PURE=1 restores the general path.
+    // Speculative verify rows (several conversations' blocks, or one conversation's): a verify is
+    // NOT a prompt even at 32 rows.  kSpecBatch 32 (0786428) let a verify reach M == 32 = 8 users x 4
+    // rows, where dense_pure stopped writing bn in fp32 while the verify's DeltaNet gate projection
+    // still reads it (mm(d.la_ab, bn, ...)): every answer garbage, no draft accepted, and the FFN took
+    // the prompt GEMM's whole-weight bf16 dequant (verify 80 -> 236 ms).  MEASURED 2026-11-12, one
+    // B70, 8 users: tokens/step 8.00 of 8 sequences.  Batched admission (spans) stays a prompt.
+    const bool verify_shape = (seqb && seqb->verify) || (next_tokens && !(seqb && seqb->spans));
     const bool dense_pure = !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && !cfg.is_moe() &&
+        !verify_shape &&
         !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
         !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
         !std::getenv("GRIMOIRE_NO_DENSE_PURE");
@@ -21953,7 +21961,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_swiglu_bf16_out(q,t0,xb,M,d.sh_gu.output_rows()/2);
                     pp_mark("  FFN swiglu");
                     mmb(d.sh_down,xb,r0);
-                }else if(!tp_enabled() && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                }else if(!tp_enabled() && !verify_shape && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
                    gemm_fast_swiglu_supported(d.sh_gu.w,M) &&
                    gemm_fast_supported(d.sh_down.w,M)){
                     launch_gemm_fast_swiglu(q,d.sh_gu.w,bn_bf,xb,M);
@@ -23122,8 +23130,11 @@ void GrimoireScheduler::run() {
             taking.swap(rest);
         }
         std::vector<std::shared_ptr<SchedJob>> admitted_round;
-        const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2 &&
-            std::none_of(taking.begin(),taking.end(),[](const auto& j){return j->sampling.enabled();})) ? [&] {
+        // Sampled requests too (2026-11-12): admit_batch samples each prompt's first token in
+        // prefill's spans branch with its slot's options (target_choice), set just before the call
+        // below.  Excluding them (11-09) admitted every sampled prompt alone and held all first
+        // tokens for the round: one B70, 8 users of ~60-token prompts, TTFT 2.28 s = 8 x 287 ms.
+        const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2) ? [&] {
             const int b = e.prefill_token_budget();
             return b > 0 ? std::min(admit_batch_tokens, b) : admit_batch_tokens; }() : 0;
         while (batchable && admit_cap > 0 && taking.size() >= 2) {
@@ -23141,7 +23152,17 @@ void GrimoireScheduler::run() {
             const auto bt0 = std::chrono::steady_clock::now();
             bool batched = false;
             try {
-                for(size_t i=0;i<slot_busy.size();++i)if(!slot_busy[i])e.slot_sampling[i]={};
+                // admit_batch puts prompt k in the k-th idle slot (its `pick`) and samples that
+                // prompt's first token with the slot's options: give each slot its request's.
+                size_t k = 0;
+                for (size_t i = 0; i < slot_busy.size(); ++i) {
+                    if (slot_busy[i]) continue;
+                    if (k < group.size()) {
+                        e.slot_sampling[i] = group[k]->sampling;
+                        ++e.sampling_epoch.at(i);
+                    } else e.slot_sampling[i] = {};
+                    ++k;
+                }
                 batched = e.admit_batch(prompts, slot_busy, bslots, bfirst);
             }
             catch (const std::exception& ex) {
