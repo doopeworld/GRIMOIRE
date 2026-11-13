@@ -148,7 +148,10 @@ public:
         const bool handles_ok = first ? send_handle() && recv_handle() : recv_handle() && send_handle();
         if (!handles_ok) { if (received_fd >= 0) ::close(received_fd); reason = "P2P handle exchange failed"; return false; }
         std::memcpy(&peer_handle, &received_fd, sizeof received_fd);
-        ok = api.open(context, device, peer_handle, ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED, &imported) == ZE_RESULT_SUCCESS;
+        // Flags 0, not ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED: MEASURED 2026-11-13 (two-process Level Zero test, both
+        // cards enumerated, P2PDMA kernel) -- the uncached import is never resident (0x70000003), the default one
+        // is and 64 KB pushes land correctly (39-47 us).  The copy engine only WRITES through this mapping.
+        ok = api.open(context, device, peer_handle, 0, &imported) == ZE_RESULT_SUCCESS;
         ::close(received_fd);
         // The import must be mappable here.  MEASURED 2026-11-13 (Tower, P2PDMA kernel): with one card per
         // process (ZE_AFFINITY_MASK=r) zeMemOpenIpcHandle succeeds but residency fails (0x70000003) and copies
