@@ -150,6 +150,12 @@ public:
         std::memcpy(&peer_handle, &received_fd, sizeof received_fd);
         ok = api.open(context, device, peer_handle, ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED, &imported) == ZE_RESULT_SUCCESS;
         ::close(received_fd);
+        // The import must be mappable here.  MEASURED 2026-11-13 (Tower, P2PDMA kernel): with one card per
+        // process (ZE_AFFINITY_MASK=r) zeMemOpenIpcHandle succeeds but residency fails (0x70000003) and copies
+        // into the import never run -- both ranks stalled.  With both cards enumerated it maps and works
+        // (docker-entrypoint.sh: GRIMOIRE_MULTI_SEE_ALL=1).  Checked here so that case falls back instead.
+        bool not_resident = false;
+        if (ok && api.resident(context, device, imported, capacity * 2) != ZE_RESULT_SUCCESS) { ok = false; not_resident = true; }
         if (ok) {
             uint32_t n = 0; ok = api.groups(device, &n, nullptr) == ZE_RESULT_SUCCESS && n;
             std::vector<ze_command_queue_group_properties_t> groups(n);
@@ -163,7 +169,10 @@ public:
             ok = ok && ordinal < n && api.create(context, device, &cd, &copies) == ZE_RESULT_SUCCESS;
         }
         if (!ipc::exchange(fd, first, ok, peer_ok)) { reason = "P2P import agreement failed"; return false; }
-        if (!ok || !peer_ok) return unavailable("peer IPC import unsupported by driver/topology");
+        if (!ok || !peer_ok)
+            return unavailable(not_resident ? "peer memory import not resident here (each rank must see both cards: "
+                                              "GRIMOIRE_MULTI_SEE_ALL=1)"
+                                            : "peer IPC import unsupported by driver/topology");
         enabled = true; reason = "direct Level Zero IPC peer copies";
         return true;
     }
@@ -192,13 +201,16 @@ public:
             } else if (extra) {
                 auto out = reinterpret_cast<float*>(own);
                 q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { out[i] = src[i] + extra[i]; }).wait_and_throw();
-            } else {
-                q.wait_and_throw(); if (!native_copy(own, src, n * width)) return false;
             }
+            // PUSH (2026-11-13): this rank's copy engine WRITES its partial into the peer's receive half
+            // (imported + capacity) instead of reading the peer's send half.  MEASURED on the Tower (Core
+            // Ultra 200H root complex, custom P2PDMA kernel): peer writes work (64 KB checked, 2.43 GB/s), the
+            // old pull (a P2P read) stalled both ranks in the warm-up with the engines idle.  An fp32 partial
+            // with nothing to add goes straight from src.
+            const void* payload = (bf16 || extra) ? static_cast<const void*>(own) : static_cast<const void*>(src);
+            if (!native_copy(static_cast<uint8_t*>(imported) + capacity, payload, n * width)) return false;
             const Packet ready{++sequence, n * width, 1, uint32_t(bf16)};
-            if (!exchange_packet(ready) || !native_copy(other, imported, n * width)) return false;
-            const Packet consumed{sequence, n * width, 2, uint32_t(bf16)};
-            if (!exchange_packet(consumed)) return false;
+            if (!exchange_packet(ready)) return false;   // both partials have landed in the receive halves
             const bool rank0 = rank == 0;
             if (bf16) {
                 const auto a = reinterpret_cast<const uint16_t*>(rank0 ? own : other);
@@ -207,10 +219,15 @@ public:
                     src[i] = sycl::bit_cast<float>(uint32_t(a[i]) << 16) + sycl::bit_cast<float>(uint32_t(b[i]) << 16);
                 }).wait_and_throw();
             } else {
-                const auto a = reinterpret_cast<const float*>(rank0 ? own : other);
-                const auto b = reinterpret_cast<const float*>(rank0 ? other : own);
-                q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { src[i] = a[i] + b[i]; }).wait_and_throw();
+                // fp32 a + b == b + a, so reading this rank's partial in place (src, or own when a CPU partial
+                // was added) gives both ranks the same bits
+                const float* mine = extra ? reinterpret_cast<const float*>(own) : src;
+                const auto peer_part = reinterpret_cast<const float*>(other);
+                q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { src[i] = mine[i] + peer_part[i]; }).wait_and_throw();
             }
+            // both ranks have read their receive half: the next chunk / call may overwrite it
+            const Packet consumed{sequence, n * width, 2, uint32_t(bf16)};
+            if (!exchange_packet(consumed)) return false;
         }
         op.done=true; return true;
     }
@@ -221,7 +238,8 @@ public:
         q.wait_and_throw();
         for (size_t at = 0; at < bytes; at += capacity) {
             const size_t n = std::min(capacity, bytes - at);
-            if (!native_copy(owned, reinterpret_cast<const uint8_t*>(src) + at, n)) return false;
+            // push into the receiver's buffer (a P2P write; reads of the peer stalled on the Tower, 11-13)
+            if (!native_copy(imported, reinterpret_cast<const uint8_t*>(src) + at, n)) return false;
             Packet msg{++sequence, n, 3, 0}, ack{};
             if (!ipc::write_all(socket, &msg, sizeof msg) || !ipc::read_all(socket, &ack, sizeof ack) ||
                 ack.seq != msg.seq || ack.bytes != n || ack.kind != 4 || ack.format != 0) return false;
@@ -236,7 +254,7 @@ public:
         for (size_t at = 0; at < bytes; at += capacity) {
             const size_t n = std::min(capacity, bytes - at); Packet msg{};
             if (!ipc::read_all(socket, &msg, sizeof msg) || msg.seq != ++sequence || msg.bytes != n ||
-                msg.kind != 3 || msg.format != 0 || !native_copy(reinterpret_cast<uint8_t*>(dst) + at, imported, n)) return false;
+                msg.kind != 3 || msg.format != 0 || !native_copy(reinterpret_cast<uint8_t*>(dst) + at, owned, n)) return false;
             const Packet ack{sequence, n, 4, 0};
             if (!ipc::write_all(socket, &ack, sizeof ack)) return false;
         }

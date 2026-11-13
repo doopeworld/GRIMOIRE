@@ -80,8 +80,16 @@ case "${1:-server}" in
         # Later ranks listen and earlier ones connect, so start from the back.
         # Process substitution keeps $! the server's PID (not the log
         # prefixer's) -- see tools/serve_pp2_worker.sh.
+        # GRIMOIRE_MULTI_SEE_ALL=1: every rank sees every card and rank r uses card r.  Needed for
+        # GRIMOIRE_P2P: a Level Zero IPC import of the other card's VRAM only becomes resident when that
+        # card is enumerated in the importing process (MEASURED 2026-11-13 on a P2PDMA kernel).
         for ((r = n - 1; r >= 0; --r)); do
-            env "GRIMOIRE_${mode}_RANK=$r" "ZE_AFFINITY_MASK=${devs[r]}" "GRIMOIRE_DEVICES=$zeros" \
+            if [ "${GRIMOIRE_MULTI_SEE_ALL:-0}" = 1 ]; then
+                rmask=$(IFS=,; echo "${devs[*]}"); rdev=$(seq -s, 0 $((n - 1)))
+            else
+                rmask=${devs[r]}; rdev=$zeros
+            fi
+            env "GRIMOIRE_${mode}_RANK=$r" "ZE_AFFINITY_MASK=$rmask" "GRIMOIRE_DEVICES=$rdev" \
                 /grimoire/bin/grimoire-server "$@" > >(sed -u "s/^/[rank$r] /") 2>&1 &
             pids[r]=$!
         done
