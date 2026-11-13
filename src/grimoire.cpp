@@ -10770,7 +10770,19 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     // size, so GRIMOIRE_SPEC_ROWS=32 is the 0786428 behaviour.
     static const int spec_rows=[] { const char* e=std::getenv("GRIMOIRE_SPEC_ROWS");
         const int v=e&&*e?std::atoi(e):16; return std::clamp(v,2,kSpecBatch); }();
-    const int max_depth=std::max(0,std::min(requested,spec_rows/n-1));
+    // Depth cap per number of conversations, on top of the row rule: GRIMOIRE_SPEC_DEPTHS=d1,d2,d3,... (the n-th
+    // entry caps n users; missing entries = the row rule alone).  Default "15,5": two users draft 5 deep (12 rows)
+    // instead of 6 (14 rows).  MEASURED 2026-11-13, TP2 Swift INT4 MTP K6, BetterBench concurrency 2 (48 sampled
+    // requests, the vLLM comparison config), total tok/s: depth 6 / 5 / 4 = 167.7 / 176.2 / 172.9 (vLLM TP2 173.3).
+    // A row cap (GRIMOIRE_SPEC_ROWS=12) would also stop speculation at 8 users; this touches n == 2 only.
+    static const std::vector<int> depth_by_n=[] {
+        std::vector<int> v; const char* e=std::getenv("GRIMOIRE_SPEC_DEPTHS");
+        if(!e) e="15,5";
+        for(const char* p=e; *p; ) { char* end=nullptr; const long x=std::strtol(p,&end,10);
+            if(end==p) break; v.push_back(int(std::clamp<long>(x,0,15))); p=end; while(*p==','||*p==' ') ++p; }
+        return v; }();
+    int max_depth=std::max(0,std::min(requested,spec_rows/n-1));
+    if(n>=1 && size_t(n)<=depth_by_n.size()) max_depth=std::min(max_depth,depth_by_n[size_t(n-1)]);
     // Batched drafting (mtp_draft_rows): every row's depth first, then ONE pass of the head
     // per depth over the rows that still draft.  The row loop below drafts only when the
     // head cannot be batched (an MoE head, DFlash, GRIMOIRE_MTP_BATCH_DRAFT=0) or n == 1.
