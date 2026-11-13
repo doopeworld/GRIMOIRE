@@ -8,9 +8,9 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.4**); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page (latest: **v1.10.6**, 2026-11-13); [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default; **v1.10.4** (2026-11-05) makes MXFP4 speculative decoding faster (Qwen3.8-27B MXFP4 + MTP: +26% for one user), lets 4-bit models use the overlapped two-GPU prompt path (Qwen3.8-27B GPTQ on two B70s: pp4096 1,733 -> 3,093), halves the two-GPU decode exchange, and keeps Flash-Next fast on a busy machine ([details](#served-image-validation-2026-11-05-v1104)). Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default; **v1.10.4** (2026-11-05) makes MXFP4 speculative decoding faster (Qwen3.8-27B MXFP4 + MTP: +26% for one user), lets 4-bit models use the overlapped two-GPU prompt path (Qwen3.8-27B GPTQ on two B70s: pp4096 1,733 -> 3,093), halves the two-GPU decode exchange, and keeps Flash-Next fast on a busy machine ([details](#served-image-validation-2026-11-05-v1104)). **v1.10.6** (2026-11-13) makes speculative decoding serve several users at once on one and two cards: Swift-1.5 Qwen3.8-27B GPTQ-Int4 on two B70s scores **133.6** in BetterBench against vLLM's 131.0 on the same machine and wins at 1, 2, 4 and 8 users; it also runs Qwen3.8-27B-Uncensored (FP8 as INT8) on two cards with a 262K context ([details](#release-v1106-2026-11-13)). v1.10.6's source is on branch [`i4a8-prompt-1112`](https://github.com/doopeworld/GRIMOIRE/tree/i4a8-prompt-1112), not merged into main yet. Still on a branch: the not validated for release Flash-Next MTP head on [`flashnext-mtp`](https://github.com/doopeworld/GRIMOIRE/tree/flashnext-mtp).
 
 ## Our test system
 
@@ -21,7 +21,7 @@ Every number on this page was measured on one machine:
 | Host | Beelink GTi15 Ultra mini PC, Intel Core Ultra 9 285H (16 cores: 6 P + 8 E + 2 LP-E), 96 GB DDR5-5600, Unraid (Linux 6.18), Docker |
 | GPU 0 | Intel Arc Pro B70, 32 GB, on the Beelink EX Pro dock: **PCIe Gen4 x8** |
 | GPU 1 | Intel Arc Pro B70, 32 GB, on an **M.2-to-OCuLink adapter with a PCIe redriver**: **PCIe Gen4 x4** (a passive adapter made the card drop off the bus under load; the redriver fixed it) |
-| Power | each GPU on its own 550 W supply; GRIMOIRE runs the cards at their own firmware limit (no governor) |
+| Power | each GPU on its own supply: GPU 0 550 W, GPU 1 750 W since 2026-11-12 (GPU 1's earlier drops under load came from its old 550 W supply); GRIMOIRE runs the cards at their own firmware limit (no governor) |
 | GPU-to-GPU | **no peer-to-peer**: Linux does not allow PCIe P2P between these two root ports on this CPU, so every byte between the cards goes through host memory |
 | Software | oneAPI 2026.1, Intel GPU driver 26.27 (Level Zero 1.15.39122), Intel oneDNN 3.13.4 for the prompt GEMMs, one GRIMOIRE process per GPU; the v1.10.x images ship oneAPI 2026.2, driver 26.35 and oneDNN 3.14 (checked 2026-10-28: same answers, same speed) |
 | Benchmark | [llama-benchy](https://github.com/eugr/llama-benchy) 0.4.0 through GRIMOIRE's OpenAI-compatible server, one user unless noted, greedy decoding |
@@ -119,6 +119,50 @@ about the cost of one).  The BF16 GGUF gives **token-identical** output to the s
 UD-IQ4_XS, UD-IQ2_XXS, Q4_0 and Q8_0 files load and generate correctly (Q8_0 as `--proj int8`: 99.2%
 top-1).  Qwen3.8-Flash-Next GGUF: not supported yet.
 
+### Release v1.10.6, 2026-11-13
+
+Built for the Arc Pro B70 and the Arc Pro B60 / Arc B580; measured on two Arc Pro B70s (this machine).
+
+Swift-1.5 Qwen3.8-27B GPTQ-Int4 + MTP (K=6, draft vocabulary 65,536). BetterBench, same corpus and
+settings for both engines, both on two B70s; vLLM = intel/llm-scaler-vllm 0.31.0-b1, tensor parallel 2,
+in its own container:
+
+| Two B70s | Weighted | 1 / 2 / 4 / 8 users (tok/s) | Prompt 2K / 8K | First token |
+|---|---:|---:|---:|---:|
+| **GRIMOIRE v1.10.6**, tensor parallel | **133.6** | **123.0 / 174.8 / 240.5 / 276.5** | **1,573 / 2,951** | **168 ms** |
+| vLLM, tensor parallel | 131.0 | 117.8 / 173.3 / 223.2 / 266.2 | 957 / 957 | 173 ms |
+
+llama-benchy 0.4.0, same checkpoint, total tg128 after a 4,096-token prompt:
+
+| Setup | pp4096 | tg128 total, 1 / 2 / 4 / 8 users |
+|---|---:|---:|
+| Two B70s, tensor parallel | 3,071 | 130.5 / 195.8 / 288.6 / 344.3 |
+| One B70 | 1,839 | 99.7 / 146.9 / 234.0 / 254.2 |
+
+The two Swift tables were measured with the same source (`db25416`) built for the B70 only.
+
+Qwen3.8-27B-Uncensored (FP8 checkpoint loaded as `--proj int8`), two B70s, tensor parallel, MTP K=6,
+one conversation slot, 262,144-token context, llama-benchy 0.4.0, the v1.10.6 release image:
+
+| pp4096 | tg128 | pp16384 | tg128 after 16K |
+|---:|---:|---:|---:|
+| 3,401 | 74.7 | 2,965 | 63.3 |
+
+**What v1.10.6 changes:**
+
+- MTP drafts for up to 8 users at once; a verify pass holds at most 16 rows (`GRIMOIRE_SPEC_ROWS`); two users
+  draft 5 tokens deep (`GRIMOIRE_SPEC_DEPTHS`, default `15,5`).
+- Sampled requests (temperature > 0) are admitted together, so several users get their first token sooner.
+- INT4 prompts up to 160 rows run in 32-row INT4 pieces (about half the time to first token on short prompts);
+  opt-in `GRIMOIRE_I4A8=1` uses 8-bit activations for long INT4 prompts (+14-22% prefill, lossy).
+- Two cards: BAR receive on by default again; INT4 split plans for 7-row and 9-16-row verify passes.
+- Verify-path kernels: norm 15.5 -> 4.8 us a call, no residual traffic on dense models, DeltaNet reads the next
+  row ahead (same results bit for bit).
+- Server: seeded top-k / top-p sampling with exact sampled MTP correction, clean stop on SIGTERM.
+
+MTP decode speed moves with the text (how many drafted tokens are accepted), so one-user tg128 varies by several
+tok/s between runs.
+
 ### Served image validation, 2026-11-05 (v1.10.4)
 
 The release image's own binaries on one Arc Pro B70, llama-benchy 0.4.0, pp4096 / tg128, v1.10.3 -> v1.10.4, same
@@ -194,12 +238,13 @@ answers are not token-identical to the default, so treat it as a throughput opti
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.4/grimoire-b70-v1.10.4.tar.gz
-docker load < grimoire-b70-v1.10.4.tar.gz              # -> grimoire-b70:v1.10.4
-docker tag grimoire-b70:v1.10.4 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.6/grimoire-b70-v1.10.6.tar.gz
+docker load < grimoire-b70-v1.10.6.tar.gz              # -> grimoire-b70:v1.10.6
+docker tag grimoire-b70:v1.10.6 grimoire-b70:latest    # the commands below use :latest
 ```
 
-v1.10.4 ([above](#served-image-validation-2026-11-05-v1104)) keeps v1.10.3's three opt-in speed modes
+v1.10.6 ([above](#release-v1106-2026-11-13)) adds the multi-user speculative decoding work to everything v1.10.4
+has and ships oneDNN 3.13.4 with oneAPI 2026.2 and GPU driver 26.35. v1.10.4 ([above](#served-image-validation-2026-11-05-v1104)) keeps v1.10.3's three opt-in speed modes
 ([v1.10.3 table](#served-image-validation-2026-11-02-v1103)); native GGUF expert grouping is now on by default. Like v1.10.2 it includes native GGUF decode
 and prompt speed-ups and MTP from the GGUF file's own head, runs on the Arc Pro B70 and the Arc Pro
 B60 / Arc B580, serves MTP to several users on two GPUs, reads GGUF files, runs the FP8 checkpoint
