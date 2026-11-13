@@ -527,6 +527,79 @@ sycl::event launch_deltanet_prefill(sycl::queue& q, const DeltaNetPrefillParams&
     return deltanet_prefill_wg(q, p, deps);
 }
 
+namespace {
+// One work-group of WG items per token; each item keeps EPT elements of its row in registers, so every
+// load is issued up front and the second pass does not re-read h.
+template <int WG, int EPT>
+sycl::event rmsnorm_residual_regs(sycl::queue& q, float* h, const float* r0, const float* r1,
+                                  const bf16_t* weight, float* out, int tokens, int hidden, float eps,
+                                  sycl_bf16* out_bf, const std::vector<sycl::event>& deps, float weight_offset) {
+    return q.submit([&](sycl::handler& hd) {
+        hd.depends_on(deps);
+        sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);
+        hd.parallel_for(
+            sycl::nd_range<1>(size_t(tokens) * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int t = int(it.get_group(0));
+                const int lid = int(it.get_local_id(0));
+                const int sgid = int(sg.get_group_id()[0]);
+                const int lane = int(sg.get_local_id()[0]);
+                float* ht = h + int64_t(t) * hidden;
+                float* ot = out ? out + int64_t(t) * hidden : nullptr;
+                sycl_bf16* obt = out_bf ? out_bf + int64_t(t) * hidden : nullptr;
+                const float* a = r0 ? r0 + int64_t(t) * hidden : nullptr;
+                const float* b = r1 ? r1 + int64_t(t) * hidden : nullptr;
+                float vals[EPT];
+                #pragma unroll
+                for (int e = 0; e < EPT; ++e) {
+                    const int i = lid + e * WG;
+                    vals[e] = i < hidden ? ht[i] : 0.0f;
+                }
+                if (a) {
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        if (i < hidden) vals[e] += a[i];
+                    }
+                }
+                if (b) {
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        if (i < hidden) vals[e] += b[i];
+                    }
+                }
+                float ss = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < EPT; ++e) {
+                    const int i = lid + e * WG;
+                    if (i < hidden) {
+                        if (a || b) ht[i] = vals[e];
+                        ss = sycl::fma(vals[e], vals[e], ss);
+                    }
+                }
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                float* pt = partial.template get_multi_ptr<sycl::access::decorated::no>().get();
+                if (lane == 0) pt[sgid] = ss;
+                sycl::group_barrier(it.get_group());
+                float total = 0.0f;
+                for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
+                const float scale = sycl::rsqrt(total / float(hidden) + eps);
+                #pragma unroll
+                for (int e = 0; e < EPT; ++e) {
+                    const int i = lid + e * WG;
+                    if (i < hidden) {
+                        const float v = vals[e] * scale * (weight_offset + bf16_to_f32(weight[i]));
+                        if (ot) ot[i] = v;
+                        if (obt) obt[i] = sycl_bf16(v);
+                    }
+                }
+            });
+    });
+}
+}  // namespace
+
 // One work-group per token.  This is the batched counterpart of the
 // decode residual+RMSNorm fusion and intentionally uses the same reduction
 // order inside each row, making state-equivalence failures easy to localise.
@@ -549,71 +622,22 @@ sycl::event launch_rmsnorm_residual_batched(
     // 2026-10-09, Qwen3.8-27B MTP verify (7 rows): the loop form was 21 us (input norm)
     // and 16 us (post norm) per layer, latency-bound on one dependent load per element.
     constexpr int EPT = 32;
-    if (hidden <= EPT * WG) {
-        return q.submit([&](sycl::handler& hd) {
-            hd.depends_on(deps);
-            sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);
-            hd.parallel_for(
-                sycl::nd_range<1>(size_t(tokens) * WG, WG),
-                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                    const auto sg = it.get_sub_group();
-                    const int t = int(it.get_group(0));
-                    const int lid = int(it.get_local_id(0));
-                    const int sgid = int(sg.get_group_id()[0]);
-                    const int lane = int(sg.get_local_id()[0]);
-                    float* ht = h + int64_t(t) * hidden;
-                    float* ot = out ? out + int64_t(t) * hidden : nullptr;
-                    sycl_bf16* obt = out_bf ? out_bf + int64_t(t) * hidden : nullptr;
-                    const float* a = r0 ? r0 + int64_t(t) * hidden : nullptr;
-                    const float* b = r1 ? r1 + int64_t(t) * hidden : nullptr;
-                    float vals[EPT];
-                    #pragma unroll
-                    for (int e = 0; e < EPT; ++e) {
-                        const int i = lid + e * WG;
-                        vals[e] = i < hidden ? ht[i] : 0.0f;
-                    }
-                    if (a) {
-                        #pragma unroll
-                        for (int e = 0; e < EPT; ++e) {
-                            const int i = lid + e * WG;
-                            if (i < hidden) vals[e] += a[i];
-                        }
-                    }
-                    if (b) {
-                        #pragma unroll
-                        for (int e = 0; e < EPT; ++e) {
-                            const int i = lid + e * WG;
-                            if (i < hidden) vals[e] += b[i];
-                        }
-                    }
-                    float ss = 0.0f;
-                    #pragma unroll
-                    for (int e = 0; e < EPT; ++e) {
-                        const int i = lid + e * WG;
-                        if (i < hidden) {
-                            if (a || b) ht[i] = vals[e];
-                            ss = sycl::fma(vals[e], vals[e], ss);
-                        }
-                    }
-                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
-                    float* pt = partial.template get_multi_ptr<sycl::access::decorated::no>().get();
-                    if (lane == 0) pt[sgid] = ss;
-                    sycl::group_barrier(it.get_group());
-                    float total = 0.0f;
-                    for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
-                    const float scale = sycl::rsqrt(total / float(hidden) + eps);
-                    #pragma unroll
-                    for (int e = 0; e < EPT; ++e) {
-                        const int i = lid + e * WG;
-                        if (i < hidden) {
-                            const float v = vals[e] * scale * (weight_offset + bf16_to_f32(weight[i]));
-                            if (ot) ot[i] = v;
-                            if (obt) obt[i] = sycl_bf16(v);
-                        }
-                    }
-                });
-        });
-    }
+    // Verify-sized batches (MTP verify = 7 rows for one user, <= 16 rows): one 256-item group per row
+    // leaves 25 of the 32 Xe cores idle and each row latency-bound.  MEASURED 2026-11-13 (unitrace, one
+    // B70, Swift INT4 MTP K6, single user): 15.5 us per call, 130 calls per step = 2.0 ms of a ~41 ms
+    // step.  A 1024-item group per row (5 elements per item at hidden 5120) puts 4x the loads in flight.
+    // Different per-item element split = different fp32 summation order (not bit-identical to 256).
+    // GRIMOIRE_NORM_WG=256 restores the 256-item kernel at every size.
+    static const int small_wg = [] {
+        const char* e = std::getenv("GRIMOIRE_NORM_WG");
+        return e && std::atoi(e) == 256 ? 256 : 1024;
+    }();
+    if (small_wg == 1024 && tokens <= 64 && hidden <= 8 * 1024)
+        return rmsnorm_residual_regs<1024, 8>(q, h, r0, r1, weight, out, tokens, hidden, eps, out_bf, deps,
+                                              weight_offset);
+    if (hidden <= EPT * WG)
+        return rmsnorm_residual_regs<WG, EPT>(q, h, r0, r1, weight, out, tokens, hidden, eps, out_bf, deps,
+                                              weight_offset);
     return q.submit([&](sycl::handler& hd) {
         hd.depends_on(deps);
         sycl::local_accessor<float, 1> partial(WG / SG_SIZE, hd);

@@ -404,29 +404,38 @@ static sycl::event dn_verify_sg(sycl::queue& q_, const DeltaNetParams& p, const 
                 for (int u = 0; u < PL; ++u) sv[u] = S[u * SG_SIZE + lane];
 
                 const int r0 = gg.row0[grp], nr = gg.nrows[grp];
-                for (int t = 0; t < nr; ++t) {
-                    const int r = r0 + t;
+                // Prefetch (11-13): row t+1's k / q / v / a / beta are loaded while row t computes, so
+                // the rows' load latencies overlap instead of adding up (same arithmetic, same bits).
+                float kn[PL], qn[PL], an = 0.0f, bn = 0.0f, vn = 0.0f;
+                auto fetch = [&](int r) {
                     const float* kr = pp.k + (int64_t(r) * nk + khead) * KD;
                     const float* qr = pp.q + (int64_t(r) * nk + khead) * KD;
-                    float kv[PL];
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) { kn[u] = kr[u * SG_SIZE + lane]; qn[u] = qr[u * SG_SIZE + lane]; }
+                    an = pp.a[int64_t(r) * pp.n_heads + head];
+                    bn = pp.beta[int64_t(r) * pp.n_heads + head];
+                    vn = pp.v[(int64_t(r) * pp.n_heads + head) * VD + row];
+                };
+                if (nr > 0) fetch(r0);
+                for (int t = 0; t < nr; ++t) {
+                    const int r = r0 + t;
+                    float kv[PL], qv[PL];
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) { kv[u] = kn[u]; qv[u] = qn[u]; }
+                    const float av = an, bv = bn, vi = vn;
+                    if (t + 1 < nr) fetch(r + 1);
                     float w = 0.0f;
                     #pragma unroll
-                    for (int u = 0; u < PL; ++u) {
-                        kv[u] = kr[u * SG_SIZE + lane];
-                        w = sycl::fma(sv[u], kv[u], w);
-                    }
+                    for (int u = 0; u < PL; ++u) w = sycl::fma(sv[u], kv[u], w);
                     w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
 
-                    const float av = pp.a[int64_t(r) * pp.n_heads + head];
-                    const float bv = pp.beta[int64_t(r) * pp.n_heads + head];
-                    const float vi = pp.v[(int64_t(r) * pp.n_heads + head) * VD + row];
                     const float corr = bv * (vi - av * w);
                     float o = 0.0f;
                     #pragma unroll
                     for (int u = 0; u < PL; ++u) {
                         const float sN = sycl::fma(av, sv[u], corr * kv[u]);
                         sv[u] = sN;
-                        o = sycl::fma(sN, qr[u * SG_SIZE + lane], o);
+                        o = sycl::fma(sN, qv[u], o);
                     }
                     o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
                     if (lane == 0)
@@ -481,20 +490,28 @@ static sycl::event dn_replay_sg(sycl::queue& q_, const DeltaNetParams& p, const 
                 float sv[PL];
                 #pragma unroll
                 for (int u = 0; u < PL; ++u) sv[u] = S[u * SG_SIZE + lane];
-                for (int t = 0; t < nrows; ++t) {
+                // prefetch of row t+1 under row t, as dn_verify_sg (same arithmetic, same bits)
+                float kn[PL], an = 0.0f, bn = 0.0f, vn = 0.0f;
+                auto fetch = [&](int t) {
                     const float* sr = sv_base + int64_t(t) * srow;
                     const float* kr = sr + int64_t(khead) * KD;
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) kn[u] = kr[u * SG_SIZE + lane];
+                    an = sr[aoff + head];
+                    bn = sr[aoff + pp.n_heads + head];
+                    vn = sr[voff + int64_t(head) * VD + row];
+                };
+                if (nrows > 0) fetch(0);
+                for (int t = 0; t < nrows; ++t) {
                     float kv[PL];
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) kv[u] = kn[u];
+                    const float av = an, bv = bn, vi = vn;
+                    if (t + 1 < nrows) fetch(t + 1);
                     float w = 0.0f;
                     #pragma unroll
-                    for (int u = 0; u < PL; ++u) {
-                        kv[u] = kr[u * SG_SIZE + lane];
-                        w = sycl::fma(sv[u], kv[u], w);
-                    }
+                    for (int u = 0; u < PL; ++u) w = sycl::fma(sv[u], kv[u], w);
                     w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
-                    const float av = sr[aoff + head];
-                    const float bv = sr[aoff + pp.n_heads + head];
-                    const float vi = sr[voff + int64_t(head) * VD + row];
                     const float corr = bv * (vi - av * w);
                     #pragma unroll
                     for (int u = 0; u < PL; ++u) sv[u] = sycl::fma(av, sv[u], corr * kv[u]);

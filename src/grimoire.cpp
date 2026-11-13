@@ -19713,6 +19713,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
         !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
         !std::getenv("GRIMOIRE_NO_DENSE_PURE");
+    // Dense models (no MoE layer anywhere) never write r1 (the shared-expert residual): it holds the zeros
+    // of the memset at the top of prefill() for the whole pass.  So skip its per-layer re-zeroing (64 fills
+    // per verify step on Qwen3.8-27B) and do not hand it to the norms (one third of their reads).
+    // MEASURED 2026-11-13 (unitrace, one B70, single-user MTP verify): fills 1.9 us x 64 per step.
+    // GRIMOIRE_R1_ALWAYS=1 restores the old per-layer zeroing and reads.
+    static const bool r1_always=std::getenv("GRIMOIRE_R1_ALWAYS")!=nullptr;
+    const bool r1_zero = !cfg.is_moe() && !exact_verify && !defer_moe_gather && !r1_always;
     const float* a8_cached_src = nullptr;
     const sycl_bf16* a8_cached_bf = nullptr;
     int a8_cached_k = 0;
@@ -20604,7 +20611,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         else if(exact_verify)
             input_bf_ready=norm_rows(bh,r0,r1,d.in_norm,bn);
         else input_bf_ready=launch_rmsnorm_residual_batched(
-            q,bh,r0_in_h?nullptr:r0,dense_pure?nullptr:r1,d.in_norm,
+            q,bh,r0_in_h?nullptr:r0,(dense_pure||r1_zero)?nullptr:r1,d.in_norm,
             (norm_bf_only||dense_pure)?nullptr:bn,M,H,cfg.rms_eps,bn_bf);
         r0_in_h=false;
         if(exact_verify && debug && li==probe_layer)
@@ -21452,7 +21459,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             a8_cached_src=nullptr;
             a8_cached_bf=nullptr;
             bn_bf_sync=!exact_verify && !norm_bf_only && !dense_pure;
-            if(!dense_pure) q.memset(r1,0,size_t(M)*H*sizeof(float));
+            if(!dense_pure && !r1_zero) q.memset(r1,0,size_t(M)*H*sizeof(float));
             pp_mark("dense FFN, TP chunked (both all-reduces)");
             if(timing){
                 tshm.s_block_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tb).count();
@@ -22062,7 +22069,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // Megatron TP: down_proj ran on this rank's FFN columns only.
             if(!r0_in_h && !tp_block_reduce(r0,size_t(M)*H))
                 throw std::runtime_error("TP prefill FFN all-reduce failed");
-            if(!dense_pure) q.memset(r1,0,size_t(M)*H*sizeof(float));
+            if(!dense_pure && !r1_zero) q.memset(r1,0,size_t(M)*H*sizeof(float));
         }
         if(prefill_host_progress){
             q.wait_and_throw();
@@ -22095,7 +22102,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
           launch_rmsnorm_moe_residual_batched(q,bh,moe_res,pinv,rwt,r1,fnorm,bn,
               nullptr,M,cfg.top_k,H,cfg.rms_eps);
       else if(exact_verify) norm_rows(bh,r0,r1,fnorm,bn);
-      else launch_rmsnorm_residual_batched(q,bh,r0_in_h?nullptr:r0,r1,fnorm,bn,M,H,cfg.rms_eps);
+      else launch_rmsnorm_residual_batched(q,bh,r0_in_h?nullptr:r0,r1_zero?nullptr:r1,fnorm,bn,M,H,cfg.rms_eps);
       if(prefill_host_progress){q.wait_and_throw();
           std::fprintf(stderr,"    prefill stage: final norm done\n");std::fflush(stderr);}
       if (next_tokens && spans_mode) {
