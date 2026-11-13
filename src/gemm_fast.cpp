@@ -4277,6 +4277,21 @@ sycl::event launch_int4_smallm_wide(sycl::queue& q, const QuantWeight& w, const 
         int ks = 0;
         if (tiles >= 600 && K >= 4096 && K < 12288) ks = 4;
         else if (tiles >= 256 && K >= 4096 && K < 12288) ks = 2;
+        // 2026-11-13: the bands the rule above missed, from the 11-12 sweep (i4sweep1112-ks*.out, engine
+        // kernel, Swift group 128, weights from DRAM, M = 16, us, smallm_plan -> this; max rel <= 1e-6):
+        // TP2 out/o N=5120 K=3072 26.6 -> 19.6 (KS 2), TP2 z N=3072 K=5120 28.6 -> 19.0 (KS 2), one-card
+        // k/v N=1024 9.8 -> 6.5 (KS 8), TP2 k/v N=512 5.1 -> 4.4 (KS 16), one-card down K=17408 103.9 -> 98.9
+        // (KS 24).  9..16 rows = 2..8 users verifying (c2 = 14 rows, c4 / c8 = 16).
+        // GRIMOIRE_I4_WIDE_PLAN11=0 = the rule as it was.
+        static const bool plan1113 = [] { const char* e = std::getenv("GRIMOIRE_I4_WIDE_PLAN11");
+            return !(e && *e == '0'); }();
+        if (plan1113 && ks == 0 && M <= 16) {
+            if (tiles >= 256 && K >= 2048 && K < 4096) ks = 2;
+            else if (tiles >= 128 && tiles < 256 && K >= 4096 && K < 12288) ks = 2;
+            else if (tiles <= 32 && K >= 4096 && K < 12288) ks = 16;
+            else if (tiles <= 64 && K >= 4096 && K < 12288) ks = 8;
+            else if (tiles >= 256 && K >= 12288 && K <= 20480) ks = 24;
+        }
         if (ks > 0) {
             int kc = (K + ks - 1) / ks;
             kc = (kc + 127) / 128 * 128;
