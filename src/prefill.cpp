@@ -556,6 +556,15 @@ sycl::event rmsnorm_residual_regs(sycl::queue& q, float* h, const float* r0, con
                     const int i = lid + e * WG;
                     vals[e] = i < hidden ? ht[i] : 0.0f;
                 }
+                // WG 1024 (verify rows): the norm weights load with the row instead of after the reduction
+                float wv[WG == 1024 ? EPT : 1];
+                if constexpr (WG == 1024) {
+                    #pragma unroll
+                    for (int e = 0; e < EPT; ++e) {
+                        const int i = lid + e * WG;
+                        wv[e] = i < hidden ? weight_offset + bf16_to_f32(weight[i]) : 0.0f;
+                    }
+                }
                 if (a) {
                     #pragma unroll
                     for (int e = 0; e < EPT; ++e) {
@@ -584,13 +593,24 @@ sycl::event rmsnorm_residual_regs(sycl::queue& q, float* h, const float* r0, con
                 if (lane == 0) pt[sgid] = ss;
                 sycl::group_barrier(it.get_group());
                 float total = 0.0f;
-                for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
+                if constexpr (WG == 1024) {
+                    // 64 partials: 4 per lane, then one sub-group reduction (every sub-group gets the same
+                    // sum in the same order), instead of 64 dependent SLM reads per item
+                    #pragma unroll
+                    for (int j = 0; j < WG / SG_SIZE / SG_SIZE; ++j) total += pt[lane + j * SG_SIZE];
+                    total = sycl::reduce_over_group(sg, total, sycl::plus<float>());
+                } else {
+                    for (int i = 0; i < WG / SG_SIZE; ++i) total += pt[i];
+                }
                 const float scale = sycl::rsqrt(total / float(hidden) + eps);
                 #pragma unroll
                 for (int e = 0; e < EPT; ++e) {
                     const int i = lid + e * WG;
                     if (i < hidden) {
-                        const float v = vals[e] * scale * (weight_offset + bf16_to_f32(weight[i]));
+                        float wgt;
+                        if constexpr (WG == 1024) wgt = wv[e];
+                        else wgt = weight_offset + bf16_to_f32(weight[i]);
+                        const float v = vals[e] * scale * wgt;
                         if (ot) ot[i] = v;
                         if (obt) obt[i] = sycl_bf16(v);
                     }
