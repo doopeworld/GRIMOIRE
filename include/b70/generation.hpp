@@ -52,12 +52,23 @@ struct SpecStats {
     std::function<void()> fence;
     double snap_ms=0, draft_ms=0, verify_ms=0, commit_ms=0;
 };
+// Phase boundaries for one request: prompt submitted -> prefill done
+// (prompt_ready), then first/last emitted token.  GRIMOIRE_GENERATION_PHASES=1
+// turns it on; a null pointer records nothing and calls no clock.  This is the
+// only prefill/decode split that does not depend on a tracer being attached to
+// the right process at the right time, so it is what the frozen fixture scores.
+struct GenerationTiming {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point start{}, prompt_ready{}, first_token{}, last_token{};
+    size_t prefill_tokens = 0;
+};
 struct GenerationOptions {
     int max_tokens=0, eos=-1, eot=-1, draft_depth=0;
     bool dflash=false, mtp=false, graph=false;
     // Optional; nothing is recorded when null.  Declared last so the
     // existing aggregate initialisations stay valid.
     SpecStats* stats=nullptr;
+    GenerationTiming* timing=nullptr;
 };
 inline int generation_budget(const std::vector<int32_t>& ids, int requested, int capacity, int vocab) {
     if(ids.empty())throw std::invalid_argument("prompt must contain at least one token");
@@ -87,6 +98,10 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
     out.clear();reason=FinishReason::Length;
     o.max_tokens=generation_budget(prompt,o.max_tokens,e.max_seq,e.cfg.vocab);
     if(!o.max_tokens)return 0;
+    if(o.timing) {
+        *o.timing = {};
+        o.timing->start = GenerationTiming::Clock::now();
+    }
     // Snapshot at the END of the request, covering prompt AND reply, so
     // the next turn can resume from the whole conversation rather than
     // from the prompt this one happened to start with.  Without it the
@@ -290,6 +305,10 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
         for(auto t:tail)if(!e.forward(t))throw std::runtime_error("sequential prefill failed");
     }
     e.sync();
+    if(o.timing) {
+        o.timing->prefill_tokens = tail.size();
+        o.timing->prompt_ready = GenerationTiming::Clock::now();
+    }
     if(o.dflash) {
         std::vector<int32_t> unused;
         if(!e.dflash_draft(0,e.pos,unused,true))throw std::runtime_error("DFlash context preparation failed");
@@ -301,6 +320,10 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
         if(t<0||t>=e.cfg.vocab)throw std::runtime_error("engine returned an invalid token");
         if(stop(t)){reason=FinishReason::Stop;return false;}
         out.push_back(t);
+        if(o.timing) {
+            o.timing->last_token = GenerationTiming::Clock::now();
+            if(out.size()==1) o.timing->first_token = o.timing->last_token;
+        }
         if(callback&&!callback(t)){reason=FinishReason::Cancelled;return false;}
         return int(out.size())<o.max_tokens;
     };

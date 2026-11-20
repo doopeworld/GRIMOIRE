@@ -18,12 +18,23 @@ bin/test_http: tests/test_http.cpp include/b70/http_request.hpp include/b70/json
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $< -o $@
 
+QFN_TP_TESTS = bin/test_qfn_shard_plan
+
+$(QFN_TP_TESTS): bin/%: tests/%.cpp $(wildcard include/b70/qfn_*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $< -o $@
+
 .PHONY: test-correctness
-test-correctness: bin/test_generation bin/test_http
+test-correctness: bin/test_generation bin/test_http $(QFN_TP_TESTS) bin/test_qfn_indexed_load
 	./bin/test_generation
 	./bin/test_http
+	@set -e; for test in $(QFN_TP_TESTS); do ./$$test; done
+	env -u GRIMOIRE_QFN_PLE_SOURCE -u GRIMOIRE_MODEL_ROOT ./bin/test_qfn_indexed_load
 
 HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp
+bin/test_qfn_indexed_load: tests/test_qfn_indexed_load.cpp $(HOST_MODEL_SRC) $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect bin/tok_dump
 
 GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
@@ -220,10 +231,12 @@ SYCL_CXX ?= icpx
 SYCL_TARGET ?= intel_gpu_bmg_g31,intel_gpu_bmg_g21
 COMMA := ,
 NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
+NATIVE_DEVICE_SPLIT ?= $(if $(filter spir64,$(SYCL_TARGET)),per_kernel,auto)
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
 NATIVE_SRC = grimoire qwen35_loader native_model safetensors gguf gguf_decode gguf_qwen35 quantize gptq \
- gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer
+ gemv_decode gemm_xmx gemm_fast attention attn_verify_dpas deltanet moe_kernels tiered_moe cpu_experts \
+ moe_ref ops prefill tokenizer
 NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
 
 .PHONY: native
@@ -242,9 +255,9 @@ $(NATIVE_DIR)/server.o: tools/grimoire_server.cpp
 	$(SYCL_CXX) $(NATIVE_FLAGS) -MMD -MP -c $< -o $@
 
 $(NATIVE_DIR)/grimoire: $(NATIVE_OBJ) $(NATIVE_DIR)/cli.o
-	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+	$(SYCL_CXX) $(NATIVE_FLAGS) -fsycl-device-code-split=$(NATIVE_DEVICE_SPLIT) $^ -ldl -lpthread -o $@
 
 $(NATIVE_DIR)/grimoire-server: $(NATIVE_OBJ) $(NATIVE_DIR)/server.o
-	$(SYCL_CXX) $(NATIVE_FLAGS) $^ -ldl -lpthread -o $@
+	$(SYCL_CXX) $(NATIVE_FLAGS) -fsycl-device-code-split=$(NATIVE_DEVICE_SPLIT) $^ -ldl -lpthread -o $@
 
 -include $(wildcard $(NATIVE_DIR)/*.d)

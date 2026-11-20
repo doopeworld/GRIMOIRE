@@ -31,6 +31,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <cerrno>
+#include <filesystem>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -48,6 +51,46 @@ std::string read_file(const std::string& p) {
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
     std::fclose(f);
     return out;
+}
+
+using ShardMembers = std::map<std::string, std::vector<std::string>>;
+
+bool checkpoint_members(const std::string& dir, bool required,
+                        ShardMembers& shards, std::string& err) {
+    const std::string path = dir + "/model.safetensors.index.json";
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) != 0 && errno == ENOENT && !required) return true;
+    try {
+        const auto doc = Json::parse(read_file(path));
+        const auto& map = doc.at("weight_map");
+        if (map.kind != Json::Kind::Object || map.object.empty())
+            throw std::invalid_argument("weight_map must be a nonempty object");
+        for (const auto& [name, value] : map.object) {
+            const auto file = value.text();
+            if (file.size() <= 12 || file.compare(file.size()-12, 12, ".safetensors") ||
+                file.find('/') != std::string::npos || file.find('\\') != std::string::npos ||
+                file.find('\0') != std::string::npos || name.empty())
+                throw std::invalid_argument("invalid shard filename or key for " + name);
+            shards[dir + "/" + file].push_back(name);
+        }
+    } catch (const std::invalid_argument& e) {
+        err = path + ": " + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool open_indexed_shard(SafeTensors& st, const std::string& path,
+                        const std::filesystem::path& root, std::string& err) {
+    std::error_code ec;
+    const auto resolved = std::filesystem::canonical(path, ec);
+    if (ec) { err = path + ": " + ec.message(); return false; }
+    const auto relative = resolved.lexically_relative(root);
+    if (relative.empty() || *relative.begin() == "..") {
+        err = path + ": shard resolves outside model root " + root.string();
+        return false;
+    }
+    return st.open(resolved.string(), err);
 }
 
 // Minimal scalar extraction: find "key" then the next number/string/bool.
@@ -893,11 +936,31 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     native_model.reset();
     std::string native_path=dir+"/model-v3.b70";
     if (::access(native_path.c_str(),F_OK)!=0) native_path=dir+"/model-v2.b70";
+    const char* ple_source = std::getenv("GRIMOIRE_QFN_PLE_SOURCE");
+    const bool external_ple = ple_source && *ple_source;
+    const bool use_native = !use_gguf && ::access(native_path.c_str(), F_OK) == 0;
+    if (external_ple && (!cfg.is_qwen4_exp || use_gguf || use_native || cfg.ple_layer_ids.empty())) {
+        err = "GRIMOIRE_QFN_PLE_SOURCE requires a Qwen4-Exp safetensors target with PLE";
+        return false;
+    }
+    ShardMembers primary;
+    std::filesystem::path model_root;
+    if (cfg.is_qwen4_exp && !use_gguf && !use_native) {
+        if (!checkpoint_members(dir, external_ple, primary, err)) return false;
+        if (!primary.empty()) {
+            const char* configured_root = std::getenv("GRIMOIRE_MODEL_ROOT");
+            std::error_code ec;
+            const auto model_dir = std::filesystem::canonical(dir, ec);
+            if (!ec) model_root = configured_root && *configured_root
+                ? std::filesystem::canonical(configured_root, ec) : model_dir.parent_path();
+            if (ec) { err = "cannot resolve model root: " + ec.message(); return false; }
+        }
+    }
     if(use_gguf) {
         if(!(cfg.is_gemma4 ? gguf_gemma4_index(*this,err)
              : cfg.is_qwen3 ? gguf_qwen3_index(*this,err)
              : gguf_qwen35_index(*this,err)))return false;
-    } else if (::access(native_path.c_str(),F_OK)==0) {
+    } else if (use_native) {
         native_model=std::make_unique<NativeModel>();
         if(!native_model->open(native_path,err))return false;
         const auto* rec=native_model->records();
@@ -930,20 +993,31 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             err = "unsupported embedding quantization scheme: " + scheme; return false;
         }
         int side_shard = -1;
-        for (size_t i = 0; i < hf.shards.size(); ++i) {
+        if (primary.empty()) {
+            for (const auto& file : hf.shards) primary.try_emplace(file);
+        } else if (embed_recipe) {
+            primary.try_emplace(dir + "/" + side);
+        }
+        for (const auto& [file, names] : primary) {
             auto st = std::make_unique<SafeTensors>();
-            if (!st->open(hf.shards[i], err)) return false;
-            const bool is_side = embed_recipe && hf.shards[i] == dir + "/" + side;
-            if (is_side) side_shard = int(i);
-            for (const auto& kv : st->tensors()) {
-                // Select the recipe below, not by lexicographic duplicate order.
-                // The original dense embedding remains in the ordinary index.
-                if (is_side) continue;
-                if (skip_vision && (kv.first.find(".visual.")!=std::string::npos||kv.first.find("vision")!=std::string::npos)) continue;
+            if (model_root.empty() ? !st->open(file, err) :
+                !open_indexed_shard(*st, file, model_root, err)) return false;
+            const bool is_side = embed_recipe && file == dir + "/" + side;
+            if (is_side) side_shard = int(shards.size());
+            auto add = [&](const STTensor& t) {
+                if (is_side || (skip_vision && (t.name.find(".visual.") != std::string::npos ||
+                                               t.name.find("vision") != std::string::npos))) return;
                 TensorRef r;
-                r.shard = int(i);
-                r.t     = kv.second;
-                index[kv.first] = r;
+                r.shard = int(shards.size());
+                r.t = t;
+                index[t.name] = std::move(r);
+            };
+            if (names.empty()) {
+                for (const auto& kv : st->tensors()) add(kv.second);
+            } else for (const auto& name : names) {
+                const auto* t = st->find(name);
+                if (!t) { err = file + ": indexed tensor not found: " + name; return false; }
+                add(*t);
             }
             shards.push_back(std::move(st));
         }
@@ -981,6 +1055,56 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
               index.count("model.language_model.norm.weight"))
            ? "model.language_model." : "model.";
     if (selected_embedding.ok()) index[prefix + "embed_tokens.weight"] = selected_embedding;
+
+    if (external_ple) {
+        ShardMembers source;
+        if (!checkpoint_members(ple_source, true, source, err)) return false;
+        std::map<int, std::string> table_prefix;
+        for (int layer : cfg.ple_layer_ids) {
+            if (layer <= 0 || layer > cfg.n_layers) { err = "invalid PLE layer ID"; return false; }
+            table_prefix.emplace(layer, prefix + "layers." + std::to_string(layer - 1) +
+                                       ".ple.ple_embedding.ngram_embedding.");
+        }
+        std::map<int, size_t> table_entries;
+        for (const auto& [file, names] : source) {
+            std::unique_ptr<SafeTensors> st;
+            for (const auto& name : names) for (const auto& [layer, base] : table_prefix) {
+                if (name.compare(0, base.size(), base) != 0) continue;
+                const auto key = name.substr(base.size());
+                const bool part = key.size() > 13 && key.compare(0, 6, "shard_") == 0 &&
+                    key.compare(key.size()-7, 7, ".weight") == 0 &&
+                    key.find_first_not_of("0123456789", 6) == key.size()-7;
+                if (!part && key != "weight" && key != "weight_scale") continue;
+                if (!st) {
+                    st = std::make_unique<SafeTensors>();
+                    if (!open_indexed_shard(*st, file, model_root, err)) return false;
+                }
+                const auto* t = st->find(name);
+                if (!t) { err = file + ": indexed PLE tensor not found: " + name; return false; }
+                TensorRef r;
+                r.shard = int(shards.size());
+                r.t = *t;
+                if (!index.emplace(name, std::move(r)).second) {
+                    err = "external PLE overlaps the target: " + name;
+                    return false;
+                }
+                if (key != "weight_scale") ++table_entries[layer];
+                break;
+            }
+            if (st) shards.push_back(std::move(st));
+        }
+        for (const auto& [layer, base] : table_prefix) {
+            size_t parts = 0;
+            while (parts < table_entries[layer] &&
+                   index.count(base + "shard_" + std::to_string(parts) + ".weight")) ++parts;
+            const bool flat = index.count(base + "weight") != 0;
+            if ((flat && (parts || table_entries[layer] != 1)) ||
+                (!flat && (parts == 0 || parts != table_entries[layer]))) {
+                err = "external PLE requires one complete table per layer: " + base;
+                return false;
+            }
+        }
+    }
 
     // Offline format compilers operate over the checkpoint index directly.
     // Some BF16 releases store all experts in fused 3-D tensors rather than

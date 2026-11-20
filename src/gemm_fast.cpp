@@ -558,14 +558,17 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
 //          C *= s0 for columns < split, s1 from split on (split is a
 //          multiple of TN, so one fragment never straddles it).  EPI 1:
 //          gate *= s0 and up *= s1 before silu(gate) * up.
-template <int EPI, bool SC = false>
+template <int EPI, bool SC = false, int TileN = NC2>
 sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* B,
                            void* out, int M, int N, int K,
                            const std::vector<sycl::event>& deps, int ldb = 0,
-                           float s0 = 1.0f, float s1 = 1.0f, int split = 0) {
-    constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SG_SIZE;
+                           float s0 = 1.0f, float s1 = 1.0f, int split = 0, const float* hc_norm = nullptr) {
+    static_assert(TileN % NC1 == 0 && (TileN == NC2 || EPI == 0));
+    constexpr int SGM = MC2 / MC1, SGN = TileN / NC1, WG = SGM * SGN * SG_SIZE;
     const int LDB = ldb ? ldb : N;               // B's column pitch: N rounded up to NC2
-    const int nMB = (M + MC2 - 1) / MC2, nNB = LDB / NC2, FI = N / 2, GM = gemm_group_m();
+    const int nMB = (M + MC2 - 1) / MC2;
+    const int nNB = TileN == NC2 ? LDB / TileN : (N + TileN - 1) / TileN;
+    const int FI = N / 2, GM = gemm_group_m();
     const int PD = gemm_prefetch();
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
@@ -582,7 +585,7 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
             // B columns of fragment n.  For EPI 1 the scratch is gate/up
             // interleaved (dequant_mxfp4_stream ilv_fi), so fragments 0-1 are
             // gate and 2-3 the matching up columns either way.
-            auto bcol = [&](int n) { return nb * NC2 + sn * NC1 + n * TN; };
+            auto bcol = [&](int n) { return nb * TileN + sn * NC1 + n * TN; };
             auto pA = sycl::address_space_cast<sycl::access::address_space::global_space,
                                                sycl::access::decorated::no>(A);
             auto pB = sycl::address_space_cast<sycl::access::address_space::global_space,
@@ -667,6 +670,40 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                             matrix::layout::row_major, size_t(M), size_t(N),
                             size_t(m0 + m * TM), size_t(bcol(n)));
                     }
+            } else if constexpr (EPI == 3) {
+                // Four consecutive DPAS result fragments share hidden
+                // coordinates across the four HC streams. Consume their
+                // gates in the existing FP32 branch order before storing.
+                static_assert(NC1 / TN == 4);
+                const int hidden = N / 4;
+                const int col = bcol(0) / 4;
+                auto norm = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                     sycl::access::decorated::no>(hc_norm);
+                auto output = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(static_cast<float*>(out));
+                #pragma unroll
+                for (int m = 0; m < MC1 / TM; ++m) {
+                    const int row = m0 + m * TM;
+                    matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN> merged;
+                    matrix::joint_matrix_fill(sg, merged, 0.0f);
+                    auto sum = sycl::ext::oneapi::detail::get_wi_data(sg, merged);
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN> input;
+                        ix::joint_matrix_load_checked(sg, input, norm + size_t(c) * hidden, size_t(N),
+                            matrix::layout::row_major, size_t(M), size_t(hidden), size_t(row), size_t(col));
+                        auto x = sycl::ext::oneapi::detail::get_wi_data(sg, input);
+                        auto gate = sycl::ext::oneapi::detail::get_wi_data(sg, acc[m][c]);
+                        #pragma unroll
+                        for (int i = 0; i < TM; ++i)
+                            sum[i] = float(sum[i]) +
+                                (1.0f / (1.0f + sycl::exp(-float(gate[i])))) * float(x[i]);
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < TM; ++i) sum[i] = float(sum[i]) / 4.0f;
+                    ix::joint_matrix_store_checked(sg, merged, output, size_t(hidden),
+                        matrix::layout::row_major, size_t(M), size_t(hidden), size_t(row), size_t(col));
+                }
             } else {
                 // silu(gate) * up in registers, rounded to a bf16 tile, one
                 // bounds-checked 2-D block store.  (Per-element coordinate
@@ -975,6 +1012,11 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                             const std::vector<sycl::event>& deps,
                             const uint32_t* qbits = nullptr, int qwords = 0, int qrat = 4,
                             int window = 0) {
+    // GRIMOIRE_FLASH_TIMING=1: split the K/V repack pre-pass from the fused
+    // QK^T / online-softmax / PV kernel. Fenced; diagnosis only.
+    static const bool flash_timed = std::getenv("GRIMOIRE_FLASH_TIMING") != nullptr;
+    std::chrono::steady_clock::time_point flash_t0{};
+    if (flash_timed) { q.wait_and_throw(); flash_t0 = std::chrono::steady_clock::now(); }
     constexpr int NF = D / TN, WG = FA_NSG * SG_SIZE;
     FlashScratch& fs = flash_scratch_for(q);
     const int kend = start + tokens;
@@ -1146,6 +1188,12 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
         if (block == 128) return flash_esimd<D, 128>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
         if (block == 64) return flash_esimd<D, 64>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
         return flash_esimd<D, 32>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
+    }
+    if (flash_timed) {
+        q.wait_and_throw();
+        std::fprintf(stderr, "QFN flash prefill prepass: heads=%d kvh=%d d=%d tokens=%d start=%d prepass_ms=%.3f\n",
+                     H, KVH, D, tokens, start,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flash_t0).count());
     }
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
@@ -1450,7 +1498,7 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
     static_assert(KC1 == 2 * 16 && KC1 <= kMXBlock, "decode: one E8M0 scale per k half");
     const int N = w.N, K = w.K, FI = N / 2;
     const int nMB = (M + MC2 - 1) / MC2, nNB = N / NC2, GM = gemm_group_m();
-    return q.submit([&](sycl::handler& h) {
+    return     q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const QuantWeight wc = w;
         sycl::local_accessor<uint32_t, 1> Bs(2 * BT, h);
@@ -3768,17 +3816,34 @@ sycl::event i4a8_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, v
 } // namespace
 #endif
 
-bool gemm_fast_supported(const QuantWeight& w, int M) {
+// Shape/scratch eligibility only: "can this path run at all for this weight".
+// Callers that must keep working at any M (the HC-down tiled projection) use
+// this, so an M cap chosen for the dense projections cannot switch them off.
+bool gemm_fast_shape_ok(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FAST_GEMM") != nullptr;
     const size_t np = size_t(w.N + NC2 - 1) / NC2 * NC2;
     return !off && M >= 32 && w.payload && w.N % 16 == 0 && w.K % KC1 == 0 &&
            np * size_t(w.K) <= kMaxScratchElems;
 }
 
+// The dequantise-once-then-GEMM path costs a full weight copy per call, which
+// pays at small M and loses at large M. Measured on four B70s (m32 + HC
+// tiled/fused + DecodeM8, chunk 2048): disabling it outright gave prefill
+// 2,876 -> 2,672 ms and 2,814 -> 2,620 ms (-205 / -194 ms, both orders).
+// GRIMOIRE_FAST_GEMM_MAX_M overrides the cap; 1000000 restores legacy behaviour.
+bool gemm_fast_supported(const QuantWeight& w, int M) {
+    static const int max_m = [] {
+        const char* e = std::getenv("GRIMOIRE_FAST_GEMM_MAX_M");
+        return e && *e ? std::atoi(e) : 512;
+    }();
+    return M <= max_m && gemm_fast_shape_ok(w, M);
+}
+
+
 namespace {
 
 // Dequantize W once into the scratch, then one GEMM launch over all M rows.
-template <int EPI>
+template <int EPI, int TileN = NC2>
 sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, void* out,
                           int M, const std::vector<sycl::event>& deps) {
     const int N = w.N, K = w.K;
@@ -3879,7 +3944,7 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
         e = dequant_any(q, w, s.w, deps);
     }
     if (timed) { lap(stage_times().dq, t0); ++stage_times().calls; }
-    e = gemm_bf16_vnni<EPI>(q, x, s.w, out, M, N, K, {e}, Np);
+    e = gemm_bf16_vnni<EPI, false, TileN>(q, x, s.w, out, M, N, K, {e}, Np);
     if (timed) lap(stage_times().main, t0);
     return e;
 }
@@ -3890,6 +3955,49 @@ sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
                              const std::vector<sycl::event>& deps) {
     return gemm_fast_run<0>(q, w, x, y, M, deps);
+}
+
+sycl::event launch_qfn_hc_pack_up(sycl::queue& q, const QuantWeight& w, sycl_bf16* packed) {
+    constexpr int hidden = 2560, branches = 4;
+    if (w.fmt != Fmt::BF16 || w.K != 320 || w.N != hidden * branches || !w.payload || !packed)
+        throw std::invalid_argument("invalid QFN HC up weight for persistent packing");
+    const auto* source = w.payload;
+    const size_t pitch = w.row_bytes;
+    return q.parallel_for(sycl::range<2>(size_t(w.K / 2), size_t(w.N)), [=](sycl::id<2> id) {
+        const int n = int(id[1]);
+        const int branch = (n / TN) % branches;
+        const int h = (n / (TN * branches)) * TN + n % TN;
+        const auto* row = reinterpret_cast<const sycl_bf16*>(source + size_t(branch * hidden + h) * pitch);
+        const size_t kp = id[0] * 2;
+        const size_t output = (id[0] * hidden * branches + size_t(n)) * 2;
+        packed[output] = row[kp];
+        packed[output + 1] = row[kp + 1];
+    });
+}
+
+sycl::event launch_qfn_hc_up_mean(sycl::queue& q, const QuantWeight& w,
+                                 const sycl_bf16* packed, const sycl_bf16* x,
+                                 const float* normed, float* out, int rows,
+                                 const std::vector<sycl::event>& deps) {
+    if (w.fmt != Fmt::BF16 || w.K != 320 || w.N != 10240 || rows != 2048 ||
+        !packed || !normed || !gemm_fast_shape_ok(w, rows))
+        throw std::invalid_argument("invalid QFN fused HC up/mean operands");
+    return gemm_bf16_vnni<3>(q, x, packed, out, rows, w.N, w.K, deps, w.N,
+                            1.0f, 1.0f, 0, normed);
+}
+
+sycl::event launch_qfn_hc_down_tiled(sycl::queue& q, const QuantWeight& w,
+                                    const sycl_bf16* x, float* y, int rows,
+                                    const std::vector<sycl::event>& deps) {
+    if (w.fmt != Fmt::BF16 || w.K != 10240 || w.N != 320 || !gemm_fast_shape_ok(w, rows))
+        throw std::invalid_argument("invalid QFN HC BF16 output-tiled operands");
+#ifdef GRIMOIRE_WITH_ONEDNN
+    if (onednn_gemm_ok(w, rows))
+        throw std::invalid_argument("QFN HC tiling requires native BF16 GEMM");
+#endif
+    // Keep the packed weight pitch, each subgroup's fragments, and its
+    // entire K accumulation unchanged; partition only output columns.
+    return gemm_fast_run<0, 64>(q, w, x, y, rows, deps);
 }
 
 // h[M][N] += x W^T in place (the residual add fused into the epilogue).

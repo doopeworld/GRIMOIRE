@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Opt-in Linux Intel Level Zero IPC transport. GPU payload stays on GPUs;
 // Unix sockets carry handles, readiness and consumption acknowledgements only.
-// No device-side polling, cross-device atomics, or imported host allocations.
 #pragma once
 #include "b70/ipc_socket.hpp"
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <level_zero/ze_api.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
@@ -17,6 +19,7 @@
 
 namespace b70 {
 class PeerCopy {
+    friend class PeerPush4;
     struct Api {
         void* library = nullptr;
         decltype(&zeDeviceGetProperties) properties = nullptr;
@@ -96,18 +99,20 @@ public:
         if (std::string(e) == "1" || std::string(e) == "required") return 2;
         return -1;
     }
+    static size_t requested_capacity() {
+        const char* e = std::getenv("GRIMOIRE_P2P_CHUNK_MB");
+        return size_t(e ? std::clamp(std::atoi(e), 1, 64) : 4) << 20;
+    }
     // Returns false only for a protocol error or a required but unavailable
     // path. Both endpoints exchange every decision before choosing fallback.
     // Each process retains its per-worker ZE_AFFINITY_MASK. The remote device
     // may be invisible to enumeration; a successful peer IPC import is the
     // capability check enforced by Level Zero / the kernel in that case.
-    bool setup(sycl::queue& q, int fd, bool initiator, std::string& reason, bool allow_same_device = false) {
+    bool setup(sycl::queue& q, int fd, bool initiator, std::string& reason) {
         reset(); socket = fd; first = initiator;
         Hello own{}, peer{};
         const int mode = requested_mode(); own.mode = mode < 0 ? 3u : uint32_t(mode);
-        own.bytes = size_t(4) << 20;
-        if (const char* e = std::getenv("GRIMOIRE_P2P_CHUNK_MB"))
-            own.bytes = size_t(std::clamp(std::atoi(e), 1, 64)) << 20;
+        own.bytes = requested_capacity();
         try {
             if(mode>0) api.load();
             if (mode > 0 && api.ready() && q.get_backend() == sycl::backend::ext_oneapi_level_zero) {
@@ -126,7 +131,7 @@ public:
         auto unavailable = [&](const char* why) { reason = why; reset(); return !required; };
         if (!own.mode || !peer.mode) return unavailable("disabled on one or both ranks");
         if (!own.available || !peer.available) return unavailable("Level Zero IPC API unavailable");
-        if (!allow_same_device && std::memcmp(&own.uuid, &peer.uuid, sizeof own.uuid) == 0)
+        if (std::memcmp(&own.uuid, &peer.uuid, sizeof own.uuid) == 0)
             return unavailable("ranks select the same physical GPU");
         capacity = size_t(std::min(own.bytes, peer.bytes));
         uint32_t ok = 0, peer_ok = 0;
@@ -271,6 +276,216 @@ public:
         if (exported_live) { api.put(context, exported); exported_live = false; }
         if (owned) { api.free(context, owned); owned = nullptr; }
         capacity = 0; sequence = 0;
+    }
+};
+
+// A receive slot belongs to exactly one sender, and only its owning GPU
+// reads it. The rank-zero hub brokers descriptors but never stages payloads.
+class PeerPush4 {
+    std::array<PeerCopy, 4> links;
+    std::array<int, 4> fds{-1, -1, -1, -1};
+    uint64_t sequence_ = 0;
+    bool enabled = false, broken = false;
+
+    void disconnect() {
+        broken = true;
+        for (int fd : fds) if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+    }
+
+    sycl::event sum(sycl::queue& q, float* local, size_t n, const std::array<const float*, 4>& src) {
+        return q.submit([&](sycl::handler& h) {
+            // Preserve the socket/host arithmetic association exactly.
+            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                float acc = src[0][i] + src[1][i];
+                acc = acc + src[2][i];
+                local[i] = acc + src[3][i];
+            });
+        });
+    }
+
+public:
+    ~PeerPush4() { reset(); }
+    bool active() const { return enabled; }
+    uint64_t sequence() const { return sequence_; }
+    void enable() { enabled = true; }
+
+    bool setup(sycl::queue& q, const std::vector<int>& hub, int rank, std::string& reason) {
+        reset();
+        const auto routing_failure = [&](const char* message) {
+            reason = message;
+            for (int fd : hub)
+                if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+            for (int fd : fds)
+                if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+            return false;
+        };
+        // Rank 0 creates every pair in fixed order. Each other rank receives
+        // endpoints in peer order from its existing rank-zero connection.
+        if (rank == 0) {
+            for (int a = 0; a < 4; ++a) for (int b = a + 1; b < 4; ++b) {
+                int pair[2];
+                if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+                    return routing_failure("cannot allocate TP4 peer socket pair");
+                }
+                const bool sent_a = a == 0 || ipc::send_fd(hub[a], pair[0]);
+                if (a == 0) fds[b] = pair[0]; else ::close(pair[0]);
+                const bool sent_b = ipc::send_fd(hub[b], pair[1]);
+                ::close(pair[1]);
+                if (!sent_a || !sent_b) { return routing_failure("cannot send TP4 peer socket"); }
+            }
+        } else {
+            for (int peer = 0; peer < 4; ++peer) if (peer != rank && !ipc::recv_fd(hub[0], fds[peer])) {
+                return routing_failure("cannot receive TP4 peer socket");
+            }
+        }
+        bool available = true;
+        for (int peer = 0; peer < 4; ++peer) if (peer != rank) {
+            std::string why;
+            if (!links[peer].setup(q, fds[peer], rank < peer, why) || !links[peer].active()) {
+                if (available) reason = "rank " + std::to_string(peer) + ": " + why;
+                available = false;
+            }
+        }
+        return available;
+    }
+
+    struct Timing {
+        size_t calls = 0, peer_bytes = 0;
+        double drain_ms = 0, copy_ms = 0, ready_ms = 0, sum_ms = 0, reuse_ms = 0, gather_ms = 0;
+    };
+    // When recording timings the caller has already drained the queue.
+    bool allreduce(sycl::queue& q, float* data, size_t elems, int rank, Timing* timing = nullptr,
+                   bool fanout = false, bool reduce_scatter = false) {
+        if (!enabled || broken) return false;
+        const auto exchange = [&](const PeerCopy::Packet& own) {
+            if (fanout) return ipc::exchange_small_fanout(fds, rank, own, [](const auto& a, const auto& b) {
+                return a.seq == b.seq && a.bytes == b.bytes && a.kind == b.kind && a.format == b.format;
+            });
+            for (int peer = 0; peer < 4; ++peer)
+                if (peer != rank && !links[peer].exchange_packet(own)) return false;
+            return true;
+        };
+        using Clock = std::chrono::steady_clock;
+        auto lap = timing ? Clock::now() : Clock::time_point{};
+        auto record = [&](double Timing::*bucket) {
+            if (!timing) return;
+            const auto now = Clock::now();
+            timing->*bucket += std::chrono::duration<double, std::milli>(now - lap).count();
+            lap = now;
+        };
+        struct Guard {
+            PeerPush4& transport;
+            bool done = false;
+            ~Guard() { if (!done) transport.disconnect(); }
+        } guard{*this};
+        const size_t limit = links[rank == 0 ? 1 : 0].capacity / sizeof(float);
+        if (!timing) q.wait_and_throw();
+        if (reduce_scatter) {
+            // Each pair already owns two IPC banks. First scatter partials
+            // into bank zero, then send the canonical reduced slices back
+            // through bank one. Peer copies and local copies are distinct.
+            for (int peer = 0; peer < 4; ++peer)
+                if (peer != rank && links[peer].capacity != limit * sizeof(float)) return false;
+            for (size_t at = 0; at < elems; at += 4 * limit) {
+                const size_t n = std::min(4 * limit, elems - at);
+                const size_t bytes = n * sizeof(float);
+                float* const local = data + at;
+                std::array<size_t, 5> offset{};
+                for (size_t shard = 0; shard <= 4; ++shard) offset[shard] = n * shard / 4;
+                auto shard_size = [&](int peer) { return offset[peer + 1] - offset[peer]; };
+                const size_t own_count = shard_size(rank);
+                const auto send_shards = [&](bool gather) {
+                    bool ok = true;
+                    for (int peer = 0; peer < 4; ++peer) if (peer != rank) {
+                        auto& link = links[peer];
+                        const int shard = gather ? rank : peer;
+                        const size_t payload = shard_size(shard) * sizeof(float);
+                        if (!payload) continue;
+                        auto* dest = static_cast<uint8_t*>(link.imported) + (gather ? link.capacity : 0);
+                        if (link.api.copy(link.copies, dest, local + offset[shard],
+                                          payload, nullptr, 0, nullptr) != ZE_RESULT_SUCCESS)
+                            ok = false;
+                        if (timing) timing->peer_bytes += payload;
+                    }
+                    for (int peer = 0; peer < 4; ++peer) if (peer != rank) {
+                        auto& link = links[peer];
+                        if (link.api.sync(link.copies, 120000000000ULL) != ZE_RESULT_SUCCESS)
+                            ok = false;
+                    }
+                    return ok;
+                };
+
+                if (!send_shards(false)) return false;
+                record(&Timing::copy_ms);
+                const uint64_t sequence = ++sequence_;
+                if (!exchange({sequence, bytes, 4, 0})) return false;
+                record(&Timing::ready_ms);
+                if (own_count) {
+                    std::array<const float*, 4> src{};
+                    for (int peer = 0; peer < 4; ++peer)
+                        src[peer] = peer == rank ? local + offset[rank] :
+                            static_cast<const float*>(links[peer].owned);
+                    sum(q, local + offset[rank], own_count, src).wait_and_throw();
+                }
+                record(&Timing::sum_ms);
+                if (!send_shards(true)) return false;
+                record(&Timing::copy_ms);
+                if (!exchange({sequence, bytes, 5, 0})) return false;
+                record(&Timing::ready_ms);
+                for (int peer = 0; peer < 4; ++peer) if (peer != rank && shard_size(peer)) {
+                    const auto& link = links[peer];
+                    q.memcpy(local + offset[peer], static_cast<const uint8_t*>(link.owned) + link.capacity,
+                             shard_size(peer) * sizeof(float));
+                }
+                q.wait_and_throw();
+                record(&Timing::gather_ms);
+                if (!exchange({sequence, bytes, 6, 0})) return false;
+                record(&Timing::reuse_ms);
+            }
+            if (timing) ++timing->calls;
+            guard.done = true;
+            return true;
+        }
+        for (size_t at = 0; at < elems; at += limit) {
+            const size_t n = std::min(limit, elems - at), bytes = n * sizeof(float);
+            float* const local = data + at;
+            std::array<const float*, 4> src{};
+            src[rank] = local;
+            for (int peer = 0; peer < 4; ++peer) if (peer != rank)
+                src[peer] = reinterpret_cast<const float*>(static_cast<uint8_t*>(links[peer].owned) + links[peer].capacity);
+            bool copies_ok = true;
+            for (int peer = 0; peer < 4; ++peer) if (peer != rank) {
+                auto& link = links[peer];
+                auto* const dst = static_cast<uint8_t*>(link.imported) + link.capacity;
+                if (timing) timing->peer_bytes += bytes;
+                if (link.api.copy(link.copies, dst, local, bytes, nullptr, 0, nullptr) != ZE_RESULT_SUCCESS)
+                    copies_ok = false;
+            }
+            for (int peer = 0; peer < 4; ++peer) if (peer != rank) {
+                auto& link = links[peer];
+                if (link.api.sync(link.copies, 120000000000ULL) != ZE_RESULT_SUCCESS) copies_ok = false;
+            }
+            if (!copies_ok) return false;
+            record(&Timing::copy_ms);
+            const PeerCopy::Packet ready{++sequence_, bytes, 1, 0};
+            if (!exchange(ready)) return false;
+            record(&Timing::ready_ms);
+            sum(q, local, n, src).wait_and_throw();
+            record(&Timing::sum_ms);
+            const PeerCopy::Packet consumed{sequence_, bytes, 2, 0};
+            if (!exchange(consumed)) return false;
+            record(&Timing::reuse_ms);
+        }
+        if (timing) ++timing->calls;
+        guard.done = true;
+        return true;
+    }
+
+    void reset() {
+        enabled = broken = false;
+        sequence_ = 0;
+        for (auto& link : links) link.reset();
+        for (int& fd : fds) if (fd >= 0) { ::close(fd); fd = -1; }
     }
 };
 } // namespace b70

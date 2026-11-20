@@ -209,6 +209,22 @@ sycl::event launch_gemv_batch(sycl::queue& q, const QuantWeight& w,
 sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
                             const sycl_bf16* x, float* y, int M,
                             const std::vector<sycl::event>& deps = {});
+struct QfnMoeTile;
+// Two independent 5120-wide BF16 products for Flash-Next's HC down projection.
+sycl::event launch_qfn_hc_pack_up(sycl::queue& q, const QuantWeight& w, sycl_bf16* packed);
+sycl::event launch_qfn_hc_up_mean(sycl::queue& q, const QuantWeight& w,
+    const sycl_bf16* packed, const sycl_bf16* x, const float* normed, float* out,
+    int rows, const std::vector<sycl::event>& deps = {});
+sycl::event launch_qfn_hc_down_tiled(sycl::queue& q, const QuantWeight& w,
+                                    const sycl_bf16* x, float* y, int rows,
+                                    const std::vector<sycl::event>& deps);
+sycl::event launch_qfn_int4_grouped(sycl::queue& q, const QuantWeight& w, int expert_width,
+                                   const sycl_bf16* x, float* y, const QfnMoeTile* tiles,
+                                   int tile_count, const std::vector<sycl::event>& deps = {}, bool wide_n = false,
+                                   const int32_t* live_tiles = nullptr, bool prefetch = false);
+sycl::event launch_qfn_int4_offset_grouped(sycl::queue& q, const QuantWeight& w, int expert_width,
+                                          const sycl_bf16* x, float* y, const int32_t* offsets,
+                                          int workers, const std::vector<sycl::event>& deps = {});
 // Large-M prompt GEMM (src/gemm_fast.cpp; bin/libgrimoire_gemm.so in the
 // AOT binaries).  launch_gemm_xmx() takes it whenever the shape fits.
 // Large-M GEMM with SwiGLU fused into the epilogue (gemm_fast.cpp): w is
@@ -239,6 +255,7 @@ bool gemm_fast_swiglu_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
                                     sycl_bf16* h, int M,
                                     const std::vector<sycl::event>& deps = {});
+bool gemm_fast_shape_ok(const QuantWeight& w, int M);
 bool gemm_fast_supported(const QuantWeight& w, int M);
 sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
@@ -976,6 +993,9 @@ sycl::event launch_deltanet_gates_batched(sycl::queue& q, const float* ab,
 sycl::event launch_deltanet_native_gates(sycl::queue& q, const float* ab,
     float* gate_a_head_major, float* beta_head_major, int tokens, int heads, int64_t stride,
     const std::vector<sycl::event>& deps = {});
+sycl::event launch_l2norm_heads_pair_f32(sycl::queue& q, float* a, float* b,
+                                         int n_heads, int dim,
+                                         const std::vector<sycl::event>& deps = {});
 sycl::event launch_l2norm_heads_pair_bf16(sycl::queue& q,const float* qsrc,
     const float* ksrc,sycl_bf16* qdst,sycl_bf16* kdst,int n_heads,int dim,
     const std::vector<sycl::event>& deps = {});
@@ -984,7 +1004,7 @@ sycl::event launch_l2norm_heads_pair_bf16_io(sycl::queue& q,sycl_bf16* qv,
 sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
     int tokens, int inter, const std::vector<sycl::event>& deps = {});
 sycl::event launch_swiglu_bf16_out(sycl::queue& q, const float* gu, sycl_bf16* out,
-    int tokens, int inter, const std::vector<sycl::event>& deps = {});
+    int tokens, int inter, const std::vector<sycl::event>& deps = {}, const int32_t* live_rows = nullptr);
 sycl::event launch_swiglu_f16_batched(sycl::queue& q, const float* gu,
     float* out, int tokens, int inter,
     const std::vector<sycl::event>& deps = {});
@@ -1005,7 +1025,7 @@ sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
     const std::vector<sycl::event>& deps = {});
 sycl::event launch_permute_rows_bf16(sycl::queue& q, const float* src,
     const int32_t* perm_token, sycl_bf16* dst, int rows, int width,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, const int32_t* live_rows = nullptr);
 sycl::event launch_moe_unpermute(sycl::queue& q, const float* src,
     const int32_t* inverse, const float* route_weight, float* dst,
     int tokens, int top_k, int hidden,

@@ -1,0 +1,36 @@
+# Clean CPU compilation of the complete C1 native engine and both SYCL libraries.
+CXX := icpx
+TLA ?= $(error set TLA to the pinned sycl-tla checkout)
+FP := -std=c++20 -fno-fast-math -ffp-contract=fast -fno-math-errno
+SPIR := -fsycl -fsycl-targets=spir64 -fsycl-device-code-split=per_kernel -O2 $(FP) -DGRIMOIRE_QFN_XE2_PREFILL -Iinclude -Isrc -Ixe2
+EXT := -Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate
+AOT := -fsycl -fsycl-targets=intel_gpu_bmg_g31 -O3 $(FP) -fPIC -shared -Iinclude -Isrc
+ENGINE := grimoire qwen35_loader native_model safetensors quantize gptq gemv_decode gguf gguf_decode gguf_qwen35 gemm_xmx attention deltanet moe_kernels tiered_moe cpu_experts moe_ref ops prefill tokenizer
+OBJECTS := $(addprefix obj/,$(addsuffix .o,$(ENGINE))) obj/grimoire_main.o obj/xe2-bench.o
+
+qfn-combined: $(OBJECTS) libgrimoire_attn.so libgrimoire_gemm.so
+	$(CXX) $(SPIR) $(EXT) -fsycl-max-parallel-link-jobs=8 $(OBJECTS) -pthread -L. -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$$ORIGIN' -o $@
+
+obj:
+	mkdir -p $@
+obj/%.o: src/%.cpp | obj
+	$(CXX) $(SPIR) -MMD -MP -c $< -o $@
+obj/grimoire_main.o: tools/grimoire_main.cpp | obj
+	$(CXX) $(SPIR) -MMD -MP -c $< -o $@
+obj/xe2-bench.o: xe2/bench.cpp | obj
+	$(CXX) $(SPIR) -DCUTLASS_ENABLE_HEADERS_ONLY -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET -DCUTLASS_VERSIONS_GENERATED \
+	  -isystem $(TLA)/include -isystem $(TLA)/tools/util/include -isystem $(TLA)/applications \
+	  -isystem xe2/qualified -c $< -o $@
+libgrimoire_attn.so: src/attn_verify_dpas.cpp
+	$(CXX) $(AOT) -Xsycl-target-backend=intel_gpu_bmg_g31 '-options -doubleGRF' $< -o $@
+libgrimoire_gemm.so: src/gemm_fast.cpp
+	$(CXX) $(AOT) -Xsycl-target-backend=intel_gpu_bmg_g31 '-options "-cl-intel-256-GRF-per-thread -doubleGRF"' $< -o $@
+.DELETE_ON_ERROR:
+
+SERVER_OBJECTS := $(filter-out obj/grimoire_main.o,$(OBJECTS)) obj/grimoire_server.o
+obj/grimoire_server.o: tools/grimoire_server.cpp | obj
+	$(CXX) $(SPIR) -MMD -MP -c $< -o $@
+qfn-server: $(SERVER_OBJECTS) libgrimoire_attn.so libgrimoire_gemm.so
+	$(CXX) $(SPIR) $(EXT) -fsycl-max-parallel-link-jobs=8 $(SERVER_OBJECTS) -pthread -L. -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$$ORIGIN' -o $@
+
+-include $(wildcard obj/*.d)

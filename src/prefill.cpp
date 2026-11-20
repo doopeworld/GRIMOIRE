@@ -36,6 +36,7 @@
 #include "kv_k8.hpp"
 #include "gemv_step.hpp"
 #include "b70/prefill_qk_math.hpp"
+#include "b70/qgate_layout.hpp"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -2016,6 +2017,10 @@ static sycl::event launch_dflash2_block_attention_impl(
     constexpr int QT=16, KT=16, WG=QT*SG_SIZE;
     const int qtiles=(tokens+QT-1)/QT;
     const int end=context_len+tokens;
+    const char* trim_env = std::getenv("GRIMOIRE_QFN_PREFILL_CAUSAL_TILES");
+    const bool trim = trim_env && std::strcmp(trim_env, "1") == 0 && causal &&
+        sliding_window == 0 && tokens >= 32 && num_heads == 6 &&
+        num_kv_heads == 1 && head_dim == 256;
     const int begin=(causal&&sliding_window>0)
         ? std::max(0,context_len+1-sliding_window)
         : (sliding_window>0 ? std::max(0,end-sliding_window) : 0);
@@ -2045,7 +2050,10 @@ static sycl::event launch_dflash2_block_attention_impl(
                 #pragma unroll
                 for(int j=0;j<MAXD;++j)acc[j]=0.0f;
                 float m=-std::numeric_limits<float>::infinity(),l=0.0f;
-                for(int s0=begin;s0<end;s0+=KT){
+                // Every query in the block masks keys beyond this tile's
+                // last causal position. Skip only whole tiles of masked keys.
+                const int scan_end = trim ? sycl::min(end, context_len + (qt + 1) * QT) : end;
+                for(int s0=begin;s0<scan_end;s0+=KT){
                     for(int x=lid;x<head_dim*KT;x+=WG){
                         const int d=x/KT,k=x%KT,s=s0+k;
                         ksl[x]=s<end?e4m3_to_f32(kh[int64_t(d)*seq_cap+s]):0.0f;
@@ -2339,14 +2347,13 @@ sycl::event launch_split_dn_fused_projections(sycl::queue& q,const float* src,
 sycl::event launch_split_qgate_batched(sycl::queue& q, const float* src,
     float* qout, float* gout, int tokens, int heads, int dim,
     const std::vector<sycl::event>& deps) {
-    const int half = heads * dim, stride = 2 * half;
+    const int half = heads * dim;
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(tokens) * half), [=](sycl::id<1> id) {
-            const int64_t z = int64_t(id[0]); const int t = int(z / half), hd = int(z % half);
-            const int head = hd / dim, d = hd % dim;
-            const int64_t base = int64_t(t) * stride + int64_t(head) * 2 * dim;
-            qout[z] = src[base + d];
-            gout[z] = src[base + dim + d];
+            const auto z = int64_t(id[0]);
+            const auto p = qgate_offsets(z, dim);
+            qout[z] = src[p.q];
+            gout[z] = src[p.gate];
         });
     });
 }
@@ -2354,12 +2361,15 @@ sycl::event launch_split_qgate_batched(sycl::queue& q, const float* src,
 sycl::event launch_split_qgate_bf16(sycl::queue&q,const sycl_bf16*src,
     sycl_bf16*qout,float*gout,int tokens,int heads,int dim,
     const std::vector<sycl::event>&deps){
- const int half=heads*dim,stride=2*half;
- return q.submit([&](sycl::handler&h){h.depends_on(deps);
-  h.parallel_for(sycl::range<1>(size_t(tokens)*half),[=](sycl::id<1>id){
-   int64_t z=id[0];int t=int(z/half),hd=int(z%half),head=hd/dim,d=hd%dim;
-   int64_t base=int64_t(t)*stride+int64_t(head)*2*dim;
-   qout[z]=src[base+d];gout[z]=float(src[base+dim+d]);});});
+    const int half = heads * dim;
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(size_t(tokens) * half), [=](sycl::id<1> id) {
+            const auto z = int64_t(id[0]);
+            const auto p = qgate_offsets(z, dim);
+            qout[z] = src[p.q];
+            gout[z] = float(src[p.gate]);
+        });
+    });
 }
 
 sycl::event launch_qk_norm_rope_bf16_batched(sycl::queue&q,sycl_bf16*qv,
@@ -2459,10 +2469,11 @@ sycl::event launch_swiglu_batched(sycl::queue& q, const float* gu, float* out,
 // that only feeds the down projection: out = bf16(silu(gate) * up), the same values
 // without the fp32 [tokens][inter] round trip.
 sycl::event launch_swiglu_bf16_out(sycl::queue& q, const float* gu, sycl_bf16* out,
-    int tokens, int inter, const std::vector<sycl::event>& deps) {
+    int tokens, int inter, const std::vector<sycl::event>& deps, const int32_t* live_rows) {
     return q.submit([&](sycl::handler& h) { h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(tokens) * inter), [=](sycl::id<1> id) {
             const int t = int(id[0] / inter), d = int(id[0] % inter);
+            if (live_rows && t >= *live_rows) return;
             const int64_t z = int64_t(t) * inter + d;
             const float g = gu[int64_t(t) * 2 * inter + d];
             out[z] = sycl_bf16((g / (1.0f + sycl::exp(-g))) * gu[int64_t(t) * 2 * inter + inter + d]);
@@ -2643,10 +2654,11 @@ sycl::event launch_gate_sigmoid_mul_batched(sycl::queue& q, float* x,
 
 sycl::event launch_permute_rows_bf16(sycl::queue& q, const float* src,
     const int32_t* perm_token, sycl_bf16* dst, int rows, int width,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps, const int32_t* live_rows) {
     return q.submit([&](sycl::handler& h){h.depends_on(deps);
         h.parallel_for(sycl::range<2>(size_t(rows),size_t(width)),[=](sycl::id<2> id){
             const int r=int(id[0]), d=int(id[1]);
+            if (live_rows && r >= *live_rows) return;
             dst[int64_t(r)*width+d]=sycl_bf16(src[int64_t(perm_token[r])*width+d]);
         });});
 }
