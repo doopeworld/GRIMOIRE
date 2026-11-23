@@ -16,6 +16,7 @@
 #include "inkling2_sycl.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -39,7 +40,7 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
+class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
@@ -102,6 +103,8 @@ struct Layer {
     uint16_t *Wp = nullptr, *Wo = nullptr, *Wr = nullptr;
     int koff = 0, kfull = 0;  // full-attention conv static weights: this card's channel offset and the full width
     uint16_t *WpT = nullptr, *WoT = nullptr, *WrT = nullptr, *cdownT[4]{};  // decode tiles [N/16][K/8][16][8]
+    int8_t *WpQ = nullptr, *WoQ = nullptr;   // INK_I8=1: the same tiles as int8, one fp32 scale per row
+    float *WpS = nullptr, *WoS = nullptr;
     float* rbias = nullptr;
     uint16_t *nq = nullptr, *nk = nullptr, *nv = nullptr, *nm = nullptr;
     uint16_t *qs = nullptr, *rs = nullptr, *table = nullptr;
@@ -134,7 +137,8 @@ struct GateBatch { GateJob j[3]; int count; };
 // Two-card watchdog: every exchange stamps progress; no progress for 60 s -> print where each card is and exit.
 static std::atomic<long long> g_tp_progress{0};
 static std::atomic<int> g_tp_stage[2] = {};
-static double g_tp_wait_ms[2][2] = {};   // per card: copy-out wait, thread meet
+static double g_tp_wait_ms[2][2] = {};
+static constexpr uint32_t kEmpty = 0xFFFFFFFFu;   // never a computed fp32 (Intel NaNs are 0x7fc00000)   // per card: copy-out wait, thread meet
 static long g_tp_n[2] = {};
 static long long now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -142,6 +146,13 @@ struct TPX {
     static constexpr int NS = 8;
     float* hb[2][NS] = {};
     float* ib[2][NS] = {};   // small exchanges: card r's IN slots (pinned in r's context); the peer's host thread fills them
+    // device mailboxes (INK_DEVX=1, after Xenithium's comm/mailbox_esimd.hpp, adapted to pinned host memory because the
+    // Tower has no P2P): box[r] = card r's inbox, [2 parities][kBoxWords] words, every word its own flag (kEmpty until
+    // the peer's system-scope store lands). Each card's kernel stores into the peer's inbox and spins on its own.
+    static constexpr size_t kBoxWords = 8 * 2304;
+    uint32_t* box[2] = {};
+    uint32_t* err = nullptr;   // [2] spin timeouts
+    int mcount[2] = {0, 0};
     sycl::event d2h[2][NS], h2d[2][NS];
     std::barrier<> bar{2};
     float bv[2][8] = {};
@@ -170,6 +181,7 @@ public:
     void load_mtp(const std::string& path);
     std::vector<int> mtp_step(int t, const int* forced = nullptr);
     bool use_graph = true;
+    int gpar_ = 0, gex_ = 0;   // two-card graph: mailbox count at capture, exchanges inside
     bool taps_on = false;
 
 private:
@@ -224,6 +236,10 @@ private:
     }
     void load();
     uint16_t* tiled(const uint16_t* src, int N, int K);
+    void quant_tiled(const uint16_t* T, int N, int K, int8_t*& q, float*& sc);
+    template <int MODE> void gemvt8(const int8_t* T, const float* sc, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1,
+                                    float* y1, int end1, const float* x2, float* y2, float cap = 0.f);
+    bool i8_ = std::getenv("INK_I8") && std::atoi(std::getenv("INK_I8")) == 1;
     template <int MODE> void gemvt(const uint16_t* T, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
                                    const float* x2, float* y2);
     // tiled, M <= 8 rows: x rows at ldx; segment outputs y0/y1/y2 with their own row pitch; rows >= nvalid not written
@@ -231,7 +247,9 @@ private:
                                     float* y0, size_t ld0, int end0, float* y1, size_t ld1, int end1, float* y2, size_t ld2, int nvalid,
                                     float cap = 0.f);
     uint16_t* unembedT_ = nullptr;
-    uint16_t* unembedFullT_ = nullptr;   // two cards + MTP: the drafter's full-vocab copy (tiled)
+    uint16_t* unembedFullT_ = nullptr;
+    int8_t* unembedQ_ = nullptr;
+    float* unembedS_ = nullptr;   // two cards + MTP: the drafter's full-vocab copy (tiled)
     void run(int M);
     void dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, const uint16_t* xb, float* y, size_t ldy, int M, bool round);
     template <int MODE> void gemv(const uint16_t* W, int rows, int K, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
@@ -289,6 +307,7 @@ void Engine::load() {
         unembed_ = dev_.alloc<uint16_t>(size_t(vrows_) * h_);
         q_.memcpy(unembed_, src, size_t(vrows_) * h_ * 2).wait();
         unembedT_ = tiled(src, vrows_, h_);
+        if (i8_) quant_tiled(unembedT_, vrows_, h_, unembedQ_, unembedS_);
     }
     fnorm_ = up<uint16_t>(root + "norm.weight");
     oquery_ = up<float>(root + "attn_res.output_query");
@@ -327,6 +346,7 @@ void Engine::load() {
         Ly.Wp = dev_.alloc<uint16_t>(stage.size());
         q_.memcpy(Ly.Wp, stage.data(), stage.size() * 2).wait();
         Ly.WpT = tiled(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_);
+        if (i8_) quant_tiled(Ly.WpT, Ly.NA + Ly.NB + Ly.NC, h_, Ly.WpQ, Ly.WpS);
         {   // this card's columns of the attention output projection
             const uint16_t* src = reinterpret_cast<const uint16_t*>(host(t + "wo_ud.weight"));
             std::vector<uint16_t> wo(size_t(h_) * Qr);
@@ -334,6 +354,7 @@ void Engine::load() {
             Ly.Wo = dev_.alloc<uint16_t>(wo.size());
             q_.memcpy(Ly.Wo, wo.data(), wo.size() * 2).wait();
             Ly.WoT = tiled(wo.data(), h_, Qr);
+            if (i8_) quant_tiled(Ly.WoT, h_, Qr, Ly.WoQ, Ly.WoS);
         }
         Ly.Wr = up<uint16_t>(s + "mlp.gate.weight");
         Ly.WrT = tiled(reinterpret_cast<const uint16_t*>(host(s + "mlp.gate.weight")), c_.experts, h_);
@@ -418,7 +439,7 @@ void Engine::load() {
     sel_ = dev_.zeros<int>(mm * TK); wts_ = dev_.zeros<float>(mm * TK);
     act_ = dev_.zeros<float>(TK * c_.inter);
     dbuf_ = dev_.zeros<float>(TK * h_);
-    logits_ = dev_.zeros<float>(c_.output_vocab);
+    logits_ = dev_.zeros<float>(std::max(c_.output_vocab, c_.vocab));
     bestv_ = dev_.zeros<float>(16);
     if (world_ > 1) {
         peer_ = dev_.zeros<float>(mm * h_);
@@ -505,6 +526,72 @@ uint16_t* Engine::tiled(const uint16_t* src, int N, int K) {
     uint16_t* d = dev_.alloc<uint16_t>(T.size());
     q_.memcpy(d, T.data(), T.size() * 2).wait();
     return d;
+}
+
+// INK_I8=1 (opt-in; changes numerics): a tiled BF16 weight as int8 in the same tile order, scale = row absmax / 127,
+// q = rne(w / scale).  Decode reads half the bytes of the BF16 tiles.
+void Engine::quant_tiled(const uint16_t* T, int N, int K, int8_t*& qo, float*& so) {
+    qo = dev_.alloc<int8_t>(size_t(N) * K);
+    so = dev_.alloc<float>(N);
+    int8_t* q = qo;
+    float* sc = so;
+    const size_t K8 = size_t(K) / 8;
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(256), cgh);
+        cgh.parallel_for<InkQuantT>(sycl::nd_range<1>(size_t(N) * 256, 256), [=](sycl::nd_item<1> it) {
+            const size_t r = it.get_group(0);
+            const int lid = int(it.get_local_id(0));
+            auto at = [&](size_t k) { return (((r / 16) * K8 + k / 8) * 16 + r % 16) * 8 + k % 8; };
+            float mx = 0.f;
+            for (size_t k = lid; k < size_t(K); k += 256) mx = sycl::fmax(mx, sycl::fabs(bfw(T[at(k)])));
+            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+            const float s = mx > 0.f ? mx / 127.f : 1.f;
+            for (size_t k = lid; k < size_t(K); k += 256) q[at(k)] = int8_t(sycl::clamp(sycl::rint(bfw(T[at(k)]) / s), -127.f, 127.f));
+            if (lid == 0) sc[r] = s;
+        });
+    });
+    q_.wait();
+}
+
+template <int MODE>
+void Engine::gemvt8(const int8_t* T, const float* sc, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1, float* y1,
+                    int end1, const float* x2, float* y2, float cap) {
+    const int tiles = N / 16, K8 = K / 8, per = K8 / KS;
+    if (N % 16 || K8 % KS) throw std::runtime_error("gemvt8 geometry");
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(size_t(KS) * 16), cgh);
+        cgh.parallel_for<InkGemvT8<MODE>>(sycl::nd_range<1>(size_t(tiles) * KS * 16, size_t(KS) * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int tile = int(it.get_group(0)), q = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+            const int r0 = tile * 16;
+            const float* x = r0 < end0 ? x0 : (r0 < end1 ? x1 : x2);
+            const int8_t* w = T + size_t(tile) * K8 * 128 + lane * 8;
+            float a0 = 0.f, a1 = 0.f;
+            for (int ko = q * per; ko < (q + 1) * per; ++ko) {
+                const sycl::vec<int8_t, 8> wv = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(w + size_t(ko) * 128);
+                const sycl::float4 a = *reinterpret_cast<const sycl::float4*>(x + ko * 8);
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(x + ko * 8 + 4);
+                a0 = sycl::fma(float(wv[0]), a[0], a0); a1 = sycl::fma(float(wv[1]), a[1], a1);
+                a0 = sycl::fma(float(wv[2]), a[2], a0); a1 = sycl::fma(float(wv[3]), a[3], a1);
+                a0 = sycl::fma(float(wv[4]), b[0], a0); a1 = sycl::fma(float(wv[5]), b[1], a1);
+                a0 = sycl::fma(float(wv[6]), b[2], a0); a1 = sycl::fma(float(wv[7]), b[3], a1);
+            }
+            float acc = a0 + a1;
+            if (KS > 1) {
+                red[q * 16 + lane] = acc;
+                sycl::group_barrier(it.get_group());
+                if (q == 0) { acc = 0.f; for (int t = 0; t < KS; ++t) acc += red[t * 16 + lane]; }
+            }
+            if (q == 0) {
+                const int r = r0 + lane;
+                acc *= sc[r];
+                float* y = r < end0 ? y0 + r : (r < end1 ? y1 + (r - end0) : y2 + (r - end1));
+                if constexpr (MODE == 0) *y = bfr(acc);
+                else if constexpr (MODE == 1) *y = acc;
+                else { const float lin = bfr(acc); *y = cap * sycl::tanh(lin / cap); }
+            }
+        });
+    });
 }
 
 // Decode GEMV on the tiled layout (urakozz's lane-per-column idea): a sub-group owns 16 output
@@ -1275,7 +1362,32 @@ void Engine::allreduce(float* buf, size_t n) {
     // Host-mediated: copy out, wait for our own copy, meet the other card's thread, copy its part in.
     // No event of one device is ever waited on by the other device's queue.
     TPX& x = *tpx_;
-    const int me = rank_, peer = 1 - rank_, k = x.counter[me]++ % TPX::NS;
+    const int me = rank_, peer = 1 - rank_;
+    if (x.box[0] && n <= TPX::kBoxWords) {
+        // device-side exchange: no host wait, so a whole decode step can be one graph
+        const int par = x.mcount[me]++ & 1;
+        uint32_t* to = x.box[peer] + size_t(par) * TPX::kBoxWords;
+        uint32_t* own = x.box[me] + size_t(par) * TPX::kBoxWords;
+        uint32_t* err = x.err + me;
+        q_.parallel_for<InkMail>(sycl::range<1>(n), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            const float v = buf[i];
+            uint32_t w = sycl::bit_cast<uint32_t>(v);
+            if (w == kEmpty) w = 0x7fc00000u;
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space>(to[i]).store(w);
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space> in(own[i]);
+            uint32_t got = in.load();
+            for (int it = 0; got == kEmpty && it < (1 << 20); ++it) got = in.load();
+            if (got == kEmpty) {
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space>(*err).store(1u);
+                got = 0x7fc00000u;
+            }
+            in.store(kEmpty);
+            buf[i] = bfr(v + sycl::bit_cast<float>(got));
+        });
+        return;
+    }
+    const int k = x.counter[me]++ % TPX::NS;
     float* mine = x.hb[me][k];
     const float* theirs = x.hb[peer][k];
     g_tp_stage[me] = 1;  // copying out
@@ -1352,15 +1464,21 @@ int Engine::step(int token, std::vector<float>* logits_out) {
     const bool taps_saved = taps_on;
     taps_on = false;
     struct Restore { bool& f; bool v; ~Restore() { f = v; } } restore{taps_on, taps_saved};
-    if (use_graph && !gexec_ && world_ == 1) {
+    if (use_graph && !gexec_ && (world_ == 1 || (tpx_ && tpx_->box[0]))) {
+        if (world_ > 1) gpar_ = tpx_->mcount[rank_];
         sycl_ext::command_graph<sycl_ext::graph_state::modifiable> g(q_.get_context(), q_.get_device());
         g.begin_recording(q_);
         run(1);
         g.end_recording(q_);
         gexec_ = std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(g.finalize());
+        if (world_ > 1) { gex_ = tpx_->mcount[rank_] - gpar_; tpx_->mcount[rank_] = gpar_; }   // recording ran nothing
     }
-    if (gexec_) q_.ext_oneapi_graph(*gexec_);
-    else run(1);
+    // two cards: the graph's mailbox parities are baked from capture time; replay only on the same parity
+    const bool replay = gexec_ && (world_ == 1 || ((tpx_->mcount[rank_] - gpar_) & 1) == 0);
+    if (replay) {
+        q_.ext_oneapi_graph(*gexec_);
+        if (world_ > 1) tpx_->mcount[rank_] += gex_;
+    } else run(1);
     if (logits_out) { logits_out->resize(c_.output_vocab); q_.memcpy(logits_out->data(), logits_, size_t(c_.output_vocab) * sizeof(float)); }
     const int next = final_token();
     ++pos_;
@@ -1499,7 +1617,8 @@ void Engine::run(int M) {
         }
         const int NA = Ly.NA, NB = Ly.NB, NC = Ly.NC;
         if (M == 1) {
-            gemvt<0>(Ly.WpT, NA + NB + NC, h, 2, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
+            if (Ly.WpQ) gemvt8<0>(Ly.WpQ, Ly.WpS, NA + NB + NC, h, 4, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
+            else gemvt<0>(Ly.WpT, NA + NB + NC, h, 2, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
         } else {
             const uint16_t* xb[3] = {nb_, same ? nb_ : nb_ + size_t(MM) * h, same ? nb_ : nb_ + 2 * size_t(MM) * h};
             if (M <= 8)
@@ -1858,11 +1977,13 @@ void Engine::run(int M) {
         }
         mark(2);
         if (world_ > 1) {
-            if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            if (M == 1 && Ly.WoQ) gemvt8<1>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            else if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
             else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, false);
             allreduce(row(Z), size_t(M) * h);
-        } else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        } else if (M == 1 && Ly.WoQ) gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);
         int bank_row = -1;
@@ -2022,7 +2143,8 @@ void Engine::run(int M) {
         return;
     }
     const int VL = vvalid_, vbase = v0_;
-    gemv<2>(unembed_, VL, h, row(N0, M - 1), logits_, VL, nullptr, nullptr, VL, nullptr, nullptr, c_.logit_cap);
+    if (unembedQ_) gemvt8<2>(unembedQ_, unembedS_, vrows_, h, 2, row(N0, M - 1), logits_, vrows_, nullptr, nullptr, vrows_, nullptr, nullptr, c_.logit_cap);
+    else gemv<2>(unembed_, VL, h, row(N0, M - 1), logits_, VL, nullptr, nullptr, VL, nullptr, nullptr, c_.logit_cap);
     {
         const float* lg = logits_;
         float* bv = amx_v_;
@@ -2258,9 +2380,30 @@ int main(int argc, char** argv) try {
         const bool shared = std::getenv("INK_TPCTX") && std::string(std::getenv("INK_TPCTX")) == "shared";
         std::printf("two cards, %s contexts\n", shared ? "one shared" : "separate");
         sycl::context cs(devs), c0(devs[0]), c1(devs[1]);
-        sycl::queue q0(shared ? cs : c0, devs[0], sycl::property_list{sycl::property::queue::in_order()});
-        sycl::queue q1(shared ? cs : c1, devs[1], sycl::property_list{sycl::property::queue::in_order()});
+        // INK_DEVX=1: device mailboxes in pinned host memory of the two-card context; each card's queue in its own SYCL
+        // context over that same native Level Zero context (Xenithium rt/fabric.cpp), so both kernels can touch the boxes
+        const bool devx = std::getenv("INK_DEVX") && std::atoi(std::getenv("INK_DEVX")) == 1;
+        auto per_card = [&](int r) {
+            if (!devx) return r == 0 ? c0 : c1;
+            const auto nat = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(cs);
+            return sycl::make_context<sycl::backend::ext_oneapi_level_zero>(
+                sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::context>{nat, {devs[r]}, sycl::ext::oneapi::level_zero::ownership::keep});
+        };
+        sycl::context k0 = per_card(0), k1 = per_card(1);
+        sycl::queue q0(shared ? cs : k0, devs[0], sycl::property_list{sycl::property::queue::in_order()});
+        sycl::queue q1(shared ? cs : k1, devs[1], sycl::property_list{sycl::property::queue::in_order()});
         TPX tpx;
+        if (devx) {
+            for (int r = 0; r < 2; ++r) {
+                tpx.box[r] = sycl::malloc_host<uint32_t>(2 * TPX::kBoxWords, cs);
+                if (!tpx.box[r]) throw std::runtime_error("mailbox");
+                std::fill(tpx.box[r], tpx.box[r] + 2 * TPX::kBoxWords, kEmpty);
+            }
+            tpx.err = sycl::malloc_host<uint32_t>(2, cs);
+            tpx.err[0] = tpx.err[1] = 0;
+            std::printf("device mailboxes in pinned host memory (system atomics on host USM: %s / %s)\n",
+                        devs[0].has(sycl::aspect::usm_atomic_host_allocations) ? "yes" : "no", devs[1].has(sycl::aspect::usm_atomic_host_allocations) ? "yes" : "no");
+        }
         g_tp_progress = now_ms();
         std::thread([&] {
             for (;;) {
@@ -2333,6 +2476,7 @@ int main(int argc, char** argv) try {
                 std::vector<int> out{nx};
                 for (int g = 1; g < 12; ++g) { nx = E.step(nx); out.push_back(nx); }
                 if (r == 0) { std::printf("two-card greedy after 5 prompt tokens:"); for (int v : out) std::printf(" %d", v); std::printf("\n"); }
+                if (r == 0 && tpx.err) std::printf("  mailbox spin timeouts after check: card 0 %u, card 1 %u\n", tpx.err[0], tpx.err[1]);
                 E.reset();
             }
             if (r == 0) std::printf("| test | tokens | time (ms) | tok/s |\n|---|---|---|---|\n");
@@ -2350,6 +2494,7 @@ int main(int argc, char** argv) try {
                 const double tms = ms_since(t0);
                 if (r == 0) { std::printf("| pp%d | %d | %.1f | %.1f |\n| tg%d @ %d | %d | %.1f | %.1f |\n", pp, pp, pms, 1000.0 * pp / pms, tg, pp, tg, tms, 1000.0 * tg / tms); std::fflush(stdout); }
                 if (r == 0) for (int c = 0; c < 2; ++c) std::printf("  card %d: %ld exchanges, copy-out wait %.1f ms, thread meet %.1f ms\n", c, g_tp_n[c], g_tp_wait_ms[c][0], g_tp_wait_ms[c][1]);
+                if (r == 0 && tpx.err) std::printf("  mailbox spin timeouts: card 0 %u, card 1 %u\n", tpx.err[0], tpx.err[1]);
             }
         };
         std::thread t1(work, 1);
