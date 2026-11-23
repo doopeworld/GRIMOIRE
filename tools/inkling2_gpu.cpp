@@ -473,9 +473,9 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
     const size_t RS = rs_;
     const float f = 1.f / std::sqrt(float(h));
     q_.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(16 * 2 * kMixRows), cgh);
+        sycl::local_accessor<float, 1> red(sycl::range<1>(64 * 2 * kMixRows), cgh);
         sycl::local_accessor<float, 1> tot(sycl::range<1>(2 * kMixRows), cgh);
-        cgh.parallel_for<InkMix>(sycl::nd_range<1>(size_t(b.count) * M * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        cgh.parallel_for<InkMix>(sycl::nd_range<1>(size_t(b.count) * M * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const int gi = int(it.get_group(0));
             const MixJob& J = b.j[gi / M];
             const size_t mo = size_t(m0 + gi % M) * h;
@@ -486,7 +486,7 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
             float ss[kMixRows], qd[kMixRows];
 #pragma unroll
             for (int r = 0; r < kMixRows; ++r) { ss[r] = 0.f; qd[r] = 0.f; }
-            for (int i = lid; i < h; i += 256) {
+            for (int i = lid; i < h; i += 1024) {
                 const float qv = J.query[i];
 #pragma unroll
                 for (int r = 0; r < kMixRows; ++r)
@@ -500,7 +500,7 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
                     if (lane == 0) { red[sgid * 2 * kMixRows + r] = a; red[sgid * 2 * kMixRows + kMixRows + r] = c; }
                 }
             sycl::group_barrier(it.get_group());
-            if (lid < 2 * kMixRows) { float t = 0.f; for (int g = 0; g < 16; ++g) t += red[g * 2 * kMixRows + lid]; tot[lid] = t; }
+            if (lid < 2 * kMixRows) { float t = 0.f; for (int g = 0; g < 64; ++g) t += red[g * 2 * kMixRows + lid]; tot[lid] = t; }
             sycl::group_barrier(it.get_group());
             float inv[kMixRows], sc[kMixRows];
             float high = -INFINITY;
@@ -512,7 +512,7 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
             for (int r = 0; r < kMixRows; ++r)
                 if (r < n) { sc[r] = sycl::exp(sc[r] - high); sum += sc[r]; }
             float* out = pool + size_t(J.out) * RS + mo;
-            for (int i = lid; i < h; i += 256) {
+            for (int i = lid; i < h; i += 1024) {
                 float o = 0.f;
 #pragma unroll
                 for (int r = 0; r < kMixRows; ++r)
@@ -528,18 +528,19 @@ void Engine::rms(const NormBatch& b, int M, int m0) {
     const int h = h_;
     const size_t RS = rs_;
     const float eps = c_.eps;
-    q_.parallel_for<InkRms>(sycl::nd_range<1>(size_t(b.count) * M * 256, 256), [=](sycl::nd_item<1> it) {
+    const int WGN = M == 1 ? 1024 : 256;
+    q_.parallel_for<InkRms>(sycl::nd_range<1>(size_t(b.count) * M * WGN, WGN), [=](sycl::nd_item<1> it) {
         const int gi = int(it.get_group(0));
         const NormJob& J = b.j[gi / M];
         const int m = m0 + gi % M;
         const int lid = int(it.get_local_id(0));
         const float* x = pool + size_t(J.in) * RS + size_t(m) * h;
         float ss = 0.f;
-        for (int i = lid; i < h; i += 256) ss += x[i] * x[i];
+        for (int i = lid; i < h; i += WGN) ss += x[i] * x[i];
         ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
         const float r = 1.f / sycl::sqrt(ss / float(h) + eps);
         float* y = pool + size_t(J.out) * RS + size_t(m) * h;
-        for (int i = lid; i < h; i += 256) {
+        for (int i = lid; i < h; i += WGN) {
             const float v = bfr((x[i] * r) * bfw(J.w[i]));
             y[i] = v;
             if (J.outb) J.outb[size_t(m) * h + i] = tobf(v);
@@ -611,16 +612,21 @@ inline void fill_tables(float* e4, float* wp, float* wt, int lid, int lsz) {
         const float sgn = (lid & 8) ? -1.f : 1.f;
         const float mag = c == 0 ? 0.f : (c == 1 ? 0.5f : (c <= 3 ? 1.f : (c <= 5 ? 2.f : 4.f)));
         const bool t = c == 3 || c == 5 || c == 7;
-        wp[lid] = t ? 0.f : sgn * mag;
-        wt[lid] = t ? sgn * mag : 0.f;
+        wp[2 * lid] = t ? 0.f : sgn * mag;
+        wp[2 * lid + 1] = t ? sgn * mag : 0.f;
+        wt[lid] = 0.f;
     }
 }
 inline void nv8(uint32_t w, const float* xr, const float* wp, const float* wt, float& A, float& B) {
+    // wp and wt interleaved: wp[2n] = class-1 weight, wp[2n+1] = class-1.5 weight (one 8-byte SLM read)
+    (void)wt;
+    const sycl::float2* t2 = reinterpret_cast<const sycl::float2*>(wp);
 #pragma unroll
     for (int t = 0; t < 8; ++t) {
         const uint32_t n = (w >> (4 * t)) & 15u;
-        A = sycl::fma(wp[n], xr[t], A);
-        B = sycl::fma(wt[n], xr[t], B);
+        const sycl::float2 v = t2[n];
+        A = sycl::fma(v[0], xr[t], A);
+        B = sycl::fma(v[1], xr[t], B);
     }
 }
 // NVFP4 block table: value(code c) = bfr((e2m1(c)*sc)*outer) = {0, q1/2, q1, q3, 2q1, 2q3, 4q1, 4q3} (exact).
@@ -636,6 +642,39 @@ inline float nvt8(uint32_t w, const float* xr, const sycl::vec<float, 8>& tv, fl
         acc = sycl::fma((n & 8u) ? -v : v, xr[t], acc);
     }
     return acc;
+}
+// 16-entry code tables held in the sub-group's registers (lane j = code j), read by shuffle: no SLM traffic.
+inline float tab_p(int lane) {
+    const int c = lane & 7;
+    const float sgn = (lane & 8) ? -1.f : 1.f;
+    const float mag = c == 0 ? 0.f : (c == 1 ? 0.5f : (c <= 3 ? 1.f : (c <= 5 ? 2.f : 4.f)));
+    return (c == 3 || c == 5 || c == 7) ? 0.f : sgn * mag;
+}
+inline float tab_t(int lane) {
+    const int c = lane & 7;
+    const float sgn = (lane & 8) ? -1.f : 1.f;
+    const float mag = c <= 3 ? 1.f : (c <= 5 ? 2.f : 4.f);
+    return (c == 3 || c == 5 || c == 7) ? sgn * mag : 0.f;
+}
+inline void nvs8(sycl::sub_group sg, uint32_t w, const float* xr, float tp, float tt, float& A, float& B) {
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t n = (w >> (4 * t)) & 15u;
+        A = sycl::fma(sycl::select_from_group(sg, tp, n), xr[t], A);
+        B = sycl::fma(sycl::select_from_group(sg, tt, n), xr[t], B);
+    }
+}
+// Byte table: tb[b] = (class-1 lo, class-1.5 lo, class-1 hi, class-1.5 hi) for byte b (two E2M1 codes).
+inline void fill_btab(sycl::float4* tb, const float* wp, int lid, int lsz) {
+    for (int b = lid; b < 256; b += lsz) tb[b] = sycl::float4(wp[2 * (b & 15)], wp[2 * (b & 15) + 1], wp[2 * (b >> 4)], wp[2 * (b >> 4) + 1]);
+}
+inline void nvb8(uint32_t w, const float* xr, const sycl::float4* tb, float& A, float& B) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const sycl::float4 t = tb[(w >> (8 * j)) & 255u];
+        A = sycl::fma(t[0], xr[2 * j], A); B = sycl::fma(t[1], xr[2 * j], B);
+        A = sycl::fma(t[2], xr[2 * j + 1], A); B = sycl::fma(t[3], xr[2 * j + 1], B);
+    }
 }
 inline float mx4(uint32_t w, const float* xr, const float* e4) {
     float a = 0.f;
@@ -663,15 +702,21 @@ void Engine::experts_decode(const Layer& Ly) {
         const uint8_t *W = Ly.gu, *S = Ly.gus;
         const float *amax = Ly.gua, *den = Ly.gud;
         const size_t rb = NV ? h / 2 : h, sb = NV ? h / 16 : h / 32;
-        const int steps = h / 256, wpb = I / (R * SGS);
+        const int wpb = I / (R * SGS);
+        constexpr int steps = 9;
+        if (h != 256 * steps) throw std::runtime_error("decode experts: hidden 2304 only");
         q_.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> e4s(256, cgh), wps(16, cgh), wts(16, cgh);
+            sycl::local_accessor<float, 1> e4s(256, cgh), wps(32, cgh), wts(16, cgh);
+            sycl::local_accessor<sycl::float4, 1> tbs(256, cgh);
             cgh.parallel_for<InkGu>(sycl::nd_range<1>(size_t(TK) * wpb * SGS * 16, SGS * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int lid = int(it.get_local_id(0));
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* wp = wps.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* wt = wts.template get_multi_ptr<sycl::access::decorated::no>().get();
+                sycl::float4* tb = tbs.template get_multi_ptr<sycl::access::decorated::no>().get();
                 fill_tables(e4, wp, wt, lid, SGS * 16);
+                sycl::group_barrier(it.get_group());
+                fill_btab(tb, wp, lid, SGS * 16);
                 sycl::group_barrier(it.get_group());
                 auto sg = it.get_sub_group();
                 const int lane = int(sg.get_local_linear_id());
@@ -682,6 +727,7 @@ void Engine::experts_decode(const Layer& Ly) {
                 float g[R], u[R];
 #pragma unroll
                 for (int r = 0; r < R; ++r) { g[r] = 0.f; u[r] = 0.f; }
+#pragma unroll
                 for (int k = 0; k < steps; ++k) {
                     const int blk = k * 16 + lane;
                     float xr[16];
@@ -693,8 +739,8 @@ void Engine::experts_decode(const Layer& Ly) {
                             const sycl::uint2 pg = *reinterpret_cast<const sycl::uint2*>(W + gr * rb + size_t(blk) * 8);
                             const sycl::uint2 pu = *reinterpret_cast<const sycl::uint2*>(W + ur * rb + size_t(blk) * 8);
                             float ag = 0.f, bg = 0.f, au = 0.f, bu = 0.f;
-                            nv8(pg[0], xr, wp, wt, ag, bg); nv8(pg[1], xr + 8, wp, wt, ag, bg);
-                            nv8(pu[0], xr, wp, wt, au, bu); nv8(pu[1], xr + 8, wp, wt, au, bu);
+                            nvb8(pg[0], xr, tb, ag, bg); nvb8(pg[1], xr + 8, tb, ag, bg);
+                            nvb8(pu[0], xr, tb, au, bu); nvb8(pu[1], xr + 8, tb, au, bu);
                             const float sgc = e4[S[gr * sb + blk]], suc = e4[S[ur * sb + blk]];
                             g[r] += bfrf(sgc * outer) * ag + bfrf((1.5f * sgc) * outer) * bg;
                             u[r] += bfrf(suc * outer) * au + bfrf((1.5f * suc) * outer) * bu;
@@ -726,15 +772,21 @@ void Engine::experts_decode(const Layer& Ly) {
         const uint8_t *W = Ly.dn, *S = Ly.dns;
         const float *amax = Ly.dna, *den = Ly.dnd;
         const size_t rb = NV ? I / 2 : I, sb = NV ? I / 16 : I / 32;
-        const int steps = I / 128, wpb = h / (R * SGS);
+        const int wpb = h / (R * SGS);
+        constexpr int steps = 9;
+        if (I != 128 * steps) throw std::runtime_error("decode experts: inter 1152 only");
         q_.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> e4s(256, cgh), wps(16, cgh), wts(16, cgh);
+            sycl::local_accessor<float, 1> e4s(256, cgh), wps(32, cgh), wts(16, cgh);
+            sycl::local_accessor<sycl::float4, 1> tbs(256, cgh);
             cgh.parallel_for<InkDown>(sycl::nd_range<1>(size_t(TK) * wpb * SGS * 16, SGS * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int lid = int(it.get_local_id(0));
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* wp = wps.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* wt = wts.template get_multi_ptr<sycl::access::decorated::no>().get();
+                sycl::float4* tb = tbs.template get_multi_ptr<sycl::access::decorated::no>().get();
                 fill_tables(e4, wp, wt, lid, SGS * 16);
+                sycl::group_barrier(it.get_group());
+                fill_btab(tb, wp, lid, SGS * 16);
                 sycl::group_barrier(it.get_group());
                 auto sg = it.get_sub_group();
                 const int lane = int(sg.get_local_linear_id());
@@ -746,6 +798,7 @@ void Engine::experts_decode(const Layer& Ly) {
                 float d[R];
 #pragma unroll
                 for (int r = 0; r < R; ++r) d[r] = 0.f;
+#pragma unroll
                 for (int k = 0; k < steps; ++k) {
                     const int c = k * 16 + lane;
                     float xr[8];
@@ -756,7 +809,7 @@ void Engine::experts_decode(const Layer& Ly) {
                         if (NV) {
                             const uint32_t pw = *reinterpret_cast<const uint32_t*>(W + rw * rb + size_t(c) * 4);
                             float A = 0.f, B = 0.f;
-                            nv8(pw, xr, wp, wt, A, B);
+                            nvb8(pw, xr, tb, A, B);
                             const float sc = e4[S[rw * sb + c / 2]];
                             d[r] += bfrf(sc * outer) * A + bfrf((1.5f * sc) * outer) * B;
                         } else {

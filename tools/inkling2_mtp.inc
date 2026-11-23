@@ -94,7 +94,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
         const size_t rb = NV ? h / 2 : h, sb = NV ? h / 16 : h / 32;
         const int steps = h / 256, wpb = I / (R * SGS);
         q_.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> e4s(256, cgh), wps(16, cgh), wts(16, cgh);
+            sycl::local_accessor<float, 1> e4s(256, cgh), wps(32, cgh), wts(16, cgh);
             cgh.parallel_for<InkGuS>(sycl::nd_range<1>(size_t(U) * wpb * SGS * 16, SGS * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int lid = int(it.get_local_id(0));
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -178,7 +178,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
         const size_t rb = NV ? I / 2 : I, sb = NV ? I / 16 : I / 32;
         const int steps = I / 128, wpb = h / (R * SGS);
         q_.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> e4s(256, cgh), wps(16, cgh), wts(16, cgh);
+            sycl::local_accessor<float, 1> e4s(256, cgh), wps(32, cgh), wts(16, cgh);
             cgh.parallel_for<InkDownS>(sycl::nd_range<1>(size_t(U) * wpb * SGS * 16, SGS * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int lid = int(it.get_local_id(0));
                 float* e4 = e4s.template get_multi_ptr<sycl::access::decorated::no>().get();
