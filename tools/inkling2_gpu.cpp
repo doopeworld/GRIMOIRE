@@ -39,12 +39,12 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
+class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
 class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
-class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkHistV; class InkPosV;
+class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
     const float* A; int NA, oq, orel, osink, og;
@@ -134,11 +134,14 @@ struct GateBatch { GateJob j[3]; int count; };
 // Two-card watchdog: every exchange stamps progress; no progress for 60 s -> print where each card is and exit.
 static std::atomic<long long> g_tp_progress{0};
 static std::atomic<int> g_tp_stage[2] = {};
+static double g_tp_wait_ms[2][2] = {};   // per card: copy-out wait, thread meet
+static long g_tp_n[2] = {};
 static long long now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 struct TPX {
     static constexpr int NS = 8;
     float* hb[2][NS] = {};
+    float* ib[2][NS] = {};   // small exchanges: card r's IN slots (pinned in r's context); the peer's host thread fills them
     sycl::event d2h[2][NS], h2d[2][NS];
     std::barrier<> bar{2};
     float bv[2][8] = {};
@@ -151,6 +154,7 @@ enum Row { HID, RES, X0, X1, X2, XM, N0, N1, N2, NM, M0, M1, M2, M3, PRE, PREV, 
 class Engine {
 public:
     double sect_ms_[8] = {};
+    void sync_all() { q_.wait(); }
     Engine(sycl::queue& q, const std::string& dir, int limit, int chunk, int rank = 0, int world = 1, TPX* tpx = nullptr)
         : q_(q), ck_(Checkpoint::open(dir)), c_(ck_.config), dev_(q), limit_(limit), mmax_(std::max(1, chunk)), rank_(rank), world_(world), tpx_(tpx) {
         if (limit < 1 || limit > c_.max_context) throw std::invalid_argument("bad context");
@@ -187,6 +191,8 @@ private:
     float* tbl_d_ = nullptr;
     void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
     int final_token(int m = 0);
+    void final_tokens(int n, int* out);
+    void argmax_rows_v(const float* lg, int ld, int V, int n, int* out, float* val, int base);
     size_t rs_ = 0;
     std::vector<Visit> visits_;
     std::vector<Layer> L_;
@@ -225,6 +231,7 @@ private:
                                     float* y0, size_t ld0, int end0, float* y1, size_t ld1, int end1, float* y2, size_t ld2, int nvalid,
                                     float cap = 0.f);
     uint16_t* unembedT_ = nullptr;
+    uint16_t* unembedFullT_ = nullptr;   // two cards + MTP: the drafter's full-vocab copy (tiled)
     void run(int M);
     void dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, const uint16_t* xb, float* y, size_t ldy, int M, bool round);
     template <int MODE> void gemv(const uint16_t* W, int rows, int K, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
@@ -417,7 +424,8 @@ void Engine::load() {
         peer_ = dev_.zeros<float>(mm * h_);
         for (int k = 0; k < TPX::NS; ++k) {  // this card's outgoing slots, pinned in its own context
             tpx_->hb[rank_][k] = sycl::malloc_host<float>(mm * h_, q_.get_context());
-            if (!tpx_->hb[rank_][k]) throw std::runtime_error("pinned host exchange buffers");
+            tpx_->ib[rank_][k] = sycl::malloc_host<float>(size_t(64) * h_, q_.get_context());
+            if (!tpx_->hb[rank_][k] || !tpx_->ib[rank_][k]) throw std::runtime_error("pinned host exchange buffers");
         }
     }
     amx_v_ = dev_.zeros<float>(4096); amx_i_ = dev_.zeros<int>(4096);
@@ -1271,7 +1279,25 @@ void Engine::allreduce(float* buf, size_t n) {
     float* mine = x.hb[me][k];
     const float* theirs = x.hb[peer][k];
     g_tp_stage[me] = 1;  // copying out
+    const auto t0 = std::chrono::steady_clock::now();
     q_.memcpy(mine, buf, n * sizeof(float)).wait();
+    const auto t1 = std::chrono::steady_clock::now();
+    g_tp_wait_ms[me][0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    ++g_tp_n[me];
+    if (n <= size_t(64) * h_) {
+        // small (decode / verify): the host thread writes our part straight into the peer's pinned IN slot and the
+        // add kernel reads its own IN slot over PCIe -- no copy-in command.  Slot k is reused NS exchanges later,
+        // after this card's add kernel ran (its later copy-out waits behind it on the in-order queue).
+        std::memcpy(x.ib[peer][k], mine, n * sizeof(float));
+        g_tp_stage[me] = 2;
+        x.bar.arrive_and_wait();
+        g_tp_wait_ms[me][1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        g_tp_stage[me] = 3;
+        g_tp_progress = now_ms();
+        const float* in = x.ib[me][k];
+        q_.parallel_for<InkAddRoundH>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + in[i[0]]); });
+        return;
+    }
     g_tp_stage[me] = 2;  // waiting for the other card's thread
     x.bar.arrive_and_wait();
     g_tp_stage[me] = 3;
@@ -1284,6 +1310,25 @@ void Engine::allreduce(float* buf, size_t n) {
 }
 
 // Both cards hold the best (value, index) of their vocabulary half; the host picks (lowest index on ties).
+// n rows' tokens: one card = next_; two cards = per row the better (value, lowest index on ties) of both halves
+void Engine::final_tokens(int n, int* out) {
+    if (world_ == 1) { q_.memcpy(out, next_, size_t(n) * sizeof(int)).wait(); return; }
+    float v[8]; int i[8];
+    q_.memcpy(v, bestv_, size_t(n) * sizeof(float));
+    q_.memcpy(i, next_, size_t(n) * sizeof(int)).wait();
+    g_tp_stage[rank_] = 6;
+    g_tp_progress = now_ms();
+    TPX& x = *tpx_;
+    for (int m = 0; m < n; ++m) { x.bv[rank_][m] = v[m]; x.bi[rank_][m] = i[m]; }
+    x.bar.arrive_and_wait();
+    for (int m = 0; m < n; ++m) {
+        const float v0 = x.bv[0][m], v1 = x.bv[1][m];
+        const int i0 = x.bi[0][m], i1 = x.bi[1][m];
+        out[m] = (v1 > v0 || (v1 == v0 && i1 < i0)) ? i1 : i0;
+    }
+    x.bar.arrive_and_wait();
+}
+
 int Engine::final_token(int m) {
     float v; int i;
     if (world_ > 1) g_tp_stage[rank_] = 4;  // reading the token
@@ -1965,8 +2010,13 @@ void Engine::run(int M) {
     }
     const int V = c_.output_vocab;
     if (all_logits_) {
-        gemvtm<2>(unembedT_, c_.vocab, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V, c_.logit_cap);
-        argmax_rows(logitsM_, V, M, next_);
+        if (world_ == 1) {
+            gemvtm<2>(unembedT_, c_.vocab, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V, c_.logit_cap);
+            argmax_rows(logitsM_, V, M, next_);
+        } else {   // this card's vocabulary half; best (value, global index) per row, picked across cards on the host
+            gemvtm<2>(unembedT_, vrows_, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, vrows_, nullptr, 0, vrows_, nullptr, 0, vvalid_, c_.logit_cap);
+            argmax_rows_v(logitsM_, V, vvalid_, M, next_, bestv_, v0_);
+        }
         int* pd = pos_d_;
         q_.single_task<InkPosV>([=]() { *pd += M; });
         return;
@@ -2044,7 +2094,7 @@ int main(int argc, char** argv) try {
     const auto ids = read_ids(argv[3]);
     const int ctx = std::atoi(argv[4]);
     const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devs.size() != 1 && mode != "tp") throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
+    if (devs.size() != 1 && mode != "tp" && mode != "tpmtp") throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
     sycl::queue q(devs[0], sycl::property_list{sycl::property::queue::in_order()});
     std::printf("%s\n", devs[0].get_info<sycl::info::device::name>().c_str());
     if (mode == "check") {
@@ -2196,7 +2246,8 @@ int main(int argc, char** argv) try {
         }
         return 0;
     }
-    if (mode == "tp") {
+    if (mode == "tp" || mode == "tpmtp") {
+        // tpmtp: inkling2_gpu MODEL tpmtp IDS CTX PP N [CHUNK]: two cards, plain greedy vs DSpark MTP
         // inkling2_gpu MODEL tp IDS CTX PP_LIST TG [CHUNK]: two cards (both visible), greedy check of the first prompt + bench
         std::vector<int> pps;
         { std::stringstream ss(argv[5]); std::string t; while (std::getline(ss, t, ',')) pps.push_back(std::atoi(t.c_str())); }
@@ -2229,7 +2280,52 @@ int main(int argc, char** argv) try {
             g_tp_progress = now_ms();
         }
         for (auto& e : eng) e->use_graph = false;
+        const bool mtp_mode = mode == "tpmtp";
+        auto work_mtp = [&](int r) {
+            Engine& E = *eng[r];
+            E.load_mtp(std::string(argv[1]) + "/mtp.safetensors");
+            g_tp_progress = now_ms();
+            const int n = tg;
+            std::vector<int> p(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), size_t(pps[0])));
+            {   // warm-up
+                int nx = E.prefill(p);
+                for (int i = 0; i < 4; ++i) nx = E.step(nx);
+                E.reset();
+                nx = E.prefill(p);
+                for (int i = 0; i < 2; ++i) { const auto got = E.mtp_step(nx); nx = got.back(); }
+                E.reset();
+            }
+            int nx = E.prefill(p);
+            std::vector<int> plain{nx};
+            E.sync_all();
+            auto t0 = std::chrono::steady_clock::now();
+            for (int g = 1; g < n; ++g) { nx = E.step(nx); plain.push_back(nx); }
+            const double tpl = ms_since(t0);
+            E.reset();
+            nx = E.prefill(p);
+            std::vector<int> spec{nx};
+            int steps = 0;
+            E.sync_all();
+            t0 = std::chrono::steady_clock::now();
+            while (int(spec.size()) < n) {
+                const auto got = E.mtp_step(spec.back());
+                spec.insert(spec.end(), got.begin(), got.end());
+                ++steps;
+            }
+            const double ts = ms_since(t0);
+            spec.resize(n);
+            int same = 0;
+            while (same < n && plain[same] == spec[same]) ++same;
+            if (r == 0) {
+                std::printf("two cards, prompt %d tokens, %d new tokens\n", int(p.size()), n);
+                std::printf("plain head:"); for (int g = 0; g < std::min(n, 16); ++g) std::printf(" %d", plain[g]);
+                std::printf("\nplain greedy: %.1f tok/s\n", 1000.0 * (n - 1) / tpl);
+                std::printf("MTP: %.1f tok/s, %d steps, %.2f tokens/step, %.1f ms/step\n", 1000.0 * (n - 1) / ts, steps, double(n - 1) / steps, ts / steps);
+                std::printf("MTP output equals plain greedy for the first %d of %d tokens\n", same, n);
+            }
+        };
         auto work = [&](int r) {
+            if (mtp_mode) { work_mtp(r); return; }
             Engine& E = *eng[r];
             {   // warm-up + 5-token greedy check
                 std::vector<int> five(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 5));
@@ -2247,10 +2343,13 @@ int main(int argc, char** argv) try {
                 auto t0 = std::chrono::steady_clock::now();
                 int nx = E.prefill(p);
                 const double pms = ms_since(t0);
+                E.sync_all();
+                g_tp_n[r] = 0; g_tp_wait_ms[r][0] = g_tp_wait_ms[r][1] = 0;
                 t0 = std::chrono::steady_clock::now();
                 for (int g = 0; g < tg; ++g) nx = E.step(nx);
                 const double tms = ms_since(t0);
                 if (r == 0) { std::printf("| pp%d | %d | %.1f | %.1f |\n| tg%d @ %d | %d | %.1f | %.1f |\n", pp, pp, pms, 1000.0 * pp / pms, tg, pp, tg, tms, 1000.0 * tg / tms); std::fflush(stdout); }
+                if (r == 0) for (int c = 0; c < 2; ++c) std::printf("  card %d: %ld exchanges, copy-out wait %.1f ms, thread meet %.1f ms\n", c, g_tp_n[c], g_tp_wait_ms[c][0], g_tp_wait_ms[c][1]);
             }
         };
         std::thread t1(work, 1);

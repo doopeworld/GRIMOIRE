@@ -301,6 +301,17 @@ void Engine::load_mtp(const std::string& path) {
         return d;
     };
     const int h = h_, V = c_.output_vocab, Vp = c_.vocab;
+    // the drafter needs every vocabulary row: one card has them all; two cards load a full copy for it
+    const uint16_t* Urow = unembed_;
+    uint16_t* Ufull = nullptr;
+    if (world_ > 1) {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(host("model.llm.unembed.weight"));
+        Ufull = sycl::malloc_device<uint16_t>(size_t(Vp) * h, q_);
+        if (!Ufull) throw std::runtime_error("mtp: full unembed");
+        q_.memcpy(Ufull, src, size_t(Vp) * h * 2).wait();
+        unembedFullT_ = tiled(src, Vp, h);
+        Urow = Ufull;
+    } else unembedFullT_ = unembedT_;
     for (int l = 0; l < 3; ++l) {
         const auto s = "layers." + std::to_string(l) + ".";
         DLayer& L = d_.L[l];
@@ -360,7 +371,7 @@ void Engine::load_mtp(const std::string& path) {
         if (!tmp) throw std::runtime_error("mtp fold scratch");
         b70::QuantWeight w;
         w.fmt = b70::Fmt::BF16; w.N = 256; w.K = h; w.payload = reinterpret_cast<const uint8_t*>(dhoT); w.row_bytes = int64_t(h) * 2;
-        b70::launch_gemm_fast(q_, w, reinterpret_cast<const bf16x*>(unembed_), tmp, V);
+        b70::launch_gemm_fast(q_, w, reinterpret_cast<const bf16x*>(Urow), tmp, V);
         d_.foldW = dev_.alloc<uint16_t>(size_t(V) * 256);
         uint16_t* fw = d_.foldW;
         q_.parallel_for<InkCopy>(sycl::range<1>(size_t(V) * 256), [=](sycl::id<1> id) { fw[id[0]] = tobf(tmp[id[0]]); });
@@ -369,9 +380,10 @@ void Engine::load_mtp(const std::string& path) {
         float* dhb = dev_.alloc<float>(h);
         q_.memcpy(dhb, hb.data(), size_t(h) * 4).wait();
         d_.foldB = dev_.alloc<float>(V);
-        gemv<0>(unembed_, V, h, dhb, d_.foldB, V, nullptr, nullptr, V, nullptr, nullptr);
+        gemv<0>(Urow, V, h, dhb, d_.foldB, V, nullptr, nullptr, V, nullptr, nullptr);
         q_.wait();
         sycl::free(tmp, q_);
+        if (Ufull) sycl::free(Ufull, q_);
     }
     const size_t mm = size_t(mmax_);
     d_.r = dev_.zeros<float>(8 * size_t(h)); d_.x = dev_.zeros<float>(8 * size_t(h)); d_.qkv = dev_.zeros<float>(8 * 5120);
@@ -624,7 +636,7 @@ void Engine::draft_block(int t, int p_in) {
         if (bd) dump_dev(q_, ("r_mlp" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
     }
     norm8(r, d_.norm, d_.fin, 7, 1);
-    gemvtm<0>(unembedT_, c_.vocab, h, 1, 7, d_.fin + h, d_.fin + h, d_.fin + h, h, d_.base, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V);
+    gemvtm<0>(unembedFullT_, c_.vocab, h, 1, 7, d_.fin + h, d_.fin + h, d_.fin + h, h, d_.base, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V);
     if (bd) { dump_dev(q_, "fin", d_.fin, 8 * size_t(h) * 4); dump_dev(q_, "base", d_.base, 7 * size_t(V) * 4); }
     // Markov walk: 7 sequential steps on the device
     q_.memset(d_.state, 0, 256 * sizeof(float));
@@ -705,6 +717,26 @@ void Engine::argmax_rows(const float* lg, int V, int n, int* out) {
     });
 }
 
+// Row-wise argmax over the first V of ld-pitched rows: global index (base + i) and value (lowest index on ties).
+void Engine::argmax_rows_v(const float* lg, int ld, int V, int n, int* out, float* val, int base) {
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> lv(sycl::range<1>(1024), cgh);
+        sycl::local_accessor<int, 1> li(sycl::range<1>(1024), cgh);
+        cgh.parallel_for<InkArgMV>(sycl::nd_range<1>(size_t(n) * 1024, 1024), [=](sycl::nd_item<1> it) {
+            const int m = int(it.get_group(0)), lid = int(it.get_local_id(0));
+            const float* x = lg + size_t(m) * ld;
+            float best = -INFINITY; int bidx = 0x7fffffff;
+            for (int k = lid; k < V; k += 1024) if (x[k] > best) { best = x[k]; bidx = k; }
+            lv[lid] = best; li[lid] = bidx;
+            for (int s = 512; s > 0; s >>= 1) {
+                sycl::group_barrier(it.get_group());
+                if (lid < s && (lv[lid + s] > lv[lid] || (lv[lid + s] == lv[lid] && li[lid + s] < li[lid]))) { lv[lid] = lv[lid + s]; li[lid] = li[lid + s]; }
+            }
+            if (lid == 0) { out[m] = li[0] + base; val[m] = lv[0]; }
+        });
+    });
+}
+
 // One speculative step: draft from (t, pos), verify [t, d1..d7], keep the accepted prefix.
 // Returns the emitted tokens (accepted drafts + the target's next token).
 std::vector<int> Engine::mtp_step(int t, const int* forced) {
@@ -720,8 +752,8 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
     run(8);
     verify_ = all_logits_ = false;
     int nx[8], dr[8];
-    q_.memcpy(nx, next_, 8 * sizeof(int));
-    q_.memcpy(dr, d_.dtok, 8 * sizeof(int)).wait();
+    q_.memcpy(dr, d_.dtok, 8 * sizeof(int));
+    final_tokens(8, nx);
     int a = 0;
     while (a < 7 && nx[a] == dr[a + 1]) ++a;
     static int dbg = std::getenv("INK_DEBUG") ? std::atoi(std::getenv("INK_DEBUG")) : 0;
