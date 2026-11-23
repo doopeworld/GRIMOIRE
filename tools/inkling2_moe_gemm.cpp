@@ -200,7 +200,7 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
     // packed (16 KB), each sub-group's 8 x 64 bf16 weights (16 KB); Q goes through K+V once into registers.
     // Scores stay in the DPAS accumulators: element r of a work-item = row r, column = lane (8 x 16 fp32 tile).
     constexpr int NSG = 16, BM = NSG * TM, BN = 64, D = 128, WGS = NSG * SGS;
-    constexpr int OFF_V = 16384, OFF_P = 32768, SLM = 49152;
+    constexpr int OFF_V = 16384, OFF_P = 32768, SLM = 65536;   // P region: per sub-group 8 x 64 fp32 scores, then bf16 weights
     const int nb = (g.M + BM - 1) / BM;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(SLM), h);
@@ -214,7 +214,8 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
             uint8_t* base8 = slm.template get_multi_ptr<sycl::access::decorated::no>().get();
             uint16_t* Ks = reinterpret_cast<uint16_t*>(base8);
             uint16_t* Vs = reinterpret_cast<uint16_t*>(base8 + OFF_V);
-            uint16_t* Ps = reinterpret_cast<uint16_t*>(base8 + OFF_P) + sm * TM * BN;
+            uint16_t* Ps = reinterpret_cast<uint16_t*>(base8 + OFF_P + sm * TM * BN * 4);
+            float* Sf = reinterpret_cast<float*>(base8 + OFF_P + sm * TM * BN * 4);
             const int base = *a.posd;
             const int mf = b * BM, ml = sycl::min(a.M - 1, mf + BM - 1);
             const int posf = base + mf;
@@ -225,6 +226,8 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
             auto pK = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(reinterpret_cast<bf16*>(Ks));
             auto pV = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(reinterpret_cast<bf16*>(Vs));
             auto pP = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(reinterpret_cast<bf16*>(Ps));
+            auto pSf = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(Sf);
+            const int lane = int(sg.get_local_linear_id());
             {   // Q block (bf16-valued floats) -> SLM [128][128] bf16 (all 32 KB) -> registers
                 uint16_t* Qs = reinterpret_cast<uint16_t*>(base8);
                 const int r = lid / 2, h2 = lid % 2, m = mf + r;
@@ -235,22 +238,43 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
             matrix::joint_matrix<sycl::sub_group, bf16, matrix::use::a, TM, TKB, matrix::layout::row_major> qa[D / TKB];
 #pragma unroll
             for (int kk = 0; kk < D / TKB; ++kk) matrix::joint_matrix_load(sg, qa[kk], pQ + sm * TM * D + kk * TKB, D);
-            auto load_kv = [&](int k0, bool with_v) {
-                // 64 keys x 128 dims; 256 work-items: key lid/4, 32 dims each
-                const int kk = lid / 4, q4 = lid % 4, kp = k0 + kk;
+            // next block's K / V fetched into registers while the current block computes, stored to SLM after
+            sycl::uint4 kr[4], va[2], vb[2];
+            const int kk_ld = (sm & 3) * 16 + lane, q4_ld = sm >> 2;
+            auto fetch_kv = [&](int k0, bool with_v) {
+                const int kp = k0 + kk_ld;
                 const bool ok = kp <= hi;
-                const size_t row = size_t(ok ? kp % a.cap : 0) * a.K + hd + q4 * 32;
-                for (int d0 = 0; d0 < 32; d0 += 8) {
-                    sycl::vec<uint16_t, 8> kv(0), vv(0);
-                    if (ok) {
-                        kv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(a.kc + row + d0);
-                        if (with_v) vv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(a.vc + row + d0);
-                    }
+                const sycl::uint4* src = reinterpret_cast<const sycl::uint4*>(a.kc + size_t(ok ? kp % a.cap : 0) * a.K + hd + q4_ld * 32);
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
-                        const int dd = q4 * 32 + d0 + e;
-                        Ks[((dd >> 1) * BN + kk) * 2 + (dd & 1)] = kv[e];
-                        if (with_v) Vs[((kk >> 1) * D + dd) * 2 + (kk & 1)] = vv[e];
+                for (int v = 0; v < 4; ++v) kr[v] = ok ? src[v] : sycl::uint4(0u);
+                if (with_v)
+#pragma unroll
+                    for (int t2 = 0; t2 < 2; ++t2) {
+                        const int kp2 = sm * 2 + t2, d0 = lane * 8, ka = k0 + 2 * kp2, kb = ka + 1;
+                        va[t2] = ka <= hi ? *reinterpret_cast<const sycl::uint4*>(a.vc + size_t(ka % a.cap) * a.K + hd + d0) : sycl::uint4(0u);
+                        vb[t2] = kb <= hi ? *reinterpret_cast<const sycl::uint4*>(a.vc + size_t(kb % a.cap) * a.K + hd + d0) : sycl::uint4(0u);
+                    }
+            };
+            auto store_kv = [&](bool with_v) {
+                uint32_t* Kw = reinterpret_cast<uint32_t*>(Ks);
+#pragma unroll
+                for (int v = 0; v < 4; ++v)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) Kw[(q4_ld * 16 + v * 4 + i) * BN + kk_ld] = kr[v][i];
+                if (with_v) {
+                    uint32_t* Vw = reinterpret_cast<uint32_t*>(Vs);
+#pragma unroll
+                    for (int t2 = 0; t2 < 2; ++t2) {
+                        const int kp2 = sm * 2 + t2, d0 = lane * 8;
+                        sycl::uint4 w0, w1;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const uint32_t lo2 = (va[t2][i] & 0xFFFFu) | (vb[t2][i] << 16), hi2 = (va[t2][i] >> 16) | (vb[t2][i] & 0xFFFF0000u);
+                            if (i < 2) { w0[2 * i] = lo2; w0[2 * i + 1] = hi2; } else { w1[2 * (i - 2)] = lo2; w1[2 * (i - 2) + 1] = hi2; }
+                        }
+                        sycl::uint4* dst = reinterpret_cast<sycl::uint4*>(Vw + kp2 * D + d0);
+                        dst[0] = w0;
+                        dst[1] = w1;
                     }
                 }
             };
@@ -268,32 +292,52 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
                 }
             };
             // score of row m (absolute), key kp, raw dot x
-            auto score = [&](float x, int m, int kp) {
-                const float qkv = bfr_(bfr_(x) * a.scale);
-                const int distance = base + m - kp;
-                const float bias = distance < a.E ? bfw_(a.bias[(size_t(m) * a.H + j) * a.E + distance]) : 0.f;
-                return bfr_(qkv + bias);
+            auto score = [&](float x, float bias) { return bfr_(bfr_(bfr_(x) * a.scale) + bias); };
+            // all 32 bias values of this lane for a key block, loaded up front (independent loads, clamped index)
+            float bv[TM][4];
+            auto load_bias = [&](int k0) {
+#pragma unroll
+                for (int r = 0; r < TM; ++r) {
+                    const int m = sycl::min(m0 + r, a.M - 1);
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) {
+                        const int distance = base + m - (k0 + c4 * 16 + lane);
+                        const int dc = sycl::clamp(distance, 0, a.E - 1);
+                        const float v = bfw_(a.bias[(size_t(m) * a.H + j) * a.E + dc]);
+                        bv[r][c4] = distance < a.E ? v : 0.f;
+                    }
+                }
             };
             float mx[TM], l[TM];
 #pragma unroll
             for (int r = 0; r < TM; ++r) { mx[r] = -INFINITY; l[r] = 0.f; }
             const bool any = m0 < a.M;
+            fetch_kv(lo, false);
             for (int k0 = lo; k0 <= hi; k0 += BN) {
                 sycl::group_barrier(grp);
-                load_kv(k0, false);
+                store_kv(false);
                 sycl::group_barrier(grp);
+                if (k0 + BN <= hi) fetch_kv(k0 + BN, false);
                 if (!any) continue;
                 qk();
 #pragma unroll
-                for (int n = 0; n < BN / TN; ++n)
-                    ix::joint_matrix_apply(sg, s[n], [&](float& x, size_t r, size_t c) {
-                        const int m = m0 + int(r), pos = base + m, kp = k0 + n * TN + int(c);
-                        const int first = pos + 1 - sycl::min(pos + 1, a.win);
+                for (int n = 0; n < BN / TN; ++n) matrix::joint_matrix_store(sg, s[n], pSf + n * TN, BN, matrix::layout::row_major);
+                load_bias(k0);
+                sycl::group_barrier(sg);
+#pragma unroll
+                for (int r = 0; r < TM; ++r) {
+                    const int m = m0 + r, pos = base + m;
+                    const int first = pos + 1 - sycl::min(pos + 1, a.win);
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) {
+                        const int col = c4 * 16 + lane, kp = k0 + col;
                         if (m < a.M && kp >= first && kp <= pos) {
-                            const float sc = score(x, m, kp);
+                            const float sc = score(Sf[r * BN + col], bv[r][c4]);
                             if (sc > mx[r]) { l[r] = l[r] * sycl::exp(mx[r] - sc) + 1.f; mx[r] = sc; } else l[r] += sycl::exp(sc - mx[r]);
                         }
-                    });
+                    }
+                }
+                sycl::group_barrier(sg);
             }
             float high[TM], sum[TM];
 #pragma unroll
@@ -308,21 +352,34 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
             matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN> o[D / TN];
 #pragma unroll
             for (int n = 0; n < D / TN; ++n) matrix::joint_matrix_fill(sg, o[n], 0.0f);
+            fetch_kv(lo, true);
             for (int k0 = lo; k0 <= hi; k0 += BN) {
                 sycl::group_barrier(grp);
-                load_kv(k0, true);
+                store_kv(true);
                 sycl::group_barrier(grp);
+                if (k0 + BN <= hi) fetch_kv(k0 + BN, true);
                 if (!any) continue;
                 qk();
 #pragma unroll
-                for (int n = 0; n < BN / TN; ++n)
-                    ix::joint_matrix_apply(sg, s[n], [&](float& x, size_t r, size_t c) {
-                        const int m = m0 + int(r), pos = base + m, kp = k0 + n * TN + int(c);
-                        const int first = pos + 1 - sycl::min(pos + 1, a.win);
-                        float w = 0.f;
-                        if (m < a.M && kp >= first && kp <= pos) w = bfr_(sycl::exp(score(x, m, kp) - high[r]) / sum[r]);
-                        Ps[int(r) * BN + n * TN + int(c)] = b70::f32_to_bf16(w).bits;
-                    });
+                for (int n = 0; n < BN / TN; ++n) matrix::joint_matrix_store(sg, s[n], pSf + n * TN, BN, matrix::layout::row_major);
+                load_bias(k0);
+                sycl::group_barrier(sg);
+                float w[TM][4];
+#pragma unroll
+                for (int r = 0; r < TM; ++r) {
+                    const int m = m0 + r, pos = base + m;
+                    const int first = pos + 1 - sycl::min(pos + 1, a.win);
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) {
+                        const int col = c4 * 16 + lane, kp = k0 + col;
+                        w[r][c4] = (m < a.M && kp >= first && kp <= pos) ? bfr_(sycl::exp(score(Sf[r * BN + col], bv[r][c4]) - high[r]) / sum[r]) : 0.f;
+                    }
+                }
+                sycl::group_barrier(sg);   // all scores read before the bf16 weights overwrite them
+#pragma unroll
+                for (int r = 0; r < TM; ++r)
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) Ps[r * BN + c4 * 16 + lane] = b70::f32_to_bf16(w[r][c4]).bits;
                 sycl::group_barrier(sg);
 #pragma unroll
                 for (int kk = 0; kk < BN / TKB; ++kk) {
