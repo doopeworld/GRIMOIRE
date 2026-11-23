@@ -28,11 +28,11 @@ template <int F> class InkMoeG;
 template <int F>
 sycl::event run(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb, int N, int K,
                 const bf16* A, float* out, const int* tiles, int T, const int* uinfo, const float* outer,
-                const std::vector<sycl::event>& deps) {
+                const std::vector<sycl::event>& deps, int Md) {
     constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SGS;
     constexpr int KP = KC1 / 2, BT = KP * NC2;
     static_assert(WG == 2 * NC2, "decode: two work-items per column (16 k each)");
-    const int nNB = N / NC2;
+    const int nNB = (N + NC2 - 1) / NC2;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         sycl::local_accessor<uint32_t, 1> Bs(2 * BT, h);
@@ -42,24 +42,30 @@ sycl::event run(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, size_t r
             auto sg = it.get_sub_group();
             const int lid = int(it.get_local_id(0)), L = int(it.get_group(0));
             const int t = L / nNB, nb = L % nNB;
-            const int u = tiles[2 * t], mb = tiles[2 * t + 1];
-            const int el = uinfo[3 * u], M = uinfo[3 * u + 2];
-            const int64_t rbase = uinfo[3 * u + 1];
-            const float o = outer[u];
+            // F == 2: one dense BF16 weight, tiles implicit (row block t of Md rows)
+            const int u = F == 2 ? 0 : tiles[2 * t], mb = F == 2 ? t : tiles[2 * t + 1];
+            const int el = F == 2 ? 0 : uinfo[3 * u], M = F == 2 ? Md : uinfo[3 * u + 2];
+            const int64_t rbase = F == 2 ? 0 : uinfo[3 * u + 1];
+            const float o = F == 2 ? 1.f : outer[u];
             const int s = lid / SGS, sm = s / SGN, sn = s % SGN;
             const int m0 = mb * MC2 + sm * MC1;
             const bool active = m0 < M, full = m0 + MC1 <= M;
             const bf16* Ae = A + rbase * K;
             const int dn = lid % NC2, dh = lid / NC2;
-            const int64_t grow = int64_t(el) * N + nb * NC2 + dn;
+            const bool wrow_ok = nb * NC2 + dn < N;
+            const int64_t grow = int64_t(el) * N + (wrow_ok ? nb * NC2 + dn : 0);
             const uint8_t* prow = pay + grow * int64_t(rb);
             const uint8_t* srow = scl + grow * int64_t(sb);
             uint32_t* bs = Bs.template get_multi_ptr<sycl::access::decorated::no>().get();
-            sycl::uint4 pk{0, 0, 0, 0};
+            sycl::uint4 pk{0, 0, 0, 0}, pk2{0, 0, 0, 0};
             uint8_t sbyte = 0;
             auto fetch = [&](int k) {
                 const int kb = k + dh * 16;
-                if constexpr (F == 0) {
+                if constexpr (F == 2) {
+                    const sycl::uint4* src = reinterpret_cast<const sycl::uint4*>(prow + size_t(kb) * 2);
+                    pk = wrow_ok ? src[0] : sycl::uint4(0u);
+                    pk2 = wrow_ok ? src[1] : sycl::uint4(0u);
+                } else if constexpr (F == 0) {
                     const sycl::uint2 v = *reinterpret_cast<const sycl::uint2*>(prow + (kb >> 1));
                     pk[0] = v[0]; pk[1] = v[1];
                     sbyte = srow[kb >> 4];
@@ -70,7 +76,10 @@ sycl::event run(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, size_t r
             };
             auto decode = [&](int buf) {
                 uint32_t* d = bs + buf * BT + dh * (KP / 2) * NC2 + dn;
-                if constexpr (F == 0) {
+                if constexpr (F == 2) {
+#pragma unroll
+                    for (int p = 0; p < 8; ++p) d[p * NC2] = p < 4 ? pk[p] : pk2[p - 4];
+                } else if constexpr (F == 0) {
                     // bf((e2m1 * sc) * o) exactly: |e2m1| = 2^k * {1, 1.5} and both products are exact up to the
                     // final rounding, which a power of two does not change -> 2^k * bf(sc*o) or 2^k * bf(1.5sc*o)
                     const float sc = b70::e4m3_to_f32(sbyte);
@@ -149,7 +158,8 @@ sycl::event run(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, size_t r
 #pragma unroll
                 for (int n = 0; n < NC1 / TN; ++n) {
                     const int col = nb * NC2 + sn * NC1 + n * TN;
-                    if (full)
+                    if (F == 2 && col >= N) continue;
+                    if (full && (F != 2 || col + TN <= N))
                         matrix::joint_matrix_store(sg, acc[m][n], pC + size_t(m0 + m * TM) * N + col, N, matrix::layout::row_major);
                     else
                         ix::joint_matrix_store_checked(sg, acc[m][n], pC, size_t(N), matrix::layout::row_major, size_t(M),
@@ -167,8 +177,15 @@ sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const u
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
                             const float* outer, const std::vector<sycl::event>& deps) {
     const bf16* a = reinterpret_cast<const bf16*>(A);
-    return fmt == 0 ? run<0>(q, pay, scl, rb, sb, N, K, a, out, tiles, T, uinfo, outer, deps)
-                    : run<1>(q, pay, scl, rb, sb, N, K, a, out, tiles, T, uinfo, outer, deps);
+    return fmt == 0 ? run<0>(q, pay, scl, rb, sb, N, K, a, out, tiles, T, uinfo, outer, deps, 0)
+                    : run<1>(q, pay, scl, rb, sb, N, K, a, out, tiles, T, uinfo, outer, deps, 0);
+}
+
+// Dense BF16 W [N][K] (any N, K % 32 == 0): y [M][N] fp32 = x [M][K] bf16 . W^T.  No per-M setup (oneDNN builds a
+// primitive per new M), so every prompt length runs at once.
+sycl::event ink_dense_bf16(sycl::queue& q, const uint16_t* W, int N, int K, const uint16_t* x, float* y, int M) {
+    return run<2>(q, reinterpret_cast<const uint8_t*>(W), nullptr, size_t(K) * 2, 0, N, K, reinterpret_cast<const bf16*>(x), y,
+                  nullptr, (M + MC2 - 1) / MC2, nullptr, nullptr, {}, M);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

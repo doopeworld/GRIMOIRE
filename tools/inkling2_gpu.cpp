@@ -56,6 +56,7 @@ struct InkAttnArgs {
     const uint16_t* bias;   // [M][H][E] bf16 = bf(sum_r rel[r] * table[r][d])
 };
 sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g);
+sycl::event ink_dense_bf16(sycl::queue& q, const uint16_t* W, int N, int K, const uint16_t* x, float* y, int M);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
                             const float* outer, const std::vector<sycl::event>& deps);
@@ -600,6 +601,14 @@ void Engine::gemvtm(const uint16_t* T, int N, int K, int KS, int M, const float*
 }
 
 void Engine::dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, const uint16_t* xb, float* y, size_t ldy, int M, bool round) {
+    // full prompt chunks: oneDNN (faster; its per-M kernels are built once for M = chunk); any other row count:
+    // the own BF16 GEMM, which needs no per-M setup (oneDNN cost ~450 ms on a new 512-row prompt)
+    static const bool use_onednn = std::getenv("INK_DENSE_ONEDNN") != nullptr;
+    if (M >= 32 && xb && !use_onednn && K % 32 == 0 && M != mmax_) {
+        if (ldy != size_t(N)) throw std::runtime_error("dense: output pitch must be N");
+        ink_dense_bf16(q_, W, N, K, xb, y, M);
+        return;
+    }
     if (M >= 32 && xb) {
         b70::QuantWeight w;
         w.fmt = b70::Fmt::BF16; w.N = N; w.K = K; w.payload = reinterpret_cast<const uint8_t*>(W); w.row_bytes = int64_t(K) * 2;
@@ -816,8 +825,13 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
             wg.fmt = wf.fmt = b70::Fmt::BF16; wg.N = wf.N = h; wg.K = wf.K = rank; wg.row_bytes = wf.row_bytes = int64_t(rank) * 2;
             wg.payload = reinterpret_cast<const uint8_t*>(b.j[j].gain);
             wf.payload = reinterpret_cast<const uint8_t*>(b.j[j].forget);
-            b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(lb), G, M);
-            b70::launch_gemm_fast(q_, wf, reinterpret_cast<const bf16x*>(lb), F, M);
+            if (rank % 32 == 0 && !std::getenv("INK_DENSE_ONEDNN") && M != mmax_) {
+                ink_dense_bf16(q_, b.j[j].gain, h, rank, lb, G, M);
+                ink_dense_bf16(q_, b.j[j].forget, h, rank, lb, F, M);
+            } else {
+                b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(lb), G, M);
+                b70::launch_gemm_fast(q_, wf, reinterpret_cast<const bf16x*>(lb), F, M);
+            }
             const GateJob J = b.j[j];
             q_.parallel_for<InkGateBlendM>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const size_t t = id[0];
@@ -2086,11 +2100,16 @@ int main(int argc, char** argv) try {
         const int tg = argc > 6 ? std::atoi(argv[6]) : 128;
         const int chunk = argc > 7 ? std::atoi(argv[7]) : 2048;
         Engine eng(q, argv[1], ctx, chunk);
-        {   // warm-up: graph capture, GEMM kernels, expert path
+        {   // warm-up: graph capture, GEMM kernels (one full chunk: oneDNN's kernels for M = chunk), expert path
             std::vector<int> w(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), size_t(std::min(chunk, 256))));
             int nx = eng.prefill(w);
             for (int i = 0; i < 4; ++i) nx = eng.step(nx);
             eng.reset();
+            if (ids.size() >= size_t(chunk) && chunk + 8 <= ctx) {
+                std::vector<int> fc(ids.begin(), ids.begin() + chunk);
+                eng.prefill(fc);
+                eng.reset();
+            }
         }
         std::printf("| test | tokens | time (ms) | tok/s |\n|---|---|---|---|\n");
         for (int pp : pps) {
