@@ -39,7 +39,7 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
+class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
@@ -229,6 +229,7 @@ private:
     template <int MODE> void gemv(const uint16_t* W, int rows, int K, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
                                   const float* x2, float* y2, float cap = 0.f);
     void mix(const MixBatch& b, int M, int m0 = 0);
+    void mix_small(const MixBatch& b, int M, int m0);
     void rms(const NormBatch& b, int M, int m0 = 0);
     void gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M);
     void experts_decode(const Layer& Ly);
@@ -434,7 +435,7 @@ void Engine::load() {
         q_.memcpy(slotptr_, sp.data(), sp.size() * sizeof(SlotPtrs)).wait();
     }
     if (mmax_ > 1) {
-        inb_ = dev_.zeros<uint16_t>((mm * TK + 64) * h_); outb_ = dev_.zeros<uint16_t>(mm * TK * h_);
+        inb_ = dev_.zeros<uint16_t>((mm * TK + 64) * h_);
         gather_ = dev_.zeros<int>(mm * TK); pairpos_ = dev_.zeros<int>(mm * TK);
         // expert scratch: row-major BF16 weights of one projection, fp32 GEMM rows, BF16 activations (+64 pad rows)
         const size_t R = mm * TK + 64;
@@ -618,7 +619,7 @@ void Engine::dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, 
     }
 }
 
-void Engine::mix(const MixBatch& b, int M, int m0) {
+void Engine::mix_small(const MixBatch& b, int M, int m0) {
     float* pool = pool_;
     const int h = h_;
     const size_t RS = rs_;
@@ -626,7 +627,7 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
     q_.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(64 * 2 * kMixRows), cgh);
         sycl::local_accessor<float, 1> tot(sycl::range<1>(2 * kMixRows), cgh);
-        cgh.parallel_for<InkMix>(sycl::nd_range<1>(size_t(b.count) * M * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        cgh.parallel_for<InkMixS>(sycl::nd_range<1>(size_t(b.count) * M * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             const int gi = int(it.get_group(0));
             const MixJob& J = b.j[gi / M];
             const size_t mo = size_t(m0 + gi % M) * h;
@@ -668,6 +669,76 @@ void Engine::mix(const MixBatch& b, int M, int m0) {
 #pragma unroll
                 for (int r = 0; r < kMixRows; ++r)
                     if (r < n) o += (pool[size_t(J.rows[r]) * RS + mo + i] * inv[r]) * (sc[r] / sum);
+                out[i] = o;
+            }
+        });
+    });
+}
+
+void Engine::mix(const MixBatch& b, int M, int m0) {
+    // decode / verify rows: the 1024-thread kernel (more work-groups' worth of threads for few rows)
+    if (M * b.count < 64) { mix_small(b, M, m0); return; }
+    // prompt rows: one 256-thread work-group per (job, row); each thread keeps its <= 9 elements of every bank row in registers
+    float* pool = pool_;
+    const int h = h_;
+    const size_t RS = rs_;
+    const float f = 1.f / std::sqrt(float(h));
+    constexpr int WG = 256, PT = 9;
+    if (h > WG * PT) throw std::runtime_error("mix: hidden > 2304");
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(16 * 2 * kMixRows), cgh);
+        sycl::local_accessor<float, 1> tot(sycl::range<1>(2 * kMixRows), cgh);
+        cgh.parallel_for<InkMix>(sycl::nd_range<1>(size_t(b.count) * M * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int gi = int(it.get_group(0));
+            const MixJob& J = b.j[gi / M];
+            const size_t mo = size_t(m0 + gi % M) * h;
+            const int lid = int(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const int sgid = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+            const int n = J.n;
+            float v[kMixRows][PT], qv[PT];
+#pragma unroll
+            for (int t = 0; t < PT; ++t) { const int i = lid + t * WG; qv[t] = i < h ? J.query[i] : 0.f; }
+            float ss[kMixRows], qd[kMixRows];
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r) {
+                ss[r] = 0.f; qd[r] = 0.f;
+#pragma unroll
+                for (int t = 0; t < PT; ++t) {
+                    const int i = lid + t * WG;
+                    v[r][t] = (r < n && i < h) ? pool[size_t(J.rows[r]) * RS + mo + i] : 0.f;
+                    ss[r] = sycl::fma(v[r][t], v[r][t], ss[r]);
+                    qd[r] = sycl::fma(qv[t], v[r][t], qd[r]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) {
+                    const float a = sycl::reduce_over_group(sg, ss[r], sycl::plus<float>());
+                    const float c = sycl::reduce_over_group(sg, qd[r], sycl::plus<float>());
+                    if (lane == 0) { red[sgid * 2 * kMixRows + r] = a; red[sgid * 2 * kMixRows + kMixRows + r] = c; }
+                }
+            sycl::group_barrier(it.get_group());
+            if (lid < 2 * kMixRows) { float t = 0.f; for (int g = 0; g < 16; ++g) t += red[g * 2 * kMixRows + lid]; tot[lid] = t; }
+            sycl::group_barrier(it.get_group());
+            float inv[kMixRows], sc[kMixRows];
+            float high = -INFINITY;
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) { inv[r] = 1.f / sycl::sqrt(tot[r] / float(h) + 1e-6f); sc[r] = tot[kMixRows + r] * inv[r] * f; high = sycl::fmax(high, sc[r]); }
+            float sum = 0.f;
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) { sc[r] = sycl::exp(sc[r] - high); sum += sc[r]; }
+            float* out = pool + size_t(J.out) * RS + mo;
+#pragma unroll
+            for (int t = 0; t < PT; ++t) {
+                const int i = lid + t * WG;
+                if (i >= h) continue;
+                float o = 0.f;
+#pragma unroll
+                for (int r = 0; r < kMixRows; ++r)
+                    if (r < n) o += (v[r][t] * inv[r]) * (sc[r] / sum);
                 out[i] = o;
             }
         });
@@ -1096,11 +1167,9 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
                 wd.fmt = b70::Fmt::BF16; wd.N = h; wd.K = I; wd.row_bytes = int64_t(I) * 2; wd.payload = reinterpret_cast<const uint8_t*>(wb);
                 b70::launch_gemm_fast(q_, wd, reinterpret_cast<const bf16x*>(act) + size_t(off[e]) * I, proj + size_t(off[e]) * h, (count[e] + 31) / 32 * 32);
             }
-        uint16_t* ob = outb_;
-        q_.parallel_for<InkOutB>(sycl::range<1>(size_t(M) * TK * h), [=](sycl::id<1> id) { ob[id[0]] = tobf(proj[id[0]]); });
     }
     {
-        const uint16_t* outb = outb_;
+        const float* outp = xs_.projection;   // fp32 expert outputs; bf-rounded here (was a separate bf16 pass)
         const int* pp = pairpos_;
         const int* sl = sel_;
         const float* w = wts_;
@@ -1113,7 +1182,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
             float acc = 0.f;
             for (int s = 0; s < TK; ++s) {
                 const int e = sl[m * TK + s];
-                if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * bfw(outb[size_t(pp[m * TK + s]) * h + ch]);
+                if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * bfr(outp[size_t(pp[m * TK + s]) * h + ch]);
             }
             yb[t] = tp ? acc : bfr(acc);
         });
@@ -1552,17 +1621,19 @@ void Engine::run(int M) {
                 q_.parallel_for<InkBias>(sycl::range<1>(size_t(M) * Hh * (E / 16)), [=](sycl::id<1> id) {
                     const size_t t = id[0], d0 = (t % (E / 16)) * 16, mj = t / (E / 16);
                     const int m = int(mj / Hh), j = int(mj % Hh);
-                    float rl[16];
+                    float b[16];
 #pragma unroll
-                    for (int r = 0; r < 16; ++r) rl[r] = pA[size_t(m) * NA + orel + j * 16 + r];
+                    for (int e = 0; e < 16; ++e) b[e] = 0.f;
+#pragma unroll
+                    for (int r = 0; r < 16; ++r) {   // same order per output: r = 0..15
+                        const float rl = pA[size_t(m) * NA + orel + j * 16 + r];
+                        const sycl::vec<uint16_t, 16> tv = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(table + size_t(r) * E + d0);
+#pragma unroll
+                        for (int e = 0; e < 16; ++e) b[e] += rl * bfw(tv[e]);
+                    }
                     sycl::vec<uint16_t, 16> o;
 #pragma unroll
-                    for (int e = 0; e < 16; ++e) {
-                        float b = 0.f;
-#pragma unroll
-                        for (int r = 0; r < 16; ++r) b += rl[r] * bfw(table[size_t(r) * E + d0 + e]);
-                        o[e] = tobf(b);
-                    }
+                    for (int e = 0; e < 16; ++e) o[e] = tobf(b[e]);
                     *reinterpret_cast<sycl::vec<uint16_t, 16>*>(bs + mj * E + d0) = o;
                 });
                 ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
