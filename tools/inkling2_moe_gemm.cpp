@@ -424,3 +424,22 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
         });
     });
 }
+
+// Repack one projection of every expert (NVFP4 row-major [n][k/2] + scales [n][k/16]) into the xexp layout.
+sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales) {
+    const int T = N / 16, G = K / 128;
+    q.parallel_for(sycl::range<1>(size_t(E) * N * (K / 2)), [=](sycl::id<1> id) {
+        const size_t i = id[0], per = size_t(N) * (K / 2), e = i / per, r = i % per;
+        const size_t blk = r / 1024, within = r % 1024, gi = blk / T, t = blk % T;
+        const size_t kh = within / 16, lane = within % 16;          // kh = kg / 2
+        const size_t n = t * 16 + lane, kb = gi * 64 + kh;          // byte column in the row
+        codes[i] = pay[e * per + n * (K / 2) + kb];
+    });
+    return q.parallel_for(sycl::range<1>(size_t(E) * N * (K / 16)), [=](sycl::id<1> id) {
+        const size_t i = id[0], per = size_t(N) * (K / 16), e = i / per, r = i % per;
+        const size_t blk = r / 128, within = r % 128, gi = blk / T, t = blk % T;
+        const size_t c = within / 16, lane = within % 16;
+        const size_t n = t * 16 + lane, kb = gi * 8 + c;
+        scales[i] = scl[e * per + n * (K / 16) + kb];
+    });
+}

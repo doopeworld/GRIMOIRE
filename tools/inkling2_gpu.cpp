@@ -58,6 +58,17 @@ struct InkAttnArgs {
 };
 sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g);
 sycl::event ink_dense_bf16(sycl::queue& q, const uint16_t* W, int N, int K, const uint16_t* x, float* y, int M);
+struct InkXArgs {
+    const uint8_t* codes; const uint8_t* scales;
+    const float* amax; const float* den;
+    const int* sel; int e0, en, topk;
+    int N, K;
+    const float* x; size_t ldx;
+    float* out;
+    int gate_up; float gcap, ucap;
+};
+sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g);
+sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
                             const float* outer, const std::vector<sycl::event>& deps);
@@ -112,6 +123,7 @@ struct Layer {
     uint16_t *kw = nullptr, *vw = nullptr, *aconv = nullptr, *mconv = nullptr;
     uint16_t *cdown[4]{}, *cgain[4]{}, *cforget[4]{};
     uint8_t *gu = nullptr, *gus = nullptr, *dn = nullptr, *dns = nullptr;
+    uint8_t *guX = nullptr, *gusX = nullptr, *dnX = nullptr, *dnsX = nullptr;   // INK_XEXP=1: DPAS decode layout
     float *gua = nullptr, *gud = nullptr, *dna = nullptr, *dnd = nullptr;
     const float *hgua = nullptr, *hgud = nullptr, *hdna = nullptr, *hdnd = nullptr;  // host copies (prompt path)
     float *aq = nullptr, *mq = nullptr;
@@ -406,6 +418,14 @@ void Engine::load() {
             Ly.dna = up<float>(e + "w2_weight_amax"); Ly.dnd = up<float>(e + "w2_weight_outer_scale_denominator");
             Ly.hdna = reinterpret_cast<const float*>(host(e + "w2_weight_amax"));
             Ly.hdnd = reinterpret_cast<const float*>(host(e + "w2_weight_outer_scale_denominator"));
+        }
+        static const bool xexp = std::getenv("INK_XEXP") && std::atoi(std::getenv("INK_XEXP")) == 1;
+        if (xexp && Ly.fgu == PackedFormat::NVFP4 && Ly.fdn == PackedFormat::NVFP4) {
+            const int I2 = 2 * c_.inter, hh = h_, II = c_.inter;
+            Ly.guX = dev_.alloc<uint8_t>(size_t(en_) * I2 * hh / 2); Ly.gusX = dev_.alloc<uint8_t>(size_t(en_) * I2 * hh / 16);
+            Ly.dnX = dev_.alloc<uint8_t>(size_t(en_) * hh * II / 2); Ly.dnsX = dev_.alloc<uint8_t>(size_t(en_) * hh * II / 16);
+            ink_xexp_pack(q_, Ly.gu, Ly.gus, en_, I2, hh, Ly.guX, Ly.gusX);
+            ink_xexp_pack(q_, Ly.dn, Ly.dns, en_, hh, II, Ly.dnX, Ly.dnsX);
         }
         if (i) Ly.aq = up<float>(root + "attn_res.attn_queries." + std::to_string(i - 1));
         Ly.mq = up<float>(root + "attn_res.mlp_queries." + std::to_string(i));
@@ -1049,6 +1069,11 @@ inline void load_x(const float* g, float* xr, int n) {
 
 void Engine::experts_decode(const Layer& Ly) {
     const int h = h_, I = c_.inter, TK = c_.top_k, e0 = e0_, en = en_;
+    if (Ly.guX) {   // DPAS decode (tools/inkling2_moe_gemm.cpp ink_xexp)
+        ink_xexp(q_, InkXArgs{Ly.guX, Ly.gusX, Ly.gua, Ly.gud, sel_, e0, en, TK, 2 * I, h, row(NM), 0, act_, 1, c_.gate_cap, c_.up_cap});
+        ink_xexp(q_, InkXArgs{Ly.dnX, Ly.dnsX, Ly.dna, Ly.dnd, sel_, e0, en, TK, h, I, act_, size_t(I), dbuf_, 0, 0.f, 0.f});
+        return;
+    }
     const float gcap = c_.gate_cap, ucap = c_.up_cap;
     const int* sel = sel_;
     float* act = act_;
