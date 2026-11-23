@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <barrier>
 #include <thread>
 
@@ -38,12 +39,26 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkHist; class InkGather; class InkCombine; class InkAddRound; class InkPartial;
+class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
 class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkHistV; class InkPosV;
+
+struct InkAttnArgs {
+    const float* A; int NA, oq, orel, osink, og;
+    int H, groups, E;
+    const uint16_t* table; const uint16_t *kc, *vc;
+    int cap, K, win; float scale;
+    float* aout; uint16_t* aoutb; int Q;
+    const int* posd; int M;
+    const uint16_t* bias;   // [M][H][E] bf16 = bf(sum_r rel[r] * table[r][d])
+};
+sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g);
+sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
+                            int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
+                            const float* outer, const std::vector<sycl::event>& deps);
 
 namespace ink {
 
@@ -115,6 +130,11 @@ struct GateJob { int cur, msg, out; const uint16_t* gain; const uint16_t* forget
 struct GateBatch { GateJob j[3]; int count; };
 
 // Two-card exchange: pinned host slots, cross-queue events, one std::barrier per exchange (no host wait on the GPU).
+// Two-card watchdog: every exchange stamps progress; no progress for 60 s -> print where each card is and exit.
+static std::atomic<long long> g_tp_progress{0};
+static std::atomic<int> g_tp_stage[2] = {};
+static long long now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
 struct TPX {
     static constexpr int NS = 8;
     float* hb[2][NS] = {};
@@ -129,6 +149,7 @@ enum Row { HID, RES, X0, X1, X2, XM, N0, N1, N2, NM, M0, M1, M2, M3, PRE, PREV, 
 
 class Engine {
 public:
+    double sect_ms_[8] = {};
     Engine(sycl::queue& q, const std::string& dir, int limit, int chunk, int rank = 0, int world = 1, TPX* tpx = nullptr)
         : q_(q), ck_(Checkpoint::open(dir)), c_(ck_.config), dev_(q), limit_(limit), mmax_(std::max(1, chunk)), rank_(rank), world_(world), tpx_(tpx) {
         if (limit < 1 || limit > c_.max_context) throw std::invalid_argument("bad context");
@@ -155,7 +176,14 @@ private:
     int rank_ = 0, world_ = 1;
     TPX* tpx_ = nullptr;
     int e0_ = 0, en_ = 0, v0_ = 0, vrows_ = 0, vvalid_ = 0;
-    float *peer_ = nullptr, *bestv_ = nullptr;
+    float *peer_ = nullptr, *bestv_ = nullptr, *gate_g_ = nullptr, *gate_f_ = nullptr;
+    uint16_t* lowb_ = nullptr;
+    // pinned table (copied to tbl_d_ per visit): [0,128) used expert ids, [128,256) gate|up outer, [256,384) down outer,
+    // [384,768) uinfo (local expert, first row, rows), [768, ...) grouped-GEMM tiles (u, row block)
+    static constexpr size_t kTbl = 768 + 2 * 4096;
+    float* elist_ = nullptr;
+    uint16_t* bias_ = nullptr;
+    float* tbl_d_ = nullptr;
     void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
     int final_token(int m = 0);
     size_t rs_ = 0;
@@ -205,6 +233,7 @@ private:
     void gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M);
     void experts_decode(const Layer& Ly);
     void experts_prompt(const Layer& Ly, int M);
+    void dequant_used(PackedFormat f, int N, int K, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb, int nu, int outer_at, uint16_t* dst, int u0 = 0);
     void hist_update(float* hist, const float* src, size_t ld, int n, int M);
     void hist_update_v(int slot, int kind, const float* src, size_t ld, int n, int M);
     // small-M (verify) path
@@ -384,12 +413,10 @@ void Engine::load() {
     bestv_ = dev_.zeros<float>(16);
     if (world_ > 1) {
         peer_ = dev_.zeros<float>(mm * h_);
-        if (rank_ == 0)
-            for (int r = 0; r < 2; ++r)
-                for (int k = 0; k < TPX::NS; ++k) {
-                    tpx_->hb[r][k] = sycl::malloc_host<float>(mm * h_, q_.get_context());
-                    if (!tpx_->hb[r][k]) throw std::runtime_error("pinned host exchange buffers");
-                }
+        for (int k = 0; k < TPX::NS; ++k) {  // this card's outgoing slots, pinned in its own context
+            tpx_->hb[rank_][k] = sycl::malloc_host<float>(mm * h_, q_.get_context());
+            if (!tpx_->hb[rank_][k]) throw std::runtime_error("pinned host exchange buffers");
+        }
     }
     amx_v_ = dev_.zeros<float>(4096); amx_i_ = dev_.zeros<int>(4096);
     tok_ = dev_.zeros<int>(std::max<size_t>(mm, 8)); next_ = dev_.zeros<int>(16); pos_d_ = dev_.zeros<int>(1);
@@ -407,10 +434,13 @@ void Engine::load() {
         q_.memcpy(slotptr_, sp.data(), sp.size() * sizeof(SlotPtrs)).wait();
     }
     if (mmax_ > 1) {
-        inb_ = dev_.zeros<uint16_t>(mm * TK * h_); outb_ = dev_.zeros<uint16_t>(mm * TK * h_);
+        inb_ = dev_.zeros<uint16_t>((mm * TK + 64) * h_); outb_ = dev_.zeros<uint16_t>(mm * TK * h_);
         gather_ = dev_.zeros<int>(mm * TK); pairpos_ = dev_.zeros<int>(mm * TK);
-        const auto sz = b70::inkling2::expert_scratch_sizes(mmax_, h_, c_.inter);
-        xs_ = ExpertScratch{dev_.alloc<uint32_t>(sz.weight_pairs), dev_.alloc<float>(sz.projection), dev_.alloc<bf16x>(sz.activation)};
+        // expert scratch: row-major BF16 weights of one projection, fp32 GEMM rows, BF16 activations (+64 pad rows)
+        const size_t R = mm * TK + 64;
+        xs_ = ExpertScratch{dev_.alloc<uint32_t>(size_t(c_.inter) * h_), dev_.alloc<float>(R * std::max<size_t>(2 * c_.inter, h_)), dev_.alloc<bf16x>(R * c_.inter)};
+        elist_ = sycl::malloc_host<float>(kTbl, q_.get_context());
+        tbl_d_ = dev_.alloc<float>(kTbl);
     }
     q_.wait();
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -703,6 +733,29 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
             gemvtm<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, M, xj, xj, xj, 2 * h, low + size_t(j) * MM * rank, rank, rank, nullptr, 0, rank, nullptr, 0, rank);
         }
         else dense(Ly.cdown[ctrl[j]], rank, 2 * h, xcat + size_t(j) * MM * 2 * h, 2 * h, xcatb + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, rank, M, true);
+    if (M >= 32) {
+        // prompt rows: gain / forget as two GEMMs over the BF16-rounded low rows (K = rank), then an elementwise blend
+        if (!gate_g_) { gate_g_ = dev_.alloc<float>(size_t(MM) * h); gate_f_ = dev_.alloc<float>(size_t(MM) * h); lowb_ = dev_.alloc<uint16_t>(size_t(MM) * rank); }
+        float *G = gate_g_, *F = gate_f_;
+        uint16_t* lb = lowb_;
+        for (int j = 0; j < b.count; ++j) {
+            const float* lw = low + size_t(j) * MM * rank;
+            q_.parallel_for<InkLowB>(sycl::range<1>(size_t(M) * rank), [=](sycl::id<1> id) { lb[id[0]] = tobf(bfr(lw[id[0]])); });
+            b70::QuantWeight wg, wf;
+            wg.fmt = wf.fmt = b70::Fmt::BF16; wg.N = wf.N = h; wg.K = wf.K = rank; wg.row_bytes = wf.row_bytes = int64_t(rank) * 2;
+            wg.payload = reinterpret_cast<const uint8_t*>(b.j[j].gain);
+            wf.payload = reinterpret_cast<const uint8_t*>(b.j[j].forget);
+            b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(lb), G, M);
+            b70::launch_gemm_fast(q_, wf, reinterpret_cast<const bf16x*>(lb), F, M);
+            const GateJob J = b.j[j];
+            q_.parallel_for<InkGateBlendM>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
+                const size_t t = id[0];
+                const float c = pool[size_t(J.cur) * RS + t], mm = pool[size_t(J.msg) * RS + t];
+                pool[size_t(J.out) * RS + t] = (1.f - sycl::tanh(F[t])) * c + sycl::tanh(G[t]) * mm;
+            });
+        }
+        return;
+    }
     const size_t total = size_t(b.count) * M * h, groups = (total + 7) / 8;
     q_.parallel_for<InkGateBlend>(sycl::nd_range<1>(groups * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto sg = it.get_sub_group();
@@ -987,15 +1040,64 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
     }
     const size_t rbg = Ly.fgu == PackedFormat::NVFP4 ? h / 2 : h, sbg = Ly.fgu == PackedFormat::NVFP4 ? h / 16 : h / 32;
     const size_t rbd = Ly.fdn == PackedFormat::NVFP4 ? I / 2 : I, sbd = Ly.fdn == PackedFormat::NVFP4 ? I / 16 : I / 32;
-    for (int e = 0; e < E; ++e) {
-        if (!count[e] || e < e0_ || e >= e0_ + en_) continue;
-        const size_t el = size_t(e - e0_);
-        const float og = Ly.fgu == PackedFormat::NVFP4 ? Ly.hgua[e] / Ly.hgud[0] : 1.f;
-        const float od = Ly.fdn == PackedFormat::NVFP4 ? Ly.hdna[e] / Ly.hdnd[0] : 1.f;
-        const ExpertMatrix gu{Ly.fgu, 2 * I, h, Ly.gu + el * 2 * I * rbg, Ly.gus + el * 2 * I * sbg, og};
-        const ExpertMatrix dn{Ly.fdn, h, I, Ly.dn + el * h * rbd, Ly.dns + el * h * sbd, od};
-        b70::inkling2::launch_expert_ffn(q_, gu, dn, count[e], reinterpret_cast<const bf16x*>(inb_) + size_t(off[e]) * h,
-                                         reinterpret_cast<bf16x*>(outb_) + size_t(off[e]) * h, c_.gate_cap, c_.up_cap, xs_);
+    std::vector<int> used;
+    for (int e = e0_; e < e0_ + en_; ++e) if (count[e]) used.push_back(e);
+    int* ids = reinterpret_cast<int*>(elist_);   // the sel_ download above waited: no kernel still reads the list
+    for (size_t u = 0; u < used.size(); ++u) {
+        const int e = used[u];
+        ids[u] = e;
+        elist_[128 + u] = Ly.fgu == PackedFormat::NVFP4 ? Ly.hgua[e] / Ly.hgud[0] : 1.f;
+        elist_[256 + u] = Ly.fdn == PackedFormat::NVFP4 ? Ly.hdna[e] / Ly.hdnd[0] : 1.f;
+    }
+    const int nu = int(used.size());
+    if (nu) {
+        uint16_t* wb = reinterpret_cast<uint16_t*>(xs_.weight_pairs);
+        float* proj = xs_.projection;
+        uint16_t* act = reinterpret_cast<uint16_t*>(xs_.activation);
+        static const bool grouped = !std::getenv("INK_EXP_ONEDNN");
+        int T = 0;
+        int* ui = ids + 384;
+        int* tl = ids + 768;
+        for (int u = 0; u < nu; ++u) {
+            const int e = used[u];
+            ui[3 * u] = e - e0_; ui[3 * u + 1] = off[e]; ui[3 * u + 2] = count[e];
+            for (int mb = 0; mb * 256 < count[e]; ++mb) { tl[2 * T] = u; tl[2 * T + 1] = mb; ++T; }
+        }
+        if (grouped) q_.memcpy(tbl_d_, elist_, (768 + 2 * size_t(T)) * sizeof(float));
+        const int* tiles_d = reinterpret_cast<const int*>(tbl_d_) + 768;
+        const int* ui_d = reinterpret_cast<const int*>(tbl_d_) + 384;
+        const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
+        if (grouped)
+            ink_moe_grouped(q_, fg, Ly.gu, Ly.gus, rbg, sbg, 2 * I, h, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, {});
+        else
+            for (int u = 0; u < nu; ++u) {
+                const int e = used[u];
+                dequant_used(Ly.fgu, 2 * I, h, Ly.gu, Ly.gus, rbg, sbg, 1, 128, wb, u);
+                b70::QuantWeight wg;
+                wg.fmt = b70::Fmt::BF16; wg.N = 2 * I; wg.K = h; wg.row_bytes = int64_t(h) * 2; wg.payload = reinterpret_cast<const uint8_t*>(wb);
+                b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(inb_) + size_t(off[e]) * h, proj + size_t(off[e]) * 2 * I, (count[e] + 31) / 32 * 32);
+            }
+        const float gcap = c_.gate_cap, ucap = c_.up_cap;
+        q_.parallel_for<InkActP>(sycl::range<1>(size_t(M) * TK * I), [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            // same formula as inkling2::launch_expert_ffn: BF16-rounded linear outputs, softcaps, sigmoid of the raw gate
+            const float g = bfr(proj[2 * i]), u = bfr(proj[2 * i + 1]);
+            const float z = sycl::exp(-sycl::fabs(g));
+            const float sig = (g >= 0.f ? 1.f : z) / (1.f + z);
+            act[i] = tobf((gcap * sycl::tanh(g / gcap)) * sig * (ucap * sycl::tanh(u / ucap)));
+        });
+        if (grouped)
+            ink_moe_grouped(q_, fd, Ly.dn, Ly.dns, rbd, sbd, h, I, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, {});
+        else
+            for (int u = 0; u < nu; ++u) {
+                const int e = used[u];
+                dequant_used(Ly.fdn, h, I, Ly.dn, Ly.dns, rbd, sbd, 1, 256, wb, u);
+                b70::QuantWeight wd;
+                wd.fmt = b70::Fmt::BF16; wd.N = h; wd.K = I; wd.row_bytes = int64_t(I) * 2; wd.payload = reinterpret_cast<const uint8_t*>(wb);
+                b70::launch_gemm_fast(q_, wd, reinterpret_cast<const bf16x*>(act) + size_t(off[e]) * I, proj + size_t(off[e]) * h, (count[e] + 31) / 32 * 32);
+            }
+        uint16_t* ob = outb_;
+        q_.parallel_for<InkOutB>(sycl::range<1>(size_t(M) * TK * h), [=](sycl::id<1> id) { ob[id[0]] = tobf(proj[id[0]]); });
     }
     {
         const uint16_t* outb = outb_;
@@ -1014,6 +1116,48 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
                 if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * bfw(outb[size_t(pp[m * TK + s]) * h + ch]);
             }
             yb[t] = tp ? acc : bfr(acc);
+        });
+    }
+}
+
+// Every used expert's projection decoded in ONE launch: exact Inkling weights (bfr((e2m1*scale)*outer), as
+// expert_bf16_pair), row-major BF16, coalesced reads; expert u goes to dst + u*N*K.  Then oneDNN's BF16 GEMM per
+// expert (the dense prompt path).  GEMM rows are padded to a multiple of 32 so oneDNN builds few primitives; pad
+// rows read the next expert's inputs and their outputs are overwritten by the next expert's GEMM (in order).
+void Engine::dequant_used(PackedFormat f, int N, int K, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
+                          int nu, int outer_at, uint16_t* dst, int u0) {
+    const int* ids = reinterpret_cast<const int*>(elist_) + u0;
+    const float* outer = elist_ + outer_at + u0;
+    const int e0 = e0_;
+    if (f == PackedFormat::NVFP4) {
+        const int KB = K / 16;
+        q_.parallel_for<InkDqNv>(sycl::range<1>(size_t(nu) * N * KB), [=](sycl::id<1> id) {
+            const size_t t = id[0], u = t / (size_t(N) * KB), r = t % (size_t(N) * KB), n = r / KB, kb = r % KB;
+            const size_t el = size_t(ids[u] - e0);
+            const float o = outer[u];
+            const uint8_t* pw = pay + (el * N + n) * rb;
+            const float sc = b70::e4m3_to_f32(scl[(el * N + n) * sb + kb]);
+            const sycl::uint2 v = *reinterpret_cast<const sycl::uint2*>(pw + kb * 8);
+            sycl::vec<uint16_t, 16> ov;
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const uint32_t byte = ((b < 4 ? v[0] : v[1]) >> (8 * (b & 3))) & 0xFFu;
+                ov[2 * b] = tobf((b70::e2m1_to_f32(uint8_t(byte & 15)) * sc) * o);
+                ov[2 * b + 1] = tobf((b70::e2m1_to_f32(uint8_t(byte >> 4)) * sc) * o);
+            }
+            *reinterpret_cast<sycl::vec<uint16_t, 16>*>(dst + (u * N + n) * size_t(K) + kb * 16) = ov;
+        });
+    } else {
+        const int KB = K / 32;
+        q_.parallel_for<InkDqMx>(sycl::range<1>(size_t(nu) * N * KB * 2), [=](sycl::id<1> id) {
+            const size_t t = id[0] / 2, half = id[0] % 2, u = t / (size_t(N) * KB), r = t % (size_t(N) * KB), n = r / KB, kb = r % KB;
+            const size_t el = size_t(ids[u] - e0);
+            const float sc = b70::e8m0_to_f32(scl[(el * N + n) * sb + kb]);
+            const sycl::uint4 v = *reinterpret_cast<const sycl::uint4*>(pay + (el * N + n) * rb + kb * 32 + half * 16);
+            sycl::vec<uint16_t, 16> ov;
+#pragma unroll
+            for (int b = 0; b < 16; ++b) ov[b] = tobf(b70::e4m3_to_f32(uint8_t((v[b / 4] >> (8 * (b & 3))) & 0xFFu)) * sc);
+            *reinterpret_cast<sycl::vec<uint16_t, 16>*>(dst + (u * N + n) * size_t(K) + kb * 32 + half * 16) = ov;
         });
     }
 }
@@ -1043,8 +1187,12 @@ void Engine::allreduce(float* buf, size_t n) {
     const int me = rank_, peer = 1 - rank_, k = x.counter[me]++ % TPX::NS;
     float* mine = x.hb[me][k];
     const float* theirs = x.hb[peer][k];
+    g_tp_stage[me] = 1;  // copying out
     q_.memcpy(mine, buf, n * sizeof(float)).wait();
+    g_tp_stage[me] = 2;  // waiting for the other card's thread
     x.bar.arrive_and_wait();
+    g_tp_stage[me] = 3;
+    g_tp_progress = now_ms();
     float* pr = peer_;
     q_.memcpy(pr, theirs, n * sizeof(float));
     q_.parallel_for<InkAddRound>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + pr[i[0]]); });
@@ -1055,9 +1203,12 @@ void Engine::allreduce(float* buf, size_t n) {
 // Both cards hold the best (value, index) of their vocabulary half; the host picks (lowest index on ties).
 int Engine::final_token(int m) {
     float v; int i;
+    if (world_ > 1) g_tp_stage[rank_] = 4;  // reading the token
     q_.memcpy(&v, bestv_ + m, sizeof(float));
     q_.memcpy(&i, next_ + m, sizeof(int)).wait();
     if (world_ == 1) return i;
+    g_tp_stage[rank_] = 5;
+    g_tp_progress = now_ms();
     TPX& x = *tpx_;
     x.bv[rank_][m] = v; x.bi[rank_][m] = i;
     x.bar.arrive_and_wait();
@@ -1140,6 +1291,17 @@ void Engine::run(int M) {
         return J;
     };
     int vi = -1;
+    // INK_SECT=1: host-wall time per section of the prompt path (waits after each section; slows the run)
+    static const bool sect_on = std::getenv("INK_SECT") != nullptr;
+    auto sect_t = std::chrono::steady_clock::now();
+    auto mark = [&](int k) {
+        if (!sect_on || M == 1) return;
+        q_.wait();
+        const auto now = std::chrono::steady_clock::now();
+        sect_ms_[k] += std::chrono::duration<double, std::milli>(now - sect_t).count();
+        sect_t = now;
+    };
+    mark(7);
     for (const auto& v : visits_) {
         ++vi;
         static const int tapmode = std::getenv("INK_TAPMODE") ? std::atoi(std::getenv("INK_TAPMODE")) : 0;
@@ -1221,6 +1383,7 @@ void Engine::run(int M) {
                 dense(Ly.Wp + size_t(NA + NB) * h, NC, h, row(nrm[2]), h, xb[2], projC_, NC, M, true);
             }
         }
+        mark(0);
         const int oq = kOQ, orel = Q, osink = Q + H * R, og = Q + H * R + 32;
         {   // per (row, head): q/rel clip, k/v short conv + clip / value norm, cache append
             float *pA = projA_, *pB = projB_, *pC = projC_;
@@ -1283,6 +1446,7 @@ void Engine::run(int M) {
             if (M > 1 && verify_) { hist_update_v(v.cache_slot, 0, projB_, NB, K, M); hist_update_v(v.cache_slot, 1, projC_, NC, K, M); }
             else if (M > 1) { hist_update(sl.khist, projB_, NB, K, M); hist_update(sl.vhist, projC_, NC, K, M); }
         }
+        mark(1);
         {   // attention over the cached window
             const int cap = sl.cap, win = sl.win, E = Ly.E, groups = H / KVH;
             const float scale = 1.f / std::sqrt(float(D));
@@ -1379,6 +1543,119 @@ void Engine::run(int M) {
                     for (int x = 0; x < nch; ++x) acc += part[(size_t(j) * NCH + x) * 128 + d];
                     aout[j * D + d] = bfr(bfr(acc) * sigm(bfr(pA[og + j * D + d])));
                 });
+            } else if (M >= 16 && !std::getenv("INK_ATT_SIMT")) {
+                // prompt rows on the matrix unit (tools/inkling2_moe_gemm.cpp)
+                if (!bias_) bias_ = dev_.alloc<uint16_t>(size_t(mmax_) * std::max(c_.local.heads, c_.full.heads) * std::max(c_.window, c_.rel_extent));
+                uint16_t* bs = bias_;
+                const int Hh = H;
+                // bias[m][j][d] = bf(sum_r rel[m][j][r] * table[r][d]), the reference's summation order
+                q_.parallel_for<InkBias>(sycl::range<1>(size_t(M) * Hh * (E / 16)), [=](sycl::id<1> id) {
+                    const size_t t = id[0], d0 = (t % (E / 16)) * 16, mj = t / (E / 16);
+                    const int m = int(mj / Hh), j = int(mj % Hh);
+                    float rl[16];
+#pragma unroll
+                    for (int r = 0; r < 16; ++r) rl[r] = pA[size_t(m) * NA + orel + j * 16 + r];
+                    sycl::vec<uint16_t, 16> o;
+#pragma unroll
+                    for (int e = 0; e < 16; ++e) {
+                        float b = 0.f;
+#pragma unroll
+                        for (int r = 0; r < 16; ++r) b += rl[r] * bfw(table[size_t(r) * E + d0 + e]);
+                        o[e] = tobf(b);
+                    }
+                    *reinterpret_cast<sycl::vec<uint16_t, 16>*>(bs + mj * E + d0) = o;
+                });
+                ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
+            } else if (M >= 16) {
+                // prompt rows: a work-group = 16 consecutive query rows of one head (one sub-group each); every 16-key
+                // tile of K / V goes through SLM once for all 16 rows.  Same per-score arithmetic as the M <= 8 path.
+                const int RB = 16, nb = (M + RB - 1) / RB;
+                q_.submit([&](sycl::handler& cgh) {
+                    sycl::local_accessor<float, 1> qs(sycl::range<1>(RB * 144), cgh);
+                    sycl::local_accessor<float, 1> kt(sycl::range<1>(16 * 132), cgh);
+                    sycl::local_accessor<float, 1> vt(sycl::range<1>(16 * 128), cgh);
+                    cgh.parallel_for<InkAttT>(sycl::nd_range<1>(size_t(nb) * H * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                        auto g = it.get_group();
+                        auto sg = it.get_sub_group();
+                        const int lid = int(it.get_local_id(0)), r = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+                        const int b = int(it.get_group(0)) / H, j = int(it.get_group(0)) % H;
+                        const int m = b * RB + r, mlast = sycl::min(M - 1, b * RB + RB - 1);
+                        const bool live = m < M;
+                        const int base = *posd;
+                        const int pos = base + m;
+                        const int count = sycl::min(pos + 1, win), first = pos + 1 - count;
+                        const int pfirst = base + b * RB, lo = sycl::max(0, pfirst + 1 - sycl::min(pfirst + 1, win)), hi = base + mlast;
+                        const float* A = pA + size_t(live ? m : 0) * NA;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) qs[r * 144 + lane * 8 + e] = live ? A[oq + j * D + lane * 8 + e] : 0.f;
+                        qs[r * 144 + 128 + lane] = live ? A[orel + j * R + lane] : 0.f;
+                        const int hd = (j / groups) * D;
+                        float* ktp = kt.template get_multi_ptr<sycl::access::decorated::no>().get();
+                        float* vtp = vt.template get_multi_ptr<sycl::access::decorated::no>().get();
+                        auto load_tile = [&](float* t, const uint16_t* src, int k0, int pitch) {
+                            // 16 keys x 128 dims, 256 threads x 8 elements
+                            const int kk = lid / 16, d0 = (lid % 16) * 8, kp = k0 + kk;
+                            if (kp <= hi) {
+                                const sycl::vec<uint16_t, 8> v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(src + size_t(kp % cap) * K + hd + d0);
+#pragma unroll
+                                for (int e = 0; e < 8; ++e) t[kk * pitch + d0 + e] = bfw(v[e]);
+                            }
+                        };
+                        auto score = [&](int kp) {
+                            const int k = kp & 15;
+                            float s = 0.f;
+#pragma unroll 8
+                            for (int d0 = 0; d0 < 128; ++d0) s += qs[r * 144 + d0] * kt[k * 132 + d0];
+                            const float qk = bfr(bfr(s) * scale);
+                            const int distance = pos - kp;
+                            float bias = 0.f;
+                            if (distance < E)
+                                for (int rr = 0; rr < 16; ++rr) bias += qs[r * 144 + 128 + rr] * bfw(table[size_t(rr) * E + distance]);
+                            return bfr(qk + bfr(bias));
+                        };
+                        float mx = -INFINITY, l = 0.f;
+                        for (int k0 = lo; k0 <= hi; k0 += 16) {
+                            sycl::group_barrier(g);
+                            load_tile(ktp, kc, k0, 132);
+                            sycl::group_barrier(g);
+                            const int kp = k0 + lane;
+                            if (live && kp >= first && kp <= pos) {
+                                const float s = score(kp);
+                                if (s > mx) { l = l * sycl::exp(mx - s) + 1.f; mx = s; } else l += sycl::exp(s - mx);
+                            }
+                        }
+                        const float gm = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                        const float lsum = sycl::reduce_over_group(sg, mx == -INFINITY ? 0.f : l * sycl::exp(mx - gm), sycl::plus<float>());
+                        const float sink = live ? bfr(A[osink + j]) : 0.f;
+                        const float high = sycl::fmax(sink, gm);
+                        const float sum = sycl::exp(sink - high) + lsum * sycl::exp(gm - high);
+                        float acc[8];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+                        for (int k0 = lo; k0 <= hi; k0 += 16) {
+                            sycl::group_barrier(g);
+                            load_tile(ktp, kc, k0, 132);
+                            load_tile(vtp, vc, k0, 128);
+                            sycl::group_barrier(g);
+                            const int kp = k0 + lane;
+                            const float w = (live && kp >= first && kp <= pos) ? bfr(sycl::exp(score(kp) - high) / sum) : 0.f;
+#pragma unroll
+                            for (int kk = 0; kk < 16; ++kk) {
+                                const float wk = sycl::select_from_group(sg, w, kk);
+#pragma unroll
+                                for (int e = 0; e < 8; ++e) acc[e] = sycl::fma(wk, vt[kk * 128 + lane * 8 + e], acc[e]);
+                            }
+                        }
+                        if (live)
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) {
+                                const int c = j * D + lane * 8 + e;
+                                const float o = bfr(bfr(acc[e]) * sigm(bfr(A[og + c])));
+                                aout[size_t(m) * Q + c] = o;
+                                aoutb[size_t(m) * Q + c] = tobf(o);
+                            }
+                    });
+                });
             } else {
                 // one sub-group per (row, head): lane-per-key scores, two passes (max/sum, then weighted values)
                 const size_t sgs = size_t(M) * H, ng = (sgs + 7) / 8;
@@ -1449,6 +1726,7 @@ void Engine::run(int M) {
                 });
             }
         }
+        mark(2);
         if (world_ > 1) {
             if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
@@ -1500,6 +1778,7 @@ void Engine::run(int M) {
             xm = GM;
         }
         { NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, M >= 2 ? nmb_ : nullptr}; nb.count = 1; rms(nb, M); }
+        mark(3);
         // router: sigmoid scores, top-k by score + bias, weights = scale * score / sum, sorted by expert id
         if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
         else if (M <= 8) gemvtm<1>(Ly.WrT, c_.experts, h, 32, M, row(NM), row(NM), row(NM), h, rlog_, c_.experts, c_.experts, nullptr, 0, c_.experts, nullptr, 0, c_.experts);
@@ -1538,6 +1817,7 @@ void Engine::run(int M) {
                 });
             });
         }
+        mark(4);
         if (M == 1) experts_decode(Ly);
         else if (M <= 8) experts_small(Ly, M);
         else experts_prompt(Ly, M);
@@ -1555,6 +1835,7 @@ void Engine::run(int M) {
             }
             allreduce(row(YB), size_t(M) * h);
         }
+        mark(5);
         {   // hidden = bf(residual + sconv(y)); y = bf(sum_s w_s d_s) in slot (= ascending expert) order
             const uint16_t* w = Ly.mconv;
             float* hist = sl.mhist;
@@ -1586,6 +1867,7 @@ void Engine::run(int M) {
             if (M > 1 && verify_) hist_update_v(v.cache_slot, 3, row(YB), h, h, M);
             else if (M > 1) hist_update(sl.mhist, row(YB), h, h, M);
         }
+        mark(6);
     }
     const bool allrows = all_logits_ || taps_on;
     {   // output mix, norm (all rows when the drafter needs the taps or a verify needs every row's logits)
@@ -1667,6 +1949,7 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 
 int main(int argc, char** argv) try {
     using namespace ink;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 6) {
         std::fprintf(stderr, "usage: inkling2_gpu MODEL_DIR check IDS CONTEXT NEW_TOKENS [REF_LOGITS|-] [CHUNK]\n"
                              "       inkling2_gpu MODEL_DIR bench IDS CONTEXT PP_LIST TG [CHUNK]\n");
@@ -1750,6 +2033,10 @@ int main(int argc, char** argv) try {
             for (int g = 0; g < tg; ++g) nx = eng.step(nx);
             const double tms = ms_since(t0);
             std::printf("| pp%d | %d | %.1f | %.1f |\n| tg%d @ %d | %d | %.1f | %.1f |\n", pp, pp, pms, 1000.0 * pp / pms, tg, pp, tg, tms, 1000.0 * tg / tms);
+            if (std::getenv("INK_SECT")) {
+                static const char* nm[8] = {"pre-attn mix/norm/Wp", "q/k/v prep", "attention", "Wo+residual+mix+norm", "router+gates", "experts", "post", "embed"};
+                for (int k = 0; k < 8; ++k) { std::printf("  sect %-22s %8.1f ms\n", nm[k], eng.sect_ms_[k]); eng.sect_ms_[k] = 0; }
+            }
             std::fflush(stdout);
         }
         return 0;
@@ -1826,14 +2113,30 @@ int main(int argc, char** argv) try {
         const int tg = argc > 6 ? std::atoi(argv[6]) : 128;
         const int chunk = argc > 7 ? std::atoi(argv[7]) : 2048;
         if (devs.size() != 2) throw std::runtime_error("tp: expected two GPUs");
-        sycl::context ctx2(devs);
-        sycl::queue q0(ctx2, devs[0], sycl::property_list{sycl::property::queue::in_order()});
-        sycl::queue q1(ctx2, devs[1], sycl::property_list{sycl::property::queue::in_order()});
+        // one context per card unless INK_TPCTX=shared: no object of one device is ever used by the other's queue
+        const bool shared = std::getenv("INK_TPCTX") && std::string(std::getenv("INK_TPCTX")) == "shared";
+        std::printf("two cards, %s contexts\n", shared ? "one shared" : "separate");
+        sycl::context cs(devs), c0(devs[0]), c1(devs[1]);
+        sycl::queue q0(shared ? cs : c0, devs[0], sycl::property_list{sycl::property::queue::in_order()});
+        sycl::queue q1(shared ? cs : c1, devs[1], sycl::property_list{sycl::property::queue::in_order()});
         TPX tpx;
+        g_tp_progress = now_ms();
+        std::thread([&] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                if (now_ms() - g_tp_progress.load() > 60000) {
+                    std::printf("WATCHDOG: no progress for 60 s; card 0 stage %d, card 1 stage %d (1 copy-out wait, 2 thread meet, 4 token read)\n",
+                                g_tp_stage[0].load(), g_tp_stage[1].load());
+                    std::_Exit(3);
+                }
+            }
+        }).detach();
         std::unique_ptr<Engine> eng[2];
         {   // rank 0 allocates the shared host slots: load it first
             eng[0] = std::make_unique<Engine>(q0, argv[1], ctx, chunk, 0, 2, &tpx);
+            g_tp_progress = now_ms();
             eng[1] = std::make_unique<Engine>(q1, argv[1], ctx, chunk, 1, 2, &tpx);
+            g_tp_progress = now_ms();
         }
         for (auto& e : eng) e->use_graph = false;
         auto work = [&](int r) {
