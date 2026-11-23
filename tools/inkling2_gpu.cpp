@@ -1037,17 +1037,19 @@ void Engine::hist_update_v(int slot, int kind, const float* src, size_t ld, int 
 }
 
 void Engine::allreduce(float* buf, size_t n) {
+    // Host-mediated: copy out, wait for our own copy, meet the other card's thread, copy its part in.
+    // No event of one device is ever waited on by the other device's queue.
     TPX& x = *tpx_;
     const int me = rank_, peer = 1 - rank_, k = x.counter[me]++ % TPX::NS;
     float* mine = x.hb[me][k];
     const float* theirs = x.hb[peer][k];
-    const sycl::event prev = x.h2d[peer][k];
-    x.d2h[me][k] = q_.submit([&](sycl::handler& h) { h.depends_on(prev); h.memcpy(mine, buf, n * sizeof(float)); });
+    q_.memcpy(mine, buf, n * sizeof(float)).wait();
     x.bar.arrive_and_wait();
-    const sycl::event ready = x.d2h[peer][k];
     float* pr = peer_;
-    x.h2d[me][k] = q_.submit([&](sycl::handler& h) { h.depends_on(ready); h.memcpy(pr, theirs, n * sizeof(float)); });
+    q_.memcpy(pr, theirs, n * sizeof(float));
     q_.parallel_for<InkAddRound>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + pr[i[0]]); });
+    // the peer must not overwrite our read slot before the copy-in ran: slots rotate over NS exchanges and every
+    // exchange waits on its own copy-out, which runs after this card's earlier copy-in (in-order queue)
 }
 
 // Both cards hold the best (value, index) of their vocabulary half; the host picks (lowest index on ties).
