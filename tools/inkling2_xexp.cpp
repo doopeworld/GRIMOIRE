@@ -7,6 +7,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include "b70/formats.hpp"
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 struct InkXArgs {
@@ -17,6 +18,7 @@ struct InkXArgs {
     const float* x; size_t ldx;                      // input per slot: x + slot * ldx (ldx 0 = shared row)
     float* out;                                      // gate_up: act [slot][N/2]; down: dbuf [slot][N]
     int gate_up; float gcap, ucap;
+    const uint32_t* lut;   // [2][256]: byte -> bf16 pair of the 1x / 1.5x magnitude class (0 for the other class)
 };
 
 namespace {
@@ -125,4 +127,106 @@ static sycl::event xexp_run1(sycl::queue& q, const InkXArgs& g) {
     });
 }
 
-sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g) { return xexp_run1(q, g); }
+// SLM-table version (Grimoire's Ornith ESIMD MoE trick): one gather per weight byte per class gives the VNNI dword
+// of both nibbles -- no per-nibble arithmetic.  KS threads per (slot, tile) split K; next block loaded ahead.
+template <int KS> class InkXExpL;
+template <int KS>
+static sycl::event xexp_lut(sycl::queue& q, const InkXArgs& g) {
+    const int T = g.N / 16, G = g.K / 128;
+    return q.submit([&](sycl::handler& h) {
+        const InkXArgs a = g;
+        h.parallel_for<InkXExpL<KS>>(sycl::nd_range<1>(size_t(a.topk) * T * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<2048 + KS * 16 * sizeof(float)>();
+            const int part = int(it.get_local_id(0));
+            if (part == 0)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) es::slm_block_store<uint32_t, 128>(uint32_t(i * 512), es::block_load<uint32_t, 128>(a.lut + i * 128));
+            const int grp = int(it.get_group(0)), s = grp / T, t = grp % T;
+            const int e = a.sel[s];
+            const bool own = e >= a.e0 && e < a.e0 + a.en;
+            es::barrier();
+            es::simd<float, 16> acc = 0.f;
+            if (own) {
+                const size_t el = size_t(e - a.e0);
+                const float o = a.amax[e] / a.den[0];
+                const uint8_t* cb = a.codes + el * size_t(a.N) * (a.K / 2) + size_t(t) * 1024;
+                const uint8_t* sb = a.scales + el * size_t(a.N) * (a.K / 16) + size_t(t) * 128;
+                const float* x = a.x + size_t(s) * a.ldx;
+                constexpr auto kStream = es::properties{es::cache_hint_L1<es::cache_hint::streaming>, es::cache_hint_L2<es::cache_hint::uncached>, es::alignment<64>};
+                const size_t gstride = size_t(T) * 1024, sstride = size_t(T) * 128;
+                const int g0 = part * G / KS, g1 = (part + 1) * G / KS;
+                es::simd<uint8_t, 1024> nxt;
+                es::simd<uint8_t, 128> nsc;
+                nxt.template select<512, 1>(0) = es::block_load<uint8_t, 512>(cb + g0 * gstride, kStream);
+                nxt.template select<512, 1>(512) = es::block_load<uint8_t, 512>(cb + g0 * gstride + 512, kStream);
+                nsc = es::block_load<uint8_t, 128>(sb + g0 * sstride, kStream);
+                for (int gi = g0; gi < g1; ++gi) {
+                    es::simd<uint8_t, 1024> raw = nxt;
+                    es::simd<uint8_t, 128> sc8 = nsc;
+                    if (gi + 1 < g1) {
+                        nxt.template select<512, 1>(0) = es::block_load<uint8_t, 512>(cb + (gi + 1) * gstride, kStream);
+                        nxt.template select<512, 1>(512) = es::block_load<uint8_t, 512>(cb + (gi + 1) * gstride + 512, kStream);
+                        nsc = es::block_load<uint8_t, 128>(sb + (gi + 1) * sstride, kStream);
+                    }
+                    es::simd<float, 128> xf = es::block_load<float, 128>(x + gi * 128);
+                    es::simd<sycl::ext::oneapi::bfloat16, 128> xb = xf;
+                    es::simd<float, 128> scf = v_e4m3<128>(es::simd<uint32_t, 128>(sc8));
+                    es::simd<float, 128> q1 = v_bfr<128>(scf * o), q3 = v_bfr<128>((scf * 1.5f) * o);
+#pragma unroll
+                    for (int c = 0; c < 8; ++c) {
+                        es::simd<uint8_t, 128> by = raw.template select<128, 1>(c * 128);
+                        es::simd<uint32_t, 128> off = es::simd<uint32_t, 128>(by) << 2;
+                        es::simd<uint32_t, 128> d1, d3;
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            es::simd<uint32_t, 16> o16 = off.template select<16, 1>(v * 16);
+                            d1.template select<16, 1>(v * 16) = es::slm_gather<uint32_t, 16>(o16);
+                            d3.template select<16, 1>(v * 16) = es::slm_gather<uint32_t, 16>(o16 + 1024u);
+                        }
+                        es::simd<sycl::ext::oneapi::bfloat16, 256> B1 = d1.template bit_cast_view<sycl::ext::oneapi::bfloat16>().read();
+                        es::simd<sycl::ext::oneapi::bfloat16, 256> B3 = d3.template bit_cast_view<sycl::ext::oneapi::bfloat16>().read();
+                        es::simd<sycl::ext::oneapi::bfloat16, 16> A = xb.template select<16, 1>(c * 16);
+                        es::simd<float, 16> z = 0.f;
+                        es::simd<float, 16> r1 = xmx::dpas<8, 1, float, float, sycl::ext::oneapi::bfloat16, sycl::ext::oneapi::bfloat16>(z, B1, A);
+                        es::simd<float, 16> r3 = xmx::dpas<8, 1, float, float, sycl::ext::oneapi::bfloat16, sycl::ext::oneapi::bfloat16>(z, B3, A);
+                        acc += q1.template select<16, 1>(c * 16) * r1 + q3.template select<16, 1>(c * 16) * r3;
+                    }
+                }
+            }
+            if constexpr (KS > 1) {
+                es::slm_block_store<float, 16>(uint32_t(2048 + part * 16 * sizeof(float)), acc);
+                es::barrier();
+                if (part != 0) return;
+                acc = 0.f;
+#pragma unroll
+                for (int p = 0; p < KS; ++p) acc += es::slm_block_load<float, 16>(uint32_t(2048 + p * 16 * sizeof(float)));
+            }
+            if (a.gate_up) {
+                if (!own) return;
+                es::simd<float, 16> r = v_bfr<16>(acc);
+                es::simd<float, 8> gg = r.template select<8, 2>(0), uu = r.template select<8, 2>(1);
+                es::simd<float, 8> out;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float g0 = gg[i], u0 = uu[i];
+                    const float sg = g0 >= 0.f ? 1.f / (1.f + sycl::exp(-g0)) : sycl::exp(g0) / (1.f + sycl::exp(g0));
+                    out[i] = (a.gcap * th_(g0 / a.gcap)) * sg * (a.ucap * th_(u0 / a.ucap));
+                }
+                out = v_bfr<8>(out);
+                es::block_store<float, 8>(a.out + size_t(s) * (a.N / 2) + t * 8, out);
+            } else {
+                es::simd<float, 16> r = own ? v_bfr<16>(acc) : es::simd<float, 16>(0.f);
+                es::block_store<float, 16>(a.out + size_t(s) * a.N + t * 16, r);
+            }
+        });
+    });
+}
+
+sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g) {
+    static const int mode = std::getenv("INK_XEXP_MODE") ? std::atoi(std::getenv("INK_XEXP_MODE")) : 0;
+    if (mode == 1) return xexp_run1(q, g);
+    const int G = g.K / 128;
+    if (G % 6 == 0) return xexp_lut<6>(q, g);
+    if (G % 3 == 0) return xexp_lut<3>(q, g);
+    return xexp_lut<1>(q, g);
+}
