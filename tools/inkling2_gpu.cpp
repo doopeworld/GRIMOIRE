@@ -39,6 +39,7 @@ class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; c
 class InkHist; class InkGather; class InkCombine;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
+template <int M> class InkGemvTM;
 class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkHistV; class InkPosV;
 
@@ -170,6 +171,11 @@ private:
     uint16_t* tiled(const uint16_t* src, int N, int K);
     template <int MODE> void gemvt(const uint16_t* T, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
                                    const float* x2, float* y2);
+    // tiled, M <= 8 rows: x rows at ldx; segment outputs y0/y1/y2 with their own row pitch; rows >= nvalid not written
+    template <int MODE> void gemvtm(const uint16_t* T, int N, int K, int KS, int M, const float* x0, const float* x1, const float* x2, size_t ldx,
+                                    float* y0, size_t ld0, int end0, float* y1, size_t ld1, int end1, float* y2, size_t ld2, int nvalid,
+                                    float cap = 0.f);
+    uint16_t* unembedT_ = nullptr;
     void run(int M);
     void dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, const uint16_t* xb, float* y, size_t ldy, int M, bool round);
     template <int MODE> void gemv(const uint16_t* W, int rows, int K, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
@@ -218,6 +224,7 @@ void Engine::load() {
     embed_ = up<uint16_t>(root + "embed.weight");
     embed_norm_ = up<uint16_t>(root + "embed_norm.weight");
     unembed_ = up<uint16_t>(root + "unembed.weight");
+    unembedT_ = tiled(reinterpret_cast<const uint16_t*>(host(root + "unembed.weight")), c_.vocab, h_);
     fnorm_ = up<uint16_t>(root + "norm.weight");
     oquery_ = up<float>(root + "attn_res.output_query");
     xq_ = up<float>(root + "middle_cycle_cross_pass_queries");
@@ -447,6 +454,66 @@ void Engine::gemvt(const uint16_t* T, int N, int K, int KS, const float* x0, flo
     });
 }
 
+template <int MODE>
+void Engine::gemvtm(const uint16_t* T, int N, int K, int KS, int M, const float* x0, const float* x1, const float* x2, size_t ldx,
+                    float* y0, size_t ld0, int end0, float* y1, size_t ld1, int end1, float* y2, size_t ld2, int nvalid, float cap) {
+    const int tiles = N / 16, K8 = K / 8, per = K8 / KS;
+    if (N % 16 || K8 % KS || M < 1 || M > 8) throw std::runtime_error("gemvtm geometry");
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(KS > 1 ? size_t(KS) * 16 * 8 : 1), cgh);
+        cgh.parallel_for<InkGemvTM<MODE>>(sycl::nd_range<1>(size_t(tiles) * KS * 16, size_t(KS) * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int tile = int(it.get_group(0)), q = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+            const int r0 = tile * 16;
+            const float* x = r0 < end0 ? x0 : (r0 < end1 ? x1 : x2);
+            const uint16_t* w = T + size_t(tile) * K8 * 128 + lane * 8;
+            float acc[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) acc[m] = 0.f;
+            for (int ko = q * per; ko < (q + 1) * per; ++ko) {
+                const sycl::vec<uint16_t, 8> wv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(w + size_t(ko) * 128);
+                float wf[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) wf[e] = bfw(wv[e]);
+#pragma unroll
+                for (int m = 0; m < 8; ++m)
+                    if (m < M) {
+                        const float* xr = x + m * ldx + ko * 8;
+                        const sycl::float4 a = *reinterpret_cast<const sycl::float4*>(xr);
+                        const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(xr + 4);
+                        float s = acc[m];
+                        s = sycl::fma(wf[0], a[0], s); s = sycl::fma(wf[1], a[1], s); s = sycl::fma(wf[2], a[2], s); s = sycl::fma(wf[3], a[3], s);
+                        s = sycl::fma(wf[4], b[0], s); s = sycl::fma(wf[5], b[1], s); s = sycl::fma(wf[6], b[2], s); s = sycl::fma(wf[7], b[3], s);
+                        acc[m] = s;
+                    }
+            }
+            if (KS > 1) {
+#pragma unroll
+                for (int m = 0; m < 8; ++m) red[(q * 8 + m) * 16 + lane] = acc[m];
+                sycl::group_barrier(it.get_group());
+                if (q == 0)
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) { float t = 0.f; for (int k = 0; k < KS; ++k) t += red[(k * 8 + m) * 16 + lane]; acc[m] = t; }
+            }
+            const int r = r0 + lane;
+            if (q == 0 && r < nvalid) {
+                float* y;
+                size_t ld;
+                if (r < end0) { y = y0 + r; ld = ld0; }
+                else if (r < end1) { y = y1 + (r - end0); ld = ld1; }
+                else { y = y2 + (r - end1); ld = ld2; }
+#pragma unroll
+                for (int m = 0; m < 8; ++m)
+                    if (m < M) {
+                        if constexpr (MODE == 0) y[m * ld] = bfr(acc[m]);
+                        else if constexpr (MODE == 1) y[m * ld] = acc[m];
+                        else { const float lin = bfr(acc[m]); y[m * ld] = cap * sycl::tanh(lin / cap); }
+                    }
+            }
+        });
+    });
+}
+
 void Engine::dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, const uint16_t* xb, float* y, size_t ldy, int M, bool round) {
     if (M >= 32 && xb) {
         b70::QuantWeight w;
@@ -577,6 +644,10 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
     });
     for (int j = 0; j < b.count; ++j)
         if (M == 1) gemvt<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, xcat + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, rank, nullptr, nullptr, rank, nullptr, nullptr);
+        else if (M <= 8) {
+            const float* xj = xcat + size_t(j) * MM * 2 * h;
+            gemvtm<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, M, xj, xj, xj, 2 * h, low + size_t(j) * MM * rank, rank, rank, nullptr, 0, rank, nullptr, 0, rank);
+        }
         else dense(Ly.cdown[ctrl[j]], rank, 2 * h, xcat + size_t(j) * MM * 2 * h, 2 * h, xcatb + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, rank, M, true);
     const size_t total = size_t(b.count) * M * h, groups = (total + 7) / 8;
     q_.parallel_for<InkGateBlend>(sycl::nd_range<1>(groups * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -1044,9 +1115,14 @@ void Engine::run(int M) {
             gemvt<0>(Ly.WpT, NA + NB + NC, h, 2, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
         } else {
             const uint16_t* xb[3] = {nb_, same ? nb_ : nb_ + size_t(MM) * h, same ? nb_ : nb_ + 2 * size_t(MM) * h};
-            dense(Ly.Wp, NA, h, row(nrm[0]), h, xb[0], projA_, NA, M, true);
-            dense(Ly.Wp + size_t(NA) * h, NB, h, row(nrm[1]), h, xb[1], projB_, NB, M, true);
-            dense(Ly.Wp + size_t(NA + NB) * h, NC, h, row(nrm[2]), h, xb[2], projC_, NC, M, true);
+            if (M <= 8)
+                gemvtm<0>(Ly.WpT, NA + NB + NC, h, 2, M, row(nrm[0]), row(nrm[1]), row(nrm[2]), h, projA_, NA, NA, projB_, NB, NA + NB, projC_, NC,
+                          NA + NB + NC);
+            else {
+                dense(Ly.Wp, NA, h, row(nrm[0]), h, xb[0], projA_, NA, M, true);
+                dense(Ly.Wp + size_t(NA) * h, NB, h, row(nrm[1]), h, xb[1], projB_, NB, M, true);
+                dense(Ly.Wp + size_t(NA + NB) * h, NC, h, row(nrm[2]), h, xb[2], projC_, NC, M, true);
+            }
         }
         const int oq = kOQ, orel = Q, osink = Q + H * R, og = Q + H * R + 32;
         {   // per (row, head): q/rel clip, k/v short conv + clip / value norm, cache append
@@ -1277,6 +1353,7 @@ void Engine::run(int M) {
             }
         }
         if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);
         int bank_row = -1;
         if (v.block_boundary) {
@@ -1323,6 +1400,7 @@ void Engine::run(int M) {
         { NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, M >= 2 ? nmb_ : nullptr}; nb.count = 1; rms(nb, M); }
         // router: sigmoid scores, top-k by score + bias, weights = scale * score / sum, sorted by expert id
         if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
+        else if (M <= 8) gemvtm<1>(Ly.WrT, c_.experts, h, 32, M, row(NM), row(NM), row(NM), h, rlog_, c_.experts, c_.experts, nullptr, 0, c_.experts, nullptr, 0, c_.experts);
         else dense(Ly.Wr, c_.experts, h, row(NM), h, nmb_, rlog_, c_.experts, M, false);
         {
             const float* lg = rlog_;
@@ -1403,7 +1481,7 @@ void Engine::run(int M) {
     }
     const int V = c_.output_vocab;
     if (all_logits_) {
-        gemvm<2>(unembed_, V, h, row(N0), h, logitsM_, V, M, c_.logit_cap);
+        gemvtm<2>(unembedT_, c_.vocab, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V, c_.logit_cap);
         argmax_rows(logitsM_, V, M, next_);
         int* pd = pos_d_;
         q_.single_task<InkPosV>([=]() { *pd += M; });

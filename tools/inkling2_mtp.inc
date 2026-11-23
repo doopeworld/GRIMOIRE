@@ -297,11 +297,19 @@ void Engine::load_mtp(const std::string& path) {
         const auto s = "layers." + std::to_string(l) + ".";
         DLayer& L = d_.L[l];
         L.sliding = l != 1;
-        L.Wqkv = cat16({{s + "self_attn.q_proj.weight", size_t(3072) * h}, {s + "self_attn.k_proj.weight", size_t(1024) * h}, {s + "self_attn.v_proj.weight", size_t(1024) * h}});
+        auto hcat = [&](std::vector<std::pair<std::string, size_t>> parts) {
+            std::vector<uint16_t> v;
+            for (auto& pr : parts) { auto [pp, nb] = H(pr.first, pr.second * 2); const auto* u = reinterpret_cast<const uint16_t*>(pp); v.insert(v.end(), u, u + pr.second); }
+            return v;
+        };
+        {
+            const auto v = hcat({{s + "self_attn.q_proj.weight", size_t(3072) * h}, {s + "self_attn.k_proj.weight", size_t(1024) * h}, {s + "self_attn.v_proj.weight", size_t(1024) * h}});
+            L.Wqkv = tiled(v.data(), 5120, h);
+        }
         L.Wkvc = cat16({{s + "self_attn.k_proj_ctx.weight", size_t(1024) * h}, {s + "self_attn.v_proj_ctx.weight", size_t(1024) * h}});
-        L.Wo = up16(s + "self_attn.o_proj.weight", size_t(h) * 3072);
-        L.Wgu = cat16({{s + "mlp.gate_proj.weight", size_t(9216) * h}, {s + "mlp.up_proj.weight", size_t(9216) * h}});
-        L.Wd = up16(s + "mlp.down_proj.weight", size_t(h) * 9216);
+        { const auto v = hcat({{s + "self_attn.o_proj.weight", size_t(h) * 3072}}); L.Wo = tiled(v.data(), h, 3072); }
+        { const auto v = hcat({{s + "mlp.gate_proj.weight", size_t(9216) * h}, {s + "mlp.up_proj.weight", size_t(9216) * h}}); L.Wgu = tiled(v.data(), 18432, h); }
+        { const auto v = hcat({{s + "mlp.down_proj.weight", size_t(h) * 9216}}); L.Wd = tiled(v.data(), h, 9216); }
         L.nin = up16(s + "input_layernorm.weight", h);
         L.npost = up16(s + "post_attention_layernorm.weight", h);
         L.qn = up16(s + "self_attn.q_norm.weight", 128);
@@ -516,7 +524,7 @@ void Engine::draft_block(int t, int p_in) {
     for (int l = 0; l < 3; ++l) {
         DLayer& L = d_.L[l];
         norm8(r, L.nin, d_.x, 8, 0);
-        gemvm<0>(L.Wqkv, 5120, h, d_.x, h, d_.qkv, 5120, 8);
+        gemvtm<0>(L.Wqkv, 5120, h, 4, 8, d_.x, d_.x, d_.x, h, d_.qkv, 5120, 5120, nullptr, 0, 5120, nullptr, 0, 5120);
         {
             float* qkv = d_.qkv;
             uint16_t *bk = d_.bk, *bv = d_.bv;
@@ -589,11 +597,11 @@ void Engine::draft_block(int t, int p_in) {
             });
         }
         if (bd) { dump_dev(q_, ("qkv" + std::to_string(l)).c_str(), d_.qkv, 8 * 5120 * 4); dump_dev(q_, ("att" + std::to_string(l)).c_str(), d_.att, 8 * 3072 * 4); }
-        gemvm<0>(L.Wo, h, 3072, d_.att, 3072, d_.o, h, 8);
+        gemvtm<0>(L.Wo, h, 3072, 8, 8, d_.att, d_.att, d_.att, 3072, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
         addres(d_.o);
         if (bd) dump_dev(q_, ("r_attn" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
         norm8(r, L.npost, d_.x, 8, 0);
-        gemvm<0>(L.Wgu, 18432, h, d_.x, h, d_.gu, 18432, 8);
+        gemvtm<0>(L.Wgu, 18432, h, 1, 8, d_.x, d_.x, d_.x, h, d_.gu, 18432, 18432, nullptr, 0, 18432, nullptr, 0, 18432);
         {
             const float* gu = d_.gu;
             float* act = d_.act;
@@ -603,12 +611,12 @@ void Engine::draft_block(int t, int p_in) {
                 act[id[0]] = bfr(bfr(g / (1.f + sycl::exp(-g))) * u);
             });
         }
-        gemvm<0>(L.Wd, h, 9216, d_.act, 9216, d_.o, h, 8);
+        gemvtm<0>(L.Wd, h, 9216, 8, 8, d_.act, d_.act, d_.act, 9216, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
         addres(d_.o);
         if (bd) dump_dev(q_, ("r_mlp" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
     }
     norm8(r, d_.norm, d_.fin, 7, 1);
-    gemvm<0>(unembed_, V, h, d_.fin + h, h, d_.base, V, 7);
+    gemvtm<0>(unembedT_, c_.vocab, h, 1, 7, d_.fin + h, d_.fin + h, d_.fin + h, h, d_.base, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V);
     if (bd) { dump_dev(q_, "fin", d_.fin, 8 * size_t(h) * 4); dump_dev(q_, "base", d_.base, 7 * size_t(V) * 4); }
     // Markov walk: 7 sequential steps on the device
     q_.memset(d_.state, 0, 256 * sizeof(float));
