@@ -61,7 +61,8 @@ void Engine::gemvm(const uint16_t* W, int rows, int K, const float* x, size_t ld
 // Experts for M <= 8 rows: (row, slot) pairs grouped by expert on the device, each used expert's
 // weights read once for all its rows (same per-weight arithmetic as experts_decode).
 void Engine::experts_small(const Layer& Ly, int M) {
-    const int h = h_, I = c_.inter, TK = c_.top_k, E = c_.experts;
+    const int h = h_, I = c_.inter, TK = c_.top_k, E = c_.experts, e0 = e0_, en = en_;
+    const bool tp = world_ > 1;
     const float gcap = c_.gate_cap, ucap = c_.up_cap;
     const int* sel = sel_;
     int* gi = g_info_;  // [0] nd, [1..128] eid, [129..257] start, [258..385] prow, [386..513] ppos
@@ -108,6 +109,8 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 const int lane = int(sg.get_local_linear_id());
                 const int i0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = gi[1 + u], p0 = gi[129 + u], np = gi[130 + u] - p0;
+                if (e < e0 || e >= e0 + en) return;
+                const int el = e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 float g[8][R], uu[8][R];
 #pragma unroll
@@ -120,7 +123,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
                     float qg1[R], qg3[R], qu1[R], qu3[R];
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        const size_t gr = size_t(e) * 2 * I + 2 * size_t(i0 + r), ur = gr + 1;
+                        const size_t gr = size_t(el) * 2 * I + 2 * size_t(i0 + r), ur = gr + 1;
                         if (NV) {
                             const sycl::uint2 a = *reinterpret_cast<const sycl::uint2*>(W + gr * rb + size_t(blk) * 8);
                             const sycl::uint2 b = *reinterpret_cast<const sycl::uint2*>(W + ur * rb + size_t(blk) * 8);
@@ -192,6 +195,8 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 const int lane = int(sg.get_local_linear_id());
                 const int j0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = gi[1 + u], p0 = gi[129 + u], np = gi[130 + u] - p0;
+                if (e < e0 || e >= e0 + en) return;
+                const int el = e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 float d[8][R];
 #pragma unroll
@@ -204,7 +209,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
                     float q1[R], q3[R];
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        const size_t rw = size_t(e) * h + j0 + r;
+                        const size_t rw = size_t(el) * h + j0 + r;
                         if (NV) {
                             pw[r] = sycl::uint2(*reinterpret_cast<const uint32_t*>(W + rw * rb + size_t(c) * 4), 0u);
                             const float sc = e4[S[rw * sb + c / 2]];
@@ -244,8 +249,11 @@ void Engine::experts_small(const Layer& Ly, int M) {
         q_.parallel_for<InkCombS>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
             const size_t t = id[0], m = t / h, ch = t % h;
             float acc = 0.f;
-            for (int s = 0; s < TK; ++s) acc += w[m * TK + s] * dbuf[size_t(gi[386 + m * TK + s]) * h + ch];
-            yb[t] = bfr(acc);
+            for (int s = 0; s < TK; ++s) {
+                const int e = sel[m * TK + s];
+                if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * dbuf[size_t(gi[386 + m * TK + s]) * h + ch];
+            }
+            yb[t] = tp ? acc : bfr(acc);
         });
     }
 }

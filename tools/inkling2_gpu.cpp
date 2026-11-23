@@ -29,6 +29,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <barrier>
+#include <thread>
 
 namespace sycl_ext = sycl::ext::oneapi::experimental;
 using bf16x = sycl::ext::oneapi::bfloat16;
@@ -36,7 +38,7 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkHist; class InkGather; class InkCombine;
+class InkHist; class InkGather; class InkCombine; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
@@ -82,6 +84,7 @@ struct Layer {
     bool sliding = true, loop = false;
     PackedFormat fgu{}, fdn{};
     uint16_t *Wp = nullptr, *Wo = nullptr, *Wr = nullptr;
+    int koff = 0, kfull = 0;  // full-attention conv static weights: this card's channel offset and the full width
     uint16_t *WpT = nullptr, *WoT = nullptr, *WrT = nullptr, *cdownT[4]{};  // decode tiles [N/16][K/8][16][8]
     float* rbias = nullptr;
     uint16_t *nq = nullptr, *nk = nullptr, *nv = nullptr, *nm = nullptr;
@@ -111,12 +114,23 @@ struct NormBatch { NormJob j[3]; int count; };
 struct GateJob { int cur, msg, out; const uint16_t* gain; const uint16_t* forget; };
 struct GateBatch { GateJob j[3]; int count; };
 
+// Two-card exchange: pinned host slots, cross-queue events, one std::barrier per exchange (no host wait on the GPU).
+struct TPX {
+    static constexpr int NS = 8;
+    float* hb[2][NS] = {};
+    sycl::event d2h[2][NS], h2d[2][NS];
+    std::barrier<> bar{2};
+    float bv[2][8] = {};
+    int bi[2][8] = {};
+    int counter[2] = {0, 0};
+};
+
 enum Row { HID, RES, X0, X1, X2, XM, N0, N1, N2, NM, M0, M1, M2, M3, PRE, PREV, G0, G1, G2, GM, Z, YB, TAP0, TAP1, TAP2, TAP3, BANK0, NROWS = BANK0 + kMaxBankRows };
 
 class Engine {
 public:
-    Engine(sycl::queue& q, const std::string& dir, int limit, int chunk)
-        : q_(q), ck_(Checkpoint::open(dir)), c_(ck_.config), dev_(q), limit_(limit), mmax_(std::max(1, chunk)) {
+    Engine(sycl::queue& q, const std::string& dir, int limit, int chunk, int rank = 0, int world = 1, TPX* tpx = nullptr)
+        : q_(q), ck_(Checkpoint::open(dir)), c_(ck_.config), dev_(q), limit_(limit), mmax_(std::max(1, chunk)), rank_(rank), world_(world), tpx_(tpx) {
         if (limit < 1 || limit > c_.max_context) throw std::invalid_argument("bad context");
         visits_ = c_.visits();
         h_ = c_.hidden;
@@ -138,6 +152,12 @@ private:
     const Config& c_;
     Dev dev_;
     int limit_, mmax_, h_ = 0, pos_ = 0;
+    int rank_ = 0, world_ = 1;
+    TPX* tpx_ = nullptr;
+    int e0_ = 0, en_ = 0, v0_ = 0, vrows_ = 0, vvalid_ = 0;
+    float *peer_ = nullptr, *bestv_ = nullptr;
+    void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
+    int final_token(int m = 0);
     size_t rs_ = 0;
     std::vector<Visit> visits_;
     std::vector<Layer> L_;
@@ -221,10 +241,17 @@ void Engine::load() {
         c_.full.heads != c_.local.heads || c_.rel_dim != 16 || c_.conv != 4 || c_.top_k != 8 || c_.experts > 128 || h_ % 256 || c_.inter % 128)
         throw std::runtime_error("geometry outside this port (head_dim 128, d_rel 16, conv 4, top-8, <= 128 experts)");
     const auto t0 = std::chrono::steady_clock::now();
+    en_ = c_.experts / world_; e0_ = rank_ * en_;
+    vrows_ = c_.vocab / world_; v0_ = rank_ * vrows_; vvalid_ = std::max(0, std::min(vrows_, c_.output_vocab - v0_));
+    if (c_.vocab % (16 * world_) || c_.experts % world_ || c_.local.kv_heads % world_) throw std::runtime_error("two-card split");
     embed_ = up<uint16_t>(root + "embed.weight");
     embed_norm_ = up<uint16_t>(root + "embed_norm.weight");
-    unembed_ = up<uint16_t>(root + "unembed.weight");
-    unembedT_ = tiled(reinterpret_cast<const uint16_t*>(host(root + "unembed.weight")), c_.vocab, h_);
+    {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(host(root + "unembed.weight")) + size_t(v0_) * h_;
+        unembed_ = dev_.alloc<uint16_t>(size_t(vrows_) * h_);
+        q_.memcpy(unembed_, src, size_t(vrows_) * h_ * 2).wait();
+        unembedT_ = tiled(src, vrows_, h_);
+    }
     fnorm_ = up<uint16_t>(root + "norm.weight");
     oquery_ = up<float>(root + "attn_res.output_query");
     xq_ = up<float>(root + "middle_cycle_cross_pass_queries");
@@ -238,24 +265,23 @@ void Engine::load() {
         Ly.sliding = c_.sliding[i];
         Ly.loop = i >= c_.loop_start && i < c_.loop_end;
         const auto& a = Ly.sliding ? c_.local : c_.full;
-        const int H = a.heads, KVH = a.kv_heads, R = c_.rel_dim;
-        struct Part { std::string name; int rows; int pad; };
-        std::vector<Part> parts = {{t + "wq_du.weight", Q, 0}, {t + "wr_du.weight", H * R, 0}, {t + "attn_sink_proj.weight", H, 32 - H},
-                                   {t + "gate_attn.weight", Q, 0}, {t + "wk_dv.weight", K, 0}};
-        if (!Ly.sliding) parts.push_back({t + "k_sconv.weight_proj", KVH * c_.conv, 0});
-        parts.push_back({t + "wv_dv.weight", K, 0});
-        if (!Ly.sliding) parts.push_back({t + "v_sconv.weight_proj", KVH * c_.conv, 0});
-        Ly.NA = Q + H * R + 32 + Q;
-        Ly.NB = K + (Ly.sliding ? 0 : KVH * c_.conv);
+        const int H = a.heads / world_, KVH = a.kv_heads / world_, R = c_.rel_dim, D = a.head_dim;
+        const int h0 = rank_ * H, kv0 = rank_ * KVH, Qr = H * D, Kr = KVH * D;
+        struct Part { std::string name; int row0; int rows; int pad; };
+        std::vector<Part> parts = {{t + "wq_du.weight", h0 * D, Qr, 0}, {t + "wr_du.weight", h0 * R, H * R, 0}, {t + "attn_sink_proj.weight", h0, H, 32 - H},
+                                   {t + "gate_attn.weight", h0 * D, Qr, 0}, {t + "wk_dv.weight", kv0 * D, Kr, 0}};
+        if (!Ly.sliding) parts.push_back({t + "k_sconv.weight_proj", kv0 * c_.conv, KVH * c_.conv, 0});
+        parts.push_back({t + "wv_dv.weight", kv0 * D, Kr, 0});
+        if (!Ly.sliding) parts.push_back({t + "v_sconv.weight_proj", kv0 * c_.conv, KVH * c_.conv, 0});
+        Ly.NA = Qr + H * R + 32 + Qr;
+        Ly.NB = Kr + (Ly.sliding ? 0 : KVH * c_.conv);
         Ly.NC = Ly.NB;
         if (H > 32 || Ly.NA % 16 || Ly.NB % 16) throw std::runtime_error("projection padding");
         stage.assign(size_t(Ly.NA + Ly.NB + Ly.NC) * h_, 0);
         int at = 0;
         for (auto& p : parts) {
-            size_t nb;
-            const auto* src = host(p.name, &nb);
-            if (nb != size_t(p.rows) * h_ * 2) throw std::runtime_error("unexpected size " + p.name);
-            std::memcpy(stage.data() + size_t(at) * h_, src, nb);
+            const auto* src = host(p.name);
+            std::memcpy(stage.data() + size_t(at) * h_, src + size_t(p.row0) * h_ * 2, size_t(p.rows) * h_ * 2);
             at += p.rows + p.pad;
         }
         if (at != Ly.NA + Ly.NB + Ly.NC) throw std::runtime_error("projection layout");
@@ -263,20 +289,28 @@ void Engine::load() {
         Ly.Wp = dev_.alloc<uint16_t>(stage.size());
         q_.memcpy(Ly.Wp, stage.data(), stage.size() * 2).wait();
         Ly.WpT = tiled(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_);
-        Ly.Wo = up<uint16_t>(t + "wo_ud.weight");
-        Ly.WoT = tiled(reinterpret_cast<const uint16_t*>(host(t + "wo_ud.weight")), h_, Q);
+        {   // this card's columns of the attention output projection
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(host(t + "wo_ud.weight"));
+            std::vector<uint16_t> wo(size_t(h_) * Qr);
+            for (int n = 0; n < h_; ++n) std::memcpy(wo.data() + size_t(n) * Qr, src + size_t(n) * Q + size_t(h0) * D, size_t(Qr) * 2);
+            Ly.Wo = dev_.alloc<uint16_t>(wo.size());
+            q_.memcpy(Ly.Wo, wo.data(), wo.size() * 2).wait();
+            Ly.WoT = tiled(wo.data(), h_, Qr);
+        }
         Ly.Wr = up<uint16_t>(s + "mlp.gate.weight");
         Ly.WrT = tiled(reinterpret_cast<const uint16_t*>(host(s + "mlp.gate.weight")), c_.experts, h_);
         Ly.rbias = up<float>(s + "mlp.gate.bias");
         if (Ly.sliding) { Ly.nq = Ly.nk = Ly.nv = up<uint16_t>(s + "attn_norm.weight"); }
         else { Ly.nq = up<uint16_t>(s + "q_input_norm.weight"); Ly.nk = up<uint16_t>(s + "k_input_norm.weight"); Ly.nv = up<uint16_t>(s + "v_input_norm.weight"); }
         Ly.nm = up<uint16_t>(s + "mlp_norm.weight");
-        Ly.qs = up<uint16_t>(t + "q_l2_clip.scale");
-        Ly.rs = up<uint16_t>(t + "rel_l2_clip.scale");
+        Ly.qs = up<uint16_t>(t + "q_l2_clip.scale") + size_t(h0) * D;
+        Ly.rs = up<uint16_t>(t + "rel_l2_clip.scale") + size_t(h0) * R;
         Ly.table = up<uint16_t>(t + "rel_logits_proj.proj");
         Ly.E = Ly.sliding ? c_.window : c_.rel_extent;
         Ly.kw = up<uint16_t>(t + (Ly.sliding ? "k_sconv.weight" : "k_sconv.static_w"));
         Ly.vw = up<uint16_t>(t + (Ly.sliding ? "v_sconv.weight" : "v_sconv.static_w"));
+        if (Ly.sliding) { Ly.kw += size_t(kv0) * D * c_.conv; Ly.vw += size_t(kv0) * D * c_.conv; }
+        Ly.koff = kv0 * D; Ly.kfull = a.kv_heads * D;
         Ly.aconv = up<uint16_t>(s + "attn_sconv.weight");
         Ly.mconv = up<uint16_t>(s + "mlp_sconv.weight");
         if (Ly.loop) {
@@ -292,8 +326,18 @@ void Engine::load() {
         Ly.fgu = ck_.layout[i].gate_up;
         Ly.fdn = ck_.layout[i].down;
         const auto e = s + "mlp.experts.";
-        Ly.gu = up<uint8_t>(e + "w13_weight"); Ly.gus = up<uint8_t>(e + "w13_weight_scale");
-        Ly.dn = up<uint8_t>(e + "w2_weight"); Ly.dns = up<uint8_t>(e + "w2_weight_scale");
+        {   // this card's experts [e0, e0 + en)
+            auto part = [&](const std::string& n) {
+                size_t nb;
+                const auto* src = host(n, &nb);
+                const size_t per = nb / c_.experts;
+                uint8_t* d = dev_.alloc<uint8_t>(per * en_);
+                q_.memcpy(d, src + per * e0_, per * en_);
+                return d;
+            };
+            Ly.gu = part(e + "w13_weight"); Ly.gus = part(e + "w13_weight_scale");
+            Ly.dn = part(e + "w2_weight"); Ly.dns = part(e + "w2_weight_scale");
+        }
         if (Ly.fgu == PackedFormat::NVFP4) {
             Ly.gua = up<float>(e + "w13_weight_amax"); Ly.gud = up<float>(e + "w13_weight_outer_scale_denominator");
             Ly.hgua = reinterpret_cast<const float*>(host(e + "w13_weight_amax"));
@@ -317,7 +361,7 @@ void Engine::load() {
         sl.cap = v.sliding ? std::min(limit_, c_.window + mmax_) : limit_;
         sl.khist = dev_.zeros<float>(3 * size_t(K)); sl.vhist = dev_.zeros<float>(3 * size_t(K));
         sl.ahist = dev_.zeros<float>(3 * size_t(h_)); sl.mhist = dev_.zeros<float>(3 * size_t(h_));
-        sl.kc = dev_.zeros<uint16_t>(size_t(sl.cap) * K); sl.vc = dev_.zeros<uint16_t>(size_t(sl.cap) * K);
+        sl.kc = dev_.zeros<uint16_t>(size_t(sl.cap) * K / world_); sl.vc = dev_.zeros<uint16_t>(size_t(sl.cap) * K / world_);
     }
     const size_t mm = size_t(mmax_), TK = size_t(c_.top_k);
     pool_ = dev_.zeros<float>(size_t(NROWS) * rs_);
@@ -337,6 +381,16 @@ void Engine::load() {
     act_ = dev_.zeros<float>(TK * c_.inter);
     dbuf_ = dev_.zeros<float>(TK * h_);
     logits_ = dev_.zeros<float>(c_.output_vocab);
+    bestv_ = dev_.zeros<float>(16);
+    if (world_ > 1) {
+        peer_ = dev_.zeros<float>(mm * h_);
+        if (rank_ == 0)
+            for (int r = 0; r < 2; ++r)
+                for (int k = 0; k < TPX::NS; ++k) {
+                    tpx_->hb[r][k] = sycl::malloc_host<float>(mm * h_, q_.get_context());
+                    if (!tpx_->hb[r][k]) throw std::runtime_error("pinned host exchange buffers");
+                }
+    }
     amx_v_ = dev_.zeros<float>(4096); amx_i_ = dev_.zeros<int>(4096);
     tok_ = dev_.zeros<int>(std::max<size_t>(mm, 8)); next_ = dev_.zeros<int>(16); pos_d_ = dev_.zeros<int>(1);
     vbuf_ = dev_.zeros<float>(S_.size() * 4 * 8 * size_t(h_));
@@ -761,7 +815,7 @@ inline void load_x(const float* g, float* xr, int n) {
 }
 
 void Engine::experts_decode(const Layer& Ly) {
-    const int h = h_, I = c_.inter, TK = c_.top_k;
+    const int h = h_, I = c_.inter, TK = c_.top_k, e0 = e0_, en = en_;
     const float gcap = c_.gate_cap, ucap = c_.up_cap;
     const int* sel = sel_;
     float* act = act_;
@@ -794,6 +848,8 @@ void Engine::experts_decode(const Layer& Ly) {
                 const int s = int(it.get_group(0)) / wpb;
                 const int i0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = sel[s];
+                if (e < e0 || e >= e0 + en) return;
+                const int el = e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 float g[R], u[R];
 #pragma unroll
@@ -805,7 +861,7 @@ void Engine::experts_decode(const Layer& Ly) {
                     load_x(x + size_t(blk) * 16, xr, 16);
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        const size_t gr = size_t(e) * 2 * I + 2 * size_t(i0 + r), ur = gr + 1;
+                        const size_t gr = size_t(el) * 2 * I + 2 * size_t(i0 + r), ur = gr + 1;
                         if (NV) {
                             const sycl::uint2 pg = *reinterpret_cast<const sycl::uint2*>(W + gr * rb + size_t(blk) * 8);
                             const sycl::uint2 pu = *reinterpret_cast<const sycl::uint2*>(W + ur * rb + size_t(blk) * 8);
@@ -864,6 +920,12 @@ void Engine::experts_decode(const Layer& Ly) {
                 const int s = int(it.get_group(0)) / wpb;
                 const int j0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = sel[s];
+                if (e < e0 || e >= e0 + en) {
+                    if (lane == 0)
+                        for (int r = 0; r < R; ++r) dbuf[size_t(s) * h + j0 + r] = 0.f;
+                    return;
+                }
+                const int el = e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 const float* a = act + size_t(s) * I;
                 float d[R];
@@ -876,7 +938,7 @@ void Engine::experts_decode(const Layer& Ly) {
                     load_x(a + size_t(c) * 8, xr, 8);
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        const size_t rw = size_t(e) * h + j0 + r;
+                        const size_t rw = size_t(el) * h + j0 + r;
                         if (NV) {
                             const uint32_t pw = *reinterpret_cast<const uint32_t*>(W + rw * rb + size_t(c) * 4);
                             float A = 0.f, B = 0.f;
@@ -926,25 +988,32 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
     const size_t rbg = Ly.fgu == PackedFormat::NVFP4 ? h / 2 : h, sbg = Ly.fgu == PackedFormat::NVFP4 ? h / 16 : h / 32;
     const size_t rbd = Ly.fdn == PackedFormat::NVFP4 ? I / 2 : I, sbd = Ly.fdn == PackedFormat::NVFP4 ? I / 16 : I / 32;
     for (int e = 0; e < E; ++e) {
-        if (!count[e]) continue;
+        if (!count[e] || e < e0_ || e >= e0_ + en_) continue;
+        const size_t el = size_t(e - e0_);
         const float og = Ly.fgu == PackedFormat::NVFP4 ? Ly.hgua[e] / Ly.hgud[0] : 1.f;
         const float od = Ly.fdn == PackedFormat::NVFP4 ? Ly.hdna[e] / Ly.hdnd[0] : 1.f;
-        const ExpertMatrix gu{Ly.fgu, 2 * I, h, Ly.gu + size_t(e) * 2 * I * rbg, Ly.gus + size_t(e) * 2 * I * sbg, og};
-        const ExpertMatrix dn{Ly.fdn, h, I, Ly.dn + size_t(e) * h * rbd, Ly.dns + size_t(e) * h * sbd, od};
+        const ExpertMatrix gu{Ly.fgu, 2 * I, h, Ly.gu + el * 2 * I * rbg, Ly.gus + el * 2 * I * sbg, og};
+        const ExpertMatrix dn{Ly.fdn, h, I, Ly.dn + el * h * rbd, Ly.dns + el * h * sbd, od};
         b70::inkling2::launch_expert_ffn(q_, gu, dn, count[e], reinterpret_cast<const bf16x*>(inb_) + size_t(off[e]) * h,
                                          reinterpret_cast<bf16x*>(outb_) + size_t(off[e]) * h, c_.gate_cap, c_.up_cap, xs_);
     }
     {
         const uint16_t* outb = outb_;
         const int* pp = pairpos_;
+        const int* sl = sel_;
         const float* w = wts_;
         float* yb = row(YB);
         const size_t total = size_t(M) * h;
+        const int e0 = e0_, en = en_;
+        const bool tp = world_ > 1;
         q_.parallel_for<InkCombine>(sycl::range<1>(total), [=](sycl::id<1> id) {
             const size_t t = id[0], m = t / h, ch = t % h;
             float acc = 0.f;
-            for (int s = 0; s < TK; ++s) acc += w[m * TK + s] * bfw(outb[size_t(pp[m * TK + s]) * h + ch]);
-            yb[t] = bfr(acc);
+            for (int s = 0; s < TK; ++s) {
+                const int e = sl[m * TK + s];
+                if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * bfw(outb[size_t(pp[m * TK + s]) * h + ch]);
+            }
+            yb[t] = tp ? acc : bfr(acc);
         });
     }
 }
@@ -967,13 +1036,42 @@ void Engine::hist_update_v(int slot, int kind, const float* src, size_t ld, int 
     });
 }
 
+void Engine::allreduce(float* buf, size_t n) {
+    TPX& x = *tpx_;
+    const int me = rank_, peer = 1 - rank_, k = x.counter[me]++ % TPX::NS;
+    float* mine = x.hb[me][k];
+    const float* theirs = x.hb[peer][k];
+    const sycl::event prev = x.h2d[peer][k];
+    x.d2h[me][k] = q_.submit([&](sycl::handler& h) { h.depends_on(prev); h.memcpy(mine, buf, n * sizeof(float)); });
+    x.bar.arrive_and_wait();
+    const sycl::event ready = x.d2h[peer][k];
+    float* pr = peer_;
+    x.h2d[me][k] = q_.submit([&](sycl::handler& h) { h.depends_on(ready); h.memcpy(pr, theirs, n * sizeof(float)); });
+    q_.parallel_for<InkAddRound>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + pr[i[0]]); });
+}
+
+// Both cards hold the best (value, index) of their vocabulary half; the host picks (lowest index on ties).
+int Engine::final_token(int m) {
+    float v; int i;
+    q_.memcpy(&v, bestv_ + m, sizeof(float));
+    q_.memcpy(&i, next_ + m, sizeof(int)).wait();
+    if (world_ == 1) return i;
+    TPX& x = *tpx_;
+    x.bv[rank_][m] = v; x.bi[rank_][m] = i;
+    x.bar.arrive_and_wait();
+    const float v0 = x.bv[0][m], v1 = x.bv[1][m];
+    const int i0 = x.bi[0][m], i1 = x.bi[1][m];
+    x.bar.arrive_and_wait();
+    return (v1 > v0 || (v1 == v0 && i1 < i0)) ? i1 : i0;
+}
+
 int Engine::step(int token, std::vector<float>* logits_out) {
     if (pos_ >= limit_) throw std::runtime_error("context full");
     q_.memcpy(tok_, &token, sizeof(int));
     const bool taps_saved = taps_on;
     taps_on = false;
     struct Restore { bool& f; bool v; ~Restore() { f = v; } } restore{taps_on, taps_saved};
-    if (use_graph && !gexec_) {
+    if (use_graph && !gexec_ && world_ == 1) {
         sycl_ext::command_graph<sycl_ext::graph_state::modifiable> g(q_.get_context(), q_.get_device());
         g.begin_recording(q_);
         run(1);
@@ -982,9 +1080,8 @@ int Engine::step(int token, std::vector<float>* logits_out) {
     }
     if (gexec_) q_.ext_oneapi_graph(*gexec_);
     else run(1);
-    int next = -1;
     if (logits_out) { logits_out->resize(c_.output_vocab); q_.memcpy(logits_out->data(), logits_, size_t(c_.output_vocab) * sizeof(float)); }
-    q_.memcpy(&next, next_, sizeof(int)).wait();
+    const int next = final_token();
     ++pos_;
     return next;
 }
@@ -1001,10 +1098,8 @@ int Engine::prefill(const std::vector<int>& ids, std::vector<float>* logits_out)
         pos_ += M;
         at += M;
     }
-    int next = -1;
     if (logits_out) { logits_out->resize(c_.output_vocab); q_.memcpy(logits_out->data(), logits_, size_t(c_.output_vocab) * sizeof(float)); }
-    q_.memcpy(&next, next_, sizeof(int)).wait();
-    return next;
+    return final_token();
 }
 
 // M rows at positions *pos_d .. *pos_d + M - 1; advances *pos_d by M.  M == 1 has no host value that
@@ -1054,7 +1149,7 @@ void Engine::run(int M) {
         const Layer& Ly = L_[i];
         const Slot& sl = S_[v.cache_slot];
         const auto& a = v.sliding ? c_.local : c_.full;
-        const int H = a.heads, KVH = a.kv_heads, D = a.head_dim, K = KVH * D, R = c_.rel_dim, Q = H * D;
+        const int H = a.heads / world_, KVH = a.kv_heads / world_, D = a.head_dim, K = KVH * D, R = c_.rel_dim, Q = H * D;
         if (i == c_.loop_start && v.pass == 0) { copy(HID, PRE); pre_bank = bank; }
         if (i == c_.loop_start && v.has_message) {
             copy(HID, PREV);
@@ -1134,7 +1229,7 @@ void Engine::run(int M) {
             const bool sliding = v.sliding;
             const float qk_clip = c_.qk_clip, rel_clip = c_.rel_clip, cscale = v.sliding ? conv_static : conv_dyn;
             const float alpha = c_.log_alpha, lfloor = float(c_.log_floor);
-            const int taps = c_.conv, G = H + 2 * KVH;
+            const int taps = c_.conv, G = H + 2 * KVH, koff = Ly.koff, kfull = Ly.kfull;
             q_.parallel_for<InkPost>(sycl::nd_range<1>(size_t(M) * G * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int ga = int(it.get_group(0)), m = ga / G, grp = ga % G, d = int(it.get_local_id(0));
                 auto g = it.get_group();
@@ -1168,7 +1263,7 @@ void Engine::run(int M) {
                 float sum = 0.f;
                 for (int lag = 0; lag <= sycl::min(pos, taps - 1); ++lag) {
                     const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(P[size_t(m - lag) * ld + ch]) : hist[size_t((pos - lag) % (taps - 1)) * K + ch]);
-                    const float wt = sliding ? bfw(w[ch * taps + taps - 1 - lag]) : bfw(w[lag * K + ch]) + bfr(dyn[kh_i * taps + lag]);
+                    const float wt = sliding ? bfw(w[ch * taps + taps - 1 - lag]) : bfw(w[lag * kfull + koff + ch]) + bfr(dyn[kh_i * taps + lag]);
                     sum += xl * wt;
                 }
                 float z = bfr((x + sum) * cscale);
@@ -1352,7 +1447,12 @@ void Engine::run(int M) {
                 });
             }
         }
-        if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        if (world_ > 1) {
+            if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
+            else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, false);
+            allreduce(row(Z), size_t(M) * h);
+        } else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);
         int bank_row = -1;
@@ -1439,6 +1539,20 @@ void Engine::run(int M) {
         if (M == 1) experts_decode(Ly);
         else if (M <= 8) experts_small(Ly, M);
         else experts_prompt(Ly, M);
+        if (world_ > 1) {
+            if (M == 1) {   // this card's experts' weighted sum (others' slots hold zeros), unrounded
+                const float* dbuf = dbuf_;
+                const float* wts = wts_;
+                float* yb = row(YB);
+                const int TK = c_.top_k;
+                q_.parallel_for<InkPartial>(sycl::range<1>(size_t(h)), [=](sycl::id<1> id) {
+                    float acc = 0.f;
+                    for (int s2 = 0; s2 < TK; ++s2) acc += wts[s2] * dbuf[size_t(s2) * h + id[0]];
+                    yb[id[0]] = acc;
+                });
+            }
+            allreduce(row(YB), size_t(M) * h);
+        }
         {   // hidden = bf(residual + sconv(y)); y = bf(sum_s w_s d_s) in slot (= ascending expert) order
             const uint16_t* w = Ly.mconv;
             float* hist = sl.mhist;
@@ -1446,12 +1560,13 @@ void Engine::run(int M) {
             const float* wts = wts_;
             const int TK = c_.top_k, taps = c_.conv;
             const float cs = conv_static;
+            const bool tp = world_ > 1;
             q_.parallel_for<InkMlpConv>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
                 const float* yb = pool + size_t(YB) * RS;
                 float x;
-                if (M == 1) {
+                if (M == 1 && !tp) {
                     float acc = 0.f;
                     for (int s = 0; s < TK; ++s) acc += wts[s] * dbuf[size_t(s) * h + ch];
                     x = bfr(acc);
@@ -1487,20 +1602,22 @@ void Engine::run(int M) {
         q_.single_task<InkPosV>([=]() { *pd += M; });
         return;
     }
-    gemv<2>(unembed_, V, h, row(N0, M - 1), logits_, V, nullptr, nullptr, V, nullptr, nullptr, c_.logit_cap);
+    const int VL = vvalid_, vbase = v0_;
+    gemv<2>(unembed_, VL, h, row(N0, M - 1), logits_, VL, nullptr, nullptr, VL, nullptr, nullptr, c_.logit_cap);
     {
         const float* lg = logits_;
         float* bv = amx_v_;
         int* bi = amx_i_;
         int* nx = next_;
-        const int per = 256 * 16, G = (V + per - 1) / per;
+        float* bestv = bestv_;
+        const int per = 256 * 16, G = (VL + per - 1) / per;
         q_.submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> lv(sycl::range<1>(256), cgh);
             sycl::local_accessor<int, 1> li(sycl::range<1>(256), cgh);
             cgh.parallel_for<InkArg1>(sycl::nd_range<1>(size_t(G) * 256, 256), [=](sycl::nd_item<1> it) {
                 const int lid = int(it.get_local_id(0)), base = int(it.get_group(0)) * per;
                 float best = -INFINITY; int bidx = 0x7fffffff;
-                for (int t = 0; t < 16; ++t) { const int k = base + t * 256 + lid; if (k < V && (lg[k] > best || (lg[k] == best && k < bidx))) { best = lg[k]; bidx = k; } }
+                for (int t = 0; t < 16; ++t) { const int k = base + t * 256 + lid; if (k < VL && (lg[k] > best || (lg[k] == best && k < bidx))) { best = lg[k]; bidx = k; } }
                 lv[lid] = best; li[lid] = bidx;
                 for (int s = 128; s > 0; s >>= 1) {
                     sycl::group_barrier(it.get_group());
@@ -1521,7 +1638,7 @@ void Engine::run(int M) {
                     sycl::group_barrier(it.get_group());
                     if (lid < s && (lv[lid + s] > lv[lid] || (lv[lid + s] == lv[lid] && li[lid + s] < li[lid]))) { lv[lid] = lv[lid + s]; li[lid] = li[lid + s]; }
                 }
-                if (lid == 0) *nx = li[0];
+                if (lid == 0) { *nx = li[0] + vbase; *bestv = lv[0]; }
             });
         });
     }
@@ -1557,7 +1674,7 @@ int main(int argc, char** argv) try {
     const auto ids = read_ids(argv[3]);
     const int ctx = std::atoi(argv[4]);
     const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devs.size() != 1) throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
+    if (devs.size() != 1 && mode != "tp") throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
     sycl::queue q(devs[0], sycl::property_list{sycl::property::queue::in_order()});
     std::printf("%s\n", devs[0].get_info<sycl::info::device::name>().c_str());
     if (mode == "check") {
@@ -1700,7 +1817,53 @@ int main(int argc, char** argv) try {
         }
         return 0;
     }
-    throw std::invalid_argument("mode must be check, bench or mtp");
+    if (mode == "tp") {
+        // inkling2_gpu MODEL tp IDS CTX PP_LIST TG [CHUNK]: two cards (both visible), greedy check of the first prompt + bench
+        std::vector<int> pps;
+        { std::stringstream ss(argv[5]); std::string t; while (std::getline(ss, t, ',')) pps.push_back(std::atoi(t.c_str())); }
+        const int tg = argc > 6 ? std::atoi(argv[6]) : 128;
+        const int chunk = argc > 7 ? std::atoi(argv[7]) : 2048;
+        if (devs.size() != 2) throw std::runtime_error("tp: expected two GPUs");
+        sycl::context ctx2(devs);
+        sycl::queue q0(ctx2, devs[0], sycl::property_list{sycl::property::queue::in_order()});
+        sycl::queue q1(ctx2, devs[1], sycl::property_list{sycl::property::queue::in_order()});
+        TPX tpx;
+        std::unique_ptr<Engine> eng[2];
+        {   // rank 0 allocates the shared host slots: load it first
+            eng[0] = std::make_unique<Engine>(q0, argv[1], ctx, chunk, 0, 2, &tpx);
+            eng[1] = std::make_unique<Engine>(q1, argv[1], ctx, chunk, 1, 2, &tpx);
+        }
+        for (auto& e : eng) e->use_graph = false;
+        auto work = [&](int r) {
+            Engine& E = *eng[r];
+            {   // warm-up + 5-token greedy check
+                std::vector<int> five(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 5));
+                int nx = E.prefill(five);
+                std::vector<int> out{nx};
+                for (int g = 1; g < 12; ++g) { nx = E.step(nx); out.push_back(nx); }
+                if (r == 0) { std::printf("two-card greedy after 5 prompt tokens:"); for (int v : out) std::printf(" %d", v); std::printf("\n"); }
+                E.reset();
+            }
+            if (r == 0) std::printf("| test | tokens | time (ms) | tok/s |\n|---|---|---|---|\n");
+            for (int pp : pps) {
+                if (size_t(pp) > ids.size() || pp + tg > ctx) continue;
+                E.reset();
+                std::vector<int> p(ids.begin(), ids.begin() + pp);
+                auto t0 = std::chrono::steady_clock::now();
+                int nx = E.prefill(p);
+                const double pms = ms_since(t0);
+                t0 = std::chrono::steady_clock::now();
+                for (int g = 0; g < tg; ++g) nx = E.step(nx);
+                const double tms = ms_since(t0);
+                if (r == 0) { std::printf("| pp%d | %d | %.1f | %.1f |\n| tg%d @ %d | %d | %.1f | %.1f |\n", pp, pp, pms, 1000.0 * pp / pms, tg, pp, tg, tms, 1000.0 * tg / tms); std::fflush(stdout); }
+            }
+        };
+        std::thread t1(work, 1);
+        work(0);
+        t1.join();
+        return 0;
+    }
+    throw std::invalid_argument("mode must be check, bench, mtp or tp");
 } catch (const std::exception& e) {
     std::fprintf(stderr, "inkling2_gpu: %s\n", e.what());
     return 1;
