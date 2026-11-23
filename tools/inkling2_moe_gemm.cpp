@@ -71,12 +71,21 @@ sycl::event run(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, size_t r
             auto decode = [&](int buf) {
                 uint32_t* d = bs + buf * BT + dh * (KP / 2) * NC2 + dn;
                 if constexpr (F == 0) {
+                    // bf((e2m1 * sc) * o) exactly: |e2m1| = 2^k * {1, 1.5} and both products are exact up to the
+                    // final rounding, which a power of two does not change -> 2^k * bf(sc*o) or 2^k * bf(1.5sc*o)
                     const float sc = b70::e4m3_to_f32(sbyte);
+                    const uint32_t q1 = tob(sc * o), q3 = tob((1.5f * sc) * o);
+                    auto val = [&](uint32_t nib) {
+                        const uint32_t mag = nib & 7u;
+                        const uint32_t bq = (mag & 1u) && mag > 1u ? q3 : q1;
+                        const int sh = mag == 1u ? -1 : int(mag >> 1) - 1;
+                        const uint32_t v = (mag == 0u || bq == 0u) ? 0u : uint32_t(int(bq) + sh * 128);
+                        return v | ((nib & 8u) << 12);
+                    };
 #pragma unroll
                     for (int p = 0; p < 8; ++p) {
                         const uint32_t byte = (pk[p >> 2] >> (8 * (p & 3))) & 0xFFu;
-                        d[p * NC2] = tob((b70::e2m1_to_f32(uint8_t(byte & 15u)) * sc) * o) |
-                                     (tob((b70::e2m1_to_f32(uint8_t(byte >> 4)) * sc) * o) << 16);
+                        d[p * NC2] = val(byte & 15u) | (val(byte >> 4) << 16);
                     }
                 } else {
                     const float sc = b70::e8m0_to_f32(sbyte);
