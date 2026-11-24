@@ -37,6 +37,8 @@
 #include <barrier>
 #include <thread>
 #include <random>
+#include <climits>
+#include <csignal>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -3395,6 +3397,11 @@ static bool write_all(int fd, const std::string& m) {
 }
 
 static std::atomic<bool> g_serve_busy{false};
+// SIGTERM / SIGINT: the running request ends at a step boundary (both cards at the same step), then the server quits;
+// no GPU work is ever cut off mid-submission (a container stop must never take a card off the bus)
+static volatile std::sig_atomic_t g_term = 0;
+static std::atomic<int> g_stop_step{INT_MAX};
+static void on_term(int) { g_term = 1; }
 
 int serve_main(int argc, char** argv) {
     if (argc < 5) { std::fprintf(stderr, "usage: inkling2_gpu MODEL serve SOCKET CTX [CHUNK] [CARDS]\n"); return 2; }
@@ -3402,6 +3409,14 @@ int serve_main(int argc, char** argv) {
     const int ctx = std::atoi(argv[4]);
     const int chunk = argc > 5 ? std::atoi(argv[5]) : 2048;
     const int cards = argc > 6 ? std::atoi(argv[6]) : 1;
+    {   // from the start (loading, warm-up included); no SA_RESTART: a blocked accept / read returns EINTR and the loop sees g_term
+        struct sigaction sa{};
+        sa.sa_handler = on_term;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+    }
     const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (int(devs.size()) != cards) throw std::runtime_error("serve: visible GPUs != CARDS");
     for (const auto& d : devs) std::printf("%s\n", d.get_info<sycl::info::device::name>().c_str());
@@ -3452,8 +3467,10 @@ int serve_main(int argc, char** argv) {
         emit({t});
         const auto t1 = std::chrono::steady_clock::now();
         if (is_stop_tok(t)) reason = "stop";
-        else while (ngen < R.max_new) {
+        else for (int k = 0; ngen < R.max_new; ++k) {
             if (E.pos() + 8 > E.limit()) break;
+            if (r == 0 && g_term && g_stop_step.load() == INT_MAX) g_stop_step = k + 1;   // rank 1 sees it before step k + 1
+            if (k >= g_stop_step.load()) break;
             const auto ts0 = std::chrono::steady_clock::now();
             const auto got = sampled ? E.mtp_step_s(t, sp, rng) : E.mtp_step(t);
             const int vr = sampled ? E.last_rows() : 8;
@@ -3535,6 +3552,7 @@ int serve_main(int argc, char** argv) {
     std::printf("READY serve %s ctx %d chunk %d cards %d\n", sock.c_str(), ctx, chunk, cards);
     std::fflush(stdout);
     while (!quit) {
+        if (g_term) { quit = true; break; }
         const int fd = ::accept(ls, nullptr, nullptr);
         if (fd < 0) continue;
         std::string buf;
@@ -3546,6 +3564,7 @@ int serve_main(int argc, char** argv) {
                 if (n <= 0) break;
                 buf.append(tmp, size_t(n));
             }
+            if (g_term) { quit = true; break; }
             if (nl == std::string::npos) break;   // client gone
             const std::string line = buf.substr(0, nl);
             buf.erase(0, nl + 1);
@@ -3573,6 +3592,7 @@ int serve_main(int argc, char** argv) {
             gen(0, R, fd);
             if (cards > 1) go.arrive_and_wait();
             g_serve_busy = false;
+            if (g_term) { quit = true; break; }
         }
         ::close(fd);
     }
