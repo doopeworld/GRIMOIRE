@@ -67,6 +67,79 @@ void Engine::experts_small(const Layer& Ly, int M) {
     const int* sel = sel_;
     int* gi = g_info_;  // [0] nd, [1..128] eid, [129..257] start, [258..385] prow, [386..513] ppos
     static const bool old_group = std::getenv("INK_OLD_GROUP") != nullptr;
+    static const bool smes0 = !std::getenv("INK_NO_SMES");
+    const bool rg = route_deferred_ && smes0 && h % 256 == 0 && I % 128 == 0;
+    if (route_deferred_ && !rg) throw std::runtime_error("verify routing deferred without the ESIMD expert path");
+    if (rg) {
+        // one 128-thread work-group: router top-k for every row (InkTopk's rank rule and weights), the expert grouping
+        // (InkGroupP's tables) and the activation gather (InkGatherS) -- three launches in one
+        const float* lg = rlog_;
+        const float* rbias = Ly.rbias;
+        int* selw = sel_;
+        float* wtsw = wts_;
+        const float rscale = c_.route_scale;
+        const int NT = M * TK, En = E;
+        uint16_t* xg = xgS_;
+        const float* xbase = row(NM);
+        static const bool sm_perm0 = !std::getenv("INK_SM_NOPERM");
+        const bool xperm = sm_perm0 && Ly.fgu == PackedFormat::NVFP4;
+        q_.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> key(sycl::range<1>(8 * 128), cgh), score(sycl::range<1>(8 * 128), cgh), total(sycl::range<1>(8), cgh);
+            sycl::local_accessor<int, 1> byrank(sycl::range<1>(64), cgh), sl(sycl::range<1>(64), cgh), start(sycl::range<1>(128), cgh),
+                ord(sycl::range<1>(128), cgh), prow(sycl::range<1>(64), cgh);
+            cgh.parallel_for<InkRouteGrp>(sycl::nd_range<1>(128, 128), [=](sycl::nd_item<1> it) {
+                auto g = it.get_group();
+                const int e = int(it.get_local_id(0));
+                for (int m = 0; m < M; ++m)
+                    if (e < En) { const float sc = sigm(lg[size_t(m) * En + e]); score[m * 128 + e] = sc; key[m * 128 + e] = sc + rbias[e]; }
+                sycl::group_barrier(g);
+                int rk[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    rk[m] = 1 << 30;
+                    if (m < M && e < En) {
+                        const float ke = key[m * 128 + e];
+                        int rank = 0;
+                        for (int f = 0; f < En; ++f) { const float kf = key[m * 128 + f]; rank += (kf > ke || (kf == ke && f < e)) ? 1 : 0; }
+                        rk[m] = rank;
+                        if (rank < TK) byrank[m * TK + rank] = e;
+                    }
+                }
+                sycl::group_barrier(g);
+                if (e < M) { float s = 0.f; for (int r = 0; r < TK; ++r) s += score[e * 128 + byrank[e * TK + r]]; total[e] = s; }
+                sycl::group_barrier(g);
+#pragma unroll
+                for (int m = 0; m < 8; ++m)
+                    if (m < M && rk[m] < TK) {
+                        int at = 0;
+                        for (int r = 0; r < TK; ++r) at += byrank[m * TK + r] < e ? 1 : 0;
+                        selw[m * TK + at] = e;
+                        wtsw[m * TK + at] = rscale * (score[m * 128 + e] / (total[m] + 1e-20f));
+                        sl[m * TK + at] = e;
+                    }
+                sycl::group_barrier(g);
+                int c = 0;
+                if (e < En) for (int t = 0; t < NT; ++t) c += sl[t] == e;
+                const int used = c > 0 ? 1 : 0;
+                const int u = sycl::exclusive_scan_over_group(g, used, sycl::plus<int>());
+                const int st = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+                const int nd = sycl::reduce_over_group(g, used, sycl::plus<int>());
+                start[e] = st; ord[e] = u;
+                if (used) { gi[1 + u] = e; gi[129 + u] = st; }
+                if (e == 0) { gi[0] = nd; gi[129 + nd] = NT; }
+                sycl::group_barrier(g);
+                if (e < NT) {
+                    const int ex = sl[e];
+                    int before = 0;
+                    for (int t = 0; t < e; ++t) before += sl[t] == ex;
+                    const int qq = start[ex] + before;
+                    gi[258 + qq] = e / TK;
+                    gi[386 + e] = qq;
+                    gi[514 + qq] = ord[ex];
+                }
+            });
+        });
+    } else
     if (old_group || E > 128 || M * TK > 128) {
     q_.single_task<InkGroup>([=]() {
         int cnt[128], slot[128], cur[128];

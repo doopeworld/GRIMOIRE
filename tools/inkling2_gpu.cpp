@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkDXB; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkDXB; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -392,6 +392,7 @@ private:
     float* projAll_ = nullptr;   // verify, sliding visits: [8][NA + NB + NC] from one INT8 launch
     float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
     bool post_bias_done_ = false;   // this visit's bias table came from InkPost
+    bool route_deferred_ = false;   // verify rows: experts_small does the router top-k (InkRouteGrp)
     void split_proj(int NA, int NB, int NC, int M);
     bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
@@ -2860,7 +2861,9 @@ void Engine::run(int M) {
             float* wts = wts_;
             const int En = c_.experts, TK = c_.top_k;
             const float rscale = c_.route_scale;
-            if (!fused_route) q_.submit([&](sycl::handler& cgh) {
+            static const bool fuse_rg = std::getenv("INK_ROUTEGRP") != nullptr;   // verify rows: top-k + grouping in one work-group (MEASURED 11-24: slower, 34.8 -> 36.9 ms/step; opt-in)
+            route_deferred_ = !fused_route && fuse_rg && M >= 2 && M <= 8 && En <= 128 && M * TK <= 64;
+            if (!fused_route && !route_deferred_) q_.submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> key(sycl::range<1>(128), cgh), score(sycl::range<1>(128), cgh);
                 sycl::local_accessor<int, 1> byrank(sycl::range<1>(16), cgh);
                 sycl::local_accessor<float, 1> total(sycl::range<1>(1), cgh);
