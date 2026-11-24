@@ -3783,7 +3783,9 @@ int main(int argc, char** argv) try {
         sycl::queue q0(c0, devs[0], sycl::property_list{sycl::property::queue::in_order()});
         sycl::queue q1(c1, devs[1], sycl::property_list{sycl::property::queue::in_order()});
         Engine E0(q0, argv[1], ctx, chunk), E1(q1, argv[1], ctx, chunk);
-        const int S = std::getenv("INK_PP_SPLIT") ? std::atoi(std::getenv("INK_PP_SPLIT")) : E0.n_visits() / 2;
+        // MEASURED 11-24 (image v1.10.11, chunk 4096): split 22 / 23 / 24 / 25 / 26 -> pp32768 4,960 / 5,089 / 5,436 /
+        // 5,557 / 5,458 tok/s (stage 1 also runs the output head): one visit more on card 0
+        const int S = std::getenv("INK_PP_SPLIT") ? std::atoi(std::getenv("INK_PP_SPLIT")) : E0.n_visits() / 2 + 1;
         E0.set_visits(0, S);
         E1.set_visits(S, -1);
         const int maxr = 3 + kMaxBankRows;
