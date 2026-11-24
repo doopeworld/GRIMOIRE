@@ -1152,7 +1152,8 @@ static sycl::event ink_attn_merge(sycl::queue& q, const InkAttnArgs& a) {
 }
 sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g) {
     if (g.nsplit > 0 && g.M <= 8) {
-        ink_attn_es_impl<64, 8, true>(q, g);
+        if (g.chunk % 64 == 0) ink_attn_es_impl<64, 8, true>(q, g);
+        else ink_attn_es_impl<32, 8, true>(q, g);
         return ink_attn_merge(q, g);
     }
     static const int tpw = [] { const char* e = std::getenv("INK_ATT_TPW"); return e ? std::atoi(e) : 8; }();

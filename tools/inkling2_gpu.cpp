@@ -391,6 +391,7 @@ private:
     int8_t* rowq(const int8_t* tiled, int N, int K, int Kp);
     float* projAll_ = nullptr;   // verify, sliding visits: [8][NA + NB + NC] from one INT8 launch
     float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
+    bool post_bias_done_ = false;   // this visit's bias table came from InkPost
     void split_proj(int NA, int NB, int NC, int M);
     bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
@@ -2299,7 +2300,18 @@ void Engine::run(int M) {
             const float qk_clip = c_.qk_clip, rel_clip = c_.rel_clip, cscale = v.sliding ? conv_static : conv_dyn;
             const float alpha = c_.log_alpha, lfloor = float(c_.log_floor);
             const int taps = c_.conv, G = H + 2 * KVH, koff = Ly.koff, kfull = Ly.kfull;
-            q_.parallel_for<InkPost>(sycl::nd_range<1>(size_t(M) * G * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            // the rel-position bias table of the matrix-unit attention (rows >= 2), built here per (row, q head) from
+            // the clipped rel values (was the InkBias launch): bias[m][j][e] = bf(sum_r rel[m][j][r] * table[r][e])
+            static const bool post_bias = !std::getenv("INK_SEP_BIAS");
+            const bool pb = post_bias && M >= 2 && D == 128 && !std::getenv("INK_ATT_SIMT") && !std::getenv("INK_NO_ATTES") && Ly.E % 1024 == 0;
+            if (pb && !bias_) bias_ = dev_.alloc<uint16_t>(size_t(mmax_) * std::max(c_.local.heads, c_.full.heads) * std::max(c_.window, c_.rel_extent));
+            uint16_t* bsp = pb ? bias_ : nullptr;
+            post_bias_done_ = pb;
+            const uint16_t* tbl = Ly.table;
+            const int Eb = Ly.E;
+            q_.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> rls(sycl::range<1>(16), cgh);
+            cgh.parallel_for<InkPost>(sycl::nd_range<1>(size_t(M) * G * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int ga = int(it.get_group(0)), m = ga / G, grp = ga % G, d = int(it.get_local_id(0));
                 auto g = it.get_group();
                 const int pos = *posd + m;
@@ -2316,7 +2328,29 @@ void Engine::run(int M) {
                         const float r = bfr(A[orel + j * R + d]) * bfw(rsc[j * R + d]);
                         const float s2 = sycl::reduce_over_group(sg, r * r, sycl::plus<float>());
                         const float f2 = sycl::fmin(1.f, rel_clip / (sycl::sqrt(s2) + 1e-6f));
-                        A[orel + j * R + d] = bfr(bfr(r * f2) * tau);
+                        const float rv = bfr(bfr(r * f2) * tau);
+                        A[orel + j * R + d] = rv;
+                        if (bsp) rls[d] = rv;
+                    }
+                    if (bsp) {   // uniform per work-group
+                        sycl::group_barrier(g);
+                        const int e0 = d * 8;
+                        for (int eb = e0; eb < Eb; eb += 128 * 8) {
+                            float b[8];
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) b[e] = 0.f;
+#pragma unroll
+                            for (int r = 0; r < 16; ++r) {   // the reference's order: r = 0..15
+                                const float rl = rls[r];
+                                const sycl::vec<uint16_t, 8> tv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(tbl + size_t(r) * Eb + eb);
+#pragma unroll
+                                for (int e = 0; e < 8; ++e) b[e] += rl * bfw(tv[e]);
+                            }
+                            sycl::vec<uint16_t, 8> o;
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) o[e] = tobf(b[e]);
+                            *reinterpret_cast<sycl::vec<uint16_t, 8>*>(bsp + (size_t(m) * H + j) * Eb + eb) = o;
+                        }
                     }
                     return;
                 }
@@ -2348,6 +2382,7 @@ void Engine::run(int M) {
                     z = bfr(z * f);
                 }
                 (isk ? kc : vc)[size_t(pos % cap) * K + ch] = tobf(z);
+            });
             });
             if (M > 1 && verify_) { hist_update_v(v.cache_slot, 0, projB_, NB, K, M); hist_update_v(v.cache_slot, 1, projC_, NC, K, M); }
             else if (M > 1) { hist_update(sl.khist, projB_, NB, K, M); hist_update(sl.vhist, projC_, NC, K, M); }
@@ -2459,7 +2494,7 @@ void Engine::run(int M) {
                 uint16_t* bs = bias_;
                 const int Hh = H;
                 // bias[m][j][d] = bf(sum_r rel[m][j][r] * table[r][d]), the reference's summation order
-                q_.parallel_for<InkBias>(sycl::range<1>(size_t(M) * Hh * (E / 16)), [=](sycl::id<1> id) {
+                if (!post_bias_done_) q_.parallel_for<InkBias>(sycl::range<1>(size_t(M) * Hh * (E / 16)), [=](sycl::id<1> id) {
                     const size_t t = id[0], d0 = (t % (E / 16)) * 16, mj = t / (E / 16);
                     const int m = int(mj / Hh), j = int(mj % Hh);
                     float b[16];
@@ -2497,9 +2532,11 @@ void Engine::run(int M) {
                     InkAttnArgs aa{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs};
                     static const bool att_split = !std::getenv("INK_NO_ATTSPLIT");
                     if (att_split && M <= 8) {   // verify rows: one thread per (head, 256-key slice), then a merge
-                        const int chunk = 256, nsplit = (std::min(win, limit_) + 15 + chunk) / chunk;
+                        // slices sized like GRIMOIRE's verify attention (~768 threads, >= 32 keys a slice): MEASURED 11-24
+                        static const int chunk_env = std::getenv("INK_ATT_CHUNK") ? std::atoi(std::getenv("INK_ATT_CHUNK")) : 64;
+                        const int chunk = chunk_env == 32 ? 32 : (chunk_env / 64) * 64, nsplit = (std::min(win, limit_) + 15 + chunk) / chunk;
                         if (!attpart_) {   // once, for the widest case (graph chains keep the pointer)
-                            attpart_n_ = size_t((limit_ + 15 + chunk) / chunk) * std::max(c_.local.heads, c_.full.heads) * 8 * 130;
+                            attpart_n_ = size_t((limit_ + 15 + 32) / 32) * std::max(c_.local.heads, c_.full.heads) * 8 * 130;
                             attpart_ = dev_.alloc<float>(attpart_n_);
                         }
                         if (size_t(nsplit) * H * 8 * 130 > attpart_n_) throw std::runtime_error("attention partials");
