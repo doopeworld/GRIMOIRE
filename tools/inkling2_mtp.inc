@@ -1268,6 +1268,7 @@ std::vector<int> Engine::mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng)
     dmax_ = 7;
     dsp_ = nullptr; drng_ = nullptr;
     const int M = (sq ? dn_ : vrows_fix_ - 1) + 1;   // verify rows: t + the drafts
+    last_rows_ = M;
     q_.memcpy(tok_, d_.dtok, size_t(M) * sizeof(int));
     verify_ = all_logits_ = true;
     run_seg(M);

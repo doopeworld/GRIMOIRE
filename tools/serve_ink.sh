@@ -9,7 +9,7 @@ NAME=ink-1123-serve
 SOCK=$X/serve/ink.sock
 cmd=$1; shift
 if [ "$cmd" = start ]; then
-  CARDS=${1:-2}; CTX=${2:-32768}; CHUNK=${3:-2048}; PORT=${4:-6911}
+  CARDS=${1:-2}; CTX=${2:-32768}; CHUNK=${3:-4096}; PORT=${4:-6911}   # chunk 4096: 8K prefill 3,276 -> 3,612 (BetterBench)
   if docker ps -a --format "{{.Names}}" | grep -q "^ink-1123-"; then echo "an ink-1123 container exists: stop it first"; docker ps -a | grep ink-1123; exit 1; fi
   mkdir -p $X/serve $X/logs; rm -f $SOCK
   P0=${INK_PCI:-0000:03:00.0}

@@ -324,6 +324,10 @@ public:
     std::vector<int> mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng);
     int sample_last(const Samp& sp, std::mt19937_64& rng);   // after prefill: the next token drawn from the last row
     int pos() const { return pos_; }
+    int last_rows() const { return last_rows_; }   // verify rows of the last mtp_step_s
+    void set_rows_tau(int rows, double tau) { vrows_fix_ = std::max(2, std::min(8, rows)); dtau_ = tau; }
+    int rows_fix() const { return vrows_fix_; }
+    double tau() const { return dtau_; }
     int limit() const { return limit_; }
     bool use_graph = true;
     int gpar_ = 0, gex_ = 0;   // two-card graph: mailbox count at capture, exchanges inside
@@ -482,9 +486,10 @@ private:
     Dist dq_[7];                        // q of each sampled draft
     int dtok_h_[8] = {};
     int dmax_ = 7, dn_ = 7;             // drafts asked for / produced by the last draft_block
+    int last_rows_ = 8;
     // sampled drafts: stop drafting once the product of q(d) over the block falls below this (INK_DRAFT_TAU, 0 = off);
     // the verify then runs drafts + 1 rows (INK_VROWS = fixed rows 2..8)
-    double dtau_ = std::getenv("INK_DRAFT_TAU") ? std::atof(std::getenv("INK_DRAFT_TAU")) : 0.0;
+    double dtau_ = std::getenv("INK_DRAFT_TAU") ? std::atof(std::getenv("INK_DRAFT_TAU")) : 0.25;   // MEASURED 11-24 (BetterBench, 2 cards): 0.15..0.5 flat at 123-125 tok/s vs 112 without
     int vrows_fix_ = std::getenv("INK_VROWS") ? std::max(2, std::min(8, std::atoi(std::getenv("INK_VROWS")))) : 8;
     void cands(int n, float* v, int* id);
   public:
@@ -3434,6 +3439,8 @@ int serve_main(int argc, char** argv) {
         g_tp_progress = now_ms();
         int ngen = 1, steps = 0;
         int hist[9] = {};   // decode steps by tokens produced (1..8)
+        int rcnt[9] = {};   // decode steps by verify rows (2..8)
+        double rms_[9] = {};   // host wall ms of those steps
         const char* reason = "length";
         auto emit = [&](const std::vector<int>& v) {
             if (r != 0 || v.empty()) return;
@@ -3447,7 +3454,11 @@ int serve_main(int argc, char** argv) {
         if (is_stop_tok(t)) reason = "stop";
         else while (ngen < R.max_new) {
             if (E.pos() + 8 > E.limit()) break;
+            const auto ts0 = std::chrono::steady_clock::now();
             const auto got = sampled ? E.mtp_step_s(t, sp, rng) : E.mtp_step(t);
+            const int vr = sampled ? E.last_rows() : 8;
+            ++rcnt[vr];
+            rms_[vr] += ms_since(ts0);
             ++steps;
             ++hist[std::min<size_t>(8, got.size())];
             g_tp_progress = now_ms();
@@ -3463,9 +3474,12 @@ int serve_main(int argc, char** argv) {
             t = got.back();
         }
         if (r == 0) {
-            char b[256];
-            std::snprintf(b, sizeof(b), " %s %zu %d %.1f %.1f %d %d,%d,%d,%d,%d,%d,%d,%d\n", reason, R.ids.size(), ngen, pms, ms_since(t1), steps,
-                          hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8]);
+            char b[640];
+            char b2[256];
+            std::snprintf(b2, sizeof(b2), " %d,%d,%d,%d,%d,%d,%d %.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f", rcnt[2], rcnt[3], rcnt[4], rcnt[5], rcnt[6], rcnt[7], rcnt[8],
+                          rms_[2], rms_[3], rms_[4], rms_[5], rms_[6], rms_[7], rms_[8]);
+            std::snprintf(b, sizeof(b), " %s %zu %d %.1f %.1f %d %d,%d,%d,%d,%d,%d,%d,%d%s\n", reason, R.ids.size(), ngen, pms, ms_since(t1), steps,
+                          hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8], b2);
             write_all(fd, "END " + R.id + b);
         }
     };
@@ -3482,6 +3496,14 @@ int serve_main(int argc, char** argv) {
         gen(r, w, -1);
         w.temp = 0.f;
         gen(r, w, -1);
+        {   // record every verify width once (two cards: one segment graph set per width)
+            Engine& E = *eng[r];
+            const int rf = E.rows_fix();
+            const double tau = E.tau();
+            w.temp = 0.7f; w.max_new = 12;
+            for (int vr = 2; vr <= 8; ++vr) { E.set_rows_tau(vr, 0.0); gen(r, w, -1); }
+            E.set_rows_tau(rf, tau);
+        }
         g_serve_busy = false;
     };
     std::thread rank1;

@@ -177,6 +177,9 @@ class Engine:
                 e = {"reason": p[2], "prompt": int(p[3]), "gen": int(p[4]), "prefill_ms": float(p[5]), "decode_ms": float(p[6]), "steps": int(p[7])}
                 if len(p) > 8:
                     e["hist"] = [int(x) for x in p[8].split(",")]   # decode steps producing 1..8 tokens
+                if len(p) > 10:
+                    e["rows"] = [int(x) for x in p[9].split(",")]   # decode steps verifying 2..8 rows
+                    e["rows_ms"] = [float(x) for x in p[10].split(",")]   # their host wall ms
                 yield ("end", e)
                 return
             elif p[0] == "ERR":
