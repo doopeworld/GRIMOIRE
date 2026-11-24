@@ -187,6 +187,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         if(!gguf_file->open(gguf_path,err))return false;
         std::string arch;
         if(!gguf_file->get_string("general.architecture",arch,err))return false;
+        if(arch=="inkling2_loop" || arch=="inkling2") {
+            err="Inkling2 is not a Qwen-compatible GGUF architecture; the Grimoire Inkling2 text reference requires native safetensors";
+            return false;
+        }
         if(!(arch=="gemma4" ? gguf_gemma4_config(*gguf_file,sidecar,j,err)
              : (arch=="qwen3"||arch=="qwen3moe")
                ? gguf_qwen3_config(*gguf_file,sidecar,j,err)
@@ -270,6 +274,10 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     // ---- config -----------------------------------------------------
     // Muse Glimmer nests the text dims under "text_config"; parse from there.
     std::string model_type; find_scalar(j, "model_type", model_type);
+    if(model_type=="inkling2_loop" || model_type=="inkling2_loop_text" || model_type=="inkling2" || model_type=="inkling2_text") {
+        err="Inkling2 has its own loop, KV/convolution state and expert layout; the B60 executor is not ready. Use the separate grimoire-inkling2-reference for host validation";
+        return false;
+    }
     const bool muse = model_type.find("muse_glimmer") != std::string::npos
                    || j.find("muse_glimmer_text") != std::string::npos;
     const bool agnes = model_type == "agnes" || model_type.rfind("agnes", 0) == 0

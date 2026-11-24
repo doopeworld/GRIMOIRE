@@ -26,6 +26,20 @@ test-correctness: bin/test_generation bin/test_http
 HOST_MODEL_SRC = src/quantize.cpp src/qwen35_loader.cpp src/safetensors.cpp src/native_model.cpp src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp src/tokenizer.cpp
 tools: bin/grimoire-quantize bin/inspect_native_model bin/gguf_inspect bin/tok_dump
 
+INKLING2_REF_SRC = src/inkling2_checkpoint.cpp src/inkling2_text_ref.cpp src/safetensors.cpp src/quantize.cpp
+.PHONY: inkling2-reference test-inkling2
+inkling2-reference: bin/grimoire-inkling2-reference
+bin/grimoire-inkling2-reference: tools/inkling2_reference.cpp $(INKLING2_REF_SRC) $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -std=c++20 -ffp-contract=off $(filter %.cpp,$^) -o $@
+
+bin/test_inkling2: tests/test_inkling2.cpp $(INKLING2_REF_SRC) $(wildcard include/b70/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -std=c++20 -ffp-contract=off $(filter %.cpp,$^) -o $@
+
+test-inkling2: bin/test_inkling2
+	./bin/test_inkling2
+
 GGUF_SRC = src/gguf.cpp src/gguf_decode.cpp
 GGUF_DECODE_HEADERS = include/b70/gguf.hpp include/b70/gguf_decode.hpp src/gguf_decode_grids.hpp
 

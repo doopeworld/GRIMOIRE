@@ -42,6 +42,7 @@
 // =====================================================================
 #include "kernels.hpp"
 #include "int4_smallm.hpp"
+#include "inkling2_sycl.hpp"
 #include "b70/tiered_moe.hpp"
 #ifdef GRIMOIRE_WITH_ONEDNN
 #include "onednn_gemm.hpp"
@@ -4018,6 +4019,69 @@ sycl::event launch_nvfp4_expert_gemm(sycl::queue& q, const uint8_t* block,
     return gemm_bf16_vnni<0, true>(q, A, scratch, out, M, N, K, {e}, 0,
                                    s0, gate_up ? s1 : s0, gate_up ? L.I : N);
 }
+
+namespace inkling2 {
+namespace {
+template<PackedFormat F>
+sycl::event pack_expert_vnni(sycl::queue& q, ExpertMatrix w, uint32_t* pairs,
+                            const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<2>(size_t(w.k)/2, size_t(w.n)), [=](sycl::id<2> at) {
+            const int kp=int(at[0]), col=int(at[1]);
+            pairs[vnni_pair_index(w.n,col,kp)] = expert_bf16_pair<F>(w,col,kp);
+        });
+    });
+}
+sycl::event pack_expert_vnni(sycl::queue& q, ExpertMatrix w, uint32_t* pairs,
+                            const std::vector<sycl::event>& deps) {
+    if(w.format==PackedFormat::NVFP4) return pack_expert_vnni<PackedFormat::NVFP4>(q,w,pairs,deps);
+    return pack_expert_vnni<PackedFormat::MXFP8>(q,w,pairs,deps);
+}
+bool supported(const ExpertMatrix& w) {
+    return w.payload && w.scales &&
+        (w.format==PackedFormat::NVFP4 ? std::isfinite(w.outer) && w.outer>=0.f :
+         w.format==PackedFormat::MXFP8 && w.outer==1.f);
+}
+} // namespace
+
+sycl::event launch_expert_ffn(sycl::queue& q, ExpertMatrix gate_up, ExpertMatrix down,
+    int rows, const Bf16* input, Bf16* out, float gate_cap, float up_cap,
+    ExpertScratch scratch, const std::vector<sycl::event>& deps) {
+    const int H=down.n, I=down.k;
+    const auto sizes=expert_scratch_sizes(rows,H,I);
+    if(gate_up.n!=2*I || gate_up.k!=H || !supported(gate_up) || !supported(down) ||
+       !input || !out || !scratch.weight_pairs || !scratch.projection || !scratch.activation ||
+       !std::isfinite(gate_cap) || !std::isfinite(up_cap) || gate_cap<=0.f || up_cap<=0.f)
+        throw std::invalid_argument("invalid Inkling2 XMX expert views, buffers or caps");
+
+    auto e=pack_expert_vnni(q,gate_up,scratch.weight_pairs,deps);
+    const auto* w=reinterpret_cast<const sycl_bf16*>(scratch.weight_pairs);
+    e=gemm_bf16_vnni<0>(q,input,w,scratch.projection,rows,2*I,H,{e});
+    e=q.submit([&](sycl::handler& h) {
+        h.depends_on(e);
+        h.parallel_for(sycl::range<1>(sizes.activation), [=](sycl::id<1> at) {
+            const size_t i=at[0];
+            // Linear outputs round to BF16 before the softcaps. Sigmoid sees
+            // the raw rounded gate, not the tanh-capped gate.
+            const float g=float(bf16_rne(scratch.projection[2*i]));
+            const float u=float(bf16_rne(scratch.projection[2*i+1]));
+            const float z=sycl::exp(-sycl::fabs(g));
+            const float sig=(g>=0.f ? 1.f : z)/(1.f+z);
+            const float act=(gate_cap*sycl::tanh(g/gate_cap))*sig*(up_cap*sycl::tanh(u/up_cap));
+            scratch.activation[i]=bf16_rne(act);
+        });
+    });
+    e=pack_expert_vnni(q,down,scratch.weight_pairs,{e});
+    e=gemm_bf16_vnni<0>(q,scratch.activation,w,scratch.projection,rows,H,I,{e});
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(e);
+        h.parallel_for(sycl::range<1>(size_t(rows)*H), [=](sycl::id<1> at) {
+            out[at[0]]=bf16_rne(scratch.projection[at[0]]);
+        });
+    });
+}
+} // namespace inkling2
 
 // ---------------------------------------------------------------------
 // Small-M MXFP4 GEMM (1..16 rows), every weight byte read ONCE for all rows:
