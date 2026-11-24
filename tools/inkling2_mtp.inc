@@ -689,6 +689,63 @@ void Engine::draft_commit(int p0, int m0, int rows) {
     }
 }
 
+
+namespace {
+// vLLM order: logits / T, top-k, softmax, top-p (smallest prefix reaching top_p, the crossing token kept), renormalize
+Engine::Dist ink_dist(const float* v, const int* id, const Engine::Samp& sp) {
+    Engine::Dist d;
+    int k = Engine::KC;
+    if (sp.top_k > 0 && sp.top_k < k) k = sp.top_k;
+    while (k > 1 && (id[k - 1] < 0 || !(v[k - 1] > -INFINITY))) --k;
+    const double T = sp.temp, mx = v[0];
+    double s = 0.0;
+    for (int j = 0; j < k; ++j) { d.id[j] = id[j]; d.p[j] = std::exp((double(v[j]) - mx) / T); s += d.p[j]; }
+    for (int j = 0; j < k; ++j) d.p[j] /= s;
+    int keep = k;
+    if (sp.top_p < 1.f) {
+        double c = 0.0;
+        for (int j = 0; j < k; ++j) { c += d.p[j]; if (c >= double(sp.top_p)) { keep = j + 1; break; } }
+    }
+    double s2 = 0.0;
+    for (int j = 0; j < keep; ++j) s2 += d.p[j];
+    for (int j = 0; j < keep; ++j) d.p[j] /= s2;
+    d.n = keep;
+    return d;
+}
+double ink_prob(const Engine::Dist& d, int tok) { for (int j = 0; j < d.n; ++j) if (d.id[j] == tok) return d.p[j]; return 0.0; }
+int ink_draw(const Engine::Dist& d, double u, int exclude) {
+    double tot = 0.0;
+    for (int j = 0; j < d.n; ++j) if (d.id[j] != exclude) tot += d.p[j];
+    if (!(tot > 0.0)) return d.id[0];
+    const double x = u * tot;
+    double c = 0.0;
+    int last = d.id[0];
+    for (int j = 0; j < d.n; ++j) {
+        if (d.id[j] == exclude) continue;
+        c += d.p[j];
+        last = d.id[j];
+        if (x < c) return d.id[j];
+    }
+    return last;
+}
+// residual max(0, p - q), renormalized (speculative sampling after a rejected draft drawn from q)
+int ink_draw_residual(const Engine::Dist& P, const Engine::Dist& Q, double u) {
+    double r[Engine::KC], tot = 0.0;
+    for (int j = 0; j < P.n; ++j) { r[j] = std::max(0.0, P.p[j] - ink_prob(Q, P.id[j])); tot += r[j]; }
+    if (!(tot > 0.0)) return ink_draw(P, u, -1);
+    const double x = u * tot;
+    double c = 0.0;
+    int last = P.id[0];
+    for (int j = 0; j < P.n; ++j) {
+        if (r[j] <= 0.0) continue;
+        c += r[j];
+        last = P.id[j];
+        if (x < c) return P.id[j];
+    }
+    return last;
+}
+}  // namespace
+
 // One draft block at positions p..p+7: row 0 = target embedding of t, rows 1..7 = mask_embed.
 // Writes drafts to d_.dtok[1..7] (d_.dtok[0] = t).
 void Engine::draft_block(int t, int p_in) {
@@ -847,7 +904,9 @@ void Engine::draft_block(int t, int p_in) {
     if (bd) { dump_dev(q_, "fin", d_.fin, 8 * size_t(h) * 4); dump_dev(q_, "base", d_.base, 7 * size_t(V) * 4); }
     // Markov walk: 7 sequential steps on the device
     q_.memset(d_.state, 0, 256 * sizeof(float));
-    for (int step = 0; step < 7; ++step) {
+    dn_ = dmax_;
+    double dcum = 1.0;
+    for (int step = 0; step < dmax_; ++step) {
         {
             float* inp = d_.inp;
             const float *st = d_.state, *fin = d_.fin + size_t(1 + step) * h, *fr = d_.frnn;
@@ -910,7 +969,25 @@ void Engine::draft_block(int t, int p_in) {
                 }
             });
         }
-        if (dsplit) {
+        if (dsp_) {
+            // sampling request: draft drawn from the drafter's q (same temperature / top-k / top-p as the target);
+            // two cards: both halves' candidates merged on the host, both ranks draw with the same RNG
+            const int kk = dsp_->top_k > 0 ? dsp_->top_k : KC;
+            if (dsplit) topk_rows(d_.dlog, vrows_, vvalid_, 1, v0_, 0.f, kk);
+            else topk_rows(d_.dlog, V, V, 1, 0, 0.f, kk);
+            float cv[KC]; int ci[KC];
+            cands(1, cv, ci);
+            // q's temperature = the request's x INK_DRAFT_TSCALE (any q keeps the output exact; a q closer to p accepts more)
+            static const double tsc = std::getenv("INK_DRAFT_TSCALE") ? std::atof(std::getenv("INK_DRAFT_TSCALE")) : 1.0;
+            Samp qs = *dsp_;
+            qs.temp = float(qs.temp * tsc);
+            dq_[step] = ink_dist(cv, ci, qs);
+            std::uniform_real_distribution<double> U(0.0, 1.0);
+            dtok_h_[1 + step] = ink_draw(dq_[step], U(*drng_), -1);
+            q_.memcpy(d_.dtok + 1 + step, &dtok_h_[1 + step], sizeof(int));
+            dcum *= ink_prob(dq_[step], dtok_h_[1 + step]);
+            if (dtau_ > 0.0 && dcum < dtau_) { dn_ = step + 1; break; }
+        } else if (dsplit) {
             // this card's best of its half -> the global best through the host (both cards take the same token)
             argmax_rows_cap(d_.dlog, vrows_, vvalid_, 1, next_, bestv_, v0_, 0.f);
             const int tok = final_token(0);
@@ -1044,5 +1121,185 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
     if (mtime) { q_.wait(); mtp_ms_[2] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tA).count(); }
     std::vector<int> out(dr + 1, dr + 1 + a);
     out.push_back(nx[a]);
+    return out;
+}
+
+// Top-KC (value, global id) per row, descending, lowest id first on equal values.  Values = the argmax formula
+// (cap tanh(bf(raw) / cap) for raw INT8 logits, else the stored value).  Stage 1: 4096 logits a work-group keep their
+// KC best (KC rounds of a work-group max over packed keys); stage 2: one work-group per row merges the G x KC.
+static inline uint64_t ink_tk_key(float v, uint32_t k) {
+    uint32_t u = sycl::bit_cast<uint32_t>(v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return (uint64_t(u) << 32) | uint64_t(0xFFFFFFFFu - k);
+}
+
+void Engine::topk_rows(const float* lg, int ld, int V, int n, int base, float cap, int kk) {
+    constexpr int K = KC;
+    const int KR = std::max(1, std::min(K, kk));   // rounds
+    const int per = 4096, G = (V + per - 1) / per;
+    if (G > 64 || n > 8 || n < 1) throw std::runtime_error("topk_rows: shape");
+    float* pv = tkpv_;
+    int* pi = tkpi_;
+    q_.parallel_for<InkTopK1>(sycl::nd_range<1>(size_t(n) * G * 256, 256), [=](sycl::nd_item<1> it) {
+        const int grp = int(it.get_group(0)), m = grp / G, gb = grp % G, lid = int(it.get_local_id(0));
+        const float* x = lg + size_t(m) * ld;
+        float v[16];
+        uint32_t used = 0;
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            const int k = gb * per + t * 256 + lid;
+            if (k < V) v[t] = cap > 0.f ? cap * sycl::tanh(bfr(x[k]) / cap) : x[k];
+            else { v[t] = -INFINITY; used |= 1u << t; }
+        }
+        auto best = [&]() {
+            int b = -1;
+            float bv = 0.f;
+#pragma unroll
+            for (int t = 0; t < 16; ++t)
+                if (!((used >> t) & 1u) && (b < 0 || v[t] > bv)) { b = t; bv = v[t]; }
+            return b;
+        };
+        int bt = best();
+        float* ov = pv + (size_t(m) * 64 + gb) * K;
+        int* oi = pi + (size_t(m) * 64 + gb) * K;
+        if (lid < K - KR) { ov[KR + lid] = -INFINITY; oi[KR + lid] = -1; }
+        for (int r = 0; r < KR; ++r) {
+            float bvv = -INFINITY;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) if (t == bt) bvv = v[t];
+            const uint64_t mine = bt >= 0 ? ink_tk_key(bvv, uint32_t(gb * per + bt * 256 + lid)) : 0ull;
+            const uint64_t g = sycl::reduce_over_group(it.get_group(), mine, sycl::maximum<uint64_t>());
+            if (g == 0ull) { if (lid == 0) { ov[r] = -INFINITY; oi[r] = -1; } continue; }
+            if (mine == g) {
+                ov[r] = bvv;
+                oi[r] = gb * per + bt * 256 + lid;
+                used |= 1u << bt;
+                bt = best();
+            }
+        }
+    });
+    float* fv = tkv_;
+    int* fi = tki_;
+    q_.parallel_for<InkTopK2>(sycl::nd_range<1>(size_t(n) * 256, 256), [=](sycl::nd_item<1> it) {
+        const int m = int(it.get_group(0)), lid = int(it.get_local_id(0));
+        const int C = G * K;   // <= 2048 = 8 per thread
+        float v[8];
+        int kk[8];
+        uint32_t used = 0;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int c = t * 256 + lid;
+            kk[t] = -1; v[t] = -INFINITY;
+            if (c < C) { v[t] = pv[size_t(m) * 64 * K + c]; kk[t] = pi[size_t(m) * 64 * K + c]; }
+            if (kk[t] < 0) used |= 1u << t;
+        }
+        auto best = [&]() {
+            int b = -1;
+            float bv = 0.f;
+            int bk = 0;
+#pragma unroll
+            for (int t = 0; t < 8; ++t)
+                if (!((used >> t) & 1u) && (b < 0 || v[t] > bv || (v[t] == bv && kk[t] < bk))) { b = t; bv = v[t]; bk = kk[t]; }
+            return b;
+        };
+        int bt = best();
+        if (lid < K - KR) { fv[m * K + KR + lid] = -INFINITY; fi[m * K + KR + lid] = -1; }
+        for (int r = 0; r < KR; ++r) {
+            float bvv = -INFINITY;
+            int bkk = 0;
+#pragma unroll
+            for (int t = 0; t < 8; ++t) if (t == bt) { bvv = v[t]; bkk = kk[t]; }
+            const uint64_t mine = bt >= 0 ? ink_tk_key(bvv, uint32_t(bkk)) : 0ull;
+            const uint64_t g = sycl::reduce_over_group(it.get_group(), mine, sycl::maximum<uint64_t>());
+            if (g == 0ull) { if (lid == 0) { fv[m * K + r] = -INFINITY; fi[m * K + r] = -1; } continue; }
+            if (mine == g) {
+                fv[m * K + r] = bvv;
+                fi[m * K + r] = base + bkk;
+                used |= 1u << bt;
+                bt = best();
+            }
+        }
+    });
+}
+
+// Host copy of the top-KC per row; two cards: both halves exchanged and merged (identical on both ranks).
+void Engine::cands(int n, float* v, int* id) {
+    q_.memcpy(v, tkv_, size_t(n) * KC * sizeof(float));
+    q_.memcpy(id, tki_, size_t(n) * KC * sizeof(int)).wait();
+    if (world_ == 1) return;
+    TPX& x = *tpx_;
+    g_tp_stage[rank_] = 7;
+    std::memcpy(x.cv[rank_], v, size_t(n) * KC * sizeof(float));
+    std::memcpy(x.ci[rank_], id, size_t(n) * KC * sizeof(int));
+    x.bar.arrive_and_wait();
+    for (int m = 0; m < n; ++m) {
+        const float* a = x.cv[0] + m * KC; const int* ai = x.ci[0] + m * KC;
+        const float* b = x.cv[1] + m * KC; const int* bi = x.ci[1] + m * KC;
+        int i = 0, j = 0;
+        for (int r = 0; r < KC; ++r) {
+            const bool ta = j >= KC || (i < KC && ai[i] >= 0 && (bi[j] < 0 || a[i] > b[j] || (a[i] == b[j] && ai[i] < bi[j])));
+            if (ta) { v[m * KC + r] = a[i]; id[m * KC + r] = ai[i]; ++i; }
+            else { v[m * KC + r] = b[j]; id[m * KC + r] = bi[j]; ++j; }
+        }
+    }
+    x.bar.arrive_and_wait();
+    g_tp_progress = now_ms();
+}
+
+
+int Engine::sample_last(const Samp& sp, std::mt19937_64& rng) {
+    topk_rows(logits_, vvalid_, vvalid_, 1, v0_, last_raw_ ? c_.logit_cap : 0.f, sp.top_k > 0 ? sp.top_k : KC);
+    float v[KC]; int id[KC];
+    cands(1, v, id);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    const Dist d = ink_dist(v, id, sp);
+    return ink_draw(d, U(rng), -1);
+}
+
+// mtp_step with sampling: the drafts are the drafter's argmax; draft d at row i is kept with probability p_i(d)
+// (exact speculative sampling for a deterministic draft), else row i's token is drawn from p_i without d.
+std::vector<int> Engine::mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng) {
+    const int p = pos_;
+    if (p + 8 > limit_) throw std::runtime_error("context full");
+    const bool sq = sample_drafts;
+    if (sq) { dsp_ = &sp; drng_ = &rng; }
+    dmax_ = vrows_fix_ - 1;
+    draft_block(t, p);
+    dmax_ = 7;
+    dsp_ = nullptr; drng_ = nullptr;
+    const int M = (sq ? dn_ : vrows_fix_ - 1) + 1;   // verify rows: t + the drafts
+    q_.memcpy(tok_, d_.dtok, size_t(M) * sizeof(int));
+    verify_ = all_logits_ = true;
+    run_seg(M);
+    verify_ = all_logits_ = false;
+    if (!vlog_) throw std::runtime_error("mtp_step_s: verify logits unknown");
+    topk_rows(vlog_, vlog_ld_, vlog_n_, M, vlog_base_, vlog_cap_, sp.top_k > 0 ? sp.top_k : KC);
+    int dr[8];
+    q_.memcpy(dr, d_.dtok, 8 * sizeof(int));
+    float cv[8 * KC]; int ci[8 * KC];
+    cands(M, cv, ci);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    int a = 0, nx = -1;
+    for (int i = 0; i < M; ++i) {
+        const Dist d = ink_dist(cv + i * KC, ci + i * KC, sp);
+        if (i == M - 1) { nx = ink_draw(d, U(rng), -1); break; }
+        const int dt = dr[i + 1];
+        const double pd = ink_prob(d, dt);
+        if (sq) {   // draft drawn from q: keep with min(1, p/q), else draw from max(0, p - q)
+            const double qd = ink_prob(dq_[i], dt);
+            if (qd > 0.0 && U(rng) < std::min(1.0, pd / qd)) { ++a; continue; }
+            nx = ink_draw_residual(d, dq_[i], U(rng));
+            break;
+        }
+        if (U(rng) < pd) { ++a; continue; }
+        nx = ink_draw(d, U(rng), dt);
+        break;
+    }
+    commit_verify(p, a);
+    draft_commit(p, 0, a + 1);
+    pos_ = p + a + 1;
+    q_.memcpy(pos_d_, &pos_, sizeof(int));
+    std::vector<int> out(dr + 1, dr + 1 + a);
+    out.push_back(nx);
     return out;
 }

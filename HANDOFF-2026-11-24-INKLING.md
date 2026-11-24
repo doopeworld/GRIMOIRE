@@ -127,3 +127,16 @@ Hardware counters (unitrace -q) fail in the container (metric init assertion).
   GRIMOIRE already measured enqueue-ahead TP with host-signaled L0 events (GRIMOIRE_TP_ASYNC, 11-19): slower on the
   285H; do not redo without a free P-core.
 
+## 11-24 late: speed tests = BetterBench (Ian: "as of now please use tool for speed test : better bench")
+
+OpenAI server for the Inkling engine (none existed; the engine only read token-ID files):
+- `tools/inkling2_gpu.cpp` mode `serve MODEL serve SOCKET CTX CHUNK CARDS`: line protocol on a Unix socket
+  (GEN / TOK / END / ERR / QUIT), one or two cards (both ranks in lockstep, same RNG seed), requests one at a time.
+- Sampling (temperature / top-k / top-p, vLLM order) on the engine: GPU top-32 per row (InkTopK1/2), candidates
+  merged across the cards on the host; exact speculative sampling on the DSpark verify rows.
+- `tools/inkling2_server.py` (Tower venv, HF tokenizers): /v1/models, /v1/chat/completions (SSE), chat_template.jinja
+  rendered for text messages (thinking-effort line, default 0.9), `<|content_thinking|>` -> reasoning_content.
+- `tools/serve_ink.sh start CARDS CTX [CHUNK] [PORT]` / `stop` (front end first, then QUIT to the idle engine).
+- `tools/bb_ink.sh TAG [args]`: BetterBench with bench-1022/betterbench-vllm1111.json (temp 0.7 / top-p 0.95 /
+  top-k 20, prefill 2K / 8K, concurrency 1/2/4/8), client on CPUs 14,15; prints the engine's tokens/step, ms/step.
+

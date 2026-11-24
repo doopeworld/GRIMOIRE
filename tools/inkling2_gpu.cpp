@@ -36,6 +36,11 @@
 #include <mutex>
 #include <barrier>
 #include <thread>
+#include <random>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 namespace sycl_ext = sycl::ext::oneapi::experimental;
 using bf16x = sycl::ext::oneapi::bfloat16;
@@ -47,7 +52,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkDXB; class InkCopyOut; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkAgAsm; class InkAgTo16; class InkAgFrom16; class InkCombineR; class InkTopK1; class InkTopK2; class InkDXB; class InkNormRoute; class InkCopyOut; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -169,7 +174,7 @@ struct Q4 { uint8_t* pay = nullptr; uint16_t* sc = nullptr; uint8_t* z = nullptr
 struct Layer {
     bool sliding = true, loop = false;
     PackedFormat fgu{}, fdn{};
-    uint16_t *Wp = nullptr, *Wo = nullptr, *Wr = nullptr;
+    uint16_t *Wp = nullptr, *Wo = nullptr, *Wr = nullptr, *WoF = nullptr;   // WoF: two cards, the full Wo (prompt rows)
     int koff = 0, kfull = 0;  // full-attention conv static weights: this card's channel offset and the full width
     uint16_t *WpT = nullptr, *WoT = nullptr, *WrT = nullptr, *cdownT[4]{};  // decode tiles [N/16][K/8][16][8]
     int8_t *WpQ = nullptr, *WoQ = nullptr;   // INK_I8=1: the same tiles as int8, one fp32 scale per row
@@ -229,6 +234,8 @@ struct TPX {
     std::barrier<> bar{2};
     float bv[2][8] = {};
     int bi[2][8] = {};
+    float cv[2][8 * 32] = {};   // sampling: each card's top-32 (value, global id) per verify row
+    int ci[2][8 * 32] = {};
     int counter[2] = {0, 0};
 };
 
@@ -309,6 +316,15 @@ public:
     int prefill(const std::vector<int>& ids, std::vector<float>* logits_out = nullptr);
     void load_mtp(const std::string& path);
     std::vector<int> mtp_step(int t, const int* forced = nullptr);
+    // ---- sampling (OpenAI server): temperature / top-k / top-p, exact speculative sampling on the verify rows
+    static constexpr int KC = 32;   // candidates kept per row (top_k above 32 or off is clamped to 32)
+    struct Samp { float temp = 0.f, top_p = 1.f; int top_k = 0; };
+    struct Dist { int n = 0; int id[KC]; double p[KC]; };   // processed distribution over the kept candidates
+    bool sample_drafts = !std::getenv("INK_GREEDY_DRAFTS");   // sampling requests: drafts drawn from the drafter's q (exact p/q test)
+    std::vector<int> mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng);
+    int sample_last(const Samp& sp, std::mt19937_64& rng);   // after prefill: the next token drawn from the last row
+    int pos() const { return pos_; }
+    int limit() const { return limit_; }
     bool use_graph = true;
     int gpar_ = 0, gex_ = 0;   // two-card graph: mailbox count at capture, exchanges inside
     // two cards: a step recorded as a chain of graphs split at its exchanges (each segment ends with the copy-out of
@@ -399,6 +415,7 @@ private:
     float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
     bool post_bias_done_ = false;   // this visit's bias table came from InkPost
     bool route_deferred_ = false;   // verify rows: experts_small does the router top-k (InkRouteGrp)
+    int nr_in_ = -1;                // 2..8 rows: the MLP norm's input row when InkNormRoute does norm + router + top-k
     // two cards, decode / verify: the exchange's add is done by the next reader (InkResid / InkMlpConv) -- the peer's
     // partial (pinned host slot) is added as the row is read; set by allreduce, consumed (cleared) by the reader
     const float* peer_in_ = nullptr;
@@ -443,6 +460,12 @@ private:
     void gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M);
     void experts_decode(const Layer& Ly);
     void experts_prompt(const Layer& Ly, int M);
+    // two cards, prompt rows: all-gathers (bf16-exact payloads) instead of fp32 all-reduces
+    bool tp_ag_ = !std::getenv("INK_TP_AR_PREFILL");
+    bool xrow_ = false;                          // experts_prompt: only this card's rows [xr0_, xr1_), every expert
+    int xr0_ = 0, xr1_ = 0;
+    float* aoutF_ = nullptr; uint16_t *aoutFb_ = nullptr, *peer16_ = nullptr, *xg16_ = nullptr;
+    void xchg_bytes(const void* src, size_t nmine, void* dst, size_t npeer);
     void dequant_used(PackedFormat f, int N, int K, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb, int nu, int outer_at, uint16_t* dst, int u0 = 0);
     void hist_update(float* hist, const float* src, size_t ld, int n, int M);
     void hist_update_v(int slot, int kind, const float* src, size_t ld, int n, int M);
@@ -451,6 +474,19 @@ private:
     bool verify_ = false, all_logits_ = false, mtp_ = false;
     float *vbuf_ = nullptr, *actS_ = nullptr, *dbufS_ = nullptr, *logitsM_ = nullptr;
     float *logitsR_ = nullptr, *amxm_v_ = nullptr; int* amxm_i_ = nullptr;
+    float *tkv_ = nullptr, *tkpv_ = nullptr; int *tki_ = nullptr, *tkpi_ = nullptr;   // top-KC: final [8][KC], partial [8][64][KC]
+    const float* vlog_ = nullptr; int vlog_ld_ = 0, vlog_n_ = 0, vlog_base_ = 0; float vlog_cap_ = 0.f;   // where the verify rows' logits are
+    void topk_rows(const float* lg, int ld, int V, int n, int base, float cap, int kk = KC);   // kk best kept (rest -inf)
+    const Samp* dsp_ = nullptr;         // set while mtp_step_s drafts: draft tokens sampled from q
+    std::mt19937_64* drng_ = nullptr;
+    Dist dq_[7];                        // q of each sampled draft
+    int dtok_h_[8] = {};
+    int dmax_ = 7, dn_ = 7;             // drafts asked for / produced by the last draft_block
+    // sampled drafts: stop drafting once the product of q(d) over the block falls below this (INK_DRAFT_TAU, 0 = off);
+    // the verify then runs drafts + 1 rows (INK_VROWS = fixed rows 2..8)
+    double dtau_ = std::getenv("INK_DRAFT_TAU") ? std::atof(std::getenv("INK_DRAFT_TAU")) : 0.0;
+    int vrows_fix_ = std::getenv("INK_VROWS") ? std::max(2, std::min(8, std::atoi(std::getenv("INK_VROWS")))) : 8;
+    void cands(int n, float* v, int* id);
   public:
     double mtp_ms_[3] = {0, 0, 0};   // INK_MTP_TIME: draft, verify, commit (host wall)
   private:   // INT8 verify unembed: raw logits, argmax partials
@@ -549,6 +585,11 @@ void Engine::load() {
         if (i4_ && (i4parts_ & 1)) {
             const std::string b = "blk." + std::to_string(i) + ".";
             Ly.Wp4 = quant4(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_, {{Ly.NA, b + "attn_q.weight"}, {Ly.NB, b + "attn_k.weight"}, {Ly.NC, b + "attn_v.weight"}});
+        }
+        if (world_ > 1 && tp_ag_) {   // the full Wo (bf16) for prompt rows (all-gathered head outputs)
+            const size_t QF = size_t(a.heads) * D;
+            Ly.WoF = dev_.alloc<uint16_t>(size_t(h_) * QF);
+            q_.memcpy(Ly.WoF, host(t + "wo_ud.weight"), size_t(h_) * QF * 2).wait();
         }
         {   // this card's columns of the attention output projection
             const uint16_t* src = reinterpret_cast<const uint16_t*>(host(t + "wo_ud.weight"));
@@ -659,6 +700,7 @@ void Engine::load() {
         att_part_ = dev_.zeros<float>(size_t(c_.local.heads) * nch * 128);
     }
     aout_ = dev_.zeros<float>(mm * Q); aoutb_ = dev_.zeros<uint16_t>(mm * Q);
+    if (world_ > 1 && tp_ag_) { aoutF_ = dev_.zeros<float>(mm * Q); aoutFb_ = dev_.zeros<uint16_t>(mm * Q); peer16_ = dev_.zeros<uint16_t>(mm * std::max<size_t>(Q, h_)); xg16_ = dev_.zeros<uint16_t>(mm * h_); }
     xcat_ = dev_.zeros<float>(3 * mm * 2 * h_); xcatb_ = dev_.zeros<uint16_t>(3 * mm * 2 * h_);
     low_ = dev_.zeros<float>(3 * mm * c_.gate_rank);
     nb_ = dev_.zeros<uint16_t>(3 * mm * h_); nmb_ = dev_.zeros<uint16_t>(mm * h_);
@@ -698,6 +740,7 @@ void Engine::load() {
     if (i8v_) logitsR_ = dev_.zeros<float>(8 * size_t(vrows_));
     if (i8v_) { int mx = 0; for (const auto& Ly : L_) mx = std::max(mx, Ly.NA + Ly.NB + Ly.NC); projAll_ = dev_.zeros<float>(8 * size_t(mx)); }
     amxm_v_ = dev_.zeros<float>(8 * 64); amxm_i_ = dev_.zeros<int>(8 * 64);
+    tkv_ = dev_.zeros<float>(8 * KC); tki_ = dev_.zeros<int>(8 * KC); tkpv_ = dev_.zeros<float>(size_t(8) * 64 * KC); tkpi_ = dev_.zeros<int>(size_t(8) * 64 * KC);
     g_info_ = dev_.zeros<int>(1024);
     {
         std::vector<SlotPtrs> sp(S_.size());
@@ -1769,10 +1812,12 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
     std::vector<int> hsel(size_t(M) * TK);
     q_.memcpy(hsel.data(), sel_, hsel.size() * sizeof(int)).wait();
     std::vector<int> count(E, 0), off(E + 1, 0), gat(size_t(M) * TK), ppos(size_t(M) * TK);
-    for (int v : hsel) count[v]++;
+    const int mr0 = xrow_ ? xr0_ : 0, mr1 = xrow_ ? xr1_ : M;   // two cards, prompt rows: this card's rows, every expert
+    const int NP = (mr1 - mr0) * TK;                             // gathered (row, slot) pairs
+    for (int m = mr0; m < mr1; ++m) for (int s = 0; s < TK; ++s) count[hsel[size_t(m) * TK + s]]++;
     for (int e = 0; e < E; ++e) off[e + 1] = off[e] + count[e];
     std::vector<int> fill(off.begin(), off.end() - 1);
-    for (int m = 0; m < M; ++m)
+    for (int m = mr0; m < mr1; ++m)
         for (int s = 0; s < TK; ++s) { const int e = hsel[size_t(m) * TK + s]; const int p = fill[e]++; gat[p] = m; ppos[size_t(m) * TK + s] = p; }
     q_.memcpy(gather_, gat.data(), gat.size() * sizeof(int));
     q_.memcpy(pairpos_, ppos.data(), ppos.size() * sizeof(int));
@@ -1780,7 +1825,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         const uint16_t* nmb = nmb_;
         uint16_t* inb = inb_;
         const int* g = gather_;
-        const size_t total = size_t(M) * TK * h;
+        const size_t total = size_t(NP) * h;
         q_.parallel_for<InkGather>(sycl::range<1>(total), [=](sycl::id<1> id) {
             const size_t t = id[0], p = t / h, ch = t % h;
             inb[t] = nmb[size_t(g[p]) * h + ch];
@@ -1789,7 +1834,8 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
     const size_t rbg = Ly.fgu == PackedFormat::NVFP4 ? h / 2 : h, sbg = Ly.fgu == PackedFormat::NVFP4 ? h / 16 : h / 32;
     const size_t rbd = Ly.fdn == PackedFormat::NVFP4 ? I / 2 : I, sbd = Ly.fdn == PackedFormat::NVFP4 ? I / 16 : I / 32;
     std::vector<int> used;
-    for (int e = e0_; e < e0_ + en_; ++e) if (count[e]) used.push_back(e);
+    const int ue0 = xrow_ ? 0 : e0_, ue1 = xrow_ ? E : e0_ + en_;
+    for (int e = ue0; e < ue1; ++e) if (count[e]) used.push_back(e);
     int* ids = reinterpret_cast<int*>(elist_);   // the sel_ download above waited: no kernel still reads the list
     for (size_t u = 0; u < used.size(); ++u) {
         const int e = used[u];
@@ -1836,7 +1882,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
                 wg.fmt = b70::Fmt::BF16; wg.N = 2 * I; wg.K = h; wg.row_bytes = int64_t(h) * 2; wg.payload = reinterpret_cast<const uint8_t*>(wb);
                 b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(inb_) + size_t(off[e]) * h, proj + size_t(off[e]) * 2 * I, (count[e] + 31) / 32 * 32);
             }
-        if (!act_done) q_.parallel_for<InkActP>(sycl::range<1>(size_t(M) * TK * I), [=](sycl::id<1> id) {
+        if (!act_done) q_.parallel_for<InkActP>(sycl::range<1>(size_t(NP) * I), [=](sycl::id<1> id) {
             const size_t i = id[0];
             // same formula as inkling2::launch_expert_ffn: BF16-rounded linear outputs, softcaps, sigmoid of the raw gate
             const float g = bfr(proj[2 * i]), u = bfr(proj[2 * i + 1]);
@@ -1866,6 +1912,16 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         const size_t total = size_t(M) * h;
         const int e0 = e0_, en = en_;
         const bool tp = world_ > 1;
+        if (xrow_) {   // this card's rows, every expert, rounded (= one card's combine)
+            const int r0 = mr0;
+            q_.parallel_for<InkCombineR>(sycl::range<1>(size_t(mr1 - mr0) * h), [=](sycl::id<1> id) {
+                const size_t t = id[0], m = r0 + t / h, ch = t % h;
+                float acc = 0.f;
+                for (int s = 0; s < TK; ++s) acc += w[m * TK + s] * bfr(outp[size_t(pp[m * TK + s]) * h + ch]);
+                yb[m * h + ch] = bfr(acc);
+            });
+            return;
+        }
         q_.parallel_for<InkCombine>(sycl::range<1>(total), [=](sycl::id<1> id) {
             const size_t t = id[0], m = t / h, ch = t % h;
             float acc = 0.f;
@@ -2025,6 +2081,28 @@ void Engine::allreduce(float* buf, size_t n) {
     // exchange waits on its own copy-out, which runs after this card's earlier copy-in (in-order queue)
 }
 
+// Two cards, prompt rows: nmine bytes of this card's device data out, the peer's npeer bytes into dst (device).
+// Host-mediated like allreduce()'s large path (copy out, wait, meet, copy in); slots rotate over NS exchanges.
+void Engine::xchg_bytes(const void* src, size_t nmine, void* dst, size_t npeer) {
+    TPX& x = *tpx_;
+    const int me = rank_, peer = 1 - rank_;
+    const int k = x.counter[me]++ % TPX::NS;
+    void* mine = x.hb[me][k];
+    const void* theirs = x.hb[peer][k];
+    g_tp_stage[me] = 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    q_.memcpy(mine, src, nmine).wait();
+    const auto t1 = std::chrono::steady_clock::now();
+    g_tp_wait_ms[me][0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    ++g_tp_n[me];
+    g_tp_stage[me] = 2;
+    x.bar.arrive_and_wait();
+    g_tp_wait_ms[me][1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    g_tp_stage[me] = 3;
+    g_tp_progress = now_ms();
+    q_.memcpy(dst, theirs, npeer);
+}
+
 // Both cards hold the best (value, index) of their vocabulary half; the host picks (lowest index on ties).
 // n rows' tokens: one card = next_; two cards = per row the better (value, lowest index on ties) of both halves
 void Engine::final_tokens(int n, int* out) {
@@ -2087,9 +2165,11 @@ void Engine::run_seg(int M) {
     align();
     const int c0 = x.counter[me];
     const size_t ns = S.g.size();
+    static const bool nowait = std::getenv("INK_SEG_NOWAIT") != nullptr;   // TIMING ONLY: no exchange waits (wrong tokens)
     for (size_t j = 0; j < ns; ++j) {
         sycl::event ev = q_.ext_oneapi_graph(*S.g[j]);
         if (j + 1 == ns) break;
+        if (nowait) continue;
         const int k = S.slot[j];
         if ((c0 + int(j)) % TPX::NS != k) throw std::runtime_error("segment replay: slot order");
         g_tp_stage[me] = 1;
@@ -2746,7 +2826,23 @@ void Engine::run(int M) {
             }
         }
         mark(2);
-        if (world_ > 1) {
+        const bool ag_att = world_ > 1 && M > 8 && tp_ag_ && Ly.WoF;
+        if (ag_att) {
+            // prompt rows: exchange the heads' bf16 outputs (exact: aout is bf16-rounded), both cards run the full Wo
+            xchg_bytes(aoutb_, size_t(M) * Q * 2, peer16_, size_t(M) * Q * 2);
+            const uint16_t *mine = aoutb_, *theirs = peer16_;
+            float* af = aoutF_;
+            uint16_t* afb = aoutFb_;
+            const int QL = Q, me = rank_;
+            q_.parallel_for<InkAgAsm>(sycl::range<1>(size_t(M) * 2 * Q), [=](sycl::id<1> id) {
+                const size_t t = id[0], m = t / (2 * QL), c = t % (2 * QL);
+                const int r = int(c / QL);
+                const uint16_t v = r == me ? mine[m * QL + c % QL] : theirs[m * QL + c % QL];
+                afb[t] = v;
+                af[t] = bfw(v);
+            });
+            dense(Ly.WoF, h, 2 * Q, aoutF_, size_t(2 * Q), aoutFb_, row(Z), h, M, false);
+        } else if (world_ > 1) {
             if (M == 1 && Ly.WoQ) gemvt8<1>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M <= 8 && i8m_ks > 0 && Ly.WoQ &&
@@ -2870,7 +2966,9 @@ void Engine::run(int M) {
             gates(gb, Ly, ctrl, M);
             xm = GM;
         }
-        { NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, M >= 2 ? nmb_ : nullptr}; nb.count = 1; rms(nb, M); }
+        static const bool norm_route = std::getenv("INK_NORM_ROUTE") != nullptr;   // 2..8 rows: MLP norm + router + top-k in one launch (MEASURED 11-24: no gain, 1 card 33.4 -> 33.3, 2 cards 24.2 -> 24.4 ms/step; opt-in)
+        nr_in_ = (norm_route && M >= 2 && M <= 8 && h == 2304 && c_.experts <= 128 && c_.top_k == 8) ? xm : -1;
+        if (nr_in_ < 0) { NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, M >= 2 ? nmb_ : nullptr}; nb.count = 1; rms(nb, M); }
         }
         mark(3);
         // router: sigmoid scores, top-k by score + bias, weights = scale * score / sum, sorted by expert id
@@ -2932,6 +3030,78 @@ void Engine::run(int M) {
                     }
                 });
             });
+        } else if (nr_in_ >= 0) {
+            // one 256-thread work-group per row: RMS norm (InkRms's formula; NM and its bf16 copy written), the 128 router
+            // logits from the normed row in SLM (two threads per expert, fp32), then InkTopk's rank rule and weights
+            const int xin = nr_in_;
+            float* pool = pool_;
+            const size_t RS = rs_;
+            const uint16_t* nw = Ly.nm;
+            uint16_t* nb16 = nmb_;
+            const uint16_t* Wr = Ly.Wr;
+            const float* rb = Ly.rbias;
+            int* sel = sel_;
+            float* wts = wts_;
+            const int En = c_.experts, TK = c_.top_k;
+            const float rscale = c_.route_scale, eps = c_.eps;
+            q_.submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> ys(sycl::range<1>(2304), cgh), part(sycl::range<1>(256), cgh), key(sycl::range<1>(128), cgh),
+                    score(sycl::range<1>(128), cgh), total(sycl::range<1>(1), cgh);
+                sycl::local_accessor<int, 1> byrank(sycl::range<1>(8), cgh);
+                cgh.parallel_for<InkNormRoute>(sycl::nd_range<1>(size_t(M) * 256, 256), [=](sycl::nd_item<1> it) {
+                    auto g = it.get_group();
+                    const int m = int(it.get_group(0)), t = int(it.get_local_id(0));
+                    const float* x = pool + size_t(xin) * RS + size_t(m) * 2304;
+                    float xv[9], ss = 0.f;
+#pragma unroll
+                    for (int j = 0; j < 9; ++j) { xv[j] = x[t + 256 * j]; ss += xv[j] * xv[j]; }
+                    ss = sycl::reduce_over_group(g, ss, sycl::plus<float>());
+                    const float r = 1.f / sycl::sqrt(ss / 2304.f + eps);
+                    float* y = pool + size_t(NM) * RS + size_t(m) * 2304;
+#pragma unroll
+                    for (int j = 0; j < 9; ++j) {
+                        const int i = t + 256 * j;
+                        const float v = bfr((xv[j] * r) * bfw(nw[i]));
+                        y[i] = v;
+                        nb16[size_t(m) * 2304 + i] = tobf(v);
+                        ys[i] = v;
+                    }
+                    sycl::group_barrier(g);
+                    {
+                        const int e = t >> 1, hf = t & 1;
+                        float acc = 0.f;
+                        if (e < En) {
+                            const uint16_t* wr = Wr + size_t(e) * 2304 + hf * 1152;
+                            const float* yy = &ys[hf * 1152];
+                            for (int k = 0; k < 1152; k += 8) {
+                                const sycl::vec<uint16_t, 8> wv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(wr + k);
+#pragma unroll
+                                for (int q2 = 0; q2 < 8; ++q2) acc += bfw(wv[q2]) * yy[k + q2];
+                            }
+                        }
+                        part[t] = acc;
+                    }
+                    sycl::group_barrier(g);
+                    if (t < En) { const float sc = sigm(part[2 * t] + part[2 * t + 1]); score[t] = sc; key[t] = sc + rb[t]; }
+                    sycl::group_barrier(g);
+                    int rank = 1 << 30;
+                    if (t < En) {
+                        rank = 0;
+                        const float ke = key[t];
+                        for (int f = 0; f < En; ++f) { const float kf = key[f]; rank += (kf > ke || (kf == ke && f < t)) ? 1 : 0; }
+                        if (rank < TK) byrank[rank] = t;
+                    }
+                    sycl::group_barrier(g);
+                    if (t == 0) { float s2 = 0.f; for (int r2 = 0; r2 < TK; ++r2) s2 += score[byrank[r2]]; total[0] = s2; }
+                    sycl::group_barrier(g);
+                    if (rank < TK) {
+                        int at = 0;
+                        for (int r2 = 0; r2 < TK; ++r2) at += byrank[r2] < t ? 1 : 0;
+                        sel[size_t(m) * TK + at] = t;
+                        wts[size_t(m) * TK + at] = rscale * (score[t] / (total[0] + 1e-20f));
+                    }
+                });
+            });
         } else if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
         else if (M <= 8 && gsmv_ && gsm_dense(Ly.Wr, c_.experts, h, nmb_, rlog_, M)) {}
         else if (M <= 8) gemvtm<1>(Ly.WrT, c_.experts, h, 32, M, row(NM), row(NM), row(NM), h, rlog_, c_.experts, c_.experts, nullptr, 0, c_.experts, nullptr, 0, c_.experts);
@@ -2944,8 +3114,8 @@ void Engine::run(int M) {
             const int En = c_.experts, TK = c_.top_k;
             const float rscale = c_.route_scale;
             static const bool fuse_rg = std::getenv("INK_ROUTEGRP") != nullptr;   // verify rows: top-k + grouping in one work-group (MEASURED 11-24: slower, 34.8 -> 36.9 ms/step; opt-in)
-            route_deferred_ = !fused_route && fuse_rg && M >= 2 && M <= 8 && En <= 128 && M * TK <= 64;
-            if (!fused_route && !route_deferred_) q_.submit([&](sycl::handler& cgh) {
+            route_deferred_ = !fused_route && fuse_rg && M >= 2 && M <= 8 && En <= 128 && M * TK <= 64 && nr_in_ < 0;
+            if (!fused_route && !route_deferred_ && nr_in_ < 0) q_.submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> key(sycl::range<1>(128), cgh), score(sycl::range<1>(128), cgh);
                 sycl::local_accessor<int, 1> byrank(sycl::range<1>(16), cgh);
                 sycl::local_accessor<float, 1> total(sycl::range<1>(1), cgh);
@@ -2973,10 +3143,28 @@ void Engine::run(int M) {
             });
         }
         mark(4);
+        // MoE rows split between the cards only for long chunks: a card then reads nearly every expert (twice the
+        // weight bytes of the expert split), which pays only when the fp32 partial exchange is the larger cost
+        static const int ag_moe_min = std::getenv("INK_AG_MOE_MIN") ? std::atoi(std::getenv("INK_AG_MOE_MIN")) : 384;
+        const bool ag_moe = world_ > 1 && M > 8 && M >= ag_moe_min && tp_ag_ && rep_;
         if (M == 1) experts_decode(Ly);
         else if (M <= 8) experts_small(Ly, M);
-        else experts_prompt(Ly, M);
-        if (world_ > 1) {
+        else {
+            if (ag_moe) { xrow_ = true; xr0_ = rank_ == 0 ? 0 : M / 2; xr1_ = rank_ == 0 ? M / 2 : M; }
+            experts_prompt(Ly, M);
+            xrow_ = false;
+        }
+        if (ag_moe) {
+            // this card's rows (rounded, bf16-exact) out, the peer's rows in
+            const int r0 = rank_ == 0 ? 0 : M / 2, r1 = rank_ == 0 ? M / 2 : M;
+            const int p0 = rank_ == 0 ? M / 2 : 0, p1 = rank_ == 0 ? M : M / 2;
+            float* yb = row(YB);
+            uint16_t* x16 = xg16_;
+            q_.parallel_for<InkAgTo16>(sycl::range<1>(size_t(r1 - r0) * h), [=](sycl::id<1> id) { x16[id[0]] = tobf(yb[size_t(r0) * h + id[0]]); });
+            xchg_bytes(xg16_, size_t(r1 - r0) * h * 2, peer16_, size_t(p1 - p0) * h * 2);
+            const uint16_t* in16 = peer16_;
+            q_.parallel_for<InkAgFrom16>(sycl::range<1>(size_t(p1 - p0) * h), [=](sycl::id<1> id) { yb[size_t(p0) * h + id[0]] = bfw(in16[id[0]]); });
+        } else if (world_ > 1) {
             if (M == 1) {   // this card's experts' weighted sum (others' slots hold zeros), unrounded
                 const float* dbuf = dbuf_;
                 const float* wts = wts_;
@@ -3086,6 +3274,7 @@ void Engine::run(int M) {
                                          size_t(vrows_), size_t(vrows_), size_t(vrows_), vrows_, vrows_, 1, 0.f}, i8m_un)) ||
          (i8v_ && unR_ && i8_small(unR_, unembedS_, 0, vrows_, kp_, xpadU_, logitsR_, M)))) {
         // INT8 unembed for the verify rows (b70::launch_fp8_smallm, raw), softcap + argmax in one pass
+        vlog_ = logitsR_; vlog_ld_ = vrows_; vlog_n_ = world_ == 1 ? V : vvalid_; vlog_base_ = world_ == 1 ? 0 : v0_; vlog_cap_ = c_.logit_cap;
         if (world_ == 1) argmax_rows_cap(logitsR_, vrows_, V, M, next_, nullptr, 0, c_.logit_cap);
         else argmax_rows_cap(logitsR_, vrows_, vvalid_, M, next_, bestv_, v0_, c_.logit_cap);
         int* pd = pos_d_;
@@ -3093,6 +3282,7 @@ void Engine::run(int M) {
         return;
     }
     if (all_logits_) {
+        vlog_ = logitsM_; vlog_ld_ = V; vlog_n_ = world_ == 1 ? V : vvalid_; vlog_base_ = world_ == 1 ? 0 : v0_; vlog_cap_ = 0.f;
         if (world_ == 1) {
             gemvtm<2>(unembedT_, c_.vocab, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V, c_.logit_cap);
             argmax_rows(logitsM_, V, M, next_);
@@ -3173,6 +3363,204 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// serve: inkling2_gpu MODEL serve SOCKET CTX CHUNK CARDS
+// Line protocol on a Unix socket (one client at a time, requests run one after another):
+//   GEN <id> <max_new> <temp> <top_p> <top_k> <seed> <n> <tok1> .. <tokn>
+//   QUIT
+// replies: TOK <id> <k> <t1> .. <tk>   (one line per decode step)
+//          END <id> <stop|length> <prompt_n> <gen_n> <prefill_ms> <decode_ms> <steps>
+//          ERR <id> <message>
+// temp 0 = greedy (the exact argmax path); temp > 0 = temperature / top-k / top-p sampling with exact speculative
+// sampling on the DSpark verify rows (a deterministic draft d is kept with probability p(d), else the token is drawn
+// from p without d).  Two cards: both ranks run every request in lockstep with the same RNG seed.
+struct ServeReq { std::string id; int max_new = 0; float temp = 0.f, top_p = 1.f; int top_k = 0; unsigned long long seed = 0; std::vector<int> ids; };
+
+static bool is_stop_tok(int t) { return t == 200006 || t == 199999; }
+
+static bool write_all(int fd, const std::string& m) {
+    size_t at = 0;
+    while (at < m.size()) {
+        const ssize_t w = ::write(fd, m.data() + at, m.size() - at);
+        if (w <= 0) return false;
+        at += size_t(w);
+    }
+    return true;
+}
+
+static std::atomic<bool> g_serve_busy{false};
+
+int serve_main(int argc, char** argv) {
+    if (argc < 5) { std::fprintf(stderr, "usage: inkling2_gpu MODEL serve SOCKET CTX [CHUNK] [CARDS]\n"); return 2; }
+    const std::string model = argv[1], sock = argv[3];
+    const int ctx = std::atoi(argv[4]);
+    const int chunk = argc > 5 ? std::atoi(argv[5]) : 2048;
+    const int cards = argc > 6 ? std::atoi(argv[6]) : 1;
+    const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
+    if (int(devs.size()) != cards) throw std::runtime_error("serve: visible GPUs != CARDS");
+    for (const auto& d : devs) std::printf("%s\n", d.get_info<sycl::info::device::name>().c_str());
+    // engines
+    std::vector<sycl::queue> qs;
+    std::vector<sycl::context> cx;
+    for (int r = 0; r < cards; ++r) cx.emplace_back(devs[r]);
+    for (int r = 0; r < cards; ++r) qs.emplace_back(cx[r], devs[r], sycl::property_list{sycl::property::queue::in_order()});
+    TPX tpx;
+    std::unique_ptr<Engine> eng[2];
+    eng[0] = std::make_unique<Engine>(qs[0], model, ctx, chunk, 0, cards, cards > 1 ? &tpx : nullptr);
+    if (cards > 1) eng[1] = std::make_unique<Engine>(qs[1], model, ctx, chunk, 1, cards, &tpx);
+    if (cards > 1) for (int r = 0; r < 2; ++r) eng[r]->use_graph = false;
+    g_tp_progress = now_ms();
+    std::thread([&] {   // a request that makes no progress for 120 s ends the process (idle waits do not count)
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (g_serve_busy && now_ms() - g_tp_progress.load() > 120000) {
+                std::printf("WATCHDOG: request without progress for 120 s; card 0 stage %d, card 1 stage %d\n", g_tp_stage[0].load(), g_tp_stage[1].load());
+                std::_Exit(3);
+            }
+        }
+    }).detach();
+    // one generation on rank r; rank 0 writes the replies to fd
+    auto gen = [&](int r, const ServeReq& R, int fd) {
+        Engine& E = *eng[r];
+        const auto t0 = std::chrono::steady_clock::now();
+        std::mt19937_64 rng(R.seed);
+        Engine::Samp sp{R.temp, R.top_p, R.top_k};
+        const bool sampled = R.temp > 0.f;
+        E.reset();
+        int t = E.prefill(R.ids);
+        if (sampled) t = E.sample_last(sp, rng);
+        const double pms = ms_since(t0);
+        g_tp_progress = now_ms();
+        int ngen = 1, steps = 0;
+        int hist[9] = {};   // decode steps by tokens produced (1..8)
+        const char* reason = "length";
+        auto emit = [&](const std::vector<int>& v) {
+            if (r != 0 || v.empty()) return;
+            std::string m = "TOK " + R.id + " " + std::to_string(v.size());
+            for (int x : v) m += " " + std::to_string(x);
+            m += "\n";
+            write_all(fd, m);
+        };
+        emit({t});
+        const auto t1 = std::chrono::steady_clock::now();
+        if (is_stop_tok(t)) reason = "stop";
+        else while (ngen < R.max_new) {
+            if (E.pos() + 8 > E.limit()) break;
+            const auto got = sampled ? E.mtp_step_s(t, sp, rng) : E.mtp_step(t);
+            ++steps;
+            ++hist[std::min<size_t>(8, got.size())];
+            g_tp_progress = now_ms();
+            std::vector<int> em;
+            bool stop = false;
+            for (int v : got) {
+                if (ngen >= R.max_new) break;
+                em.push_back(v); ++ngen;
+                if (is_stop_tok(v)) { stop = true; break; }
+            }
+            emit(em);
+            if (stop) { reason = "stop"; break; }
+            t = got.back();
+        }
+        if (r == 0) {
+            char b[256];
+            std::snprintf(b, sizeof(b), " %s %zu %d %.1f %.1f %d %d,%d,%d,%d,%d,%d,%d,%d\n", reason, R.ids.size(), ngen, pms, ms_since(t1), steps,
+                          hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8]);
+            write_all(fd, "END " + R.id + b);
+        }
+    };
+    // warm-up (records the two-card segment graphs, loads the drafter)
+    std::barrier<> go(cards);
+    ServeReq shared;
+    bool quit = false;
+    auto warm = [&](int r) {
+        eng[r]->load_mtp(model + "/mtp.safetensors");
+        g_tp_progress = now_ms();
+        ServeReq w; w.id = "warm"; w.max_new = 40; w.temp = 0.7f; w.top_p = 0.95f; w.top_k = 20; w.seed = 1;
+        for (int i = 0; i < 300; ++i) w.ids.push_back(1000 + (i * 7919) % 50000);
+        g_serve_busy = true;
+        gen(r, w, -1);
+        w.temp = 0.f;
+        gen(r, w, -1);
+        g_serve_busy = false;
+    };
+    std::thread rank1;
+    if (cards > 1) {
+        rank1 = std::thread([&] {
+            try {
+                warm(1);
+                for (;;) {
+                    go.arrive_and_wait();   // a request (or quit) is in `shared`
+                    if (quit) break;
+                    const ServeReq R = shared;
+                    gen(1, R, -1);
+                    go.arrive_and_wait();   // both done before rank 0 reads the next request
+                }
+            } catch (const std::exception& e) { std::printf("rank 1: %s\n", e.what()); std::_Exit(4); }
+        });
+    }
+    warm(0);
+    // socket
+    const int ls = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0) throw std::runtime_error("socket");
+    sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    if (sock.size() >= sizeof(a.sun_path)) throw std::runtime_error("socket path too long");
+    std::strcpy(a.sun_path, sock.c_str());
+    ::unlink(sock.c_str());
+    if (::bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(ls, 4) != 0) throw std::runtime_error("bind/listen");
+    ::chmod(sock.c_str(), 0666);
+    std::printf("READY serve %s ctx %d chunk %d cards %d\n", sock.c_str(), ctx, chunk, cards);
+    std::fflush(stdout);
+    while (!quit) {
+        const int fd = ::accept(ls, nullptr, nullptr);
+        if (fd < 0) continue;
+        std::string buf;
+        char tmp[65536];
+        for (;;) {
+            size_t nl;
+            while ((nl = buf.find('\n')) == std::string::npos) {
+                const ssize_t n = ::read(fd, tmp, sizeof(tmp));
+                if (n <= 0) break;
+                buf.append(tmp, size_t(n));
+            }
+            if (nl == std::string::npos) break;   // client gone
+            const std::string line = buf.substr(0, nl);
+            buf.erase(0, nl + 1);
+            std::istringstream ss(line);
+            std::string cmd;
+            ss >> cmd;
+            if (cmd == "QUIT") { quit = true; break; }
+            if (cmd != "GEN") { write_all(fd, "ERR - unknown command\n"); continue; }
+            ServeReq R;
+            int n = 0;
+            ss >> R.id >> R.max_new >> R.temp >> R.top_p >> R.top_k >> R.seed >> n;
+            R.ids.resize(size_t(std::max(0, n)));
+            for (int i = 0; i < n; ++i) ss >> R.ids[size_t(i)];
+            if (!ss || n <= 0) { write_all(fd, "ERR " + R.id + " bad request\n"); continue; }
+            for (int v : R.ids) if (v < 0 || v >= eng[0]->config().vocab) { n = -1; break; }
+            if (n < 0) { write_all(fd, "ERR " + R.id + " token id out of range\n"); continue; }
+            if (n + 8 + 1 > ctx) {
+                write_all(fd, "ERR " + R.id + " This model's maximum context length is " + std::to_string(ctx) + " tokens; the prompt has " + std::to_string(n) + "\n");
+                continue;
+            }
+            R.max_new = std::max(1, std::min(R.max_new, ctx - n - 8));
+            g_serve_busy = true;
+            g_tp_progress = now_ms();
+            if (cards > 1) { shared = R; go.arrive_and_wait(); }
+            gen(0, R, fd);
+            if (cards > 1) go.arrive_and_wait();
+            g_serve_busy = false;
+        }
+        ::close(fd);
+    }
+    if (cards > 1) { go.arrive_and_wait(); rank1.join(); }
+    ::close(ls);
+    ::unlink(sock.c_str());
+    std::printf("serve: quit\n");
+    return 0;
+}
+
 }  // namespace ink
 
 int main(int argc, char** argv) try {
@@ -3184,6 +3572,7 @@ int main(int argc, char** argv) try {
         return 2;
     }
     const std::string mode = argv[2];
+    if (mode == "serve") return serve_main(argc, argv);
     const auto ids = read_ids(argv[3]);
     const int ctx = std::atoi(argv[4]);
     const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
