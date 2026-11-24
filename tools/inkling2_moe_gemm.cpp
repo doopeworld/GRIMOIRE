@@ -206,6 +206,7 @@ struct InkAttnArgs {
     float* aout; uint16_t* aoutb; int Q;
     const int* posd; int M;
     const uint16_t* bias;   // [M][H][E] bf16 = bf(sum_r rel[r] * table[r][d])
+    int nsplit = 0, chunk = 0; float* part = nullptr;   // > 0: key-split partials (verify rows, M <= 8)
 };
 
 namespace {
@@ -938,29 +939,33 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
 // the end, output = bf(bf(o / sum) * sigmoid(bf(gate))) as ink_attn_prompt.  TPW threads = TPW row tiles of one head.
 // ---------------------------------------------------------------------------------------------------------------
 namespace { inline int imin_(int x, int y) { return x < y ? x : y; } }
-namespace { template <int BK, int TPW> class InkAttE; }
-template <int BK, int TPW>
+namespace { template <int BK, int TPW, bool SPLIT> class InkAttE; class InkAttMerge; }
+template <int BK, int TPW, bool SPLIT = false>
 static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
     constexpr int RB = 8, D = 128, DT = D / 16, NB = BK / 16;
     const int tiles = (g.M + RB - 1) / RB, nrb = (tiles + TPW - 1) / TPW;
     return q.submit([&](sycl::handler& h) {
         const InkAttnArgs a = g;
-        h.parallel_for<InkAttE<BK, TPW>>(sycl::nd_range<1>(size_t(nrb) * a.H * TPW, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        const size_t nthr = SPLIT ? size_t(a.H) * a.nsplit : size_t(nrb) * a.H * TPW;
+        h.parallel_for<InkAttE<BK, TPW, SPLIT>>(sycl::nd_range<1>(nthr, SPLIT ? 1 : TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
             using bfx = sycl::ext::oneapi::bfloat16;
             constexpr float NINF = -std::numeric_limits<float>::infinity();
             constexpr float LOG2E = 1.4426950408889634f;
             const int gi = int(it.get_group(0)), lt = int(it.get_local_id(0));
-            const int rb = nrb - 1 - gi / a.H, j = gi % a.H;            // heaviest row blocks first
-            const int r0 = (rb * TPW + lt) * RB;
+            const int rb = SPLIT ? 0 : nrb - 1 - gi / a.H, j = gi % a.H;   // heaviest row blocks first
+            const int sp = SPLIT ? gi / a.H : 0;                        // key slice (split mode: one thread each)
+            const int r0 = SPLIT ? 0 : (rb * TPW + lt) * RB;
             if (r0 >= a.M) return;
             const int base = *a.posd;
             const int rl = imin_(a.M - 1, r0 + RB - 1);
             const int p0 = base + r0, pl = base + rl;
             const int first0 = p0 + 1 - imin_(p0 + 1, a.win);
             const int firstl = pl + 1 - imin_(pl + 1, a.win);
-            const int klo = first0 & ~15, khi = pl;
+            const int klo0 = first0 & ~15, khi = pl;
+            const int klo = SPLIT ? klo0 + sp * a.chunk : klo0;
+            const int kend = SPLIT ? imin_(khi, klo + a.chunk - 1) : khi;   // blocks never cross a slice (chunk % BK == 0)
             const int hd = (j / a.groups) * D;
             const unsigned AW = unsigned(a.NA) * 4 - 1, AH = unsigned(a.M) - 1;
             es::simd<bfx, RB * D> qv;                                    // [dt][8 rows][16]
@@ -973,7 +978,7 @@ static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
             es::simd<float, RB * D> o = 0.0f;                            // [dt][8][16]
             es::simd<float, RB> mrow = NINF, lrow = 0.0f;
             const es::simd<int, 16> col(0, 1);
-            for (int s0 = klo; s0 <= khi; s0 += BK) {
+            for (int s0 = klo; s0 <= kend; s0 += BK) {
                 es::simd<float, NB * RB * 16> sc = 0.0f;                 // [b][8][16]
 #pragma unroll
                 for (int b = 0; b < NB; ++b) {
@@ -1074,6 +1079,20 @@ static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
                     }
                 }
             }
+            if constexpr (SPLIT) {   // partials: o [8][128] (fp32, unnormalized), then m and l per row
+                float* po = a.part + (size_t(sp) * a.H + j) * RB * D;
+                float* pml = a.part + size_t(a.nsplit) * a.H * RB * D + (size_t(sp) * a.H + j) * RB * 2;
+#pragma unroll
+                for (int r = 0; r < RB; ++r)
+#pragma unroll
+                    for (int dt = 0; dt < DT; ++dt)
+                        es::block_store<float, 16>(po + r * D + dt * 16, es::simd<float, 16>(o.template select<16, 1>((dt * RB + r) * 16)));
+                es::simd<float, 16> ml;
+                ml.template select<8, 2>(0) = mrow;
+                ml.template select<8, 2>(1) = lrow;
+                es::block_store<float, 16>(pml, ml);
+                return;
+            }
             // sink (log2 units) joins the softmax; then the output gate
             const es::simd<int, RB> ri(0, 1);
             const es::simd<int, RB> mr = es::min(ri + r0, es::simd<int, RB>(a.M - 1));
@@ -1104,7 +1123,38 @@ static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
         });
     });
 }
+// split mode: merge the key-slice partials, add the sink, apply the output gate (the unsplit kernel's epilogue)
+static sycl::event ink_attn_merge(sycl::queue& q, const InkAttnArgs& a) {
+    return q.parallel_for<InkAttMerge>(sycl::range<1>(size_t(a.M) * a.H * 128), [=](sycl::id<1> id) {
+        constexpr float L2E = 1.4426950408889634f;
+        const int d = int(id[0] % 128), j = int((id[0] / 128) % a.H), r = int(id[0] / (128 * size_t(a.H)));
+        const float* pml = a.part + size_t(a.nsplit) * a.H * 8 * 128;
+        float mx = -INFINITY;
+        for (int s = 0; s < a.nsplit; ++s) mx = sycl::fmax(mx, pml[((size_t(s) * a.H + j) * 8 + r) * 2]);
+        float l = 0.f, o = 0.f;
+        for (int s = 0; s < a.nsplit; ++s) {
+            const float ms = pml[((size_t(s) * a.H + j) * 8 + r) * 2];
+            if (ms == -INFINITY) continue;
+            const float w = sycl::exp2((ms - mx) * L2E);
+            l += pml[((size_t(s) * a.H + j) * 8 + r) * 2 + 1] * w;
+            o += a.part[((size_t(s) * a.H + j) * 8 + r) * 128 + d] * w;
+        }
+        const float sk = bfr_(a.A[size_t(r) * a.NA + a.osink + j]);
+        const float mf = sycl::fmax(mx, sk);
+        const float em = sycl::exp2((mx - mf) * L2E);
+        const float fin = em / (l * em + sycl::exp2((sk - mf) * L2E));
+        const float gt = bfr_(a.A[size_t(r) * a.NA + a.og + j * 128 + d]);
+        const float sg = 1.0f / (1.0f + sycl::exp2(gt * -L2E));
+        const float ov = bfr_(bfr_(o * fin) * sg);
+        a.aout[size_t(r) * a.Q + j * 128 + d] = ov;
+        a.aoutb[size_t(r) * a.Q + j * 128 + d] = b70::f32_to_bf16(ov).bits;
+    });
+}
 sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g) {
+    if (g.nsplit > 0 && g.M <= 8) {
+        ink_attn_es_impl<64, 8, true>(q, g);
+        return ink_attn_merge(q, g);
+    }
     static const int tpw = [] { const char* e = std::getenv("INK_ATT_TPW"); return e ? std::atoi(e) : 8; }();
     static const int bk = [] { const char* e = std::getenv("INK_ATT_BK"); return e ? std::atoi(e) : 64; }();
     if (bk == 32) return tpw == 16 ? ink_attn_es_impl<32, 16>(q, g) : ink_attn_es_impl<32, 8>(q, g);

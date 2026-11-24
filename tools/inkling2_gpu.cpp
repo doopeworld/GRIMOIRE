@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkDXB; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -58,6 +58,7 @@ struct InkAttnArgs {
     float* aout; uint16_t* aoutb; int Q;
     const int* posd; int M;
     const uint16_t* bias;   // [M][H][E] bf16 = bf(sum_r rel[r] * table[r][d])
+    int nsplit = 0, chunk = 0; float* part = nullptr;   // > 0: key-split partials (verify rows, M <= 8)
 };
 sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g);
 sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g);
@@ -382,6 +383,7 @@ private:
     int8_t* unR_ = nullptr;
     int8_t* rowq(const int8_t* tiled, int N, int K, int Kp);
     float* projAll_ = nullptr;   // verify, sliding visits: [8][NA + NB + NC] from one INT8 launch
+    float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
     void split_proj(int NA, int NB, int NC, int M);
     bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
@@ -442,18 +444,21 @@ private:
     void commit_verify(int p, int a);
     void argmax_rows(const float* lg, int V, int n, int* out);
     // DSpark drafter
-    struct DLayer { uint16_t *Wqkv, *Wkvc, *Wo, *Wgu, *Wd, *nin, *npost, *qn, *kn, *knc, *dfn, *kc, *vc; bool sliding; };
+    struct DLayer { uint16_t *Wqkv, *Wkvc, *Wo, *Wgu, *Wd, *nin, *npost, *qn, *kn, *knc, *dfn, *kc, *vc; bool sliding;
+                    int8_t *Q8[4] = {}; float* S8[4] = {}; int N8[4] = {}, K8[4] = {}, KP8[4] = {}; };   // INT8 qkv / o / gu / d (row-major, K padded)
     struct Draft {
         std::shared_ptr<b70::SafeTensors> st;
         DLayer L[3];
         uint16_t *mask, *norm, *w1, *rnnW, *rnnB, *foldW, *mdfn;
         int8_t *foldQ = nullptr, *UR = nullptr; float *foldS = nullptr, *US = nullptr, *baseR = nullptr; uint16_t* finb = nullptr;   // INT8 drafter head
+        uint16_t* xb8 = nullptr;   // INT8 drafter layers: bf16 padded input rows [8][<= 9216]
         float *alpha, *foldB;
         float *r, *x, *qkv, *att, *o, *gu, *act, *fin, *base, *state, *inp, *proj, *latent, *dlog, *frnn, *ctx, *kvc;
         uint16_t *ctxb, *bk, *bv;
         int* dtok;
     };
     Draft d_{};
+    void dgemv8(const DLayer& L, int w, const float* x, float* y);   // drafter INT8 layer GEMV, 8 rows
     void mix_norm_taps(int alpha_row, const uint16_t* w, int m0, int rows, float* out, uint16_t* outb);
     void draft_commit(int p0, int m0, int rows);
     void draft_block(int t, int p);
@@ -829,6 +834,16 @@ int8_t* Engine::rowq(const int8_t* T, int N, int K, int Kp) {
     });
     q_.wait();
     return d;
+}
+
+void Engine::dgemv8(const DLayer& L, int w, const float* x, float* y) {
+    const int K = L.K8[w], Kp = L.KP8[w];
+    uint16_t* xb = d_.xb8;
+    q_.parallel_for<InkDXB>(sycl::range<1>(size_t(8) * Kp), [=](sycl::id<1> id) {
+        const size_t m = id[0] / Kp, k = id[0] % Kp;
+        xb[id[0]] = k < size_t(K) ? tobf(x[m * K + k]) : uint16_t(0);
+    });
+    if (!i8_small(L.Q8[w], L.S8[w], 0, L.N8[w], Kp, xb, y, 8)) throw std::runtime_error("drafter INT8 layer refused");
 }
 
 void Engine::split_proj(int NA, int NB, int NC, int M) {
@@ -2462,8 +2477,20 @@ void Engine::run(int M) {
                     for (size_t k = 0; k < h1.size(); ++k) { const double d = std::fabs(double(h1[k]) - h2[k]); if (d > md) { md = d; worst = k; } if (d > 0) ++nd; mx = std::max(mx, double(std::fabs(h1[k]))); }
                     if (ncmp++ < 60) std::printf("attcmp visit %d sliding %d M %d: max|d| %.5f (max|ref| %.3f) at row %zu col %zu, %zu of %zu differ\n", vi, int(v.sliding), M, md, mx, worst / Q, worst % Q, nd, h1.size());
                     sycl::free(o2, q_); sycl::free(b2, q_);
-                } else if (att_es && D == 128 && (cap % 16 == 0 || !v.sliding))
-                    ink_attn_esimd(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
+                } else if (att_es && D == 128 && (cap % 16 == 0 || !v.sliding)) {
+                    InkAttnArgs aa{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs};
+                    static const bool att_split = !std::getenv("INK_NO_ATTSPLIT");
+                    if (att_split && M <= 8) {   // verify rows: one thread per (head, 256-key slice), then a merge
+                        const int chunk = 256, nsplit = (std::min(win, limit_) + 15 + chunk) / chunk;
+                        if (!attpart_) {   // once, for the widest case (graph chains keep the pointer)
+                            attpart_n_ = size_t((limit_ + 15 + chunk) / chunk) * std::max(c_.local.heads, c_.full.heads) * 8 * 130;
+                            attpart_ = dev_.alloc<float>(attpart_n_);
+                        }
+                        if (size_t(nsplit) * H * 8 * 130 > attpart_n_) throw std::runtime_error("attention partials");
+                        aa.nsplit = nsplit; aa.chunk = chunk; aa.part = attpart_;
+                    }
+                    ink_attn_esimd(q_, aa);
+                }
                 else
                     ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
             } else if (M >= 16) {

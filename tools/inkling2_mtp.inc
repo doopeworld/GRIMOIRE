@@ -482,6 +482,21 @@ void Engine::load_mtp(const std::string& path) {
             });
             d_.baseR = dev_.zeros<float>(8 * size_t(Vp));
             d_.finb = dev_.zeros<uint16_t>(8 * size_t(kp_));
+            if (!std::getenv("INK_DRAFT_BF16")) {   // the three drafter layers in INT8 too
+                for (int l = 0; l < 3; ++l) {
+                    DLayer& L = d_.L[l];
+                    const uint16_t* T[4] = {L.Wqkv, L.Wo, L.Wgu, L.Wd};
+                    const int N[4] = {5120, h, 18432, h}, K[4] = {h, 3072, h, 9216};
+                    for (int w = 0; w < 4; ++w) {
+                        int8_t* qt = nullptr;
+                        quant_tiled(T[w], N[w], K[w], qt, L.S8[w]);
+                        L.KP8[w] = (K[w] + 511) / 512 * 512;
+                        L.Q8[w] = rowq(qt, N[w], K[w], L.KP8[w]);
+                        L.N8[w] = N[w]; L.K8[w] = K[w];
+                    }
+                }
+                d_.xb8 = dev_.zeros<uint16_t>(8 * size_t(9216));
+            }
             q_.wait();
         }
     }
@@ -505,7 +520,7 @@ static inline void head_norm_rope(sycl::sub_group sg, const float* in, float* ou
     const int lane = int(sg.get_local_linear_id());
     float v[8], ss = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) { v[e] = in[lane * 8 + e]; ss += v[e] * v[e]; }
+    for (int e = 0; e < 8; ++e) { v[e] = bfr(in[lane * 8 + e]); ss += v[e] * v[e]; }   // raw INT8 GEMV rows: round like gemvtm<0>
     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
     const float r = 1.f / sycl::sqrt(ss / 128.f + eps);
 #pragma unroll
@@ -636,7 +651,7 @@ void Engine::draft_block(int t, int p_in) {
         });
     };
     auto addres = [&](const float* add) {
-        q_.parallel_for<InkAddRes>(sycl::range<1>(8 * size_t(h)), [=](sycl::id<1> id) { r[id[0]] = bfr(r[id[0]] + add[id[0]]); });
+        q_.parallel_for<InkAddRes>(sycl::range<1>(8 * size_t(h)), [=](sycl::id<1> id) { r[id[0]] = bfr(r[id[0]] + bfr(add[id[0]])); });
     };
     static bool bdumped = false;
     const bool bd = !bdumped && std::getenv("INK_DUMP");
@@ -644,7 +659,9 @@ void Engine::draft_block(int t, int p_in) {
     for (int l = 0; l < 3; ++l) {
         DLayer& L = d_.L[l];
         norm8(r, L.nin, d_.x, 8, 0);
-        gemvtm<0>(L.Wqkv, 5120, h, 4, 8, d_.x, d_.x, d_.x, h, d_.qkv, 5120, 5120, nullptr, 0, 5120, nullptr, 0, 5120);
+        const bool l8 = L.Q8[0] != nullptr;
+        if (l8) dgemv8(L, 0, d_.x, d_.qkv);
+        else gemvtm<0>(L.Wqkv, 5120, h, 4, 8, d_.x, d_.x, d_.x, h, d_.qkv, 5120, 5120, nullptr, 0, 5120, nullptr, 0, 5120);
         {
             float* qkv = d_.qkv;
             uint16_t *bk = d_.bk, *bv = d_.bv;
@@ -717,21 +734,24 @@ void Engine::draft_block(int t, int p_in) {
             });
         }
         if (bd) { dump_dev(q_, ("qkv" + std::to_string(l)).c_str(), d_.qkv, 8 * 5120 * 4); dump_dev(q_, ("att" + std::to_string(l)).c_str(), d_.att, 8 * 3072 * 4); }
-        gemvtm<0>(L.Wo, h, 3072, 8, 8, d_.att, d_.att, d_.att, 3072, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
+        if (l8) dgemv8(L, 1, d_.att, d_.o);
+        else gemvtm<0>(L.Wo, h, 3072, 8, 8, d_.att, d_.att, d_.att, 3072, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
         addres(d_.o);
         if (bd) dump_dev(q_, ("r_attn" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
         norm8(r, L.npost, d_.x, 8, 0);
-        gemvtm<0>(L.Wgu, 18432, h, 1, 8, d_.x, d_.x, d_.x, h, d_.gu, 18432, 18432, nullptr, 0, 18432, nullptr, 0, 18432);
+        if (l8) dgemv8(L, 2, d_.x, d_.gu);
+        else gemvtm<0>(L.Wgu, 18432, h, 1, 8, d_.x, d_.x, d_.x, h, d_.gu, 18432, 18432, nullptr, 0, 18432, nullptr, 0, 18432);
         {
             const float* gu = d_.gu;
             float* act = d_.act;
             q_.parallel_for<InkSilu>(sycl::range<1>(8 * 9216), [=](sycl::id<1> id) {
                 const size_t m = id[0] / 9216, i = id[0] % 9216;
-                const float g = gu[m * 18432 + i], u = gu[m * 18432 + 9216 + i];
+                const float g = bfr(gu[m * 18432 + i]), u = bfr(gu[m * 18432 + 9216 + i]);
                 act[id[0]] = bfr(bfr(g / (1.f + sycl::exp(-g))) * u);
             });
         }
-        gemvtm<0>(L.Wd, h, 9216, 8, 8, d_.act, d_.act, d_.act, 9216, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
+        if (l8) dgemv8(L, 3, d_.act, d_.o);
+        else gemvtm<0>(L.Wd, h, 9216, 8, 8, d_.act, d_.act, d_.act, 9216, d_.o, h, h, nullptr, 0, h, nullptr, 0, h);
         addres(d_.o);
         if (bd) dump_dev(q_, ("r_mlp" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
     }
