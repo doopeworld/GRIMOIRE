@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkDXB; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkDXB; class InkCopyOut; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -1971,7 +1971,12 @@ void Engine::allreduce(float* buf, size_t n) {
         const int k = x.counter[me]++ % TPX::NS;
         static const bool direct = !std::getenv("INK_SEG_HOSTCOPY");   // D2H straight into the peer's IN slot (MEASURED 26.2 -> 25.7 ms/step)
         float* mine = direct ? x.ib[peer][k] : x.hb[me][k];
-        q_.memcpy(mine, buf, n * sizeof(float));
+        static const bool kcopy = std::getenv("INK_SEG_KCOPY") != nullptr;   // copy-out as a compute kernel (no copy-engine handoff)
+        if (kcopy && n % 4 == 0) {
+            const sycl::float4* src4 = reinterpret_cast<const sycl::float4*>(buf);
+            sycl::float4* dst4 = reinterpret_cast<sycl::float4*>(mine);
+            q_.parallel_for<InkCopyOut>(sycl::range<1>(n / 4), [=](sycl::id<1> i) { dst4[i[0]] = src4[i[0]]; });
+        } else q_.memcpy(mine, buf, n * sizeof(float));
         seg_cur_->end_recording(q_);
         seg_dst_->g.push_back(std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(seg_cur_->finalize()));
         seg_dst_->slot.push_back(k);
