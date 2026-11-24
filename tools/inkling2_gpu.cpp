@@ -393,6 +393,10 @@ private:
     float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
     bool post_bias_done_ = false;   // this visit's bias table came from InkPost
     bool route_deferred_ = false;   // verify rows: experts_small does the router top-k (InkRouteGrp)
+    // two cards, decode / verify: the exchange's add is done by the next reader (InkResid / InkMlpConv) -- the peer's
+    // partial (pinned host slot) is added as the row is read; set by allreduce, consumed (cleared) by the reader
+    const float* peer_in_ = nullptr;
+    bool fold_add_ = false;
     void split_proj(int NA, int NB, int NC, int M);
     bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
@@ -1963,6 +1967,7 @@ void Engine::allreduce(float* buf, size_t n) {
         seg_cur_ = std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>>(q_.get_context(), q_.get_device());
         seg_cur_->begin_recording(q_);
         const float* in = x.ib[me][k];
+        if (fold_add_) { peer_in_ = in; return; }
         q_.parallel_for<InkAddRoundS>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + in[i[0]]); });
         return;
     }
@@ -1987,6 +1992,7 @@ void Engine::allreduce(float* buf, size_t n) {
         g_tp_stage[me] = 3;
         g_tp_progress = now_ms();
         const float* in = x.ib[me][k];
+        if (fold_add_) { peer_in_ = in; return; }
         q_.parallel_for<InkAddRoundH>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + in[i[0]]); });
         return;
     }
@@ -2724,7 +2730,11 @@ void Engine::run(int M) {
             else if (M <= 8 && i8v_ && i8_small(Ly.WoR, Ly.WoS, 0, h, Q, aoutb_, row(Z), M)) {}
             else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
             else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, false);
+            static const bool fold_env = !std::getenv("INK_SEP_ADD");
+            fold_add_ = fold_env && M == 1 && !std::getenv("INK_RMN");   // MEASURED: decode 93.1 -> 94.2 tok/s; verify rows slower (4 PCIe reads a value)
+            peer_in_ = nullptr;
             allreduce(row(Z), size_t(M) * h);
+            fold_add_ = false;
         } else if (M == 1 && i4_ && i4_gemv(Ly.Wo4, 0, h, aoutb_, row(Z), 1)) {
         } else if (M == 1 && gsm_ && gsm_dense(Ly.Wo, h, Q, aoutb_, row(Z), 1)) {
         } else if (M == 1 && Ly.WoQ) {
@@ -2768,16 +2778,19 @@ void Engine::run(int M) {
             const int br = bank_row;
             static const bool fold_hv2 = !std::getenv("INK_SEP_HISTV");
             float* vbZ = fold_hv2 && M > 1 && verify_ && !std::getenv("INK_HV_NOZ") ? vbuf_ + (size_t(v.cache_slot) * 4 + 2) * 8 * size_t(h) : nullptr;
+            const float* pz = peer_in_;   // two cards: the peer's partial of row(Z), added here (exchange add folded)
+            peer_in_ = nullptr;
             q_.parallel_for<InkResid>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
                 const float* zr = pool + size_t(Z) * RS;
-                const float x = bfr(zr[size_t(m) * h + ch]);
+                auto zat = [&](int mm) { return pz ? bfr(zr[size_t(mm) * h + ch] + pz[size_t(mm) * h + ch]) : zr[size_t(mm) * h + ch]; };
+                const float x = bfr(zat(m));
                 if (vbZ) vbZ[size_t(m) * h + ch] = x;
                 float sum = 0.f;
 #pragma unroll
                 for (int lag = 0; lag < 4; ++lag) {
-                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(zr[size_t(m - lag) * h + ch]) : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
+                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(zat(m - lag)) : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
                     if (lag <= pos) sum += xl * bfw(w[ch * 4 + 3 - lag]);
                 }
                 const float out = bfr((x + sum) * cs);
@@ -2919,7 +2932,11 @@ void Engine::run(int M) {
                     yb[id[0]] = acc;
                 });
             }
+            static const bool fold_env2 = !std::getenv("INK_SEP_ADD");
+            fold_add_ = fold_env2 && M == 1;
+            peer_in_ = nullptr;
             allreduce(row(YB), size_t(M) * h);
+            fold_add_ = false;
         }
         mark(5);
         {   // hidden = bf(residual + sconv(y)); y = bf(sum_s w_s d_s) in slot (= ascending expert) order
@@ -2932,6 +2949,8 @@ void Engine::run(int M) {
             const bool tp = world_ > 1;
             static const bool fold_hv3 = !std::getenv("INK_SEP_HISTV");
             float* vbY = fold_hv3 && M > 1 && verify_ && !std::getenv("INK_HV_NOY") ? vbuf_ + (size_t(v.cache_slot) * 4 + 3) * 8 * size_t(h) : nullptr;
+            const float* py = peer_in_;   // two cards: the peer's partial of row(YB), added here (exchange add folded)
+            peer_in_ = nullptr;
             q_.parallel_for<InkMlpConv>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
@@ -2942,12 +2961,13 @@ void Engine::run(int M) {
 #pragma unroll
                     for (int s = 0; s < 8; ++s) acc += wts[s] * dbuf[size_t(s) * h + ch];   // top_k == 8 (geometry check)
                     x = bfr(acc);
-                } else x = yb[size_t(m) * h + ch];
+                } else x = py ? bfr(yb[size_t(m) * h + ch] + py[size_t(m) * h + ch]) : yb[size_t(m) * h + ch];
                 if (vbY) vbY[size_t(m) * h + ch] = bfr(x);
                 float sum = 0.f;
 #pragma unroll
                 for (int lag = 0; lag < 4; ++lag) {
-                    const float xl = lag == 0 ? x : (m - lag >= 0 ? yb[size_t(m - lag) * h + ch] : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
+                    const float yl = m - lag >= 0 ? (py ? bfr(yb[size_t(m - lag) * h + ch] + py[size_t(m - lag) * h + ch]) : yb[size_t(m - lag) * h + ch]) : 0.f;
+                    const float xl = lag == 0 ? x : (m - lag >= 0 ? yl : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
                     if (lag <= pos) sum += xl * bfw(w[ch * 4 + 3 - lag]);
                 }
                 const float y = bfr((x + sum) * cs);
