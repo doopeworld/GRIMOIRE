@@ -70,3 +70,28 @@ Two cards: `run_tp.sh TAG tp IDS CTX PP_LIST TG CHUNK`, `run_tp.sh TAG tpmtp CHA
 - urakozz (OpenCL C + Level Zero command-list replay): Ornith 1 card pp4K 11,223, MTP 312; verify M=8 costs 1.57x one
   plain step; decode dispatch 0.73 us in a replayed list.
 - Reference Inkling speeds elsewhere: vLLM + DSpark RTX 5090 ~416 tok/s code / pp8K ~17.5K; llama.cpp IQ4 ~43-63 tok/s.
+
+## 11-24 later (resumed; Ian: "at least 300 tg and 5000 pp using dual gpu and mtp")
+
+| setup (measured) | before today | now |
+|---|---|---|
+| 2 B70 pipeline prompt pp16384 / pp32768 | 3,550 / 3,295 | **5,374 / 5,410** (chunk 4096) |
+| 2 B70 pipeline prompt pp4096 | 3,081 | 4,288 (chunk 2048) |
+| 1 B70 prompt pp4096 / pp16384 | 2,689 / 2,282 | 3,816 / 3,521 |
+| 2 B70 MTP, code answer (code2.txt) | -- | **159.1 tok/s** (6.08 tok/step, 38.2 ms/step) |
+| 2 B70 MTP, chat1 (384 tok) | 43.1 | 84.7 (3.14 tok/step) |
+| 1 B70 MTP code2 / chat1 | -- / 34.9 | 112.5 / 58.6 |
+| plain decode 1 B70 / 2 B70 | 78.3 / 86 | 79.0 / 86.3 |
+
+Prompt: ESIMD flash attention (InkAttE, GRIMOIRE flash_esimd design), Ornith ESIMD expert GEMM ported to NVFP4 +
+MXFP8 (InkMoeNvEs) with the softcapped SwiGLU in the epilogue, two-card pipeline mode `pp` (split 24).
+MTP verify: InkMoeSmE (GRIMOIRE moe_mxfp4_esimd_small design, fp16 DPAS, K-permuted nibble decode 0 4 1 5 2 6 3 7,
+register double buffer; in libink_xexp.so 128 GRF), INT8 Wp/Wo/unembed via b70::launch_fp8_smallm (src/gemv_decode.cpp
+built as bin/libink_gd.so), router + gate down via b70::launch_bf16_smallm, InkGroupP, InkGateBlend2, INT8 drafter head.
+code2.txt = code1 + "200001 200004" (answer starts as text, no thinking): DSpark accepts ~6 of 8 there.
+
+Two-card MTP step (code2): draft 4.4 ms (both cards, redundant), verify 33.6 ms = GPU ~25 ms + waiting for the
+other card 3.3 ms (experts split by id are unbalanced per visit) + ~5 ms host round trips (96 exchanges a step).
+Verify GPU work per card: experts ~10 ms (~330 GB/s), small M=8 kernels ~6 ms (not split), attention 2.2, dense 1.8.
+Next, in order: experts replicated on both cards + used experts split by parity; exchange straight into the
+peer's slot; M=8 small-kernel fusion; faster verify expert kernel.
