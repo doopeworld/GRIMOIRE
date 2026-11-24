@@ -120,3 +120,10 @@ What moved it (each measured, flags = the old path):
 Two-card verify step per card: experts ~9 ms (~380 GB/s), INT8 small-M ~2.2, attention ~1, ~5 ms of small
 kernels that do not shrink with two cards, ~2.5 ms idle at 96 exchanges. 300 tok/s on code needs ~20 ms/step.
 Hardware counters (unitrace -q) fail in the container (metric init assertion).
+- More measured dead ends (11-24 afternoon): bf16 payload for the 8-row exchanges -- GPU 2-byte stores into
+  pinned host memory: 400 ms/step and wrong tokens; device convert + copy engine: no gain (24.1 vs 24.3 ms) and
+  MTP != plain from token 2 (bf16 partial sums lose precision when the two cards' partials cancel). Exchange add
+  folded into per-channel verify kernels: neutral. 8-row FMA INT8 GEMV (InkEsI8M): slower than launch_fp8_smallm.
+  GRIMOIRE already measured enqueue-ahead TP with host-signaled L0 events (GRIMOIRE_TP_ASYNC, 11-19): slower on the
+  285H; do not redo without a free P-core.
+
