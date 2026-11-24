@@ -1,5 +1,5 @@
-# GitHub branches deleted on 2026-11-24: every one was fully merged into main (cc721b7 and earlier).
-# Restore one with: git push origin <sha>:refs/heads/<name>
+# GitHub branches fully merged into main on 2026-11-24 (main 133d9da contains every commit): safe to delete.
+# Not deleted yet.  If deleted, restore one with: git push origin <sha>:refs/heads/<name>
 8c3d90cc9b74c55c07a80f14854d80df021f04f8 claude/add-gplv3-license
 a4e3775a7c938de04ff1bd9a697e2fe52d171de7 claude/codex-b70-audit-fixes-u1adcv
 a52912798a0cdbc42be5650d036175461994e69b claude/grimoire-audit-testing-qa0v98
