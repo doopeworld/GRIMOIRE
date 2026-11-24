@@ -831,12 +831,16 @@ void Engine::draft_block(int t, int p_in) {
     }
     norm8(r, d_.norm, d_.fin, 7, 1);
     const bool i8head = d_.UR != nullptr;
+    // two cards: each card scores its vocabulary half (base logits + fold), the Markov step's token is the better of
+    // the two halves' best (final_token's exchange; lowest index on ties)
+    static const bool dsplit_env = !std::getenv("INK_DRAFT_FULL");
+    const bool dsplit = i8head && world_ > 1 && dsplit_env;
     if (i8head) {
         uint16_t* fb = d_.finb;
         const float* fin = d_.fin;
         const int kp = kp_;
         q_.parallel_for<InkFinB>(sycl::range<1>(size_t(7) * h), [=](sycl::id<1> id) { const size_t m = id[0] / h, i = id[0] % h; fb[(1 + m) * kp + i] = tobf(fin[(1 + m) * h + i]); });
-        if (!i8_small(d_.UR, d_.US, 0, c_.vocab, kp_, d_.finb + kp_, d_.baseR, 7)) throw std::runtime_error("drafter: INT8 head refused");
+        if (!i8_small(d_.UR, d_.US, dsplit ? v0_ : 0, dsplit ? vrows_ : c_.vocab, kp_, d_.finb + kp_, d_.baseR, 7)) throw std::runtime_error("drafter: INT8 head refused");
     } else
     gemvtm<0>(unembedFullT_, c_.vocab, h, 1, 7, d_.fin + h, d_.fin + h, d_.fin + h, h, d_.base, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V);
     if (bd) { dump_dev(q_, "fin", d_.fin, 8 * size_t(h) * 4); dump_dev(q_, "base", d_.base, 7 * size_t(V) * 4); }
@@ -871,18 +875,20 @@ void Engine::draft_block(int t, int p_in) {
         }
         {   // logits = softcap(bf(base + bf(foldB + foldW . latent))), argmax over the unpadded vocab
             const uint16_t* fw = d_.foldW;
-            const float *fb = d_.foldB, *lat = d_.latent, *base = i8head ? d_.baseR + size_t(step) * c_.vocab : d_.base + size_t(step) * V;
+            const float *fb = d_.foldB, *lat = d_.latent, *base = i8head ? d_.baseR + size_t(step) * (dsplit ? vrows_ : c_.vocab) : d_.base + size_t(step) * V;
+            const int r0f = dsplit ? v0_ : 0, VF = dsplit ? vvalid_ : V;   // rows of this card
             const int8_t* fq = d_.foldQ;
             const float* fsc = d_.foldS;
             float* lg = d_.dlog;
             const float cap = c_.logit_cap;
             static const float bias_on = std::getenv("INK_NOBIAS") ? 0.f : 1.f;
             const float bon = bias_on;
-            const size_t groups = (size_t(V) + 7) / 8;
+            const size_t groups = (size_t(VF) + 7) / 8;
             q_.parallel_for<InkFold>(sycl::nd_range<1>(groups * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 auto sg = it.get_sub_group();
-                const int rr = int(it.get_group(0)) * 8 + int(sg.get_group_linear_id());
-                if (rr >= V) return;
+                const int rl = int(it.get_group(0)) * 8 + int(sg.get_group_linear_id());   // row of this card's range
+                if (rl >= VF) return;
+                const int rr = r0f + rl;                                                    // vocabulary row
                 const int lane = int(sg.get_local_linear_id());
                 float s = 0.f;
                 if (fq) {
@@ -898,12 +904,17 @@ void Engine::draft_block(int t, int p_in) {
                 }
                 if (lane == 0) {
                     const float bias = bon * bfr(fb[rr] + s);
-                    const float v = bfr(bfr(base[rr]) + bias);
-                    lg[rr] = cap * sycl::tanh(v / cap);
+                    const float v = bfr(bfr(base[rl]) + bias);
+                    lg[rl] = cap * sycl::tanh(v / cap);
                 }
             });
         }
-        if (i8head) argmax_rows_cap(d_.dlog, V, V, 1, d_.dtok + 1 + step, nullptr, 0, 0.f);
+        if (dsplit) {
+            // this card's best of its half -> the global best through the host (both cards take the same token)
+            argmax_rows_cap(d_.dlog, vrows_, vvalid_, 1, next_, bestv_, v0_, 0.f);
+            const int tok = final_token(0);
+            q_.memcpy(d_.dtok + 1 + step, &tok, sizeof(int)).wait();
+        } else if (i8head) argmax_rows_cap(d_.dlog, V, V, 1, d_.dtok + 1 + step, nullptr, 0, 0.f);
         else argmax_rows(d_.dlog, V, 1, d_.dtok + 1 + step);
     }
     if (bd) { bdumped = true; dump_dev(q_, "dtok", d_.dtok, 8 * 4); std::printf("dumped first draft block\n"); }
