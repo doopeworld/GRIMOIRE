@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <vector>
+#include <type_traits>
 struct InkXArgs {
     const uint8_t* codes; const uint8_t* scales;   // packed, this card's experts
     const float* amax; const float* den;            // NVFP4 outer = amax[e] / den[0]
@@ -239,7 +240,7 @@ sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g) {
 // from L1 with one 2-D load per 32 K.  Groups from InkGroup: gi[0] = used experts, gi[1 + u] = expert id,
 // gi[129 + u] .. gi[130 + u] = its slots.  EPI 1: softcapped SwiGLU -> bf16 act [slot][Ne/2]; EPI 2: bf(out) as fp32.
 // ---------------------------------------------------------------------------------------------------------------
-namespace { template <int F, int EPI, int KS> class InkMoeSmE; }
+namespace { template <int F, int EPI, int KS, int TNT> class InkMoeSmE; }
 struct InkSmArgs {
     const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;
     const uint16_t* A; int slots;
@@ -252,19 +253,18 @@ struct InkSmArgs {
     int alu = 1;   // NVFP4 nibble decode: 1 ALU bit trick, 0 SLM table
     int own = -1;  // >= 0: every expert on this card; used expert u is this card's iff u % 2 == own
 };
-template <int F, int EPI, int KS>
+template <int F, int EPI, int KS, int TNT = 8>
 static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
     // 11-24 v2: weights decode to fp16 with NO per-weight arithmetic (NVFP4: byte -> fp16 pair from a 1 KB SLM table;
     // MXFP8: E4M3 byte -> fp16 bits = value x 2^-8), fp16 DPAS per 16-K (NVFP4) / 32-K (MXFP8) block, the block's
     // scale (E4M3 x outer, or 2^(x - 119)) applied once to the 8 x 16 partial.  The bf16 version spent ~1 ALU
     // instruction per weight on the decode and ran ALU-bound (360 us / visit for gate_up).  A rows are fp16 (bf16
     // values, exact); act out (EPI 1) is fp16 for the down kernel; dbuf (EPI 2) = bf(out) as fp32.
-    constexpr int TNT = 8;
     const int nG = g.Ne / (32 * TNT);
     return q.submit([&](sycl::handler& h) {
         const InkSmArgs a = g;
         const int Ug = a.own >= 0 ? (a.U + 1) / 2 : a.U;   // two cards: only this card's (parity) used-expert slots
-        h.parallel_for<InkMoeSmE<F, EPI, KS>>(sycl::nd_range<1>(size_t(Ug) * nG * TNT * KS, TNT * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        h.parallel_for<InkMoeSmE<F, EPI, KS, TNT>>(sycl::nd_range<1>(size_t(Ug) * nG * TNT * KS, TNT * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
             using hf = sycl::half;
@@ -504,20 +504,27 @@ sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int
     const int ksel = kenv > 0 ? kenv : 6;   // MEASURED 11-24: one card KS 3/6 = 38.4/38.3 ms (KS 1 48.0); two cards KS 6 ilv 24.8 vs KS 3 25.2 ms/step (down K 1152 -> 3)
     int ks = 1;
     for (int c : {6, 3, 2}) if (c <= ksel && g.K % (128 * c) == 0) { ks = c; break; }
-    if (ks == 6) {
-        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 6>(q, g) : ink_moe_small_impl<0, 2, 6>(q, g);
-        return epi == 1 ? ink_moe_small_impl<1, 1, 6>(q, g) : ink_moe_small_impl<1, 2, 6>(q, g);
-    }
-    if (ks == 3) {
-        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 3>(q, g) : ink_moe_small_impl<0, 2, 3>(q, g);
-        return epi == 1 ? ink_moe_small_impl<1, 1, 3>(q, g) : ink_moe_small_impl<1, 2, 3>(q, g);
-    }
-    if (ks == 2) {
-        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 2>(q, g) : ink_moe_small_impl<0, 2, 2>(q, g);
-        return epi == 1 ? ink_moe_small_impl<1, 1, 2>(q, g) : ink_moe_small_impl<1, 2, 2>(q, g);
-    }
-    if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 1>(q, g) : ink_moe_small_impl<0, 2, 1>(q, g);
-    return epi == 1 ? ink_moe_small_impl<1, 1, 1>(q, g) : ink_moe_small_impl<1, 2, 1>(q, g);
+    static const int tenv = [] { const char* e = std::getenv("INK_SM_TNT"); return e ? std::atoi(e) : 8; }();
+    int tnt = 8;
+    if ((tenv == 4 || tenv == 12 || tenv == 24) && (g.Ne / 32) % tenv == 0 && tenv * ks <= 64) tnt = tenv;
+    auto go = [&](auto KSc, auto TNTc) {
+        constexpr int K_ = decltype(KSc)::value, T_ = decltype(TNTc)::value;
+        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, K_, T_>(q, g) : ink_moe_small_impl<0, 2, K_, T_>(q, g);
+        return epi == 1 ? ink_moe_small_impl<1, 1, K_, T_>(q, g) : ink_moe_small_impl<1, 2, K_, T_>(q, g);
+    };
+    using I1 = std::integral_constant<int, 1>; using I2 = std::integral_constant<int, 2>; using I3 = std::integral_constant<int, 3>;
+    using I6 = std::integral_constant<int, 6>; using T4 = std::integral_constant<int, 4>; using T8 = std::integral_constant<int, 8>;
+    using T12 = std::integral_constant<int, 12>; using T24 = std::integral_constant<int, 24>;
+    auto by_tnt = [&](auto KSc) {
+        if (tnt == 4) return go(KSc, T4{});
+        if (tnt == 12) return go(KSc, T12{});
+        if (tnt == 24) return go(KSc, T24{});
+        return go(KSc, T8{});
+    };
+    if (ks == 6) return by_tnt(I6{});
+    if (ks == 3) return by_tnt(I3{});
+    if (ks == 2) return by_tnt(I2{});
+    return by_tnt(I1{});
 }
 
 // ---------------------------------------------------------------------------------------------------------------
