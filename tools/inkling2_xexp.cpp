@@ -494,7 +494,7 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
 }
 sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi) {
     static const int kenv = [] { const char* e = std::getenv("INK_SM_KS"); return e ? std::atoi(e) : 0; }();
-    const int ksel = kenv > 0 ? kenv : 3;   // MEASURED 11-24: one card KS 3 (step 48.0 -> 38.5 ms); two cards KS 3 interleaved (29.6 -> 28.9 ms)
+    const int ksel = kenv > 0 ? kenv : 6;   // MEASURED 11-24: one card KS 3/6 = 38.4/38.3 ms (KS 1 48.0); two cards KS 6 ilv 24.8 vs KS 3 25.2 ms/step (down K 1152 -> 3)
     int ks = 1;
     for (int c : {6, 3, 2}) if (c <= ksel && g.K % (128 * c) == 0) { ks = c; break; }
     if (ks == 6) {
