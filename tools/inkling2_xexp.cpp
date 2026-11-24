@@ -250,6 +250,7 @@ struct InkSmArgs {
     float gcap, ucap;
     int U;
     int alu = 1;   // NVFP4 nibble decode: 1 ALU bit trick, 0 SLM table
+    int own = -1;  // >= 0: every expert on this card; used expert u is this card's iff u % 2 == own
 };
 template <int F, int EPI>
 static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
@@ -275,8 +276,8 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
             if (F == 0) es::barrier();
             if (u >= a.gi[0]) return;
             const int e = a.gi[1 + u];
-            if (e < a.e0 || e >= a.e0 + a.en) return;
-            const int el = e - a.e0, p0 = a.gi[129 + u], np = a.gi[130 + u] - p0;
+            if (a.own >= 0 ? (u & 1) != a.own : (e < a.e0 || e >= a.e0 + a.en)) return;
+            const int el = a.own >= 0 ? e : e - a.e0, p0 = a.gi[129 + u], np = a.gi[130 + u] - p0;
             const float o = F == 0 ? a.amax[e] / a.den[0] : 1.f;
             const int nb = ng * TNT + lid;
             const int rh0 = el * a.Ne + nb * 32, rh1 = rh0 + 16;

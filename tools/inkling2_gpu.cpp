@@ -79,6 +79,7 @@ struct InkEsArgs {
     const int* sel; int e0, en, topk;
     const float* x; float* out;
     int H, I; float gcap, ucap;
+    int own = -1;
 };
 bool ink_es_moe(sycl::queue& q, const InkEsArgs& gu, const InkEsArgs& dn);
 struct InkI8Args {
@@ -105,6 +106,7 @@ struct InkSmArgs {
     float gcap, ucap;
     int U;
     int alu = 1;
+    int own = -1;
 };
 sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
@@ -306,6 +308,10 @@ private:
     int rank_ = 0, world_ = 1;
     TPX* tpx_ = nullptr;
     int e0_ = 0, en_ = 0, v0_ = 0, vrows_ = 0, vvalid_ = 0;
+    // two cards: every expert on both cards (INK_NO_EPREP=1: half each); decode / verify split the USED experts by
+    // parity at run time (slot / used-expert index), prompts keep the static halves [e0_, e0_ + en_)
+    bool rep_ = false;
+    int we0_ = 0, wen_ = 0, own_ = -1;
     float *peer_ = nullptr, *bestv_ = nullptr, *gate_g_ = nullptr, *gate_f_ = nullptr;
     uint16_t* lowb_ = nullptr;
     // pinned table (copied to tbl_d_ per visit): [0,128) used expert ids, [128,256) gate|up outer, [256,384) down outer,
@@ -444,6 +450,8 @@ void Engine::load() {
         throw std::runtime_error("geometry outside this port (head_dim 128, d_rel 16, conv 4, top-8, <= 128 experts)");
     const auto t0 = std::chrono::steady_clock::now();
     en_ = c_.experts / world_; e0_ = rank_ * en_;
+    rep_ = world_ > 1 && !std::getenv("INK_NO_EPREP");
+    we0_ = rep_ ? 0 : e0_; wen_ = rep_ ? c_.experts : en_; own_ = rep_ ? rank_ : -1;
     vrows_ = c_.vocab / world_; v0_ = rank_ * vrows_; vvalid_ = std::max(0, std::min(vrows_, c_.output_vocab - v0_));
     if (c_.vocab % (16 * world_) || c_.experts % world_ || c_.local.kv_heads % world_) throw std::runtime_error("two-card split");
     embed_ = up<uint16_t>(root + "embed.weight");
@@ -545,8 +553,8 @@ void Engine::load() {
                 size_t nb;
                 const auto* src = host(n, &nb);
                 const size_t per = nb / c_.experts;
-                uint8_t* d = dev_.alloc<uint8_t>(per * en_);
-                q_.memcpy(d, src + per * e0_, per * en_);
+                uint8_t* d = dev_.alloc<uint8_t>(per * wen_);
+                q_.memcpy(d, src + per * we0_, per * wen_);
                 return d;
             };
             Ly.gu = part(e + "w13_weight"); Ly.gus = part(e + "w13_weight_scale");
@@ -578,6 +586,7 @@ void Engine::load() {
         }
         if (xexp && Ly.fgu == PackedFormat::NVFP4 && Ly.fdn == PackedFormat::NVFP4) {
             const int I2 = 2 * c_.inter, hh = h_, II = c_.inter;
+            if (rep_) throw std::runtime_error("INK_XEXP with replicated experts: not supported");
             Ly.guX = dev_.alloc<uint8_t>(size_t(en_) * I2 * hh / 2); Ly.gusX = dev_.alloc<uint8_t>(size_t(en_) * I2 * hh / 16);
             Ly.dnX = dev_.alloc<uint8_t>(size_t(en_) * hh * II / 2); Ly.dnsX = dev_.alloc<uint8_t>(size_t(en_) * hh * II / 16);
             ink_xexp_pack(q_, Ly.gu, Ly.gus, en_, I2, hh, Ly.guX, Ly.gusX);
@@ -1515,12 +1524,12 @@ inline void load_x(const float* g, float* xr, int n) {
 }
 
 void Engine::experts_decode(const Layer& Ly) {
-    const int h = h_, I = c_.inter, TK = c_.top_k, e0 = e0_, en = en_;
+    const int h = h_, I = c_.inter, TK = c_.top_k, e0 = e0_, en = en_, own = own_;
     // INK_ESMOE=1: GRIMOIRE's Ornith ESIMD decode MoE ported to NVFP4 (tools/inkling2_moe_gemm.cpp ink_es_moe)
     static const bool esmoe = std::getenv("INK_ESMOE") && std::atoi(std::getenv("INK_ESMOE")) == 1;
     if (esmoe && Ly.fgu == PackedFormat::NVFP4 && Ly.fdn == PackedFormat::NVFP4 &&
-        ink_es_moe(q_, InkEsArgs{Ly.gu, Ly.gus, Ly.gua, Ly.gud, sel_, e0, en, TK, row(NM), act_, h, I, c_.gate_cap, c_.up_cap},
-                   InkEsArgs{Ly.dn, Ly.dns, Ly.dna, Ly.dnd, sel_, e0, en, TK, act_, dbuf_, h, I, 0.f, 0.f}))
+        ink_es_moe(q_, InkEsArgs{Ly.gu, Ly.gus, Ly.gua, Ly.gud, sel_, e0, en, TK, row(NM), act_, h, I, c_.gate_cap, c_.up_cap, own_},
+                   InkEsArgs{Ly.dn, Ly.dns, Ly.dna, Ly.dnd, sel_, e0, en, TK, act_, dbuf_, h, I, 0.f, 0.f, own_}))
         return;
     if (Ly.guX) {   // DPAS decode (tools/inkling2_moe_gemm.cpp ink_xexp)
         ink_xexp(q_, InkXArgs{Ly.guX, Ly.gusX, Ly.gua, Ly.gud, sel_, e0, en, TK, 2 * I, h, row(NM), 0, act_, 1, c_.gate_cap, c_.up_cap, xlut_});
@@ -1559,8 +1568,8 @@ void Engine::experts_decode(const Layer& Ly) {
                 const int s = int(it.get_group(0)) / wpb;
                 const int i0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = sel[s];
-                if (e < e0 || e >= e0 + en) return;
-                const int el = e - e0;
+                if (own >= 0 ? (s & 1) != own : (e < e0 || e >= e0 + en)) return;
+                const int el = own >= 0 ? e : e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 float g[R], u[R];
 #pragma unroll
@@ -1631,12 +1640,12 @@ void Engine::experts_decode(const Layer& Ly) {
                 const int s = int(it.get_group(0)) / wpb;
                 const int j0 = (int(it.get_group(0)) % wpb) * R * SGS + int(sg.get_group_linear_id()) * R;
                 const int e = sel[s];
-                if (e < e0 || e >= e0 + en) {
+                if (own >= 0 ? (s & 1) != own : (e < e0 || e >= e0 + en)) {
                     if (lane == 0)
                         for (int r = 0; r < R; ++r) dbuf[size_t(s) * h + j0 + r] = 0.f;
                     return;
                 }
-                const int el = e - e0;
+                const int el = own >= 0 ? e : e - e0;
                 const float outer = NV ? amax[e] / den[0] : 1.f;
                 const float* a = act + size_t(s) * I;
                 float d[R];
@@ -1718,7 +1727,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         int* tl = ids + 768;
         for (int u = 0; u < nu; ++u) {
             const int e = used[u];
-            ui[3 * u] = e - e0_; ui[3 * u + 1] = off[e]; ui[3 * u + 2] = count[e];
+            ui[3 * u] = e - we0_; ui[3 * u + 1] = off[e]; ui[3 * u + 2] = count[e];
             for (int mb = 0; mb * 256 < count[e]; ++mb) { tl[2 * T] = u; tl[2 * T + 1] = mb; ++T; }
         }
         if (grouped) q_.memcpy(tbl_d_, elist_, (768 + 2 * size_t(T)) * sizeof(float));
@@ -1732,10 +1741,10 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         bool act_done = false;
         const bool es_g = grouped && nves && (fg == 0 || mxes), es_d = grouped && nves && (fd == 0 || mxes);
         if (es_g && fuse_act) {
-            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, act, gcap, ucap, fg});
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, wen_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, act, gcap, ucap, fg});
             act_done = true;
         } else if (es_g)
-            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, nullptr, 0.f, 0.f, fg});
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, wen_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, nullptr, 0.f, 0.f, fg});
         else if (grouped)
             ink_moe_grouped(q_, fg, Ly.gu, Ly.gus, rbg, sbg, 2 * I, h, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, {});
         else
@@ -1755,7 +1764,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
             act[i] = tobf((gcap * sycl::tanh(g / gcap)) * sig * (ucap * sycl::tanh(u / ucap)));
         });
         if (es_d)
-            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.dn, Ly.dns, h, I, en_ * h, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, nvlut_, nullptr, 0.f, 0.f, fd});
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.dn, Ly.dns, h, I, wen_ * h, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, nvlut_, nullptr, 0.f, 0.f, fd});
         else if (grouped)
             ink_moe_grouped(q_, fd, Ly.dn, Ly.dns, rbd, sbd, h, I, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, {});
         else
@@ -1796,7 +1805,7 @@ void Engine::dequant_used(PackedFormat f, int N, int K, const uint8_t* pay, cons
                           int nu, int outer_at, uint16_t* dst, int u0) {
     const int* ids = reinterpret_cast<const int*>(elist_) + u0;
     const float* outer = elist_ + outer_at + u0;
-    const int e0 = e0_;
+    const int e0 = we0_;
     if (f == PackedFormat::NVFP4) {
         const int KB = K / 16;
         q_.parallel_for<InkDqNv>(sycl::range<1>(size_t(nu) * N * KB), [=](sycl::id<1> id) {
@@ -2311,8 +2320,10 @@ void Engine::run(int M) {
                     aout[j * D + d] = ov;
                     aoutb[j * D + d] = tobf(ov);
                 });
-            } else if (M >= 16 && !std::getenv("INK_ATT_SIMT")) {
-                // prompt rows on the matrix unit (tools/inkling2_moe_gemm.cpp)
+            } else if ((M >= 16 || (M >= 2 && D == 128 && (cap % 16 == 0 || !v.sliding) && !std::getenv("INK_OLD_ATTB") && !std::getenv("INK_NO_ATTES"))) &&
+                       !std::getenv("INK_ATT_SIMT")) {
+                // prompt rows and verify rows (2..15) on the matrix unit (tools/inkling2_moe_gemm.cpp); verify rows used
+                // InkAttB (a sub-group per row and head walking every key: 175 us a visit at ~300 keys on two cards)
                 if (!bias_) bias_ = dev_.alloc<uint16_t>(size_t(mmax_) * std::max(c_.local.heads, c_.full.heads) * std::max(c_.window, c_.rel_extent));
                 uint16_t* bs = bias_;
                 const int Hh = H;

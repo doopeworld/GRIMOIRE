@@ -83,6 +83,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 const int q = cur[u]++;
                 gi[258 + q] = m;
                 gi[386 + m * TK + s] = q;
+                gi[514 + q] = u;
             }
     });
     } else {
@@ -114,6 +115,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 const int q = start[ex] + before;
                 gi[258 + q] = e / TK;
                 gi[386 + e] = q;
+                gi[514 + q] = ord[ex];
             }
         });
     });
@@ -150,9 +152,10 @@ void Engine::experts_small(const Layer& Ly, int M) {
             ++calls; sum += nd; rows += M;
             if (calls % 480 == 0) std::printf("smstat: %ld verify visits, %.1f distinct experts per visit, %.2f rows\n", calls, double(sum) / calls, double(rows) / calls);
         }
-        ink_moe_small_esimd(q_, InkSmArgs{Ly.gu, Ly.gus, 2 * I, h, en * 2 * I, xg, slots, actSb_, gi, e0, en, Ly.gua, Ly.gud, nvlut16_, gcap, ucap, U, sm_alu}, fg, 1);
-        ink_moe_small_esimd(q_, InkSmArgs{Ly.dn, Ly.dns, h, I, en * h, actSb_, slots, dbuf, gi, e0, en, Ly.dna, Ly.dnd, nvlut16_, 0.f, 0.f, U, sm_alu_dn}, fd, 2);
+        ink_moe_small_esimd(q_, InkSmArgs{Ly.gu, Ly.gus, 2 * I, h, wen_ * 2 * I, xg, slots, actSb_, gi, e0, en, Ly.gua, Ly.gud, nvlut16_, gcap, ucap, U, sm_alu, own_}, fg, 1);
+        ink_moe_small_esimd(q_, InkSmArgs{Ly.dn, Ly.dns, h, I, wen_ * h, actSb_, slots, dbuf, gi, e0, en, Ly.dna, Ly.dnd, nvlut16_, 0.f, 0.f, U, sm_alu_dn, own_}, fd, 2);
     }
+    if (!es_ok && rep_) throw std::runtime_error("verify experts: replicated experts need the ESIMD kernels");
     if (!es_ok) {
     {
         const bool NV = Ly.fgu == PackedFormat::NVFP4;
@@ -313,12 +316,14 @@ void Engine::experts_small(const Layer& Ly, int M) {
     {   // YB[m] = bf(sum_s w_s d_s) in slot (= ascending expert) order
         const float* w = wts_;
         float* yb = row(YB);
+        const int own = own_;
         q_.parallel_for<InkCombS>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
             const size_t t = id[0], m = t / h, ch = t % h;
             float acc = 0.f;
             for (int s = 0; s < TK; ++s) {
                 const int e = sel[m * TK + s];
-                if (e >= e0 && e < e0 + en) acc += w[m * TK + s] * dbuf[size_t(gi[386 + m * TK + s]) * h + ch];
+                const int q = gi[386 + m * TK + s];
+                if (own >= 0 ? (gi[514 + q] & 1) == own : (e >= e0 && e < e0 + en)) acc += w[m * TK + s] * dbuf[size_t(q) * h + ch];
             }
             yb[t] = tp ? acc : bfr(acc);
         });

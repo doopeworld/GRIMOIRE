@@ -516,6 +516,7 @@ struct InkEsArgs {
     const int* sel; int e0, en, topk;
     const float* x; float* out;                 // gate_up: x [H] -> act [slot][I];  down: act [slot][I] -> dbuf [slot][H]
     int H, I; float gcap, ucap;
+    int own = -1;                               // >= 0: every expert is on this card; slot s is this card's iff s % 2 == own
 };
 
 // gate_up + Inkling's softcapped SwiGLU.  Work-group = KS threads splitting H; a thread owns R (gate, up) row pairs
@@ -532,8 +533,8 @@ static sycl::event es_gu(sycl::queue& q, const InkEsArgs& a) {
             const int t = int(it.get_local_id(0)), wg = int(it.get_group(0));
             const int slot = wg / rg, i0 = (wg % rg) * R, kb = t * KP;
             const int e = g.sel[slot];
-            if (e < g.e0 || e >= g.e0 + g.en) return;            // uniform per work-group
-            const int64_t el = e - g.e0, rb = H / 2, rs = H / 16;
+            if (g.own >= 0 ? (slot & 1) != g.own : (e < g.e0 || e >= g.e0 + g.en)) return;   // uniform per work-group
+            const int64_t el = g.own >= 0 ? e : e - g.e0, rb = H / 2, rs = H / 16;
             const float so = g.amax[e] / g.den[0] * 16384.f;
             es2::simd<float, KP> xs = es2::block_load<float, KP>(g.x + kb);
             es2::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
@@ -582,12 +583,12 @@ static sycl::event es_dn(sycl::queue& q, const InkEsArgs& a) {
             const int s = int(it.get_local_id(0)), o0 = int(it.get_group(0)) * R;
             const int e = g.sel[s];
             float* y = g.out + int64_t(s) * g.H + o0;
-            if (e < g.e0 || e >= g.e0 + g.en) {
+            if (g.own >= 0 ? (s & 1) != g.own : (e < g.e0 || e >= g.e0 + g.en)) {
 #pragma unroll
                 for (int r = 0; r < R; ++r) y[r] = 0.f;
                 return;
             }
-            const int64_t el = e - g.e0, rb = I / 2, rs = I / 16;
+            const int64_t el = g.own >= 0 ? e : e - g.e0, rb = I / 2, rs = I / 16;
             const float so = g.amax[e] / g.den[0] * 16384.f;
             es2::simd<float, I> hs = es2::block_load<float, I>(g.x + int64_t(s) * I);
             es2::simd<float, I / 2> he = hs.template select<I / 2, 2>(0);
