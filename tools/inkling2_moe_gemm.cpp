@@ -694,6 +694,85 @@ static sycl::event es_gemv_i8(sycl::queue& q, const InkI8Args& a) {
     });
 }
 
+// The same for M <= 8 rows (verify / drafter): the weights read once, one 16-row accumulator per input row;
+// inputs x_seg + m * ldx, outputs y_seg + m * ldy_seg (per segment), mode as es_gemv_i8.
+struct InkI8MArgs {
+    const int8_t* T; const float* sc; int N, K, M;
+    const float *x0, *x1, *x2; size_t ldx;
+    float *y0, *y1, *y2; size_t ly0, ly1, ly2; int end0, end1; int mode; float cap;
+};
+namespace { template <int KS> class InkEsI8M; }
+template <int KS>
+static sycl::event es_gemv_i8m(sycl::queue& q, const InkI8MArgs& a) {
+    const int tiles = a.N / 16;
+    return q.submit([&](sycl::handler& cgh) {
+        const InkI8MArgs g = a;
+        cgh.parallel_for<InkEsI8M<KS>>(sycl::nd_range<1>(size_t(tiles) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es2::slm_init<KS * 8 * 16 * 4>();
+            const int part = int(it.get_local_id(0)), tile = int(it.get_group(0)), r0 = tile * 16;
+            const float* x = r0 < g.end0 ? g.x0 : (r0 < g.end1 ? g.x1 : g.x2);
+            const int K32 = g.K / 32, c0 = part * K32 / KS, c1 = (part + 1) * K32 / KS;
+            const int8_t* base = g.T + size_t(tile) * (g.K / 8) * 128;
+            const int M = g.M;
+            es2::simd<float, 8 * 16> acc = 0.f;
+            for (int c = c0; c < c1; ++c) {
+                es2::simd<int8_t, 512> w = es2::block_load<int8_t, 512>(base + size_t(c) * 512);   // 4 x [16 rows][8 k]
+                es2::simd<float, 8 * 32> xv;
+#pragma unroll
+                for (int m = 0; m < 8; ++m)
+                    if (m < M) xv.template select<32, 1>(m * 32) = es2::block_load<float, 32>(x + size_t(m) * g.ldx + c * 32);
+#pragma unroll
+                for (int q4 = 0; q4 < 4; ++q4)
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const es2::simd<float, 16> wk = w.template select<16, 8>(q4 * 128 + k);
+#pragma unroll
+                        for (int m = 0; m < 8; ++m)
+                            if (m < M) acc.template select<16, 1>(m * 16) += wk * float(xv[m * 32 + q4 * 8 + k]);
+                    }
+            }
+            if constexpr (KS > 1) {
+                es2::slm_block_store<float, 128>(uint32_t(part * 512), acc);
+                es2::barrier();
+                if (part != 0) return;
+                acc = 0.f;
+#pragma unroll
+                for (int p = 0; p < KS; ++p) acc += es2::slm_block_load<float, 128>(uint32_t(p * 512));
+            }
+            const es2::simd<float, 16> s = es2::block_load<float, 16>(g.sc + r0);
+            float* y; size_t ly;
+            if (r0 < g.end0) { y = g.y0 + r0; ly = g.ly0; }
+            else if (r0 < g.end1) { y = g.y1 + (r0 - g.end0); ly = g.ly1; }
+            else { y = g.y2 + (r0 - g.end1); ly = g.ly2; }
+#pragma unroll
+            for (int m = 0; m < 8; ++m)
+                if (m < M) {
+                    es2::simd<float, 16> v = acc.template select<16, 1>(m * 16);
+                    v *= s;
+                    if (g.mode != 1)
+#pragma unroll
+                        for (int l = 0; l < 16; ++l) {
+                            float t = es_bfr(v[l]);
+                            if (g.mode == 2) t = g.cap * es_th(t / g.cap);
+                            v[l] = t;
+                        }
+                    es2::block_store<float, 16>(y + size_t(m) * ly, v);
+                }
+        });
+    });
+}
+bool ink_es_gemv_i8m(sycl::queue& q, const InkI8MArgs& a, int ks) {
+    if (a.N % 16 || a.K % 32 || a.M < 1 || a.M > 8) return false;
+    if (a.end0 % 16 || a.end1 % 16) return false;
+    switch (ks) {
+        case 2: es_gemv_i8m<2>(q, a); break;
+        case 4: es_gemv_i8m<4>(q, a); break;
+        case 16: es_gemv_i8m<16>(q, a); break;
+        default: es_gemv_i8m<8>(q, a); break;
+    }
+    return true;
+}
+
 bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks) {
     if (a.N % 16 || a.K % 32) return false;
     if (a.end0 % 16 || a.end1 % 16) return false;   // a tile must not straddle two outputs

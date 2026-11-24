@@ -566,6 +566,7 @@ void Engine::load_mtp(const std::string& path) {
                         quant_tiled(T[w], N[w], K[w], qt, L.S8[w]);
                         L.KP8[w] = (K[w] + 511) / 512 * 512;
                         L.Q8[w] = rowq(qt, N[w], K[w], L.KP8[w]);
+                        L.T8[w] = qt;
                         L.N8[w] = N[w]; L.K8[w] = K[w];
                     }
                 }

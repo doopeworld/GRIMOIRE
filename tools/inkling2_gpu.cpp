@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkDXB; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkDXB; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -88,6 +88,12 @@ struct InkI8Args {
     const float *x0, *x1, *x2; float *y0, *y1, *y2; int end0, end1; int mode; float cap;
 };
 bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks);
+struct InkI8MArgs {
+    const int8_t* T; const float* sc; int N, K, M;
+    const float *x0, *x1, *x2; size_t ldx;
+    float *y0, *y1, *y2; size_t ly0, ly1, ly2; int end0, end1; int mode; float cap;
+};
+bool ink_es_gemv_i8m(sycl::queue& q, const InkI8MArgs& a, int ks);
 struct InkNvEsArgs {
     const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;
     const uint16_t* A; float* out;
@@ -458,7 +464,8 @@ private:
     void argmax_rows(const float* lg, int V, int n, int* out);
     // DSpark drafter
     struct DLayer { uint16_t *Wqkv, *Wkvc, *Wo, *Wgu, *Wd, *nin, *npost, *qn, *kn, *knc, *dfn, *kc, *vc; bool sliding;
-                    int8_t *Q8[4] = {}; float* S8[4] = {}; int N8[4] = {}, K8[4] = {}, KP8[4] = {}; };   // INT8 qkv / o / gu / d (row-major, K padded)
+                    int8_t *Q8[4] = {}; float* S8[4] = {}; int N8[4] = {}, K8[4] = {}, KP8[4] = {};   // INT8 qkv / o / gu / d (row-major, K padded)
+                    int8_t* T8[4] = {}; };                                                          // the same, decode tiles
     struct Draft {
         std::shared_ptr<b70::SafeTensors> st;
         DLayer L[3];
@@ -851,6 +858,11 @@ int8_t* Engine::rowq(const int8_t* T, int N, int K, int Kp) {
 
 void Engine::dgemv8(const DLayer& L, int w, const float* x, float* y) {
     const int K = L.K8[w], Kp = L.KP8[w];
+    static const int i8m_d = std::getenv("INK_I8M") ? std::atoi(std::getenv("INK_I8M")) : 0;
+    if (i8m_d > 0 && L.T8[w] &&
+        ink_es_gemv_i8m(q_, InkI8MArgs{L.T8[w], L.S8[w], L.N8[w], K, 8, x, x, x, size_t(K), y, y, y, size_t(L.N8[w]), size_t(L.N8[w]),
+                                       size_t(L.N8[w]), L.N8[w], L.N8[w], 1, 0.f}, i8m_d))
+        return;
     uint16_t* xb = d_.xb8;
     q_.parallel_for<InkDXB>(sycl::range<1>(size_t(8) * Kp), [=](sycl::id<1> id) {
         const size_t m = id[0] / Kp, k = id[0] % Kp;
@@ -2263,7 +2275,11 @@ void Engine::run(int M) {
             rms(nb, M);
         }
         const int NA = Ly.NA, NB = Ly.NB, NC = Ly.NC;
-        if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && same && projAll_ && [&] {
+        static const int i8m_ks = std::getenv("INK_I8M") ? std::atoi(std::getenv("INK_I8M")) : 0;   // MEASURED 11-24: 8-row FMA GEMV slower than b70::launch_fp8_smallm (33.5 -> 38.6 ms/step): opt-in
+        if (i8m_ks > 0 && Ly.WpQ && M >= 2 && M <= 8 &&
+            ink_es_gemv_i8m(q_, InkI8MArgs{Ly.WpQ, Ly.WpS, NA + NB + NC, h, M, row(nrm[0]), row(nrm[1]), row(nrm[2]), size_t(h), projA_, projB_, projC_,
+                                           size_t(NA), size_t(NB), size_t(NC), NA, NA + NB, 0, 0.f}, i8m_ks)) {
+        } else if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && same && projAll_ && [&] {
                 // one input for all three segments (sliding visits): one launch over NA + NB + NC rows, then the three
                 // segments are views of the [M][NA + NB + NC] result
                 return i8_small(Ly.WpR, Ly.WpS, 0, NA + NB + NC, kp_, xpad_, projAll_, M);
@@ -2727,11 +2743,13 @@ void Engine::run(int M) {
         if (world_ > 1) {
             if (M == 1 && Ly.WoQ) gemvt8<1>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            else if (M <= 8 && i8m_ks > 0 && Ly.WoQ &&
+                     ink_es_gemv_i8m(q_, InkI8MArgs{Ly.WoQ, Ly.WoS, h, Q, M, aout_, aout_, aout_, size_t(Q), row(Z), row(Z), row(Z), size_t(h), size_t(h), size_t(h), h, h, 1, 0.f}, i8m_ks)) {}
             else if (M <= 8 && i8v_ && i8_small(Ly.WoR, Ly.WoS, 0, h, Q, aoutb_, row(Z), M)) {}
             else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
             else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, false);
             static const bool fold_env = !std::getenv("INK_SEP_ADD");
-            fold_add_ = fold_env && M == 1 && !std::getenv("INK_RMN");   // MEASURED: decode 93.1 -> 94.2 tok/s; verify rows slower (4 PCIe reads a value)
+            fold_add_ = fold_env && ((M == 1 && !std::getenv("INK_RMN")) || (M > 1 && M <= 8 && verify_ && !std::getenv("INK_OLD_RESIDV")));
             peer_in_ = nullptr;
             allreduce(row(Z), size_t(M) * h);
             fold_add_ = false;
@@ -2746,6 +2764,8 @@ void Engine::run(int M) {
                 gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         }
         else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        else if (M <= 8 && i8m_ks > 0 && Ly.WoQ &&
+                 ink_es_gemv_i8m(q_, InkI8MArgs{Ly.WoQ, Ly.WoS, h, Q, M, aout_, aout_, aout_, size_t(Q), row(Z), row(Z), row(Z), size_t(h), size_t(h), size_t(h), h, h, 0, 0.f}, i8m_ks)) {}
         else if (M <= 8 && i8v_ && i8_small(Ly.WoR, Ly.WoS, 0, h, Q, aoutb_, row(Z), M)) {}
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);
@@ -2780,6 +2800,36 @@ void Engine::run(int M) {
             float* vbZ = fold_hv2 && M > 1 && verify_ && !std::getenv("INK_HV_NOZ") ? vbuf_ + (size_t(v.cache_slot) * 4 + 2) * 8 * size_t(h) : nullptr;
             const float* pz = peer_in_;   // two cards: the peer's partial of row(Z), added here (exchange add folded)
             peer_in_ = nullptr;
+            if (M > 1 && M <= 8 && verify_ && !std::getenv("INK_OLD_RESIDV")) {
+                // verify rows: a work-item per channel walks the rows with the conv window in registers (each Z value
+                // and peer partial read once; the same per-row arithmetic as InkResid)
+                q_.parallel_for<InkResidV>(sycl::range<1>(size_t(h)), [=](sycl::id<1> id) {
+                    const int ch = int(id[0]);
+                    const int pos0 = *posd;
+                    const float* zr = pool + size_t(Z) * RS;
+                    float win[3];   // inputs at lags 1, 2, 3 of the current row
+#pragma unroll
+                    for (int l = 1; l <= 3; ++l) win[l - 1] = hist[size_t(((pos0 - l) % 3 + 3) % 3) * h + ch];
+                    const float w0 = bfw(w[ch * 4 + 3]), w1 = bfw(w[ch * 4 + 2]), w2 = bfw(w[ch * 4 + 1]), w3 = bfw(w[ch * 4 + 0]);
+                    for (int m = 0; m < M; ++m) {
+                        const int pos = pos0 + m;
+                        const float zv = pz ? bfr(zr[size_t(m) * h + ch] + pz[size_t(m) * h + ch]) : zr[size_t(m) * h + ch];
+                        const float x = bfr(zv);
+                        if (vbZ) vbZ[size_t(m) * h + ch] = x;
+                        float sum = 0.f;
+                        if (0 <= pos) sum += x * w0;
+                        if (1 <= pos) sum += win[0] * w1;
+                        if (2 <= pos) sum += win[1] * w2;
+                        if (3 <= pos) sum += win[2] * w3;
+                        const float out = bfr((x + sum) * cs);
+                        win[2] = win[1]; win[1] = win[0]; win[0] = x;
+                        const size_t o = size_t(m) * h + ch;
+                        const float hid = pool[size_t(HID) * RS + o];
+                        if (br >= 0) { pool[size_t(br) * RS + o] = hid; pool[size_t(RES) * RS + o] = out; }
+                        else pool[size_t(RES) * RS + o] = out + hid;
+                    }
+                });
+            } else
             q_.parallel_for<InkResid>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
@@ -2933,7 +2983,7 @@ void Engine::run(int M) {
                 });
             }
             static const bool fold_env2 = !std::getenv("INK_SEP_ADD");
-            fold_add_ = fold_env2 && M == 1;
+            fold_add_ = fold_env2 && (M == 1 || (M > 1 && M <= 8 && verify_ && !std::getenv("INK_OLD_RESIDV")));
             peer_in_ = nullptr;
             allreduce(row(YB), size_t(M) * h);
             fold_add_ = false;
@@ -2951,6 +3001,32 @@ void Engine::run(int M) {
             float* vbY = fold_hv3 && M > 1 && verify_ && !std::getenv("INK_HV_NOY") ? vbuf_ + (size_t(v.cache_slot) * 4 + 3) * 8 * size_t(h) : nullptr;
             const float* py = peer_in_;   // two cards: the peer's partial of row(YB), added here (exchange add folded)
             peer_in_ = nullptr;
+            if (M > 1 && M <= 8 && verify_ && !std::getenv("INK_OLD_RESIDV")) {
+                // verify rows: a work-item per channel walks the rows (each YB value and peer partial read once)
+                q_.parallel_for<InkMlpConvV>(sycl::range<1>(size_t(h)), [=](sycl::id<1> id) {
+                    const int ch = int(id[0]);
+                    const int pos0 = *posd;
+                    const float* yb = pool + size_t(YB) * RS;
+                    float win[3];
+#pragma unroll
+                    for (int l = 1; l <= 3; ++l) win[l - 1] = hist[size_t(((pos0 - l) % 3 + 3) % 3) * h + ch];
+                    const float w0 = bfw(w[ch * 4 + 3]), w1 = bfw(w[ch * 4 + 2]), w2 = bfw(w[ch * 4 + 1]), w3 = bfw(w[ch * 4 + 0]);
+                    for (int m = 0; m < M; ++m) {
+                        const int pos = pos0 + m;
+                        const float x = py ? bfr(yb[size_t(m) * h + ch] + py[size_t(m) * h + ch]) : yb[size_t(m) * h + ch];
+                        if (vbY) vbY[size_t(m) * h + ch] = bfr(x);
+                        float sum = 0.f;
+                        if (0 <= pos) sum += x * w0;
+                        if (1 <= pos) sum += win[0] * w1;
+                        if (2 <= pos) sum += win[1] * w2;
+                        if (3 <= pos) sum += win[2] * w3;
+                        const float y = bfr((x + sum) * cs);
+                        win[2] = win[1]; win[1] = win[0]; win[0] = x;
+                        const size_t o = size_t(m) * h + ch;
+                        pool[size_t(HID) * RS + o] = bfr(pool[size_t(RES) * RS + o] + y);
+                    }
+                });
+            } else
             q_.parallel_for<InkMlpConv>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
@@ -2997,7 +3073,12 @@ void Engine::run(int M) {
         if (taps_on) copy(N0, TAP3);
     }
     const int V = c_.output_vocab;
-    if (all_logits_ && i8v_ && unR_ && M <= 8 && i8_small(unR_, unembedS_, 0, vrows_, kp_, xpadU_, logitsR_, M)) {
+    static const int i8m_un = std::getenv("INK_I8M") ? std::atoi(std::getenv("INK_I8M")) : 0;
+    if (all_logits_ && logitsR_ && M <= 8 &&
+        ((i8m_un > 0 && unembedQ_ &&
+          ink_es_gemv_i8m(q_, InkI8MArgs{unembedQ_, unembedS_, vrows_, h, M, row(N0), row(N0), row(N0), size_t(h), logitsR_, logitsR_, logitsR_,
+                                         size_t(vrows_), size_t(vrows_), size_t(vrows_), vrows_, vrows_, 1, 0.f}, i8m_un)) ||
+         (i8v_ && unR_ && i8_small(unR_, unembedS_, 0, vrows_, kp_, xpadU_, logitsR_, M)))) {
         // INT8 unembed for the verify rows (b70::launch_fp8_smallm, raw), softcap + argmax in one pass
         if (world_ == 1) argmax_rows_cap(logitsR_, vrows_, V, M, next_, nullptr, 0, c_.logit_cap);
         else argmax_rows_cap(logitsR_, vrows_, vvalid_, M, next_, bestv_, v0_, c_.logit_cap);
