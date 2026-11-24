@@ -91,6 +91,8 @@ struct InkNvEsArgs {
     const uint16_t* A; float* out;
     const int* tiles; int T; const int* uinfo; const float* outer;
     const uint32_t* lut;
+    uint16_t* act = nullptr; float gcap = 0.f, ucap = 0.f;
+    int fmt = 0;
 };
 sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
@@ -1617,8 +1619,16 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         const int* ui_d = reinterpret_cast<const int*>(tbl_d_) + 384;
         const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
         static const bool nves = !std::getenv("INK_NO_NVES");   // GRIMOIRE's Ornith ESIMD prompt MoE, NVFP4 port
-        if (grouped && fg == 0 && nves)
-            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_});
+        static const bool fuse_act = !std::getenv("INK_NO_FUSEACT");   // softcapped SwiGLU in the gate_up epilogue
+        const float gcap = c_.gate_cap, ucap = c_.up_cap;
+        static const bool mxes = !std::getenv("INK_NO_MXES");   // the same ESIMD kernel for the MXFP8 layers
+        bool act_done = false;
+        const bool es_g = grouped && nves && (fg == 0 || mxes), es_d = grouped && nves && (fd == 0 || mxes);
+        if (es_g && fuse_act) {
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, act, gcap, ucap, fg});
+            act_done = true;
+        } else if (es_g)
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_, nullptr, 0.f, 0.f, fg});
         else if (grouped)
             ink_moe_grouped(q_, fg, Ly.gu, Ly.gus, rbg, sbg, 2 * I, h, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, {});
         else
@@ -1629,8 +1639,7 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
                 wg.fmt = b70::Fmt::BF16; wg.N = 2 * I; wg.K = h; wg.row_bytes = int64_t(h) * 2; wg.payload = reinterpret_cast<const uint8_t*>(wb);
                 b70::launch_gemm_fast(q_, wg, reinterpret_cast<const bf16x*>(inb_) + size_t(off[e]) * h, proj + size_t(off[e]) * 2 * I, (count[e] + 31) / 32 * 32);
             }
-        const float gcap = c_.gate_cap, ucap = c_.up_cap;
-        q_.parallel_for<InkActP>(sycl::range<1>(size_t(M) * TK * I), [=](sycl::id<1> id) {
+        if (!act_done) q_.parallel_for<InkActP>(sycl::range<1>(size_t(M) * TK * I), [=](sycl::id<1> id) {
             const size_t i = id[0];
             // same formula as inkling2::launch_expert_ffn: BF16-rounded linear outputs, softcaps, sigmoid of the raw gate
             const float g = bfr(proj[2 * i]), u = bfr(proj[2 * i + 1]);
@@ -1638,8 +1647,8 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
             const float sig = (g >= 0.f ? 1.f : z) / (1.f + z);
             act[i] = tobf((gcap * sycl::tanh(g / gcap)) * sig * (ucap * sycl::tanh(u / ucap)));
         });
-        if (grouped && fd == 0 && nves)
-            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.dn, Ly.dns, h, I, en_ * h, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, nvlut_});
+        if (es_d)
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.dn, Ly.dns, h, I, en_ * h, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, nvlut_, nullptr, 0.f, 0.f, fd});
         else if (grouped)
             ink_moe_grouped(q_, fd, Ly.dn, Ly.dns, rbd, sbd, h, I, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, {});
         else
@@ -2216,7 +2225,7 @@ void Engine::run(int M) {
                 });
                 static const bool att_es = !std::getenv("INK_NO_ATTES");   // ESIMD flash (GRIMOIRE flash_esimd design)
                 static const bool att_cmp = std::getenv("INK_ATT_CMP") != nullptr;
-                if (att_es && att_cmp && D == 128 && cap % 16 == 0) {   // debug: ESIMD vs the joint_matrix kernel on the same inputs
+                if (att_es && att_cmp && D == 128 && (cap % 16 == 0 || !v.sliding)) {   // debug: ESIMD vs the joint_matrix kernel on the same inputs
                     static int ncmp = 0;
                     float* o2 = sycl::malloc_device<float>(size_t(M) * Q, q_);
                     uint16_t* b2 = sycl::malloc_device<uint16_t>(size_t(M) * Q, q_);
@@ -2230,7 +2239,7 @@ void Engine::run(int M) {
                     for (size_t k = 0; k < h1.size(); ++k) { const double d = std::fabs(double(h1[k]) - h2[k]); if (d > md) { md = d; worst = k; } if (d > 0) ++nd; mx = std::max(mx, double(std::fabs(h1[k]))); }
                     if (ncmp++ < 60) std::printf("attcmp visit %d sliding %d M %d: max|d| %.5f (max|ref| %.3f) at row %zu col %zu, %zu of %zu differ\n", vi, int(v.sliding), M, md, mx, worst / Q, worst % Q, nd, h1.size());
                     sycl::free(o2, q_); sycl::free(b2, q_);
-                } else if (att_es && D == 128 && cap % 16 == 0)
+                } else if (att_es && D == 128 && (cap % 16 == 0 || !v.sliding))
                     ink_attn_esimd(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
                 else
                     ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});

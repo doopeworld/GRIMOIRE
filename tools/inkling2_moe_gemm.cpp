@@ -713,14 +713,17 @@ bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks) {
 // per 32 K from 1 KB SLM block loads.  Decode: byte -> E2M1 bf16 pair through the 1 KB table, x the E4M3 scale of its
 // 16-K half (exact), x outer, RNE to bf16 = Inkling's exact weight bf16((e2m1*sc)*outer).  out fp32 [rows][Ne].
 // ---------------------------------------------------------------------------------------------------------------
-namespace { class InkMoeNvEs; }
+namespace { template <int F, int EPI> class InkMoeNvEs; }
 struct InkNvEsArgs {
     const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;   // rows_total = local experts x Ne
     const uint16_t* A; float* out;
     const int* tiles; int T; const int* uinfo; const float* outer;
     const uint32_t* lut;                                            // [256] byte -> lo | hi << 16 (E2M1 bf16)
+    uint16_t* act = nullptr; float gcap = 0.f, ucap = 0.f;          // act != null: fused softcapped SwiGLU epilogue
+    int fmt = 0;                                                    // 0 NVFP4 (E4M3 / 16 x outer), 1 MXFP8 (E4M3 x E8M0 / 32)
 };
-sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
+template <int F, int EPI>
+static sycl::event ink_moe_nv_es_impl(sycl::queue& q, const InkNvEsArgs& g) {
     constexpr int MC2E = 256, MT = 32, TMT = MC2E / MT, TNT = 2, TPW = TMT * TNT;
     constexpr int CG = 2 * TNT;                 // 16-column groups per work-group
     constexpr int STEP = 4 * CG * 2 * 512;      // bytes of decoded B per 128 K
@@ -729,7 +732,7 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
     const int nG = g.Ne / (32 * TNT);
     return q.submit([&](sycl::handler& h) {
         const InkNvEsArgs a = g;
-        h.parallel_for<InkMoeNvEs>(sycl::nd_range<1>(size_t(a.T) * nG * TPW, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        h.parallel_for<InkMoeNvEs<F, EPI>>(sycl::nd_range<1>(size_t(a.T) * nG * TPW, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
             using bfx = sycl::ext::oneapi::bfloat16;
@@ -750,15 +753,16 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
             const bfx* Ae = reinterpret_cast<const bfx*>(a.A) + size_t(rbase) * a.K;
             const unsigned AW = unsigned(a.K) * 2 - 1, AH = unsigned(M) - 1;
             const uint32_t* payw = reinterpret_cast<const uint32_t*>(a.pay);
-            const unsigned PW = unsigned(a.K) / 2 - 1, PH = unsigned(a.rows_total) - 1, PP = unsigned(a.K) / 2 - 1;
+            const unsigned PW = unsigned(F == 0 ? a.K / 2 : a.K) - 1, PH = unsigned(a.rows_total) - 1, PP = PW;
             const uint32_t* sclw = reinterpret_cast<const uint32_t*>(a.scl);
-            const unsigned SB = unsigned(a.K) / 16;   // scale bytes a row
+            const unsigned SB = unsigned(a.K) / (F == 0 ? 16 : 32);   // scale bytes a row
             const es::simd<uint32_t, 16> iv(0, 1);
             es::barrier();
             es::simd<float, 4 * 2 * 128> acc = 0.0f;
             const int nsteps = a.K / 128;
-            es::simd<uint32_t, 64 * NC> tw;   // payload [4 dwords][16 rows] a pair
-            es::simd<uint32_t, 32 * NC> sw;   // scale dwords [2][16 rows] a pair (8 bytes = the step's 16-K blocks)
+            constexpr int TWN = F == 0 ? 64 : 128, SWN = F == 0 ? 32 : 16;
+            es::simd<uint32_t, TWN * NC> tw;   // payload [4 | 8 dwords][16 rows] a pair
+            es::simd<uint32_t, SWN * NC> sw;   // scale dwords: NVFP4 [2][16 rows] (8 x 16-K blocks), MXFP8 [16 rows] (4 x 32-K)
             auto fetch = [&](int st) SYCL_ESIMD_FUNCTION {
                 const int k1 = st * 128;
 #pragma unroll
@@ -766,11 +770,18 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
                     const int c = lid + i * TPW, mxc = c / CG, cg = c % CG;
                     const int nbc = ng * TNT + (cg >> 1);
                     const int rh = el * a.Ne + nbc * 32 + (cg & 1) * 16;
-                    tw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>(payw, PW, PH, PP, (k1 + 32 * mxc) / 8, rh);
-                    const es::simd<uint32_t, 16> so = (iv + unsigned(rh)) * SB + unsigned(k1 / 16);
-                    sw.template select<16, 1>(32 * i) = es::gather<uint32_t, 16>(sclw, so);
-                    sw.template select<16, 1>(32 * i + 16) = es::gather<uint32_t, 16>(sclw, so + 4u);
-                    if (mxc == 0 && st + 2 < nsteps) es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (st + 2) * 16, rh, PFH);
+                    if constexpr (F == 0) {
+                        tw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>(payw, PW, PH, PP, (k1 + 32 * mxc) / 8, rh);
+                        const es::simd<uint32_t, 16> so = (iv + unsigned(rh)) * SB + unsigned(k1 / 16);
+                        sw.template select<16, 1>(32 * i) = es::gather<uint32_t, 16>(sclw, so);
+                        sw.template select<16, 1>(32 * i + 16) = es::gather<uint32_t, 16>(sclw, so + 4u);
+                        if (mxc == 0 && st + 2 < nsteps) es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (st + 2) * 16, rh, PFH);
+                    } else {
+                        tw.template select<128, 1>(128 * i) = es::load_2d<uint32_t, 8, 16, 1, true, false>(payw, PW, PH, PP, (k1 + 32 * mxc) / 4, rh);
+                        const es::simd<uint32_t, 16> so = (iv + unsigned(rh)) * SB + unsigned(k1 / 32);
+                        sw.template select<16, 1>(16 * i) = es::gather<uint32_t, 16>(sclw, so);
+                        if (mxc < 2 && st + 2 < nsteps) es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (st + 2) * 32 + mxc * 16, rh, PFH);
+                    }
                 }
             };
             auto decode = [&](int st) SYCL_ESIMD_FUNCTION {
@@ -779,6 +790,26 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
                 for (int i = 0; i < NC; ++i) {
                     const int cidx = lid + i * TPW, mxc = cidx / CG, cg = cidx % CG;
                     es::simd<uint32_t, 256> vb;
+                    if constexpr (F == 1) {
+                        // E4M3 byte -> fp16 bits (value x 2^-8, exact incl. subnormals), x 2^(x - 127 + 8), RNE to bf16 (exact)
+                        const es::simd<uint32_t, 16> xb = (es::simd<uint32_t, 16>(sw.template select<16, 1>(16 * i)) >> (8 * mxc)) & 0xFFu;
+                        es::simd<uint32_t, 16> sbits = (xb + 8u) << 23;
+                        const es::simd<float, 16> s16 = sbits.template bit_cast_view<float>().read();
+#pragma unroll
+                        for (int dw = 0; dw < 8; ++dw) {
+                            const es::simd<uint32_t, 16> wx = tw.template select<16, 1>(128 * i + dw * 16);
+#pragma unroll
+                            for (int hf = 0; hf < 2; ++hf) {
+                                const es::simd<uint32_t, 16> w = hf ? es::simd<uint32_t, 16>(wx >> 16) : wx;
+                                es::simd<uint32_t, 16> hp = ((w & 0x7Fu) << 7) | ((w & 0x80u) << 8) | ((w & 0x7F00u) << 15) | ((w & 0x8000u) << 16);
+                                es::simd<float, 32> f = es::simd<float, 32>(hp.template bit_cast_view<sycl::half>().read());
+                                f.template select<16, 2>(0) = es::simd<float, 16>(f.template select<16, 2>(0)) * s16;
+                                f.template select<16, 2>(1) = es::simd<float, 16>(f.template select<16, 2>(1)) * s16;
+                                es::simd<bfx, 32> bb(f);
+                                vb.template select<16, 1>((2 * dw + hf) * 16) = bb.template bit_cast_view<uint32_t>().read();
+                            }
+                        }
+                    } else
 #pragma unroll
                     for (int hk = 0; hk < 2; ++hk) {
                         const int sbyte = 2 * mxc + hk;   // 16-K block within the 128-K step
@@ -847,16 +878,54 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
             }
             if (!active) return;
             const int nb = ng * TNT + tj;
-            float* Oe = a.out + size_t(rbase) * a.Ne;
-            const unsigned OW = unsigned(a.Ne) * 4 - 1;
+            if constexpr (EPI == 1) {
+                // columns 2i / 2i+1 = gate_i / up_i: act_i = bf((gc tanh(g/gc)) sigmoid(g) (uc tanh(u/uc))), g u = bf(.)
+                constexpr float L2E = 1.4426950408889634f;
+                uint16_t* Hb = a.act + size_t(rbase) * (a.Ne / 2);
+                const unsigned HW = unsigned(a.Ne / 2) * 2 - 1;
+                const float gc = a.gcap, uc = a.ucap;
+                auto th = [](es::simd<float, 64> x) SYCL_ESIMD_FUNCTION {
+                    const es::simd<float, 64> t = es::exp2(es::abs(x) * (-2.0f * 1.4426950408889634f));
+                    es::simd<float, 64> r = (1.0f - t) / (1.0f + t);
+                    r.merge(-r, x < 0.0f);
+                    return r;
+                };
 #pragma unroll
-            for (int rb = 0; rb < 4; ++rb)
+                for (int rb = 0; rb < 4; ++rb) {
+                    es::simd<uint16_t, 128> ov;
 #pragma unroll
-                for (int hh = 0; hh < 2; ++hh)
-                    es::store_2d<float, 16, 8>(Oe, OW, AH, OW, nb * 32 + 16 * hh, m0 + 8 * rb,
-                                               es::simd<float, 128>(acc.template select<128, 1>((rb * 2 + hh) * 128)));
+                    for (int hh = 0; hh < 2; ++hh) {
+                        es::simd<float, 128> v = acc.template select<128, 1>((rb * 2 + hh) * 128);
+                        es::simd<float, 64> gv = v.template select<64, 2>(0), uv = v.template select<64, 2>(1);
+                        gv = es::simd<float, 64>(es::simd<bfx, 64>(gv));
+                        uv = es::simd<float, 64>(es::simd<bfx, 64>(uv));
+                        const es::simd<float, 64> z = es::exp2(es::abs(gv) * -L2E);
+                        es::simd<float, 64> num = 1.0f;
+                        num.merge(z, gv < 0.0f);
+                        const es::simd<float, 64> r = (gc * th(gv / gc)) * (num / (1.0f + z)) * (uc * th(uv / uc));
+                        es::simd<bfx, 64> rb16(r);
+                        es::simd<uint16_t, 64> rbits = rb16.template bit_cast_view<uint16_t>().read();
+#pragma unroll
+                        for (int r8 = 0; r8 < 8; ++r8) ov.template select<8, 1>(r8 * 16 + hh * 8) = rbits.template select<8, 1>(r8 * 8);
+                    }
+                    es::store_2d<uint16_t, 16, 8>(Hb, HW, AH, HW, nb * 16, m0 + 8 * rb, ov);
+                }
+            } else {
+                float* Oe = a.out + size_t(rbase) * a.Ne;
+                const unsigned OW = unsigned(a.Ne) * 4 - 1;
+#pragma unroll
+                for (int rb = 0; rb < 4; ++rb)
+#pragma unroll
+                    for (int hh = 0; hh < 2; ++hh)
+                        es::store_2d<float, 16, 8>(Oe, OW, AH, OW, nb * 32 + 16 * hh, m0 + 8 * rb,
+                                                   es::simd<float, 128>(acc.template select<128, 1>((rb * 2 + hh) * 128)));
+            }
         });
     });
+}
+sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
+    if (g.fmt == 1) return g.act ? ink_moe_nv_es_impl<1, 1>(q, g) : ink_moe_nv_es_impl<1, 0>(q, g);
+    return g.act ? ink_moe_nv_es_impl<0, 1>(q, g) : ink_moe_nv_es_impl<0, 0>(q, g);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
