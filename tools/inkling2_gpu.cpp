@@ -1258,7 +1258,8 @@ void Engine::mix_small(const MixBatch& b, int M, int m0) {
 
 void Engine::mix(const MixBatch& b, int M, int m0) {
     // decode / verify rows: the 1024-thread kernel (more work-groups' worth of threads for few rows)
-    if (M * b.count < 64) { mix_small(b, M, m0); return; }
+    static const bool verify_reg_mix = std::getenv("INK_MIX_REGV") != nullptr;   // 2..8 rows on the register (one-pass) kernel
+    if (M * b.count < 64 && !(verify_reg_mix && M >= 2)) { mix_small(b, M, m0); return; }
     // prompt rows: one 256-thread work-group per (job, row); each thread keeps its <= 9 elements of every bank row in registers
     float* pool = pool_;
     const int h = h_;
