@@ -626,3 +626,75 @@ bool ink_es_moe(sycl::queue& q, const InkEsArgs& gu, const InkEsArgs& dn) {
     else es_dn<2, 1152>(q, dn);
     return true;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Decode int8 GEMV on the tiled layout [N/16][K/8][16 rows][8 k] (the engine's gemvt8 tiles), ESIMD: a thread owns a
+// 16-row tile and a K part and streams it in 512-byte block loads (16 rows x 32 k); x in registers; KS parts summed in
+// SLM in part order; y = acc * row scale (mode 0: bf-rounded, 1: raw, 2: bf + softcap).  Rows go to three outputs by
+// segment (r < end0 -> y0, < end1 -> y1, else y2), as gemvt8.
+// ---------------------------------------------------------------------------------------------------------------
+struct InkI8Args {
+    const int8_t* T; const float* sc; int N, K;
+    const float *x0, *x1, *x2; float *y0, *y1, *y2; int end0, end1; int mode; float cap;
+};
+namespace { template <int KS> class InkEsI8; }
+template <int KS>
+static sycl::event es_gemv_i8(sycl::queue& q, const InkI8Args& a) {
+    const int tiles = a.N / 16;
+    return q.submit([&](sycl::handler& cgh) {
+        const InkI8Args g = a;
+        cgh.parallel_for<InkEsI8<KS>>(sycl::nd_range<1>(size_t(tiles) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es2::slm_init<KS * 16 * 4>();
+            const int part = int(it.get_local_id(0)), tile = int(it.get_group(0)), r0 = tile * 16;
+            const float* x = r0 < g.end0 ? g.x0 : (r0 < g.end1 ? g.x1 : g.x2);
+            const int K32 = g.K / 32, c0 = part * K32 / KS, c1 = (part + 1) * K32 / KS;
+            const int8_t* base = g.T + size_t(tile) * (g.K / 8) * 128;
+            es2::simd<float, 16> acc = 0.f;
+            for (int c = c0; c < c1; ++c) {
+                es2::simd<int8_t, 512> w = es2::block_load<int8_t, 512>(base + size_t(c) * 512);   // 4 x [16 rows][8 k]
+                es2::simd<float, 32> xv = es2::block_load<float, 32>(x + c * 32);
+#pragma unroll
+                for (int q4 = 0; q4 < 4; ++q4) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        es2::simd<float, 16> wk = w.template select<16, 8>(q4 * 128 + k);
+                        acc += wk * float(xv[q4 * 8 + k]);
+                    }
+                }
+            }
+            if constexpr (KS > 1) {
+                es2::slm_block_store<float, 16>(uint32_t(part * 64), acc);
+                es2::barrier();
+                if (part != 0) return;
+                acc = 0.f;
+#pragma unroll
+                for (int p = 0; p < KS; ++p) acc += es2::slm_block_load<float, 16>(uint32_t(p * 64));
+            }
+            es2::simd<float, 16> s = es2::block_load<float, 16>(g.sc + r0);
+            acc *= s;
+            float* y = r0 < g.end0 ? g.y0 + r0 : (r0 < g.end1 ? g.y1 + (r0 - g.end0) : g.y2 + (r0 - g.end1));
+            if (g.mode == 1) { es2::block_store<float, 16>(y, acc); return; }
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                float v = es_bfr(acc[l]);
+                if (g.mode == 2) { v = g.cap * es_th(v / g.cap); }
+                acc[l] = v;
+            }
+            es2::block_store<float, 16>(y, acc);
+        });
+    });
+}
+
+bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks) {
+    if (a.N % 16 || a.K % 32) return false;
+    if (a.end0 % 16 || a.end1 % 16) return false;   // a tile must not straddle two outputs
+    switch (ks) {
+        case 1: es_gemv_i8<1>(q, a); break;
+        case 2: es_gemv_i8<2>(q, a); break;
+        case 4: es_gemv_i8<4>(q, a); break;
+        case 8: es_gemv_i8<8>(q, a); break;
+        case 16: es_gemv_i8<16>(q, a); break;
+        default: es_gemv_i8<4>(q, a); break;
+    }
+    return true;
+}

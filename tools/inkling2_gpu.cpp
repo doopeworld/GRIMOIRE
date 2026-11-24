@@ -78,6 +78,11 @@ struct InkEsArgs {
     int H, I; float gcap, ucap;
 };
 bool ink_es_moe(sycl::queue& q, const InkEsArgs& gu, const InkEsArgs& dn);
+struct InkI8Args {
+    const int8_t* T; const float* sc; int N, K;
+    const float *x0, *x1, *x2; float *y0, *y1, *y2; int end0, end1; int mode; float cap;
+};
+bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
@@ -1924,7 +1929,9 @@ void Engine::run(int M) {
             }()) {
         } else if (M == 1) {
             static const int ksp = std::getenv("INK_KS_WP") ? std::atoi(std::getenv("INK_KS_WP")) : 2;   // MEASURED 11-24: Wp+Wo 235 -> 204 ms (KS 4 -> 2)
-            if (Ly.WpQ) gemvt8<0>(Ly.WpQ, Ly.WpS, NA + NB + NC, h, ksp, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
+            static const int esk = std::getenv("INK_ESI8") ? std::atoi(std::getenv("INK_ESI8")) : 8;   // MEASURED 11-24: KS 8 186.7 ms vs SIMT gemvt8 204   // ESIMD int8 GEMV, value = K split
+            if (Ly.WpQ && esk > 0 && ink_es_gemv_i8(q_, InkI8Args{Ly.WpQ, Ly.WpS, NA + NB + NC, h, row(nrm[0]), row(nrm[1]), row(nrm[2]), projA_, projB_, projC_, NA, NA + NB, 0, 0.f}, esk)) {
+            } else if (Ly.WpQ) gemvt8<0>(Ly.WpQ, Ly.WpS, NA + NB + NC, h, ksp, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
             else gemvt<0>(Ly.WpT, NA + NB + NC, h, 2, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
         } else {
             const uint16_t* xb[3] = {nb_, same ? nb_ : nb_ + size_t(MM) * h, same ? nb_ : nb_ + 2 * size_t(MM) * h};
@@ -1980,10 +1987,12 @@ void Engine::run(int M) {
                 const float x = bfr(P[size_t(m) * ld + ch]);
                 const float* dyn = P + size_t(m) * ld + K;
                 float sum = 0.f;
-                for (int lag = 0; lag <= sycl::min(pos, taps - 1); ++lag) {
-                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(P[size_t(m - lag) * ld + ch]) : hist[size_t((pos - lag) % (taps - 1)) * K + ch]);
-                    const float wt = sliding ? bfw(w[ch * taps + taps - 1 - lag]) : bfw(w[lag * kfull + koff + ch]) + bfr(dyn[kh_i * taps + lag]);
-                    sum += xl * wt;
+#pragma unroll
+                for (int lag = 0; lag < 4; ++lag) {   // taps == 4 (geometry check); loads not serialized by a variable bound
+                    const bool on = lag <= pos;
+                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(P[size_t(m - lag) * ld + ch]) : hist[size_t(((pos - lag) % 3 + 3) % 3) * K + ch]);
+                    const float wt = sliding ? bfw(w[ch * 4 + 3 - lag]) : bfw(w[lag * kfull + koff + ch]) + bfr(dyn[kh_i * 4 + lag]);
+                    if (on) sum += xl * wt;
                 }
                 float z = bfr((x + sum) * cscale);
                 if (M == 1) hist[size_t(pos % (taps - 1)) * K + ch] = x;
@@ -2295,7 +2304,9 @@ void Engine::run(int M) {
         } else if (M == 1 && gsm_ && gsm_dense(Ly.Wo, h, Q, aoutb_, row(Z), 1)) {
         } else if (M == 1 && Ly.WoQ) {
             static const int kso = std::getenv("INK_KS_WO") ? std::atoi(std::getenv("INK_KS_WO")) : 8;
-            gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            static const int esko = std::getenv("INK_ESI8O") ? std::atoi(std::getenv("INK_ESI8O")) : 8;
+            if (!(esko > 0 && ink_es_gemv_i8(q_, InkI8Args{Ly.WoQ, Ly.WoS, h, Q, aout_, aout_, aout_, row(Z), nullptr, nullptr, h, h, 0, 0.f}, esko)))
+                gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         }
         else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
@@ -2333,9 +2344,10 @@ void Engine::run(int M) {
                 const float* zr = pool + size_t(Z) * RS;
                 const float x = bfr(zr[size_t(m) * h + ch]);
                 float sum = 0.f;
-                for (int lag = 0; lag <= sycl::min(pos, taps - 1); ++lag) {
-                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(zr[size_t(m - lag) * h + ch]) : hist[size_t((pos - lag) % (taps - 1)) * h + ch]);
-                    sum += xl * bfw(w[ch * taps + taps - 1 - lag]);
+#pragma unroll
+                for (int lag = 0; lag < 4; ++lag) {
+                    const float xl = lag == 0 ? x : (m - lag >= 0 ? bfr(zr[size_t(m - lag) * h + ch]) : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
+                    if (lag <= pos) sum += xl * bfw(w[ch * 4 + 3 - lag]);
                 }
                 const float out = bfr((x + sum) * cs);
                 if (M == 1) hist[size_t(pos % (taps - 1)) * h + ch] = x;
@@ -2491,13 +2503,15 @@ void Engine::run(int M) {
                 float x;
                 if (M == 1 && !tp) {
                     float acc = 0.f;
-                    for (int s = 0; s < TK; ++s) acc += wts[s] * dbuf[size_t(s) * h + ch];
+#pragma unroll
+                    for (int s = 0; s < 8; ++s) acc += wts[s] * dbuf[size_t(s) * h + ch];   // top_k == 8 (geometry check)
                     x = bfr(acc);
                 } else x = yb[size_t(m) * h + ch];
                 float sum = 0.f;
-                for (int lag = 0; lag <= sycl::min(pos, taps - 1); ++lag) {
-                    const float xl = lag == 0 ? x : (m - lag >= 0 ? yb[size_t(m - lag) * h + ch] : hist[size_t((pos - lag) % (taps - 1)) * h + ch]);
-                    sum += xl * bfw(w[ch * taps + taps - 1 - lag]);
+#pragma unroll
+                for (int lag = 0; lag < 4; ++lag) {
+                    const float xl = lag == 0 ? x : (m - lag >= 0 ? yb[size_t(m - lag) * h + ch] : hist[size_t(((pos - lag) % 3 + 3) % 3) * h + ch]);
+                    if (lag <= pos) sum += xl * bfw(w[ch * 4 + 3 - lag]);
                 }
                 const float y = bfr((x + sum) * cs);
                 if (M == 1) hist[size_t(pos % (taps - 1)) * h + ch] = x;
