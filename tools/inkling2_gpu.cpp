@@ -1953,7 +1953,8 @@ void Engine::allreduce(float* buf, size_t n) {
     if (seg_rec_ && n <= size_t(64) * h_) {
         // recording: the copy-out closes this segment; the add opens the next one (no host work now)
         const int k = x.counter[me]++ % TPX::NS;
-        float* mine = x.hb[me][k];
+        static const bool direct = !std::getenv("INK_SEG_HOSTCOPY");   // D2H straight into the peer's IN slot (MEASURED 26.2 -> 25.7 ms/step)
+        float* mine = direct ? x.ib[peer][k] : x.hb[me][k];
         q_.memcpy(mine, buf, n * sizeof(float));
         seg_cur_->end_recording(q_);
         seg_dst_->g.push_back(std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(seg_cur_->finalize()));
@@ -2069,11 +2070,15 @@ void Engine::run_seg(int M) {
         if ((c0 + int(j)) % TPX::NS != k) throw std::runtime_error("segment replay: slot order");
         g_tp_stage[me] = 1;
         const auto t0 = std::chrono::steady_clock::now();
-        ev.wait();
+        static const bool spin = std::getenv("INK_SEG_SPIN") != nullptr;   // poll the segment's event (MEASURED: no gain)
+        if (spin) {
+            while (ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {}
+        } else ev.wait();
         const auto t1 = std::chrono::steady_clock::now();
         g_tp_wait_ms[me][0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
         ++g_tp_n[me];
-        std::memcpy(x.ib[peer][k], x.hb[me][k], S.n[j] * sizeof(float));
+        static const bool direct = !std::getenv("INK_SEG_HOSTCOPY");
+        if (!direct) std::memcpy(x.ib[peer][k], x.hb[me][k], S.n[j] * sizeof(float));
         g_tp_stage[me] = 2;
         x.bar.arrive_and_wait();
         g_tp_wait_ms[me][1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
