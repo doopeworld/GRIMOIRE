@@ -2315,6 +2315,10 @@ void Engine::run(int M) {
             post_bias_done_ = pb;
             const uint16_t* tbl = Ly.table;
             const int Eb = Ly.E;
+            static const bool fold_hv = !std::getenv("INK_SEP_HISTV");   // verify ring inputs stored by the kernels that read them
+            const bool hvf = fold_hv && M > 1 && verify_ && !std::getenv("INK_HV_NOK");
+            float* vbK = hvf ? vbuf_ + (size_t(v.cache_slot) * 4 + 0) * 8 * size_t(h) : nullptr;
+            float* vbV = hvf ? vbuf_ + (size_t(v.cache_slot) * 4 + 1) * 8 * size_t(h) : nullptr;
             q_.submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> rls(sycl::range<1>(16), cgh);
             cgh.parallel_for<InkPost>(sycl::nd_range<1>(size_t(M) * G * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -2368,6 +2372,7 @@ void Engine::run(int M) {
                 const float* P = isk ? pB : pC;
                 const int ld = isk ? NB : NC;
                 const float x = bfr(P[size_t(m) * ld + ch]);
+                if (vbK) (isk ? vbK : vbV)[size_t(m) * h + ch] = x;
                 const float* dyn = P + size_t(m) * ld + K;
                 float sum = 0.f;
 #pragma unroll
@@ -2390,7 +2395,7 @@ void Engine::run(int M) {
                 (isk ? kc : vc)[size_t(pos % cap) * K + ch] = tobf(z);
             });
             });
-            if (M > 1 && verify_) { hist_update_v(v.cache_slot, 0, projB_, NB, K, M); hist_update_v(v.cache_slot, 1, projC_, NC, K, M); }
+            if (M > 1 && verify_) { if (!hvf) { hist_update_v(v.cache_slot, 0, projB_, NB, K, M); hist_update_v(v.cache_slot, 1, projC_, NC, K, M); } }
             else if (M > 1) { hist_update(sl.khist, projB_, NB, K, M); hist_update(sl.vhist, projC_, NC, K, M); }
         }
         mark(1);
@@ -2761,11 +2766,14 @@ void Engine::run(int M) {
             const int taps = c_.conv;
             const float cs = conv_static;
             const int br = bank_row;
+            static const bool fold_hv2 = !std::getenv("INK_SEP_HISTV");
+            float* vbZ = fold_hv2 && M > 1 && verify_ && !std::getenv("INK_HV_NOZ") ? vbuf_ + (size_t(v.cache_slot) * 4 + 2) * 8 * size_t(h) : nullptr;
             q_.parallel_for<InkResid>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
                 const float* zr = pool + size_t(Z) * RS;
                 const float x = bfr(zr[size_t(m) * h + ch]);
+                if (vbZ) vbZ[size_t(m) * h + ch] = x;
                 float sum = 0.f;
 #pragma unroll
                 for (int lag = 0; lag < 4; ++lag) {
@@ -2779,7 +2787,7 @@ void Engine::run(int M) {
                 if (br >= 0) { pool[size_t(br) * RS + o] = hid; pool[size_t(RES) * RS + o] = out; }
                 else pool[size_t(RES) * RS + o] = out + hid;
             });
-            if (M > 1 && verify_) hist_update_v(v.cache_slot, 2, row(Z), h, h, M);
+            if (M > 1 && verify_) { if (!vbZ) hist_update_v(v.cache_slot, 2, row(Z), h, h, M); }
             else if (M > 1) hist_update(sl.ahist, row(Z), h, h, M);
         }
         if (bank_row >= 0) bank.push_back(bank_row);
@@ -2922,6 +2930,8 @@ void Engine::run(int M) {
             const int TK = c_.top_k, taps = c_.conv;
             const float cs = conv_static;
             const bool tp = world_ > 1;
+            static const bool fold_hv3 = !std::getenv("INK_SEP_HISTV");
+            float* vbY = fold_hv3 && M > 1 && verify_ && !std::getenv("INK_HV_NOY") ? vbuf_ + (size_t(v.cache_slot) * 4 + 3) * 8 * size_t(h) : nullptr;
             q_.parallel_for<InkMlpConv>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> id) {
                 const int m = int(id[0] / h), ch = int(id[0] % h);
                 const int pos = *posd + m;
@@ -2933,6 +2943,7 @@ void Engine::run(int M) {
                     for (int s = 0; s < 8; ++s) acc += wts[s] * dbuf[size_t(s) * h + ch];   // top_k == 8 (geometry check)
                     x = bfr(acc);
                 } else x = yb[size_t(m) * h + ch];
+                if (vbY) vbY[size_t(m) * h + ch] = bfr(x);
                 float sum = 0.f;
 #pragma unroll
                 for (int lag = 0; lag < 4; ++lag) {
@@ -2944,7 +2955,7 @@ void Engine::run(int M) {
                 const size_t o = size_t(m) * h + ch;
                 pool[size_t(HID) * RS + o] = bfr(pool[size_t(RES) * RS + o] + y);
             });
-            if (M > 1 && verify_) hist_update_v(v.cache_slot, 3, row(YB), h, h, M);
+            if (M > 1 && verify_) { if (!vbY) hist_update_v(v.cache_slot, 3, row(YB), h, h, M); }
             else if (M > 1) hist_update(sl.mhist, row(YB), h, h, M);
         }
         mark(6);
