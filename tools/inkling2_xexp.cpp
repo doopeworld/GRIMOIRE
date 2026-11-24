@@ -295,7 +295,7 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
             const es::simd<float, 128> zero = 0.0f;
             es::simd<float, 2 * 128> acc = 0.0f;
             const bool perm = F == 0 && (a.alu & 4) != 0;
-            const bool alu = (a.alu & 1) != 0 || perm, whole = (a.alu & 2) != 0, dbuf = (a.alu & 16) != 0;
+            const bool alu = (a.alu & 1) != 0 || perm, whole = (a.alu & 2) != 0, dbuf = (a.alu & 16) != 0, pf2 = (a.alu & 64) != 0;
             // NVFP4 whole-step mode: register double buffer -- step k + 128's payload and scales are loaded before step k
             // computes (the per-step load -> use chain left the EUs at ~0.2 IPC)
             es::simd<uint32_t, 256> nx0, nx1;
@@ -331,6 +331,10 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                 es::simd<uint32_t, 16> s0a, s0b, s1a, s1b;
                 if (F == 0 && whole && dbuf) {
                     st0 = nx0; st1 = nx1; s0a = n0a; s0b = n0b; s1a = n1a; s1b = n1b;
+                    if (pf2 && k + 2 * kstep < kend) {   // the step after next into L1: two steps of loads in flight
+                        es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 2 * kstep) / 8, rh0, PFH);
+                        es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 2 * kstep) / 8, rh1, PFH);
+                    }
                     if (k + kstep < kend) load_step(k + kstep);
                 } else {
                 if constexpr (F == 0) {
