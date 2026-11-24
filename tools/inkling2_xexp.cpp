@@ -263,7 +263,8 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
     const int nG = g.Ne / (32 * TNT);
     return q.submit([&](sycl::handler& h) {
         const InkSmArgs a = g;
-        h.parallel_for<InkMoeSmE<F, EPI, KS>>(sycl::nd_range<1>(size_t(a.U) * nG * TNT * KS, TNT * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        const int Ug = a.own >= 0 ? (a.U + 1) / 2 : a.U;   // two cards: only this card's (parity) used-expert slots
+        h.parallel_for<InkMoeSmE<F, EPI, KS>>(sycl::nd_range<1>(size_t(Ug) * nG * TNT * KS, TNT * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
             using hf = sycl::half;
@@ -272,12 +273,14 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
             es::slm_init<1024 + (KS - 1) * TNT * 1024>();   // LUT, then the K-split partial sums
             const int lid0 = int(it.get_local_id(0)), grp = int(it.get_group(0));
             const int lid = lid0 % TNT, ks = lid0 / TNT;     // ks: this thread's K slice (KS threads per 32 columns)
-            const int u = grp / nG, ng = grp % nG;
-            if (F == 0 && lid0 < 8) es::slm_block_store<uint32_t, 32>(lid0 * 128, es::block_load<uint32_t, 32>(a.lut + lid0 * 32));
-            if (F == 0) es::barrier();
+            const int ug = grp / nG, ng = grp % nG;
+            const int u = a.own >= 0 ? 2 * ug + a.own : ug;
+            const bool lut_needed = F == 0 && (a.alu & 1) == 0 && (a.alu & 4) == 0;   // the SLM table only for the table decode
+            if (lut_needed && lid0 < 8) es::slm_block_store<uint32_t, 32>(lid0 * 128, es::block_load<uint32_t, 32>(a.lut + lid0 * 32));
+            if (lut_needed) es::barrier();
             if (u >= a.gi[0]) return;
             const int e = a.gi[1 + u];
-            if (a.own >= 0 ? (u & 1) != a.own : (e < a.e0 || e >= a.e0 + a.en)) return;
+            if (a.own < 0 && (e < a.e0 || e >= a.e0 + a.en)) return;
             const int el = a.own >= 0 ? e : e - a.e0, p0 = a.gi[129 + u], np = a.gi[130 + u] - p0;
             const float o = F == 0 ? a.amax[e] / a.den[0] : 1.f;
             const int nb = ng * TNT + lid;
