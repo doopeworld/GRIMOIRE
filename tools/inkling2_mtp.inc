@@ -481,8 +481,10 @@ void Engine::load_mtp(const std::string& path) {
         L.kn = up16(s + "self_attn.k_norm.weight", 128);
         L.knc = up16(s + "self_attn.k_norm_ctx.weight", 128);
         L.dfn = up16(s + "dflare_norm.weight", h);
-        L.kc = dev_.zeros<uint16_t>(size_t(limit_) * 1024);
-        L.vc = dev_.zeros<uint16_t>(size_t(limit_) * 1024);
+        // sliding layers (window 1024) keep a 2048-row ring: at a 262K context the full-length copies were 2 GiB a card
+        L.cap = L.sliding ? std::min(limit_, 2048) : limit_;
+        L.kc = dev_.zeros<uint16_t>(size_t(L.cap) * 1024);
+        L.vc = dev_.zeros<uint16_t>(size_t(L.cap) * 1024);
     }
     d_.mask = up16("mask_embed", h);
     d_.norm = up16("norm.weight", h);
@@ -664,16 +666,18 @@ void Engine::draft_commit(int p0, int m0, int rows) {
         uint16_t *kc = L.kc, *vc = L.vc;
         const uint16_t* kn = L.knc;
         const float eps = c_.eps;
+        const int capL = L.cap;
         q_.parallel_for<InkKVCtx>(sycl::nd_range<1>(size_t(rows) * 16 * 16, 16 * 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
             auto sg = it.get_sub_group();
             const int m = int(it.get_group(0)), hd = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
             const int pos = p0 + m;
+            const size_t slot = size_t(pos % capL);   // ring row (full layer: cap = limit, slot = pos)
             const float* row = kv + size_t(m) * 2048;
-            if (hd < 8) head_norm_rope(sg, row + hd * 128, nullptr, kc + size_t(pos) * 1024 + hd * 128, kn, pos, eps);
+            if (hd < 8) head_norm_rope(sg, row + hd * 128, nullptr, kc + slot * 1024 + hd * 128, kn, pos, eps);
             else {
                 const int vh = hd - 8;
 #pragma unroll
-                for (int e = 0; e < 8; ++e) vc[size_t(pos) * 1024 + vh * 128 + lane * 8 + e] = tobf(row[1024 + vh * 128 + lane * 8 + e]);
+                for (int e = 0; e < 8; ++e) vc[slot * 1024 + vh * 128 + lane * 8 + e] = tobf(row[1024 + vh * 128 + lane * 8 + e]);
             }
         });
     }
@@ -681,6 +685,7 @@ void Engine::draft_commit(int p0, int m0, int rows) {
     if (dump) {
         dumped = true;
         for (int l = 0; l < 3; ++l) {
+            if (p0 + rows > d_.L[l].cap) continue;   // ring layer past its rows: not dumpable as one span
             dump_dev(q_, ("kc" + std::to_string(l)).c_str(), d_.L[l].kc + size_t(p0) * 1024, size_t(rows) * 1024 * 2);
             dump_dev(q_, ("vc" + std::to_string(l)).c_str(), d_.L[l].vc + size_t(p0) * 1024, size_t(rows) * 1024 * 2);
         }
@@ -816,7 +821,103 @@ void Engine::draft_block(int t, int p_in) {
             const uint16_t *kc = L.kc, *vc = L.vc, *bk = d_.bk, *bv = d_.bv;
             static const bool noctx = std::getenv("INK_NOCTX") != nullptr;
             const int lo = noctx ? p_in : L.sliding ? std::max(0, p_in - 1023) : 0, nctx = p_in - lo, count = nctx + 8;
+            const int capL = L.cap;
             const float scale = 1.f / std::sqrt(128.f);
+            static const int dsplit_min = std::getenv("INK_DATT_SPLIT_MIN") ? std::atoi(std::getenv("INK_DATT_SPLIT_MIN")) : 2048;
+            if (nctx > dsplit_min) {
+                // long context: work-group = (KV head, key slice); every K / V tile of 16 keys goes through SLM once for the
+                // 24 queries that share it (8 rows x 3 heads), online softmax; then a merge that also adds the 8 block keys.
+                // Same math as the kernel below (scores, softmax, P.V), different summation order.
+                constexpr int NS = 64;
+                if (!dpart_) dpart_ = dev_.alloc<float>(size_t(NS) * 8 * 24 * 130);
+                float* part = dpart_;
+                const int sl = (nctx + NS - 1) / NS;
+                q_.submit([&](sycl::handler& cgh) {
+                    sycl::local_accessor<float, 1> qs(sycl::range<1>(24 * 128), cgh), ks(sycl::range<1>(16 * 132), cgh), vs(sycl::range<1>(16 * 128), cgh);
+                    cgh.parallel_for<InkDAttS>(sycl::nd_range<1>(size_t(8) * NS * 384, 384), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                        auto g = it.get_group();
+                        auto sg = it.get_sub_group();
+                        const int kvh = int(it.get_group(0)) / NS, sp = int(it.get_group(0)) % NS;
+                        const int lid = int(it.get_local_id(0)), qi = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+                        const int m = qi / 3, j = kvh * 3 + qi % 3;   // query qi = (row m, head j)
+                        for (int e = lid; e < 24 * 128; e += 384) { const int q2 = e / 128, d = e % 128; qs[e] = qkv[size_t(q2 / 3) * 5120 + (kvh * 3 + q2 % 3) * 128 + d]; }
+                        const int k0 = sp * sl, k1 = sycl::min(nctx, k0 + sl);
+                        float mx = -INFINITY, lsum = 0.f, acc[8];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+                        for (int t0 = k0; t0 < k1; t0 += 16) {
+                            sycl::group_barrier(g);
+                            for (int e = lid; e < 16 * 128; e += 384) {
+                                const int kk = e / 128, d = e % 128, ii = t0 + kk;
+                                const size_t row = size_t((lo + (ii < k1 ? ii : k0)) % capL) * 1024 + kvh * 128 + d;
+                                ks[kk * 132 + d] = bfw(kc[row]);
+                                vs[kk * 128 + d] = bfw(vc[row]);
+                            }
+                            sycl::group_barrier(g);
+                            const int nk = sycl::min(16, k1 - t0);
+                            float s = -INFINITY;
+                            if (lane < nk) {
+                                s = 0.f;
+                                for (int d = 0; d < 128; ++d) s += qs[qi * 128 + d] * ks[lane * 132 + d];
+                                s *= scale;
+                            }
+                            const float tm = sycl::reduce_over_group(sg, s, sycl::maximum<float>());
+                            const float nm = sycl::fmax(mx, tm);
+                            const float corr = mx == -INFINITY ? 0.f : sycl::exp(mx - nm);
+                            const float w = lane < nk ? sycl::exp(s - nm) : 0.f;
+                            lsum = lsum * corr + sycl::reduce_over_group(sg, w, sycl::plus<float>());
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) acc[e] *= corr;
+                            for (int kk = 0; kk < nk; ++kk) {
+                                const float wk = sycl::select_from_group(sg, w, kk);
+#pragma unroll
+                                for (int e = 0; e < 8; ++e) acc[e] += wk * vs[kk * 128 + lane * 8 + e];
+                            }
+                            mx = nm;
+                        }
+                        float* pp = part + ((size_t(sp) * 8 + m) * 24 + j) * 130;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) pp[lane * 8 + e] = acc[e];
+                        if (lane == 0) { pp[128] = mx; pp[129] = lsum; }
+                    });
+                });
+                q_.parallel_for<InkDAttM>(sycl::nd_range<1>(size_t(8 * 24) * 16, 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                    auto sg = it.get_sub_group();
+                    const int t2 = int(it.get_group(0)), m = t2 / 24, j = t2 % 24, kvh = j / 3, lane = int(sg.get_local_linear_id());
+                    float qv[8];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) qv[e] = qkv[size_t(m) * 5120 + j * 128 + lane * 8 + e];
+                    float bs[8];   // the 8 block keys (non-causal)
+                    for (int b = 0; b < 8; ++b) {
+                        float s = 0.f;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) s += qv[e] * bfw(bk[size_t(b) * 1024 + kvh * 128 + lane * 8 + e]);
+                        bs[b] = sycl::reduce_over_group(sg, s, sycl::plus<float>()) * scale;
+                    }
+                    float gm = -INFINITY;
+                    for (int b = 0; b < 8; ++b) gm = sycl::fmax(gm, bs[b]);
+                    for (int s2 = 0; s2 < NS; ++s2) gm = sycl::fmax(gm, part[((size_t(s2) * 8 + m) * 24 + j) * 130 + 128]);
+                    float sum = 0.f, acc[8];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+                    for (int s2 = 0; s2 < NS; ++s2) {
+                        const float* pp = part + ((size_t(s2) * 8 + m) * 24 + j) * 130;
+                        if (pp[128] == -INFINITY) continue;
+                        const float w = sycl::exp(pp[128] - gm);
+                        sum += pp[129] * w;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[e] += pp[lane * 8 + e] * w;
+                    }
+                    for (int b = 0; b < 8; ++b) {
+                        const float w = sycl::exp(bs[b] - gm);
+                        sum += w;
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[e] += w * bfw(bv[size_t(b) * 1024 + kvh * 128 + lane * 8 + e]);
+                    }
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) att[size_t(m) * 3072 + j * 128 + lane * 8 + e] = bfr(acc[e] / sum);
+                });
+            } else
             q_.submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> qsm(sycl::range<1>(8 * 128), cgh);
                 cgh.parallel_for<InkDAtt>(sycl::nd_range<1>(size_t(8 * 24 / 8) * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -827,8 +928,8 @@ void Engine::draft_block(int t, int p_in) {
 #pragma unroll
                     for (int e = 0; e < 8; ++e) qq[lane * 8 + e] = qkv[size_t(m) * 5120 + j * 128 + lane * 8 + e];
                     sycl::group_barrier(sg);
-                    auto krow = [&](int ii) { return ii < nctx ? kc + size_t(lo + ii) * 1024 + kvh * 128 : bk + size_t(ii - nctx) * 1024 + kvh * 128; };
-                    auto vrow = [&](int ii) { return ii < nctx ? vc + size_t(lo + ii) * 1024 + kvh * 128 : bv + size_t(ii - nctx) * 1024 + kvh * 128; };
+                    auto krow = [&](int ii) { return ii < nctx ? kc + size_t((lo + ii) % capL) * 1024 + kvh * 128 : bk + size_t(ii - nctx) * 1024 + kvh * 128; };
+                    auto vrow = [&](int ii) { return ii < nctx ? vc + size_t((lo + ii) % capL) * 1024 + kvh * 128 : bv + size_t(ii - nctx) * 1024 + kvh * 128; };
                     auto score = [&](int ii) {
                         const uint16_t* kr = krow(ii);
                         float s = 0.f;

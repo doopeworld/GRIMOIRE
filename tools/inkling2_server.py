@@ -126,7 +126,8 @@ class Detok:
         self.dec = {"r": codecs.getincrementaldecoder("utf-8")("replace"), "c": codecs.getincrementaldecoder("utf-8")("replace")}
 
     def feed(self, ids):
-        r, c = [], []
+        """-> [(channel 'r' | 'c', text)] in generation order (a step can end the thinking and start the answer)"""
+        seg = []
         for t in ids:
             if t in SPECIAL:
                 if t == MSG_MODEL:
@@ -142,8 +143,13 @@ class Detok:
                 continue
             ch = self.chan or "c"
             txt = self.dec[ch].decode(ID2BYTES.get(t, b""), False)
-            (r if ch == "r" else c).append(txt)
-        return "".join(r), "".join(c)
+            if not txt:
+                continue
+            if seg and seg[-1][0] == ch:
+                seg[-1] = (ch, seg[-1][1] + txt)
+            else:
+                seg.append((ch, txt))
+        return seg
 
 
 class Engine:
@@ -282,23 +288,18 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             send(chunk({"role": "assistant", "content": ""}))
         rtxt, ctxt = [], []
+        all_ids = []
         end = None
         err = None
         with ENG.lock:
             t_start = time.perf_counter()
             for kind, val in ENG.run(rid, ids, int(mx), temp, top_p, top_k, seed):
                 if kind == "tok":
-                    r, c = det.feed(val)
-                    if r or c:
+                    all_ids.extend(val)
+                    for ch, txt in det.feed(val):   # one chunk per channel run, in order
                         if stream:
-                            d = {}
-                            if r:
-                                d["reasoning_content"] = r
-                            if c:
-                                d["content"] = c
-                            send(chunk(d))
-                        rtxt.append(r)
-                        ctxt.append(c)
+                            send(chunk({"reasoning_content": txt} if ch == "r" else {"content": txt}))
+                        (rtxt if ch == "r" else ctxt).append(txt)
                 elif kind == "end":
                     end = val
                 else:
@@ -330,7 +331,7 @@ class H(BaseHTTPRequestHandler):
             msg["reasoning_content"] = "".join(rtxt)
         self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": A.name,
                          "choices": [{"index": 0, "message": msg, "finish_reason": "stop" if end["reason"] == "stop" else "length"}],
-                         "usage": usage})
+                         "usage": usage, **({"token_ids": all_ids} if body.get("debug_ids") else {})})
 
 
 def main():
