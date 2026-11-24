@@ -140,3 +140,22 @@ OpenAI server for the Inkling engine (none existed; the engine only read token-I
 - `tools/bb_ink.sh TAG [args]`: BetterBench with bench-1022/betterbench-vllm1111.json (temp 0.7 / top-p 0.95 /
   top-k 20, prefill 2K / 8K, concurrency 1/2/4/8), client on CPUs 14,15; prints the engine's tokens/step, ms/step.
 
+### BetterBench results 11-24 evening (two B70, quick = 5 passes, temp 0.7 / top-p 0.95 / top-k 20)
+| state | weighted decode | engine tok/s | tokens/step | ms/step | prefill 2K / 8K |
+|---|---|---|---|---|---|
+| first server run | 114.9 | 110.2 | 2.83 | 25.7 | 2,025 / 2,168 |
+| + sampled drafts, stop at prod q < 0.25 (default) | 136-141 | 124.4-124.7 | 2.88 | 23.2 | -- |
+| + prefill all-gathers, chunk 4096 (default) | -- | -- | -- | -- | 2,879 / 3,612 |
+| temperature 0 (BetterBench --greedy) | 124.2 | 111.7 | 2.85 | 25.5 | -- |
+- WHY BetterBench is not 251: its answers start with long thinking (template default effort 0.9; 85-100 % of the
+  tokens are thinking, most runs end at max_tokens while thinking); the drafter accepts ~2.9 tokens/step there, also
+  at temperature 0.  code2.txt ends with the answer marker (no thinking): 6.08 tokens/step.  Same engine, same
+  ~24 ms/step.
+- Verify ms by rows 2..8 (incl. draft): 18.4 / 20.0 / 22.0 / 22.7 / 24.1 / 25.1 / 26.1 -> ~16.5 ms fixed.
+- Pipeline mode (`pp`) at BetterBench depths: 1,617 tokens 2,816 tok/s, 6,323 tokens 4,500 (chunk 2048): the
+  5,374 needs 16K+ prompts; in the server it would add ~25 % at 8K and nothing at 2K.
+- gpu1 (07:00.0) logged "TLB invalidation fence timeout" twice (13:04, 17:58), no reset, both around server stops.
+- Image v1.11.0-rc1 (not published): FROM grimoire-b70:v1.10.10 + python3 + tokenizers 0.23.3 + /grimoire/inkling
+  (G31 + G21 build of 11662ae, grimoire-runs/ink-rel-1124) + /usr/local/bin/grimoire-inkling; Dockerfile in
+  grimoire-runs/image-ink-1124.
+
