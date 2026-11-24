@@ -110,6 +110,13 @@ struct InkSmArgs {
     int own = -1;
 };
 sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi);
+struct InkGBArgs {
+    const float* low; int ldlow;
+    const uint16_t* gain[3]; const uint16_t* forget[3];
+    float* pool; size_t RS; int cur[3], msg[3], out[3];
+    int count, M, h;
+};
+sycl::event ink_gate_blend_esimd(sycl::queue& q, const InkGBArgs& g);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
@@ -1416,6 +1423,15 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
         return;
     }
     static const bool blend2 = !std::getenv("INK_OLD_BLEND");
+    static const bool blende = !std::getenv("INK_NO_BLENDE");   // ESIMD DPAS gate blend (GRIMOIRE small-M pattern)
+    if (blend2 && blende && rank == 64 && M >= 2 && M <= 8 && h % 32 == 0 && (RS * 4) % 64 == 0) {
+        InkGBArgs ga{};
+        ga.low = low; ga.ldlow = int(size_t(MM) * rank);
+        for (int j = 0; j < b.count; ++j) { ga.gain[j] = b.j[j].gain; ga.forget[j] = b.j[j].forget; ga.cur[j] = b.j[j].cur; ga.msg[j] = b.j[j].msg; ga.out[j] = b.j[j].out; }
+        ga.pool = pool; ga.RS = RS; ga.count = b.count; ga.M = M; ga.h = h;
+        ink_gate_blend_esimd(q_, ga);
+        return;
+    }
     if (blend2 && rank == 64 && M >= 2 && M <= 8 && h % 128 == 0) {
         // one work-item = one output column of one job for all M rows: gain / forget rows read once (8 bf16 at a time),
         // the BF16-rounded low rows from SLM (the same value for the whole work-group: broadcast reads)

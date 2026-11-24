@@ -304,12 +304,15 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                 n0a = es::gather<uint32_t, 16>(sclw, so0); n0b = es::gather<uint32_t, 16>(sclw, so0 + 4u);
                 n1a = es::gather<uint32_t, 16>(sclw, so1); n1b = es::gather<uint32_t, 16>(sclw, so1 + 4u);
             };
-            const int KK = a.K / KS, kbeg = ks * KK, kend = kbeg + KK;
+            // K slices: contiguous (ks * K/KS ..) or interleaved 128-K steps (ks, ks + KS, ..: the KS threads of a group
+            // read neighbouring 64-byte pieces of the same rows at the same time)
+            const bool ilv = (a.alu & 32) || a.own >= 0;   // two cards: interleaved K slices (GRIMOIRE int4_smallm ilv)
+            const int KK = a.K / KS, kbeg = ilv ? ks * 128 : ks * KK, kend = ilv ? a.K : kbeg + KK, kstep = ilv ? 128 * KS : 128;
             if (F == 0 && whole && dbuf) load_step(kbeg);
-            for (int k = kbeg; k < kend; k += 128) {
+            for (int k = kbeg; k < kend; k += kstep) {
                 if (F == 0 && whole && dbuf) {
                     // fall through: the buffers are consumed below, then refilled after the copy
-                } else if (k + 128 < kend) {
+                } else if (k + kstep < kend) {
                     if constexpr (F == 0) {
                         es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 128) / 8, rh0, PFH);
                         es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 128) / 8, rh1, PFH);
@@ -325,7 +328,7 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                 es::simd<uint32_t, 16> s0a, s0b, s1a, s1b;
                 if (F == 0 && whole && dbuf) {
                     st0 = nx0; st1 = nx1; s0a = n0a; s0b = n0b; s1a = n1a; s1b = n1b;
-                    if (k + 128 < kend) load_step(k + 128);
+                    if (k + kstep < kend) load_step(k + kstep);
                 } else {
                 if constexpr (F == 0) {
                     if (whole) {
@@ -491,7 +494,7 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
 }
 sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi) {
     static const int kenv = [] { const char* e = std::getenv("INK_SM_KS"); return e ? std::atoi(e) : 0; }();
-    const int ksel = kenv > 0 ? kenv : (g.own >= 0 ? 1 : 3);   // MEASURED 11-24: one card KS 3 (step 48.0 -> 38.5 ms), two cards KS 1 (gate_up 132 vs 144 us)
+    const int ksel = kenv > 0 ? kenv : 3;   // MEASURED 11-24: one card KS 3 (step 48.0 -> 38.5 ms); two cards KS 3 interleaved (29.6 -> 28.9 ms)
     int ks = 1;
     for (int c : {6, 3, 2}) if (c <= ksel && g.K % (128 * c) == 0) { ks = c; break; }
     if (ks == 6) {
@@ -508,4 +511,75 @@ sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int
     }
     if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 1>(q, g) : ink_moe_small_impl<0, 2, 1>(q, g);
     return epi == 1 ? ink_moe_small_impl<1, 1, 1>(q, g) : ink_moe_small_impl<1, 2, 1>(q, g);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Cross-pass message gate blend for 2..8 rows on the matrix unit (the GRIMOIRE small-M pattern: a thread owns 32
+// output columns, the weight rows come in as transposed 2-D tiles = DPAS B operands, A = the BF16-rounded low rows):
+//   G = low . gain^T, F = low . forget^T  (K = rank = 64),  out = (1 - tanh F) cur + tanh G msg   (fp32)
+// ---------------------------------------------------------------------------------------------------------------
+namespace { class InkGBlendE; }
+struct InkGBArgs {
+    const float* low; int ldlow;              // [job][MM][64] fp32 (BF16-rounded on use)
+    const uint16_t* gain[3]; const uint16_t* forget[3];   // [h][64] bf16 per job
+    float* pool; size_t RS; int cur[3], msg[3], out[3];
+    int count, M, h;
+};
+sycl::event ink_gate_blend_esimd(sycl::queue& q, const InkGBArgs& g) {
+    const int nb = g.h / 32;
+    return q.submit([&](sycl::handler& h) {
+        const InkGBArgs a = g;
+        h.parallel_for<InkGBlendE>(sycl::nd_range<1>(size_t(a.count) * nb, 1), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            using bfx = sycl::ext::oneapi::bfloat16;
+            const int gi = int(it.get_group(0)), jb = gi / nb, n0 = (gi % nb) * 32;
+            const uint16_t* gw = jb == 0 ? a.gain[0] : (jb == 1 ? a.gain[1] : a.gain[2]);
+            const uint16_t* fw = jb == 0 ? a.forget[0] : (jb == 1 ? a.forget[1] : a.forget[2]);
+            const int cur = jb == 0 ? a.cur[0] : (jb == 1 ? a.cur[1] : a.cur[2]);
+            const int msg = jb == 0 ? a.msg[0] : (jb == 1 ? a.msg[1] : a.msg[2]);
+            const int out = jb == 0 ? a.out[0] : (jb == 1 ? a.out[1] : a.out[2]);
+            // A: 8 rows x 64 (rows >= M read as 0 by the 2-D load), BF16-rounded
+            const float* lw = a.low + size_t(jb) * a.ldlow;
+            const unsigned LW = 64u * 4 - 1, LH = unsigned(a.M) - 1;
+            es::simd<bfx, 128> av[4];
+#pragma unroll
+            for (int kc = 0; kc < 4; ++kc) av[kc] = es::simd<bfx, 128>(es::load_2d<float, 16, 8>(lw, LW, LH, LW, kc * 16, 0));
+            // B: weight rows n0 .. n0 + 31, K = 64: transposed u32 tiles [8 K-pairs][16 rows] per 16 K
+            const uint32_t* g32 = reinterpret_cast<const uint32_t*>(gw);
+            const uint32_t* f32 = reinterpret_cast<const uint32_t*>(fw);
+            const unsigned BW = 64u * 2 - 1, BH = unsigned(a.h) - 1;
+            es::simd<uint32_t, 128> bg[2][4], bf[2][4];
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh)
+#pragma unroll
+                for (int kc = 0; kc < 4; ++kc) {
+                    bg[hh][kc] = es::load_2d<uint32_t, 8, 16, 1, true, false>(g32, BW, BH, BW, kc * 8, n0 + 16 * hh);
+                    bf[hh][kc] = es::load_2d<uint32_t, 8, 16, 1, true, false>(f32, BW, BH, BW, kc * 8, n0 + 16 * hh);
+                }
+            const unsigned PWd = unsigned(a.h) * 4 - 1, PHd = unsigned(a.M) - 1;
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh) {
+                es::simd<float, 128> G = 0.0f, F = 0.0f;
+#pragma unroll
+                for (int kc = 0; kc < 4; ++kc) {
+                    G = xmx::dpas<8, 8, float, float, bfx, bfx>(G, es::simd<bfx, 256>(bg[hh][kc].template bit_cast_view<bfx>()), av[kc]);
+                    F = xmx::dpas<8, 8, float, float, bfx, bfx>(F, es::simd<bfx, 256>(bf[hh][kc].template bit_cast_view<bfx>()), av[kc]);
+                }
+                const float* cp = a.pool + size_t(cur) * a.RS;
+                const float* mp = a.pool + size_t(msg) * a.RS;
+                float* op = a.pool + size_t(out) * a.RS;
+                es::simd<float, 128> cv = es::load_2d<float, 16, 8>(cp, PWd, PHd, PWd, n0 + 16 * hh, 0);
+                es::simd<float, 128> mv = es::load_2d<float, 16, 8>(mp, PWd, PHd, PWd, n0 + 16 * hh, 0);
+                auto th = [](es::simd<float, 128> x) SYCL_ESIMD_FUNCTION {
+                    const es::simd<float, 128> t = es::exp2(es::abs(x) * (-2.0f * 1.4426950408889634f));
+                    es::simd<float, 128> r = (1.0f - t) / (1.0f + t);
+                    r.merge(-r, x < 0.0f);
+                    return r;
+                };
+                const es::simd<float, 128> o = (1.0f - th(F)) * cv + th(G) * mv;
+                es::store_2d<float, 16, 8>(op, PWd, PHd, PWd, n0 + 16 * hh, 0, o);
+            }
+        });
+    });
 }

@@ -141,7 +141,8 @@ void Engine::experts_small(const Layer& Ly, int M) {
             *reinterpret_cast<sycl::vec<sycl::half, 8>*>(xg + qd * h + c) = o;
         });
         const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
-        static const int sm_alu0 = (std::getenv("INK_SM_LUT") ? 0 : 1) | (std::getenv("INK_SM_WHOLE") ? 2 : 0) | (std::getenv("INK_SM_NODBUF") ? 0 : 18);
+        static const int sm_alu0 = (std::getenv("INK_SM_LUT") ? 0 : 1) | (std::getenv("INK_SM_WHOLE") ? 2 : 0) | (std::getenv("INK_SM_NODBUF") ? 0 : 18) |
+                                   (std::getenv("INK_SM_ILV") ? 32 : 0);
         const int sm_alu = sm_alu0 | (xperm ? 4 : 0) | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 8 : 0);
         const int sm_alu_dn = sm_alu0 | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 4 : 0);
         static const bool sm_stat = std::getenv("INK_SM_STAT") != nullptr;   // debug: distinct experts per verify visit
