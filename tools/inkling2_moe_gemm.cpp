@@ -698,3 +698,156 @@ bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks) {
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Prompt experts = GRIMOIRE's Ornith ESIMD grouped MoE (src/gemm_fast.cpp moe_mxfp4_esimd, EPI 0; MEASURED there
+// 52-68 TFLOP/s vs ~25 for the joint_matrix kernel) ported to NVFP4: per 128-K step the work-group decodes its B tiles
+// ONCE into SLM (double-buffered, DPAS tile order), 8 m-threads x 2 n-threads each own 32 rows x 32 columns, two DPAS
+// per 32 K from 1 KB SLM block loads.  Decode: byte -> E2M1 bf16 pair through the 1 KB table, x the E4M3 scale of its
+// 16-K half (exact), x outer, RNE to bf16 = Inkling's exact weight bf16((e2m1*sc)*outer).  out fp32 [rows][Ne].
+// ---------------------------------------------------------------------------------------------------------------
+namespace { class InkMoeNvEs; }
+struct InkNvEsArgs {
+    const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;   // rows_total = local experts x Ne
+    const uint16_t* A; float* out;
+    const int* tiles; int T; const int* uinfo; const float* outer;
+    const uint32_t* lut;                                            // [256] byte -> lo | hi << 16 (E2M1 bf16)
+};
+sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
+    constexpr int MC2E = 256, MT = 32, TMT = MC2E / MT, TNT = 2, TPW = TMT * TNT;
+    constexpr int CG = 2 * TNT;                 // 16-column groups per work-group
+    constexpr int STEP = 4 * CG * 2 * 512;      // bytes of decoded B per 128 K
+    constexpr int NC = 4 * CG / TPW;            // (32-K block, group) pairs a thread decodes
+    static_assert(NC * TPW == 4 * CG, "decode pairs must split evenly");
+    const int nG = g.Ne / (32 * TNT);
+    return q.submit([&](sycl::handler& h) {
+        const InkNvEsArgs a = g;
+        h.parallel_for<InkMoeNvEs>(sycl::nd_range<1>(size_t(a.T) * nG * TPW, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            using bfx = sycl::ext::oneapi::bfloat16;
+            constexpr auto PFH = sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+            es::slm_init<1024 + 2 * STEP>();
+            const int lid = int(it.get_local_id(0));
+            const int grp = int(it.get_group(0));
+            const int t = grp / nG, ng = grp % nG;
+            const int u = a.tiles[2 * t], mb = a.tiles[2 * t + 1];
+            const int el = a.uinfo[3 * u], M = a.uinfo[3 * u + 2];
+            const int64_t rbase = a.uinfo[3 * u + 1];
+            const float o = a.outer[u];
+            if (lid < 8) es::slm_block_store<uint32_t, 32>(lid * 128, es::block_load<uint32_t, 32>(a.lut + lid * 32));
+            const int ti = lid / TNT, tj = lid % TNT;
+            const int m0 = mb * MC2E + ti * MT;
+            const bool active = m0 < M;
+            const int nrb0 = (M - m0 + 7) / 8, nrb = nrb0 < 4 ? nrb0 : 4;
+            const bfx* Ae = reinterpret_cast<const bfx*>(a.A) + size_t(rbase) * a.K;
+            const unsigned AW = unsigned(a.K) * 2 - 1, AH = unsigned(M) - 1;
+            const uint32_t* payw = reinterpret_cast<const uint32_t*>(a.pay);
+            const unsigned PW = unsigned(a.K) / 2 - 1, PH = unsigned(a.rows_total) - 1, PP = unsigned(a.K) / 2 - 1;
+            const uint32_t* sclw = reinterpret_cast<const uint32_t*>(a.scl);
+            const unsigned SB = unsigned(a.K) / 16;   // scale bytes a row
+            const es::simd<uint32_t, 16> iv(0, 1);
+            es::barrier();
+            es::simd<float, 4 * 2 * 128> acc = 0.0f;
+            const int nsteps = a.K / 128;
+            es::simd<uint32_t, 64 * NC> tw;   // payload [4 dwords][16 rows] a pair
+            es::simd<uint32_t, 32 * NC> sw;   // scale dwords [2][16 rows] a pair (8 bytes = the step's 16-K blocks)
+            auto fetch = [&](int st) SYCL_ESIMD_FUNCTION {
+                const int k1 = st * 128;
+#pragma unroll
+                for (int i = 0; i < NC; ++i) {
+                    const int c = lid + i * TPW, mxc = c / CG, cg = c % CG;
+                    const int nbc = ng * TNT + (cg >> 1);
+                    const int rh = el * a.Ne + nbc * 32 + (cg & 1) * 16;
+                    tw.template select<64, 1>(64 * i) = es::load_2d<uint32_t, 4, 16, 1, true, false>(payw, PW, PH, PP, (k1 + 32 * mxc) / 8, rh);
+                    const es::simd<uint32_t, 16> so = (iv + unsigned(rh)) * SB + unsigned(k1 / 16);
+                    sw.template select<16, 1>(32 * i) = es::gather<uint32_t, 16>(sclw, so);
+                    sw.template select<16, 1>(32 * i + 16) = es::gather<uint32_t, 16>(sclw, so + 4u);
+                    if (mxc == 0 && st + 2 < nsteps) es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (st + 2) * 16, rh, PFH);
+                }
+            };
+            auto decode = [&](int st) SYCL_ESIMD_FUNCTION {
+                const unsigned base = 1024u + unsigned(st & 1) * STEP;
+#pragma unroll
+                for (int i = 0; i < NC; ++i) {
+                    const int cidx = lid + i * TPW, mxc = cidx / CG, cg = cidx % CG;
+                    es::simd<uint32_t, 256> vb;
+#pragma unroll
+                    for (int hk = 0; hk < 2; ++hk) {
+                        const int sbyte = 2 * mxc + hk;   // 16-K block within the 128-K step
+                        es::simd<uint32_t, 16> ev = (es::simd<uint32_t, 16>(sw.template select<16, 1>(32 * i + 16 * (sbyte >> 2))) >> (8 * (sbyte & 3))) & 0xFFu;
+                        // E4M3 -> fp32 (normal and subnormal; NaN code not produced by the checkpoint)
+                        const es::simd<uint32_t, 16> ee = (ev >> 3) & 15u, mm = ev & 7u;
+                        es::simd<uint32_t, 16> nb = ((ee + 120u) << 23) | (mm << 20);
+                        es::simd<float, 16> s16 = nb.template bit_cast_view<float>().read();
+                        es::simd<float, 16> sub = es::simd<float, 16>(mm) * (1.f / 512.f);
+                        s16.merge(sub, ee == 0u);
+#pragma unroll
+                        for (int kp = 0; kp < 8; ++kp) {
+                            const int dw = 2 * hk + (kp >> 2);
+                            es::simd<uint32_t, 16> wx = tw.template select<16, 1>(64 * i + dw * 16);
+                            const int j = kp & 3;
+                            es::simd<uint32_t, 16> addr = j == 0 ? ((wx << 2) & 0x3FCu) : ((wx >> (8 * j - 2)) & 0x3FCu);
+                            es::simd<uint32_t, 16> p = es::slm_gather<uint32_t, 16>(addr);
+                            es::simd<uint32_t, 16> lo = p << 16, hi = p & 0xFFFF0000u;
+                            es::simd<float, 16> lof = (lo.template bit_cast_view<float>().read() * s16) * o;
+                            es::simd<float, 16> hif = (hi.template bit_cast_view<float>().read() * s16) * o;
+                            es::simd<uint32_t, 16> lu = lof.template bit_cast_view<uint32_t>().read();
+                            es::simd<uint32_t, 16> hu = hif.template bit_cast_view<uint32_t>().read();
+                            lu = (lu + 0x7FFFu + ((lu >> 16) & 1u)) >> 16;
+                            hu = (hu + 0x7FFFu + ((hu >> 16) & 1u)) & 0xFFFF0000u;
+                            vb.template select<16, 1>((hk * 8 + kp) * 16) = hu | lu;
+                        }
+                    }
+                    es::slm_block_store<uint32_t, 256>(base + unsigned((mxc * CG + cg) * 2) * 512u, vb);
+                }
+            };
+            fetch(0);
+            decode(0);
+            if (nsteps > 1) fetch(1);
+            es::barrier();
+            for (int s = 0; s < nsteps; ++s) {
+                if (active) {
+                    const unsigned base = 1024u + unsigned(s & 1) * STEP;
+#pragma unroll 1
+                    for (int mx = 0; mx < 4; ++mx) {
+                        const int kk = s * 128 + 32 * mx;
+                        es::simd<bfx, 1024> av = es::load_2d<bfx, 16, 32, 2>(Ae, AW, AH, AW, kk, m0);
+#pragma unroll
+                        for (int hh = 0; hh < 2; ++hh) {
+                            es::simd<uint32_t, 256> vb = es::slm_block_load<uint32_t, 256>(base + unsigned((mx * CG + tj * 2 + hh) * 2) * 512u);
+                            const es::simd<bfx, 256> b0 = vb.template select<128, 1>(0).template bit_cast_view<bfx>().read();
+                            const es::simd<bfx, 256> b1 = vb.template select<128, 1>(128).template bit_cast_view<bfx>().read();
+#pragma unroll
+                            for (int rb = 0; rb < 4; ++rb) {
+                                if (rb < nrb) {
+                                    const es::simd<bfx, 128> a0 = av.template select<128, 1>(rb * 128);
+                                    const es::simd<bfx, 128> a1 = av.template select<128, 1>(512 + rb * 128);
+                                    es::simd<float, 128> c = acc.template select<128, 1>((rb * 2 + hh) * 128);
+                                    c = xmx::dpas<8, 8, float, float, bfx, bfx>(c, b0, a0);
+                                    c = xmx::dpas<8, 8, float, float, bfx, bfx>(c, b1, a1);
+                                    acc.template select<128, 1>((rb * 2 + hh) * 128) = c;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (s + 1 < nsteps) {
+                    decode(s + 1);
+                    if (s + 2 < nsteps) fetch(s + 2);
+                }
+                es::barrier();
+            }
+            if (!active) return;
+            const int nb = ng * TNT + tj;
+            float* Oe = a.out + size_t(rbase) * a.Ne;
+            const unsigned OW = unsigned(a.Ne) * 4 - 1;
+#pragma unroll
+            for (int rb = 0; rb < 4; ++rb)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh)
+                    es::store_2d<float, 16, 8>(Oe, OW, AH, OW, nb * 32 + 16 * hh, m0 + 8 * rb,
+                                               es::simd<float, 128>(acc.template select<128, 1>((rb * 2 + hh) * 128)));
+        });
+    });
+}

@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <barrier>
 #include <thread>
 
@@ -41,7 +43,7 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; class InkGateLow; class InkRouteTopk; class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
+class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; class InkPosP; class InkPPPack; class InkPPUnpack; class InkGateLow; class InkRouteTopk; class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
@@ -83,6 +85,13 @@ struct InkI8Args {
     const float *x0, *x1, *x2; float *y0, *y1, *y2; int end0, end1; int mode; float cap;
 };
 bool ink_es_gemv_i8(sycl::queue& q, const InkI8Args& a, int ks);
+struct InkNvEsArgs {
+    const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;
+    const uint16_t* A; float* out;
+    const int* tiles; int T; const int* uinfo; const float* outer;
+    const uint32_t* lut;
+};
+sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
@@ -196,6 +205,63 @@ enum Row { HID, RES, X0, X1, X2, XM, N0, N1, N2, NM, M0, M1, M2, M3, PRE, PREV, 
 class Engine {
 public:
     double sect_ms_[8] = {};
+    // ---- pipeline parallel (two cards, each with the full weights): this engine runs visits [vbeg_, vend_)
+    struct PPState { std::vector<int> bank, pre_bank, prev_bank; int next_bank = 0; };
+    int vbeg_ = 0, vend_ = -1;
+    PPState pp_in_, pp_out_;
+    void set_visits(int b, int e) { vbeg_ = b; vend_ = e; }
+    int n_visits() const { return int(visits_.size()); }
+    bool pp_first() const { return vbeg_ == 0; }
+    bool pp_last() const { return vend_ < 0 || vend_ >= int(visits_.size()); }
+    // rows that cross the split: HID, PRE, PREV, bank rows [BANK0, BANK0 + next_bank)
+    static std::vector<int> pp_rows(int next_bank) {
+        std::vector<int> r{HID, PRE, PREV};
+        for (int b = 0; b < next_bank; ++b) r.push_back(BANK0 + b);
+        return r;
+    }
+    // copy the crossing rows (bf16: every one is a copy of a bf16-rounded hidden state) into host[ rows ][M][h]
+    void pp_export(uint16_t* host, int M) {
+        const auto rows = pp_rows(pp_out_.next_bank);
+        uint16_t* st = ppstage_;
+        const int h = h_;
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const float* src = row(rows[k]);
+            uint16_t* d = st + k * size_t(M) * h;
+            q_.parallel_for<InkPPPack>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> i) { d[i[0]] = tobf(src[i[0]]); });
+        }
+        q_.memcpy(host, st, rows.size() * size_t(M) * h * 2).wait();
+    }
+    void pp_import(const uint16_t* host, int M, const PPState& s) {
+        pp_in_ = s;
+        const auto rows = pp_rows(s.next_bank);
+        uint16_t* st = ppstage_;
+        const int h = h_;
+        q_.memcpy(st, host, rows.size() * size_t(M) * h * 2);
+        for (size_t k = 0; k < rows.size(); ++k) {
+            float* dst = row(rows[k]);
+            const uint16_t* sv = st + k * size_t(M) * h;
+            q_.parallel_for<InkPPUnpack>(sycl::range<1>(size_t(M) * h), [=](sycl::id<1> i) { dst[i[0]] = bfw(sv[i[0]]); });
+        }
+    }
+    // one chunk / one token through this engine's visits; the last stage returns the next token, the others -1
+    int pp_run(const int* ids, int M) {
+        if (pos_ + M > limit_) throw std::runtime_error("context full");
+        q_.memcpy(tok_, ids, size_t(M) * sizeof(int));
+        if (M == 1 && use_graph) {
+            if (!gexec_) {
+                sycl_ext::command_graph<sycl_ext::graph_state::modifiable> g(q_.get_context(), q_.get_device());
+                g.begin_recording(q_);
+                run(1);
+                g.end_recording(q_);
+                gexec_ = std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(g.finalize());
+            }
+            q_.ext_oneapi_graph(*gexec_);
+        } else run(M);
+        pos_ += M;
+        return pp_last() ? final_token() : -1;
+    }
+    uint16_t* ppstage_ = nullptr;
+    void pp_alloc(int max_rows) { if (!ppstage_) ppstage_ = dev_.alloc<uint16_t>(size_t(max_rows) * mmax_ * h_); }
     void sync_all() { q_.wait(); }
     Engine(sycl::queue& q, const std::string& dir, int limit, int chunk, int rank = 0, int world = 1, TPX* tpx = nullptr)
         : q_(q), ck_(Checkpoint::open(dir)), c_(ck_.config), dev_(q), limit_(limit), mmax_(std::max(1, chunk)), rank_(rank), world_(world), tpx_(tpx) {
@@ -233,6 +299,7 @@ private:
     uint16_t* bias_ = nullptr;
     uint32_t* xlut_ = nullptr;   // ink_xexp byte tables
     int* route_cnt_ = nullptr;    // fused router: finished work-groups (reset by the last)
+    uint32_t* nvlut_ = nullptr;   // prompt ESIMD MoE: byte -> E2M1 bf16 pair (lo | hi << 16)
     float* tbl_d_ = nullptr;
     void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
     int final_token(int m = 0);
@@ -518,6 +585,13 @@ void Engine::load() {
     dbuf_ = dev_.zeros<float>(TK * h_);
     logits_ = dev_.zeros<float>(std::max(c_.output_vocab, c_.vocab));
     route_cnt_ = dev_.zeros<int>(16);
+    {
+        static const uint32_t mag[8] = {0x0000u, 0x3F00u, 0x3F80u, 0x3FC0u, 0x4000u, 0x4040u, 0x4080u, 0x40C0u};
+        std::vector<uint32_t> L(256);
+        for (int b = 0; b < 256; ++b) L[b] = (mag[b & 7] | ((b & 8) ? 0x8000u : 0u)) | ((mag[(b >> 4) & 7] | ((b & 0x80) ? 0x8000u : 0u)) << 16);
+        nvlut_ = dev_.alloc<uint32_t>(256);
+        q_.memcpy(nvlut_, L.data(), 256 * 4).wait();
+    }
     if (i4_) { kp_ = (h_ + 511) / 512 * 512; xpad_ = dev_.zeros<uint16_t>(size_t(3) * 8 * kp_); xpadU_ = dev_.zeros<uint16_t>(size_t(8) * kp_); }
     bestv_ = dev_.zeros<float>(16);
     if (world_ > 1) {
@@ -1541,7 +1615,10 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
         const int* tiles_d = reinterpret_cast<const int*>(tbl_d_) + 768;
         const int* ui_d = reinterpret_cast<const int*>(tbl_d_) + 384;
         const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
-        if (grouped)
+        static const bool nves = !std::getenv("INK_NO_NVES");   // GRIMOIRE's Ornith ESIMD prompt MoE, NVFP4 port
+        if (grouped && fg == 0 && nves)
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.gu, Ly.gus, 2 * I, h, en_ * 2 * I, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, nvlut_});
+        else if (grouped)
             ink_moe_grouped(q_, fg, Ly.gu, Ly.gus, rbg, sbg, 2 * I, h, inb_, proj, tiles_d, T, ui_d, tbl_d_ + 128, {});
         else
             for (int u = 0; u < nu; ++u) {
@@ -1560,7 +1637,9 @@ void Engine::experts_prompt(const Layer& Ly, int M) {
             const float sig = (g >= 0.f ? 1.f : z) / (1.f + z);
             act[i] = tobf((gcap * sycl::tanh(g / gcap)) * sig * (ucap * sycl::tanh(u / ucap)));
         });
-        if (grouped)
+        if (grouped && fd == 0 && nves)
+            ink_moe_nv_esimd(q_, InkNvEsArgs{Ly.dn, Ly.dns, h, I, en_ * h, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, nvlut_});
+        else if (grouped)
             ink_moe_grouped(q_, fd, Ly.dn, Ly.dns, rbd, sbd, h, I, act, proj, tiles_d, T, ui_d, tbl_d_ + 256, {});
         else
             for (int u = 0; u < nu; ++u) {
@@ -1809,7 +1888,7 @@ void Engine::run(int M) {
     float* pool = pool_;
     const size_t RS = rs_;
     const float eps = c_.eps;
-    {   // hidden = rms(embed[token], embed_norm)
+    if (pp_first()) {   // hidden = rms(embed[token], embed_norm)
         const uint16_t *Em = embed_, *w = embed_norm_;
         const int* tok = tok_;
         q_.parallel_for<InkEmbed>(sycl::nd_range<1>(size_t(M) * 256, 256), [=](sycl::nd_item<1> it) {
@@ -1825,6 +1904,7 @@ void Engine::run(int M) {
     auto copy = [&](int from, int to) { q_.memcpy(row(to), row(from), size_t(M) * h * sizeof(float)); };
     std::vector<int> bank, pre_bank, prev_bank;
     int next_bank = 0;
+    if (!pp_first()) { bank = pp_in_.bank; pre_bank = pp_in_.pre_bank; prev_bank = pp_in_.prev_bank; next_bank = pp_in_.next_bank; }
     const float conv_static = 1.f / std::sqrt(float(1 + c_.conv)), conv_dyn = 1.f / std::sqrt(float(1 + c_.conv * 2));
     auto job = [&](const std::vector<int>& b, int partial, const float* query, int out) {
         MixJob J{};
@@ -1850,6 +1930,7 @@ void Engine::run(int M) {
     mark(7);
     for (const auto& v : visits_) {
         ++vi;
+        if (vi < vbeg_ || (vend_ >= 0 && vi >= vend_)) continue;
         static const int tapmode = std::getenv("INK_TAPMODE") ? std::atoi(std::getenv("INK_TAPMODE")) : 0;
         if (taps_on && tapmode != 2) {
             const int o = tapmode == 1 ? 1 : 0;
@@ -2305,6 +2386,8 @@ void Engine::run(int M) {
         } else if (M == 1 && Ly.WoQ) {
             static const int kso = std::getenv("INK_KS_WO") ? std::atoi(std::getenv("INK_KS_WO")) : 8;
             static const int esko = std::getenv("INK_ESI8O") ? std::atoi(std::getenv("INK_ESI8O")) : 8;
+            static const bool wo2 = std::getenv("INK_WO_TWICE") != nullptr;   // experiment: L2-hot second call
+            if (wo2) ink_es_gemv_i8(q_, InkI8Args{Ly.WoQ, Ly.WoS, h, Q, aout_, aout_, aout_, row(Z), nullptr, nullptr, h, h, 0, 0.f}, esko);
             if (!(esko > 0 && ink_es_gemv_i8(q_, InkI8Args{Ly.WoQ, Ly.WoS, h, Q, aout_, aout_, aout_, row(Z), nullptr, nullptr, h, h, 0, 0.f}, esko)))
                 gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         }
@@ -2523,6 +2606,12 @@ void Engine::run(int M) {
         }
         mark(6);
     }
+    if (!pp_last()) {   // a pipeline stage before the last: hand over the state, advance the position
+        pp_out_ = PPState{bank, pre_bank, prev_bank, next_bank};
+        int* pd = pos_d_;
+        q_.single_task<InkPosP>([=]() { *pd += M; });
+        return;
+    }
     const bool allrows = all_logits_ || taps_on;
     {   // output mix, norm (all rows when the drafter needs the taps or a verify needs every row's logits)
         MixBatch mb{};
@@ -2629,7 +2718,7 @@ int main(int argc, char** argv) try {
     const auto ids = read_ids(argv[3]);
     const int ctx = std::atoi(argv[4]);
     const auto devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if (devs.size() != 1 && mode != "tp" && mode != "tpmtp") throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
+    if (devs.size() != 1 && mode != "tp" && mode != "tpmtp" && mode != "pp") throw std::runtime_error("expected exactly one visible GPU (set ONEAPI_DEVICE_SELECTOR)");
     sycl::queue q(devs[0], sycl::property_list{sycl::property::queue::in_order()});
     std::printf("%s\n", devs[0].get_info<sycl::info::device::name>().c_str());
     if (mode == "check") {
@@ -2779,6 +2868,98 @@ int main(int argc, char** argv) try {
             std::printf("\nmtp:  "); for (int g = std::max(0, same - 3); g < std::min(n, same + 8); ++g) std::printf(" %d", spec[g]);
             std::printf("\n");
         }
+        return 0;
+    }
+    if (mode == "pp") {
+        // inkling2_gpu MODEL pp IDS CTX PP_LIST TG [CHUNK]: two cards as a two-stage pipeline (each holds the full
+        // weights; card 0 runs the first half of the visits, card 1 the rest).  Prompt chunks overlap across the
+        // cards; decoding passes each token through both stages.  First line: greedy check on the first prompt.
+        std::vector<int> pps;
+        { std::stringstream ss(argv[5]); std::string t; while (std::getline(ss, t, ',')) pps.push_back(std::atoi(t.c_str())); }
+        const int tg = argc > 6 ? std::atoi(argv[6]) : 128;
+        const int chunk = argc > 7 ? std::atoi(argv[7]) : 2048;
+        if (devs.size() != 2) throw std::runtime_error("pp: expected two GPUs");
+        sycl::context c0(devs[0]), c1(devs[1]);
+        sycl::queue q0(c0, devs[0], sycl::property_list{sycl::property::queue::in_order()});
+        sycl::queue q1(c1, devs[1], sycl::property_list{sycl::property::queue::in_order()});
+        Engine E0(q0, argv[1], ctx, chunk), E1(q1, argv[1], ctx, chunk);
+        const int S = std::getenv("INK_PP_SPLIT") ? std::atoi(std::getenv("INK_PP_SPLIT")) : E0.n_visits() / 2;
+        E0.set_visits(0, S);
+        E1.set_visits(S, -1);
+        const int maxr = 3 + kMaxBankRows;
+        E0.pp_alloc(maxr); E1.pp_alloc(maxr);
+        const size_t slot_el = size_t(maxr) * chunk * 2304;
+        uint16_t* slot[2] = {sycl::malloc_host<uint16_t>(slot_el, q0), sycl::malloc_host<uint16_t>(slot_el, q0)};
+        if (!slot[0] || !slot[1]) throw std::runtime_error("pp: pinned slots");
+        std::printf("pipeline: card 0 visits [0,%d), card 1 [%d,%d), chunk %d\n", S, S, E0.n_visits(), chunk);
+        // one prompt through the pipeline, chunks overlapped (two host slots)
+        auto prefill2 = [&](const std::vector<int>& p) -> int {
+            const int n = int(p.size());
+            std::vector<std::pair<int, int>> ch;
+            for (int at = 0; at < n; at += chunk) ch.push_back({at, std::min(chunk, n - at)});
+            std::mutex mu; std::condition_variable cv;
+            int ready[2] = {-1, -1}; bool busy[2] = {false, false};
+            Engine::PPState st[2];
+            int out = -1;
+            std::exception_ptr err;
+            std::thread t1([&] {
+                try {
+                    for (size_t k = 0; k < ch.size(); ++k) {
+                        const int sidx = int(k % 2);
+                        { std::unique_lock<std::mutex> l(mu); cv.wait(l, [&] { return ready[sidx] == int(k); }); }
+                        E1.pp_import(slot[sidx], ch[k].second, st[sidx]);
+                        E1.sync_all();
+                        { std::lock_guard<std::mutex> l(mu); ready[sidx] = -1; busy[sidx] = false; }
+                        cv.notify_all();
+                        out = E1.pp_run(p.data() + ch[k].first, ch[k].second);
+                    }
+                } catch (...) { err = std::current_exception(); std::lock_guard<std::mutex> l(mu); cv.notify_all(); }
+            });
+            for (size_t k = 0; k < ch.size(); ++k) {
+                const int sidx = int(k % 2);
+                E0.pp_run(p.data() + ch[k].first, ch[k].second);
+                { std::unique_lock<std::mutex> l(mu); cv.wait(l, [&] { return !busy[sidx] || err; }); }
+                if (err) break;
+                E0.pp_export(slot[sidx], ch[k].second);
+                { std::lock_guard<std::mutex> l(mu); st[sidx] = E0.pp_out_; busy[sidx] = true; ready[sidx] = int(k); }
+                cv.notify_all();
+            }
+            t1.join();
+            if (err) std::rethrow_exception(err);
+            return out;
+        };
+        auto step2 = [&](int tok) -> int {
+            E0.pp_run(&tok, 1);
+            E0.pp_export(slot[0], 1);
+            E1.pp_import(slot[0], 1, E0.pp_out_);
+            return E1.pp_run(&tok, 1);
+        };
+        auto reset2 = [&] { E0.reset(); E1.reset(); };
+        {   // warm-up + greedy check (compare with a one-card run of the same prompt)
+            std::vector<int> w(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 64));
+            int nx = prefill2(w);
+            std::printf("two-stage greedy after %zu prompt tokens:", w.size());
+            std::printf(" %d", nx);
+            for (int g = 1; g < 16; ++g) { nx = step2(nx); std::printf(" %d", nx); }
+            std::printf("\n");
+            reset2();
+            if (ids.size() >= size_t(chunk) && chunk + 8 <= ctx) { std::vector<int> fc(ids.begin(), ids.begin() + chunk); prefill2(fc); reset2(); }
+        }
+        std::printf("| test | tokens | time (ms) | tok/s |\n|---|---|---|---|\n");
+        for (int pp : pps) {
+            if (size_t(pp) > ids.size() || pp + tg > ctx) continue;
+            reset2();
+            std::vector<int> p(ids.begin(), ids.begin() + pp);
+            E0.sync_all(); E1.sync_all();
+            auto t0 = std::chrono::steady_clock::now();
+            int nx = prefill2(p);
+            const double pms = ms_since(t0);
+            t0 = std::chrono::steady_clock::now();
+            for (int g = 0; g < tg; ++g) nx = step2(nx);
+            const double tms = ms_since(t0);
+            std::printf("| pp%d | %d | %.1f | %.1f |\n| tg%d @ %d | %d | %.1f | %.1f |\n", pp, pp, pms, 1000.0 * pp / pms, tg, pp, tg, tms, 1000.0 * tg / tms);
+        }
+        sycl::free(slot[0], q0); sycl::free(slot[1], q0);
         return 0;
     }
     if (mode == "tp" || mode == "tpmtp") {
