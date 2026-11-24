@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -406,6 +406,11 @@ private:
     struct SlotPtrs { float* ring[4]; int n[4]; };
     bool verify_ = false, all_logits_ = false, mtp_ = false;
     float *vbuf_ = nullptr, *actS_ = nullptr, *dbufS_ = nullptr, *logitsM_ = nullptr;
+    float *logitsR_ = nullptr, *amxm_v_ = nullptr; int* amxm_i_ = nullptr;
+  public:
+    double mtp_ms_[3] = {0, 0, 0};   // INK_MTP_TIME: draft, verify, commit (host wall)
+  private:   // INT8 verify unembed: raw logits, argmax partials
+    void argmax_rows_cap(const float* lg, int ld, int V, int n, int* out, float* val, int base, float cap);
     uint16_t *xgS_ = nullptr, *actSb_ = nullptr;   // ESIMD verify experts: bf16 A rows in slot order, bf16 act
     SlotPtrs* slotptr_ = nullptr;
     int* g_info_ = nullptr;
@@ -419,6 +424,7 @@ private:
         std::shared_ptr<b70::SafeTensors> st;
         DLayer L[3];
         uint16_t *mask, *norm, *w1, *rnnW, *rnnB, *foldW, *mdfn;
+        int8_t *foldQ = nullptr, *UR = nullptr; float *foldS = nullptr, *US = nullptr, *baseR = nullptr; uint16_t* finb = nullptr;   // INT8 drafter head
         float *alpha, *foldB;
         float *r, *x, *qkv, *att, *o, *gu, *act, *fin, *base, *state, *inp, *proj, *latent, *dlog, *frnn, *ctx, *kvc;
         uint16_t *ctxb, *bk, *bv;
@@ -638,6 +644,8 @@ void Engine::load() {
     actS_ = dev_.zeros<float>(128 * size_t(c_.inter)); dbufS_ = dev_.zeros<float>(128 * size_t(h_));
     xgS_ = dev_.zeros<uint16_t>(128 * size_t(h_)); actSb_ = dev_.zeros<uint16_t>(128 * size_t(c_.inter));
     logitsM_ = dev_.zeros<float>(8 * size_t(c_.output_vocab));
+    if (i8v_) logitsR_ = dev_.zeros<float>(8 * size_t(vrows_));
+    amxm_v_ = dev_.zeros<float>(8 * 64); amxm_i_ = dev_.zeros<int>(8 * 64);
     g_info_ = dev_.zeros<int>(1024);
     {
         std::vector<SlotPtrs> sp(S_.size());
@@ -2753,12 +2761,20 @@ void Engine::run(int M) {
         MixBatch mb{};
         mb.j[0] = job(bank, HID, oquery_, X0); mb.count = 1;
         mix(mb, allrows ? M : 1, allrows ? 0 : M - 1);
-        const bool padU = i4_ && un4_.pay && (allrows ? M : M) <= 8 && !allrows;
+        const bool padU = (i4_ && un4_.pay && M <= 8 && !allrows) || (i8v_ && unR_ && M <= 8 && all_logits_);
         NormBatch nb{}; nb.j[0] = NormJob{X0, fnorm_, N0, padU ? xpadU_ : nullptr, kp_}; nb.count = 1;
         rms(nb, allrows ? M : 1, allrows ? 0 : M - 1);
         if (taps_on) copy(N0, TAP3);
     }
     const int V = c_.output_vocab;
+    if (all_logits_ && i8v_ && unR_ && M <= 8 && i8_small(unR_, unembedS_, 0, vrows_, kp_, xpadU_, logitsR_, M)) {
+        // INT8 unembed for the verify rows (b70::launch_fp8_smallm, raw), softcap + argmax in one pass
+        if (world_ == 1) argmax_rows_cap(logitsR_, vrows_, V, M, next_, nullptr, 0, c_.logit_cap);
+        else argmax_rows_cap(logitsR_, vrows_, vvalid_, M, next_, bestv_, v0_, c_.logit_cap);
+        int* pd = pos_d_;
+        q_.single_task<InkPosV2>([=]() { *pd += M; });
+        return;
+    }
     if (all_logits_) {
         if (world_ == 1) {
             gemvtm<2>(unembedT_, c_.vocab, h, 1, M, row(N0), row(N0), row(N0), h, logitsM_, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V, c_.logit_cap);
@@ -3179,6 +3195,8 @@ int main(int argc, char** argv) try {
             std::vector<int> spec{nx};
             int steps = 0;
             E.sync_all();
+            g_tp_n[r] = 0; g_tp_wait_ms[r][0] = g_tp_wait_ms[r][1] = 0;
+            E.mtp_ms_[0] = E.mtp_ms_[1] = E.mtp_ms_[2] = 0;
             t0 = std::chrono::steady_clock::now();
             while (int(spec.size()) < n) {
                 const auto got = E.mtp_step(spec.back());
@@ -3186,6 +3204,9 @@ int main(int argc, char** argv) try {
                 ++steps;
             }
             const double ts = ms_since(t0);
+            E.sync_all();
+            if (r == 0) for (int c = 0; c < 2; ++c) std::printf("  card %d MTP: %ld exchanges (%.1f / step), copy-out wait %.1f ms, thread meet %.1f ms; draft %.1f verify %.1f commit %.1f ms\n", c, g_tp_n[c],
+                                                                double(g_tp_n[c]) / steps, g_tp_wait_ms[c][0], g_tp_wait_ms[c][1], eng[c]->mtp_ms_[0], eng[c]->mtp_ms_[1], eng[c]->mtp_ms_[2]);
             spec.resize(n);
             int same = 0;
             while (same < n && plain[same] == spec[same]) ++same;

@@ -139,7 +139,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
             *reinterpret_cast<sycl::vec<sycl::half, 8>*>(xg + qd * h + c) = o;
         });
         const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
-        static const int sm_alu0 = (std::getenv("INK_SM_LUT") ? 0 : 1) | (std::getenv("INK_SM_WHOLE") ? 2 : 0) | (std::getenv("INK_SM_DBUF") ? 18 : 0);
+        static const int sm_alu0 = (std::getenv("INK_SM_LUT") ? 0 : 1) | (std::getenv("INK_SM_WHOLE") ? 2 : 0) | (std::getenv("INK_SM_NODBUF") ? 0 : 18);
         const int sm_alu = sm_alu0 | (xperm ? 4 : 0) | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 8 : 0);
         const int sm_alu_dn = sm_alu0 | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 4 : 0);
         static const bool sm_stat = std::getenv("INK_SM_STAT") != nullptr;   // debug: distinct experts per verify visit
@@ -451,6 +451,34 @@ void Engine::load_mtp(const std::string& path) {
         q_.wait();
         sycl::free(tmp, q_);
         if (Ufull) sycl::free(Ufull, q_);
+        if (i8v_ && !std::getenv("INK_DRAFT_OLD")) {
+            // INT8 drafter head (same rounding as the target's INT8 unembed): base logits through b70::launch_fp8_smallm,
+            // fold rows int8 with one scale a row
+            if (world_ == 1) { d_.UR = unR_; d_.US = unembedS_; }
+            else {
+                int8_t* qt = nullptr;
+                quant_tiled(unembedFullT_, Vp, h, qt, d_.US);
+                d_.UR = rowq(qt, Vp, h, kp_);
+            }
+            d_.foldQ = dev_.alloc<int8_t>(size_t(V) * 256);
+            d_.foldS = dev_.alloc<float>(V);
+            int8_t* fq = d_.foldQ;
+            float* fs = d_.foldS;
+            q_.parallel_for<InkFoldQ>(sycl::nd_range<1>(size_t(V) * 16, 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const size_t rr = it.get_group(0);
+                const int lane = int(sg.get_local_linear_id());
+                float mx = 0.f;
+                for (int e = 0; e < 16; ++e) mx = sycl::fmax(mx, sycl::fabs(bfw(fw[rr * 256 + lane * 16 + e])));
+                mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                const float sc = mx > 0.f ? mx / 127.f : 1.f;
+                for (int e = 0; e < 16; ++e) fq[rr * 256 + lane * 16 + e] = int8_t(sycl::clamp(sycl::rint(bfw(fw[rr * 256 + lane * 16 + e]) / sc), -127.f, 127.f));
+                if (lane == 0) fs[rr] = sc;
+            });
+            d_.baseR = dev_.zeros<float>(8 * size_t(Vp));
+            d_.finb = dev_.zeros<uint16_t>(8 * size_t(kp_));
+            q_.wait();
+        }
     }
     const size_t mm = size_t(mmax_);
     d_.r = dev_.zeros<float>(8 * size_t(h)); d_.x = dev_.zeros<float>(8 * size_t(h)); d_.qkv = dev_.zeros<float>(8 * 5120);
@@ -703,6 +731,14 @@ void Engine::draft_block(int t, int p_in) {
         if (bd) dump_dev(q_, ("r_mlp" + std::to_string(l)).c_str(), r, 8 * size_t(h) * 4);
     }
     norm8(r, d_.norm, d_.fin, 7, 1);
+    const bool i8head = d_.UR != nullptr;
+    if (i8head) {
+        uint16_t* fb = d_.finb;
+        const float* fin = d_.fin;
+        const int kp = kp_;
+        q_.parallel_for<InkFinB>(sycl::range<1>(size_t(7) * h), [=](sycl::id<1> id) { const size_t m = id[0] / h, i = id[0] % h; fb[(1 + m) * kp + i] = tobf(fin[(1 + m) * h + i]); });
+        if (!i8_small(d_.UR, d_.US, 0, c_.vocab, kp_, d_.finb + kp_, d_.baseR, 7)) throw std::runtime_error("drafter: INT8 head refused");
+    } else
     gemvtm<0>(unembedFullT_, c_.vocab, h, 1, 7, d_.fin + h, d_.fin + h, d_.fin + h, h, d_.base, V, c_.vocab, nullptr, 0, c_.vocab, nullptr, 0, V);
     if (bd) { dump_dev(q_, "fin", d_.fin, 8 * size_t(h) * 4); dump_dev(q_, "base", d_.base, 7 * size_t(V) * 4); }
     // Markov walk: 7 sequential steps on the device
@@ -736,7 +772,9 @@ void Engine::draft_block(int t, int p_in) {
         }
         {   // logits = softcap(bf(base + bf(foldB + foldW . latent))), argmax over the unpadded vocab
             const uint16_t* fw = d_.foldW;
-            const float *fb = d_.foldB, *lat = d_.latent, *base = d_.base + size_t(step) * V;
+            const float *fb = d_.foldB, *lat = d_.latent, *base = i8head ? d_.baseR + size_t(step) * c_.vocab : d_.base + size_t(step) * V;
+            const int8_t* fq = d_.foldQ;
+            const float* fsc = d_.foldS;
             float* lg = d_.dlog;
             const float cap = c_.logit_cap;
             static const float bias_on = std::getenv("INK_NOBIAS") ? 0.f : 1.f;
@@ -747,19 +785,27 @@ void Engine::draft_block(int t, int p_in) {
                 const int rr = int(it.get_group(0)) * 8 + int(sg.get_group_linear_id());
                 if (rr >= V) return;
                 const int lane = int(sg.get_local_linear_id());
-                const sycl::vec<uint16_t, 16> wv = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(fw + size_t(rr) * 256 + lane * 16);
                 float s = 0.f;
+                if (fq) {
+                    const sycl::vec<int8_t, 16> qv = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(fq + size_t(rr) * 256 + lane * 16);
 #pragma unroll
-                for (int e = 0; e < 16; ++e) s += bfw(wv[e]) * lat[lane * 16 + e];
-                s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+                    for (int e = 0; e < 16; ++e) s += float(qv[e]) * lat[lane * 16 + e];
+                    s = sycl::reduce_over_group(sg, s, sycl::plus<float>()) * fsc[rr];
+                } else {
+                    const sycl::vec<uint16_t, 16> wv = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(fw + size_t(rr) * 256 + lane * 16);
+#pragma unroll
+                    for (int e = 0; e < 16; ++e) s += bfw(wv[e]) * lat[lane * 16 + e];
+                    s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
+                }
                 if (lane == 0) {
                     const float bias = bon * bfr(fb[rr] + s);
-                    const float v = bfr(base[rr] + bias);
+                    const float v = bfr(bfr(base[rr]) + bias);
                     lg[rr] = cap * sycl::tanh(v / cap);
                 }
             });
         }
-        argmax_rows(d_.dlog, V, 1, d_.dtok + 1 + step);
+        if (i8head) argmax_rows_cap(d_.dlog, V, V, 1, d_.dtok + 1 + step, nullptr, 0, 0.f);
+        else argmax_rows(d_.dlog, V, 1, d_.dtok + 1 + step);
     }
     if (bd) { bdumped = true; dump_dev(q_, "dtok", d_.dtok, 8 * 4); std::printf("dumped first draft block\n"); }
 }
@@ -780,6 +826,50 @@ void Engine::argmax_rows(const float* lg, int V, int n, int* out) {
                 if (lid < s && (lv[lid + s] > lv[lid] || (lv[lid + s] == lv[lid] && li[lid + s] < li[lid]))) { lv[lid] = lv[lid + s]; li[lid] = li[lid + s]; }
             }
             if (lid == 0) out[m] = li[0];
+        });
+    });
+}
+
+// Raw logits (ld-pitched rows, first V valid): value = cap tanh(bf(raw) / cap) (the gemvtm<2> formula), argmax with the
+// lowest index on ties; out = base + index, val (optional) = the value.  Two stages: 4096 logits a work-group, then rows.
+void Engine::argmax_rows_cap(const float* lg, int ld, int V, int n, int* out, float* val, int base, float cap) {
+    const int per = 4096, G = (V + per - 1) / per;
+    if (G > 64) throw std::runtime_error("argmax_rows_cap: vocabulary too wide");
+    float* pv = amxm_v_;
+    int* pi = amxm_i_;
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> lv(sycl::range<1>(256), cgh);
+        sycl::local_accessor<int, 1> li(sycl::range<1>(256), cgh);
+        cgh.parallel_for<InkArgC1>(sycl::nd_range<1>(size_t(n) * G * 256, 256), [=](sycl::nd_item<1> it) {
+            const int grp = int(it.get_group(0)), m = grp / G, gb = grp % G, lid = int(it.get_local_id(0));
+            const float* x = lg + size_t(m) * ld;
+            float best = -INFINITY; int bidx = 0x7fffffff;
+            for (int t = 0; t < 16; ++t) {
+                const int k = gb * per + t * 256 + lid;
+                if (k >= V) continue;
+                const float v = cap > 0.f ? cap * sycl::tanh(bfr(x[k]) / cap) : x[k];
+                if (v > best || (v == best && k < bidx)) { best = v; bidx = k; }
+            }
+            lv[lid] = best; li[lid] = bidx;
+            for (int s2 = 128; s2 > 0; s2 >>= 1) {
+                sycl::group_barrier(it.get_group());
+                if (lid < s2 && (lv[lid + s2] > lv[lid] || (lv[lid + s2] == lv[lid] && li[lid + s2] < li[lid]))) { lv[lid] = lv[lid + s2]; li[lid] = li[lid + s2]; }
+            }
+            if (lid == 0) { pv[m * 64 + gb] = lv[0]; pi[m * 64 + gb] = li[0]; }
+        });
+    });
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> lv(sycl::range<1>(64), cgh);
+        sycl::local_accessor<int, 1> li(sycl::range<1>(64), cgh);
+        cgh.parallel_for<InkArgC2>(sycl::nd_range<1>(size_t(n) * 64, 64), [=](sycl::nd_item<1> it) {
+            const int m = int(it.get_group(0)), lid = int(it.get_local_id(0));
+            lv[lid] = lid < G ? pv[m * 64 + lid] : -INFINITY;
+            li[lid] = lid < G ? pi[m * 64 + lid] : 0x7fffffff;
+            for (int s2 = 32; s2 > 0; s2 >>= 1) {
+                sycl::group_barrier(it.get_group());
+                if (lid < s2 && (lv[lid + s2] > lv[lid] || (lv[lid + s2] == lv[lid] && li[lid + s2] < li[lid]))) { lv[lid] = lv[lid + s2]; li[lid] = li[lid + s2]; }
+            }
+            if (lid == 0) { out[m] = li[0] + base; if (val) val[m] = lv[0]; }
         });
     });
 }
@@ -809,11 +899,14 @@ void Engine::argmax_rows_v(const float* lg, int ld, int V, int n, int* out, floa
 std::vector<int> Engine::mtp_step(int t, const int* forced) {
     const int p = pos_;
     if (p + 8 > limit_) throw std::runtime_error("context full");
+    static const bool mtime = std::getenv("INK_MTP_TIME") != nullptr;   // per-phase host wall times (adds waits)
+    auto tA = std::chrono::steady_clock::now();
     if (forced) {
         int dt[8] = {t};
         for (int k = 0; k < 7; ++k) dt[1 + k] = forced[k];
         q_.memcpy(d_.dtok, dt, sizeof(dt));
     } else draft_block(t, p);
+    if (mtime) { q_.wait(); const auto t = std::chrono::steady_clock::now(); mtp_ms_[0] += std::chrono::duration<double, std::milli>(t - tA).count(); tA = t; }
     q_.memcpy(tok_, d_.dtok, 8 * sizeof(int));
     verify_ = all_logits_ = true;
     run(8);
@@ -821,6 +914,7 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
     int nx[8], dr[8];
     q_.memcpy(dr, d_.dtok, 8 * sizeof(int));
     final_tokens(8, nx);
+    if (mtime) { q_.wait(); const auto t = std::chrono::steady_clock::now(); mtp_ms_[1] += std::chrono::duration<double, std::milli>(t - tA).count(); tA = t; }
     int a = 0;
     while (a < 7 && nx[a] == dr[a + 1]) ++a;
     static int dbg = std::getenv("INK_DEBUG") ? std::atoi(std::getenv("INK_DEBUG")) : 0;
@@ -836,6 +930,7 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
     draft_commit(p, 0, a + 1);
     pos_ = p + a + 1;
     q_.memcpy(pos_d_, &pos_, sizeof(int));
+    if (mtime) { q_.wait(); mtp_ms_[2] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tA).count(); }
     std::vector<int> out(dr + 1, dr + 1 + a);
     out.push_back(nx[a]);
     return out;
