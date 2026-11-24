@@ -1109,3 +1109,4 @@ sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g) {
     if (bk == 32) return tpw == 16 ? ink_attn_es_impl<32, 16>(q, g) : ink_attn_es_impl<32, 8>(q, g);
     return tpw == 16 ? ink_attn_es_impl<64, 16>(q, g) : ink_attn_es_impl<64, 8>(q, g);
 }
+

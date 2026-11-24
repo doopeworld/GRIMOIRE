@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -95,6 +95,18 @@ struct InkNvEsArgs {
     int fmt = 0;
 };
 sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g);
+struct InkSmArgs {
+    const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;
+    const uint16_t* A; int slots;
+    void* out;
+    const int* gi; int e0, en;
+    const float* amax; const float* den;
+    const uint32_t* lut;
+    float gcap, ucap;
+    int U;
+    int alu = 1;
+};
+sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
@@ -145,6 +157,7 @@ struct Layer {
     int koff = 0, kfull = 0;  // full-attention conv static weights: this card's channel offset and the full width
     uint16_t *WpT = nullptr, *WoT = nullptr, *WrT = nullptr, *cdownT[4]{};  // decode tiles [N/16][K/8][16][8]
     int8_t *WpQ = nullptr, *WoQ = nullptr;   // INK_I8=1: the same tiles as int8, one fp32 scale per row
+    int8_t *WpR = nullptr, *WoR = nullptr;   // the same int8 values row-major, K padded to 512 (GRIMOIRE INT8 small-M, verify)
     Q4 Wp4, Wo4;                               // INK_I4=1
     float *WpS = nullptr, *WoS = nullptr;
     float* rbias = nullptr;
@@ -303,6 +316,7 @@ private:
     uint32_t* xlut_ = nullptr;   // ink_xexp byte tables
     int* route_cnt_ = nullptr;    // fused router: finished work-groups (reset by the last)
     uint32_t* nvlut_ = nullptr;   // prompt ESIMD MoE: byte -> E2M1 bf16 pair (lo | hi << 16)
+    uint32_t* nvlut16_ = nullptr; // verify ESIMD MoE: byte -> E2M1 fp16 pair
     float* tbl_d_ = nullptr;
     void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
     int final_token(int m = 0);
@@ -343,10 +357,15 @@ private:
     template <int MODE> void gemvt8(const int8_t* T, const float* sc, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1,
                                     float* y1, int end1, const float* x2, float* y2, float cap = 0.f);
     bool i8_ = std::getenv("INK_I8") && std::atoi(std::getenv("INK_I8")) == 1;
+    bool i8v_ = i8_ && !std::getenv("INK_NO_I8V");   // verify (2..8 rows) dense projections: b70::launch_fp8_smallm on int8
+    int8_t* unR_ = nullptr;
+    int8_t* rowq(const int8_t* tiled, int N, int K, int Kp);
+    bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
     // launch_bf16_smallm, the Qwen / Ornith decode + verify path) on the row-major BF16 weights
     bool gsm_ = std::getenv("INK_GSM") && std::atoi(std::getenv("INK_GSM")) == 1;
     bool gsm_dense(const uint16_t* W, int N, int K, const uint16_t* X, float* Y, int M);
+    bool gsmv_ = !std::getenv("INK_NO_GSMV");   // verify router + gate down-projections: b70::launch_bf16_smallm
     bool i4_ = std::getenv("INK_I4") && std::atoi(std::getenv("INK_I4")) == 1;
     bool want_logits_ = false, last_raw_ = false;   // last_raw_: the recorded / last run left raw INT4 logits   // a caller reads logits_: keep them softcapped (no raw INT4 logits)
     int i4parts_ = std::getenv("INK_I4_PARTS") ? std::atoi(std::getenv("INK_I4_PARTS")) : 7;
@@ -387,6 +406,7 @@ private:
     struct SlotPtrs { float* ring[4]; int n[4]; };
     bool verify_ = false, all_logits_ = false, mtp_ = false;
     float *vbuf_ = nullptr, *actS_ = nullptr, *dbufS_ = nullptr, *logitsM_ = nullptr;
+    uint16_t *xgS_ = nullptr, *actSb_ = nullptr;   // ESIMD verify experts: bf16 A rows in slot order, bf16 act
     SlotPtrs* slotptr_ = nullptr;
     int* g_info_ = nullptr;
     template <int MODE> void gemvm(const uint16_t* W, int rows, int K, const float* x, size_t ldx, float* y, size_t ldy, int M, float cap = 0.f);
@@ -428,6 +448,7 @@ void Engine::load() {
         q_.memcpy(unembed_, src, size_t(vrows_) * h_ * 2).wait();
         unembedT_ = tiled(src, vrows_, h_);
         if (i8_) quant_tiled(unembedT_, vrows_, h_, unembedQ_, unembedS_);
+        if (i8v_) unR_ = rowq(unembedQ_, vrows_, h_, (h_ + 511) / 512 * 512);
         if (i4_ && (i4parts_ & 4)) un4_ = quant4(src, vrows_, h_, {{vrows_, "output.weight"}});
     }
     fnorm_ = up<uint16_t>(root + "norm.weight");
@@ -468,6 +489,7 @@ void Engine::load() {
         q_.memcpy(Ly.Wp, stage.data(), stage.size() * 2).wait();
         Ly.WpT = tiled(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_);
         if (i8_) quant_tiled(Ly.WpT, Ly.NA + Ly.NB + Ly.NC, h_, Ly.WpQ, Ly.WpS);
+        if (i8v_) Ly.WpR = rowq(Ly.WpQ, Ly.NA + Ly.NB + Ly.NC, h_, (h_ + 511) / 512 * 512);
         if (i4_ && (i4parts_ & 1)) {
             const std::string b = "blk." + std::to_string(i) + ".";
             Ly.Wp4 = quant4(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_, {{Ly.NA, b + "attn_q.weight"}, {Ly.NB, b + "attn_k.weight"}, {Ly.NC, b + "attn_v.weight"}});
@@ -480,6 +502,7 @@ void Engine::load() {
             q_.memcpy(Ly.Wo, wo.data(), wo.size() * 2).wait();
             Ly.WoT = tiled(wo.data(), h_, Qr);
             if (i8_) quant_tiled(Ly.WoT, h_, Qr, Ly.WoQ, Ly.WoS);
+            if (i8v_) Ly.WoR = rowq(Ly.WoQ, h_, Qr, (Qr + 511) / 512 * 512);
             if (i4_ && (i4parts_ & 2)) Ly.Wo4 = quant4(wo.data(), h_, Qr, {{h_, "blk." + std::to_string(i) + ".attn_output.weight"}});
         }
         Ly.Wr = up<uint16_t>(s + "mlp.gate.weight");
@@ -594,8 +617,12 @@ void Engine::load() {
         for (int b = 0; b < 256; ++b) L[b] = (mag[b & 7] | ((b & 8) ? 0x8000u : 0u)) | ((mag[(b >> 4) & 7] | ((b & 0x80) ? 0x8000u : 0u)) << 16);
         nvlut_ = dev_.alloc<uint32_t>(256);
         q_.memcpy(nvlut_, L.data(), 256 * 4).wait();
+        static const uint32_t mag16[8] = {0x0000u, 0x3800u, 0x3C00u, 0x3E00u, 0x4000u, 0x4200u, 0x4400u, 0x4600u};   // 0 .5 1 1.5 2 3 4 6
+        for (int b = 0; b < 256; ++b) L[b] = (mag16[b & 7] | ((b & 8) ? 0x8000u : 0u)) | ((mag16[(b >> 4) & 7] | ((b & 0x80) ? 0x8000u : 0u)) << 16);
+        nvlut16_ = dev_.alloc<uint32_t>(256);
+        q_.memcpy(nvlut16_, L.data(), 256 * 4).wait();
     }
-    if (i4_) { kp_ = (h_ + 511) / 512 * 512; xpad_ = dev_.zeros<uint16_t>(size_t(3) * 8 * kp_); xpadU_ = dev_.zeros<uint16_t>(size_t(8) * kp_); }
+    if (i4_ || i8v_) { kp_ = (h_ + 511) / 512 * 512; xpad_ = dev_.zeros<uint16_t>(size_t(3) * 8 * kp_); xpadU_ = dev_.zeros<uint16_t>(size_t(8) * kp_); }
     bestv_ = dev_.zeros<float>(16);
     if (world_ > 1) {
         peer_ = dev_.zeros<float>(mm * h_);
@@ -609,6 +636,7 @@ void Engine::load() {
     tok_ = dev_.zeros<int>(std::max<size_t>(mm, 8)); next_ = dev_.zeros<int>(16); pos_d_ = dev_.zeros<int>(1);
     vbuf_ = dev_.zeros<float>(S_.size() * 4 * 8 * size_t(h_));
     actS_ = dev_.zeros<float>(128 * size_t(c_.inter)); dbufS_ = dev_.zeros<float>(128 * size_t(h_));
+    xgS_ = dev_.zeros<uint16_t>(128 * size_t(h_)); actSb_ = dev_.zeros<uint16_t>(128 * size_t(c_.inter));
     logitsM_ = dev_.zeros<float>(8 * size_t(c_.output_vocab));
     g_info_ = dev_.zeros<int>(1024);
     {
@@ -753,6 +781,33 @@ bool Engine::i4_gemv(const Q4& q4, int r0, int n, const uint16_t* X, float* Y, i
         return false;
     }
     b70::launch_int4_smallm_wide(q_, w, reinterpret_cast<const bf16x*>(X), Y, M);
+    return true;
+}
+
+// int8 tiles [N/16][K/8][16][8] -> row-major [N][Kp], zero padding past K (same values as the decode path)
+int8_t* Engine::rowq(const int8_t* T, int N, int K, int Kp) {
+    int8_t* d = dev_.alloc<int8_t>(size_t(N) * Kp);
+    const size_t K8 = size_t(K) / 8;
+    q_.parallel_for<InkRowQ>(sycl::range<1>(size_t(N) * Kp), [=](sycl::id<1> id) {
+        const size_t r = id[0] / Kp, k = id[0] % Kp;
+        d[id[0]] = k < size_t(K) ? T[(((r / 16) * K8 + k / 8) * 16 + r % 16) * 8 + k % 8] : int8_t(0);
+    });
+    q_.wait();
+    return d;
+}
+
+bool Engine::i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M) {
+    if (!W) return false;
+    b70::QuantWeight w;
+    w.fmt = b70::Fmt::INT8; w.N = n; w.K = Kp; w.row_bytes = Kp; w.row_scales = 1;
+    w.payload = reinterpret_cast<const uint8_t*>(W) + size_t(r0) * Kp;
+    w.scales = S + r0;
+    if (!b70::fp8_smallm_ok(w, M, X, Y)) {
+        static bool told = false;
+        if (!told) { told = true; std::printf("INK_I8V: fp8_smallm refused N=%d K=%d M=%d r0=%d (falls back)\n", n, Kp, M, r0); }
+        return false;
+    }
+    b70::launch_fp8_smallm(q_, w, reinterpret_cast<const bf16x*>(X), Y, M);
     return true;
 }
 
@@ -1226,7 +1281,7 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
         for (int j = 0; j < b.count; ++j) cd.w[j] = Ly.cdown[ctrl[j]];
         q_.parallel_for<InkGateLow>(sycl::nd_range<1>(size_t(b.count) * rank * 256, 256), [=](sycl::nd_item<1> it) {
             const int gi = int(it.get_group(0)), jb = gi / rank, r = gi % rank;
-            const GateJob& J = b.j[jb];
+            const GateJob J = jb == 0 ? b.j[0] : (jb == 1 ? b.j[1] : b.j[2]);   // no dynamic index (it spilled 5.6 KB)
             const int lid = int(it.get_local_id(0));
             const float* cur = pool + size_t(J.cur) * RS;
             const float* msg = pool + size_t(J.msg) * RS;
@@ -1235,7 +1290,7 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
             sc = sycl::reduce_over_group(it.get_group(), sc, sycl::plus<float>());
             sm = sycl::reduce_over_group(it.get_group(), sm, sycl::plus<float>());
             const float ir = 1.f / sycl::sqrt(sc / float(h) + eps), im = 1.f / sycl::sqrt(sm / float(h) + eps);
-            const uint16_t* wr = cd.w[jb] + size_t(r) * 2 * h;
+            const uint16_t* wr = (jb == 0 ? cd.w[0] : (jb == 1 ? cd.w[1] : cd.w[2])) + size_t(r) * 2 * h;
             float acc = 0.f;
             for (int i = lid; i < h; i += 256) acc += bfr(cur[i] * ir) * bfw(wr[i]) + bfr(msg[i] * im) * bfw(wr[h + i]);
             acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
@@ -1262,7 +1317,8 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
     });
     for (int j = 0; j < b.count; ++j)
         if (M == 1) gemvt<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, xcat + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, rank, nullptr, nullptr, rank, nullptr, nullptr);
-        else if (M <= 8) {
+        else if (M <= 8 && gsmv_ && gsm_dense(Ly.cdown[ctrl[j]], rank, 2 * h, xcatb + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, M)) {
+        } else if (M <= 8) {
             const float* xj = xcat + size_t(j) * MM * 2 * h;
             gemvtm<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, M, xj, xj, xj, 2 * h, low + size_t(j) * MM * rank, rank, rank, nullptr, 0, rank, nullptr, 0, rank);
         }
@@ -1296,13 +1352,56 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
         }
         return;
     }
+    static const bool blend2 = !std::getenv("INK_OLD_BLEND");
+    if (blend2 && rank == 64 && M >= 2 && M <= 8 && h % 128 == 0) {
+        // one work-item = one output column of one job for all M rows: gain / forget rows read once (8 bf16 at a time),
+        // the BF16-rounded low rows from SLM (the same value for the whole work-group: broadcast reads)
+        const int count = b.count;
+        const GateJob J0 = b.j[0], J1 = b.j[1], J2 = b.j[2];
+        q_.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> ls(sycl::range<1>(3 * 8 * 64), cgh);
+            cgh.parallel_for<InkGateBlend2>(sycl::nd_range<1>(size_t(count) * h, 128), [=](sycl::nd_item<1> it) {
+                const int lid = int(it.get_local_id(0));
+                const size_t g = it.get_global_id(0);
+                const int jb = int(g / h), i = int(g % h);
+                for (int t = lid; t < M * 64; t += 128) ls[(jb * 8 + t / 64) * 64 + t % 64] = bfr(low[(size_t(jb) * MM + t / 64) * 64 + t % 64]);
+                sycl::group_barrier(it.get_group());
+                const GateJob J = jb == 0 ? J0 : (jb == 1 ? J1 : J2);
+                float ga[8], fa[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) { ga[m] = 0.f; fa[m] = 0.f; }
+                const sycl::uint4* gr = reinterpret_cast<const sycl::uint4*>(J.gain + size_t(i) * 64);
+                const sycl::uint4* fr = reinterpret_cast<const sycl::uint4*>(J.forget + size_t(i) * 64);
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    const sycl::uint4 gv = gr[c], fv = fr[c];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const uint32_t gw = gv[e >> 1], fw = fv[e >> 1];
+                        const float gwe = bfw(uint16_t((e & 1) ? gw >> 16 : gw & 0xFFFFu)), fwe = bfw(uint16_t((e & 1) ? fw >> 16 : fw & 0xFFFFu));
+#pragma unroll
+                        for (int m = 0; m < 8; ++m)
+                            if (m < M) { const float lv = ls[(jb * 8 + m) * 64 + c * 8 + e]; ga[m] += lv * gwe; fa[m] += lv * fwe; }
+                    }
+                }
+#pragma unroll
+                for (int m = 0; m < 8; ++m)
+                    if (m < M) {
+                        const size_t o = size_t(m) * h + i;
+                        const float cv = pool[size_t(J.cur) * RS + o], mv = pool[size_t(J.msg) * RS + o];
+                        pool[size_t(J.out) * RS + o] = (1.f - sycl::tanh(fa[m])) * cv + sycl::tanh(ga[m]) * mv;
+                    }
+            });
+        });
+        return;
+    }
     const size_t total = size_t(b.count) * M * h, groups = (total + 7) / 8;
     q_.parallel_for<InkGateBlend>(sycl::nd_range<1>(groups * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto sg = it.get_sub_group();
         const size_t t = it.get_group(0) * 8 + sg.get_group_linear_id();
         if (t >= total) return;
         const int i = int(t % h), m = int((t / h) % M), jb = int(t / (size_t(h) * M));
-        const GateJob& J = b.j[jb];
+        const GateJob J = jb == 0 ? b.j[0] : (jb == 1 ? b.j[1] : b.j[2]);   // no dynamic index (it spilled 2.4 KB)
         const int l = int(sg.get_local_linear_id());
         const float* lw = low + (size_t(jb) * MM + m) * rank;
         float gs = 0.f, fs = 0.f;
@@ -1994,7 +2093,7 @@ void Engine::run(int M) {
         {
             NormBatch nb{};
             const bool gemm = M >= 32 || (gsm_ && M <= 8);
-            const bool pad4 = i4_ && M <= 8 && Ly.Wp4.pay;
+            const bool pad4 = (i4_ && M <= 8 && Ly.Wp4.pay) || (i8v_ && M >= 2 && M <= 8 && Ly.WpR);
             if (v.sliding && !v.has_message) {
                 nb.j[0] = pad4 ? NormJob{in[0], Ly.nq, N0, xpad_, kp_} : NormJob{in[0], Ly.nq, N0, gemm ? nb_ : nullptr}; nb.count = 1;
                 nrm[0] = nrm[1] = nrm[2] = N0;
@@ -2009,7 +2108,12 @@ void Engine::run(int M) {
             rms(nb, M);
         }
         const int NA = Ly.NA, NB = Ly.NB, NC = Ly.NC;
-        if (i4_ && M <= 8 && Ly.Wp4.pay && [&] {
+        if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && [&] {
+                const uint16_t* xs[3] = {xpad_, same ? xpad_ : xpad_ + size_t(8) * kp_, same ? xpad_ : xpad_ + 2 * size_t(8) * kp_};
+                return i8_small(Ly.WpR, Ly.WpS, 0, NA, kp_, xs[0], projA_, M) && i8_small(Ly.WpR, Ly.WpS, NA, NB, kp_, xs[1], projB_, M) &&
+                       i8_small(Ly.WpR, Ly.WpS, NA + NB, NC, kp_, xs[2], projC_, M);
+            }()) {
+        } else if (i4_ && M <= 8 && Ly.Wp4.pay && [&] {
                 const uint16_t* xs[3] = {xpad_, same ? xpad_ : xpad_ + size_t(8) * kp_, same ? xpad_ : xpad_ + 2 * size_t(8) * kp_};
                 return i4_gemv(Ly.Wp4, 0, NA, xs[0], projA_, M) && i4_gemv(Ly.Wp4, NA, NB, xs[1], projB_, M) && i4_gemv(Ly.Wp4, NA + NB, NC, xs[2], projC_, M);
             }()) {
@@ -2407,6 +2511,7 @@ void Engine::run(int M) {
         if (world_ > 1) {
             if (M == 1 && Ly.WoQ) gemvt8<1>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
             else if (M == 1) gemvt<1>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+            else if (M <= 8 && i8v_ && i8_small(Ly.WoR, Ly.WoS, 0, h, Q, aoutb_, row(Z), M)) {}
             else if (M <= 8) gemvtm<1>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
             else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, false);
             allreduce(row(Z), size_t(M) * h);
@@ -2421,6 +2526,7 @@ void Engine::run(int M) {
                 gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         }
         else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        else if (M <= 8 && i8v_ && i8_small(Ly.WoR, Ly.WoS, 0, h, Q, aoutb_, row(Z), M)) {}
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);
         int bank_row = -1;
@@ -2545,6 +2651,7 @@ void Engine::run(int M) {
                 });
             });
         } else if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
+        else if (M <= 8 && gsmv_ && gsm_dense(Ly.Wr, c_.experts, h, nmb_, rlog_, M)) {}
         else if (M <= 8) gemvtm<1>(Ly.WrT, c_.experts, h, 32, M, row(NM), row(NM), row(NM), h, rlog_, c_.experts, c_.experts, nullptr, 0, c_.experts, nullptr, 0, c_.experts);
         else dense(Ly.Wr, c_.experts, h, row(NM), h, nmb_, rlog_, c_.experts, M, false);
         {

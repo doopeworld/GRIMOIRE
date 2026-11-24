@@ -66,6 +66,8 @@ void Engine::experts_small(const Layer& Ly, int M) {
     const float gcap = c_.gate_cap, ucap = c_.up_cap;
     const int* sel = sel_;
     int* gi = g_info_;  // [0] nd, [1..128] eid, [129..257] start, [258..385] prow, [386..513] ppos
+    static const bool old_group = std::getenv("INK_OLD_GROUP") != nullptr;
+    if (old_group || E > 128 || M * TK > 128) {
     q_.single_task<InkGroup>([=]() {
         int cnt[128], slot[128], cur[128];
         for (int e = 0; e < E; ++e) cnt[e] = 0;
@@ -83,11 +85,75 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 gi[386 + m * TK + s] = q;
             }
     });
+    } else {
+    // the same tables from one 128-thread work-group: counts, used-expert list and slot starts by group scans, each
+    // (row, choice) its slot = start + earlier (row, choice) pairs on the same expert (the single_task's order)
+    const int NT = M * TK;
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> cnt(sycl::range<1>(128), cgh), start(sycl::range<1>(128), cgh), ord(sycl::range<1>(128), cgh), sl(sycl::range<1>(128), cgh);
+        cgh.parallel_for<InkGroupP>(sycl::nd_range<1>(128, 128), [=](sycl::nd_item<1> it) {
+            auto g = it.get_group();
+            const int e = int(it.get_local_id(0));
+            cnt[e] = 0;
+            if (e < NT) sl[e] = sel[e];
+            sycl::group_barrier(g);
+            int c = 0;
+            if (e < E) for (int t = 0; t < NT; ++t) c += sl[t] == e;
+            const int used = c > 0 ? 1 : 0;
+            const int u = sycl::exclusive_scan_over_group(g, used, sycl::plus<int>());
+            const int st = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());
+            const int nd = sycl::reduce_over_group(g, used, sycl::plus<int>());
+            cnt[e] = c; start[e] = st; ord[e] = u;
+            if (used) { gi[1 + u] = e; gi[129 + u] = st; }
+            if (e == 0) { gi[0] = nd; gi[129 + nd] = NT; }
+            sycl::group_barrier(g);
+            if (e < NT) {
+                const int ex = sl[e];
+                int before = 0;
+                for (int t = 0; t < e; ++t) before += sl[t] == ex;
+                const int q = start[ex] + before;
+                gi[258 + q] = e / TK;
+                gi[386 + e] = q;
+            }
+        });
+    });
+    }
     float* act = actS_;
     float* dbuf = dbufS_;
     const float* xbase = row(NM);
     const int U = std::min(E, M * TK);
     constexpr int R = 2, SGS = 8;
+    static const bool smes = !std::getenv("INK_NO_SMES");   // GRIMOIRE moe_mxfp4_esimd_small design, NVFP4 / MXFP8 port
+    const bool es_ok = smes && h % 128 == 0 && I % 128 == 0 && (2 * I) % 256 == 0 && h % 256 == 0;
+    if (es_ok) {
+        uint16_t* xg = xgS_;
+        const int slots = M * TK;
+        static const bool sm_perm = !std::getenv("INK_SM_NOPERM");
+        const bool xperm = sm_perm && Ly.fgu == PackedFormat::NVFP4;
+        q_.parallel_for<InkGatherS>(sycl::range<1>(size_t(slots) * (h / 8)), [=](sycl::id<1> id) {
+            const size_t t = id[0], qd = t / (h / 8), c = (t % (h / 8)) * 8;
+            const float* src = xbase + size_t(gi[258 + qd]) * h + c;
+            sycl::vec<sycl::half, 8> o;   // bf16 values, exact in fp16; NVFP4 layers: K order 0 4 1 5 2 6 3 7 in each 8
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = sycl::half(src[xperm ? ((e & 1) ? 4 + (e >> 1) : (e >> 1)) : e]);
+            *reinterpret_cast<sycl::vec<sycl::half, 8>*>(xg + qd * h + c) = o;
+        });
+        const int fg = Ly.fgu == PackedFormat::NVFP4 ? 0 : 1, fd = Ly.fdn == PackedFormat::NVFP4 ? 0 : 1;
+        static const int sm_alu0 = (std::getenv("INK_SM_LUT") ? 0 : 1) | (std::getenv("INK_SM_WHOLE") ? 2 : 0) | (std::getenv("INK_SM_DBUF") ? 18 : 0);
+        const int sm_alu = sm_alu0 | (xperm ? 4 : 0) | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 8 : 0);
+        const int sm_alu_dn = sm_alu0 | (sm_perm && Ly.fdn == PackedFormat::NVFP4 ? 4 : 0);
+        static const bool sm_stat = std::getenv("INK_SM_STAT") != nullptr;   // debug: distinct experts per verify visit
+        if (sm_stat) {
+            static long calls = 0, sum = 0, rows = 0;
+            int nd = 0;
+            q_.memcpy(&nd, gi, sizeof(int)).wait();
+            ++calls; sum += nd; rows += M;
+            if (calls % 480 == 0) std::printf("smstat: %ld verify visits, %.1f distinct experts per visit, %.2f rows\n", calls, double(sum) / calls, double(rows) / calls);
+        }
+        ink_moe_small_esimd(q_, InkSmArgs{Ly.gu, Ly.gus, 2 * I, h, en * 2 * I, xg, slots, actSb_, gi, e0, en, Ly.gua, Ly.gud, nvlut16_, gcap, ucap, U, sm_alu}, fg, 1);
+        ink_moe_small_esimd(q_, InkSmArgs{Ly.dn, Ly.dns, h, I, en * h, actSb_, slots, dbuf, gi, e0, en, Ly.dna, Ly.dnd, nvlut16_, 0.f, 0.f, U, sm_alu_dn}, fd, 2);
+    }
+    if (!es_ok) {
     {
         const bool NV = Ly.fgu == PackedFormat::NVFP4;
         const uint8_t *W = Ly.gu, *S = Ly.gus;
@@ -242,6 +308,7 @@ void Engine::experts_small(const Layer& Ly, int M) {
                 }
             });
         });
+    }
     }
     {   // YB[m] = bf(sum_s w_s d_s) in slot (= ascending expert) order
         const float* w = wts_;
