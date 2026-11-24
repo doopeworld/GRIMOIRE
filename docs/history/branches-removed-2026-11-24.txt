@@ -1,0 +1,33 @@
+# GitHub branches deleted on 2026-11-24: every one was fully merged into main (cc721b7 and earlier).
+# Restore one with: git push origin <sha>:refs/heads/<name>
+8c3d90cc9b74c55c07a80f14854d80df021f04f8 claude/add-gplv3-license
+a4e3775a7c938de04ff1bd9a697e2fe52d171de7 claude/codex-b70-audit-fixes-u1adcv
+a52912798a0cdbc42be5650d036175461994e69b claude/grimoire-audit-testing-qa0v98
+fd41d9e81d9cf49b496b4bc64a9fa2cbd27e10d7 claude/new-session-pro26b
+a4e3775a7c938de04ff1bd9a697e2fe52d171de7 codex/b70-audit-fixes-20260911
+bf961c34ad30df05e19eb2e1e214c7ca6a9a87cc codex/composable-serving
+55a9eea76a88747b8da35fbdbb70b7a4192d8ab5 copy-draft-1114
+18818301be63fec3b64b49e6adef75df5c99b488 cpu-pool-late-workers-1102
+587e8106ac3cfd1051a657e671345a8088bfd2e7 dual-1022
+0786428a149d07f065cf88a4aecb84f2794b0a06 fast-multiuser-1111
+3cf0f37794599314497a9484d5a500948ad914b0 fast-pp-1117
+defb03cac42aec5f64f8f3d63aaf2f7f823a3b0e feature/gguf-battlemage
+aba340312adcf0fddfc85953a7489ae3503f99de flashnext-mtp
+75b14e8c32450f336da16f8a9d63e50920da61b7 fnmtp-1105
+fe88ad5092a9b0d273babdc3ab6d99ca9b9f83ca fnmtp-verify-1106
+14b34ad3d1e918d4f4f735f952a878fcbf345844 i4a8-prompt-1112
+4214498915e0d9e3315dd9def2a3358ec2b47dc8 int4-mtp-wip
+6dcbaccc16fcf336281387099fc6f273841f3d33 longctx-1115
+8a7257d0ceacd0a1f275a269ae147760ebb2824e longctx-attn-wip
+f7f4ba43ccdc8400beb589c02594b2d031d9bbbe p2p-1108
+7ff09dc744a61427efe62f34067aa325951343a0 pp-muse
+505a6f02003cbb94d170f96751fdd3f83938a198 pp-muse-backup-20260831-1745
+0140e573e8f7ade6ba909d5ea034820c670d4547 pp-muse-backup-20260831-2126
+1a1add3fd7b3ff307b58d47938a111beca6d7dd0 qwen-container-recipes
+390c9d5f94f34f3995a87ed1554a499c78b157a1 qwen-tg-restored
+f2a98b7e6263f3c70bb0d90c0fb50d0d4e52a786 radiance-heat-1106
+b0ec8be6847e50d66f5d6b3db1ceed477ba228a8 server-tools
+74c7aa988952595327e88ed8bf3f97a4dd2fed9f tools-merge
+78274a55ab1ef8293c5862b74b5abc6644523b4e tp-megatron
+35201c20f04edbe07a8cca1fcd04d960bda8242c tp-small-bf16-1104
+613cd1ea4daff441b471ff1ef77d35aaabd19b7a vllm-dflash-build-reference

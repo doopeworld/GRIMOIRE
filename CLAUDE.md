@@ -1,5 +1,8 @@
 # Working on GRIMOIRE — read this first
 
+> **2026-11-24:** the handoff / audit / results files this page names (HANDOFF-*.md, AUDIT-*.md, DAY-ONE.md, ...)
+> moved to [docs/history/](docs/history/) with their names unchanged.
+
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
 **2026-11-16: v1.10.7 RELEASED (image = 6dcbacc, branch longctx-1115, merged to main): prompt cache ON by default
