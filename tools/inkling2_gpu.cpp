@@ -69,6 +69,14 @@ struct InkXArgs {
     const uint32_t* lut;
 };
 sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g);
+struct InkEsArgs {
+    const uint8_t* pay; const uint8_t* scl;
+    const float* amax; const float* den;
+    const int* sel; int e0, en, topk;
+    const float* x; float* out;
+    int H, I; float gcap, ucap;
+};
+bool ink_es_moe(sycl::queue& q, const InkEsArgs& gu, const InkEsArgs& dn);
 sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int E, int N, int K, uint8_t* codes, uint8_t* scales);
 sycl::event ink_moe_grouped(sycl::queue& q, int fmt, const uint8_t* pay, const uint8_t* scl, size_t rb, size_t sb,
                             int N, int K, const uint16_t* A, float* out, const int* tiles, int T, const int* uinfo,
@@ -1151,6 +1159,12 @@ inline void load_x(const float* g, float* xr, int n) {
 
 void Engine::experts_decode(const Layer& Ly) {
     const int h = h_, I = c_.inter, TK = c_.top_k, e0 = e0_, en = en_;
+    // INK_ESMOE=1: GRIMOIRE's Ornith ESIMD decode MoE ported to NVFP4 (tools/inkling2_moe_gemm.cpp ink_es_moe)
+    static const bool esmoe = std::getenv("INK_ESMOE") && std::atoi(std::getenv("INK_ESMOE")) == 1;
+    if (esmoe && Ly.fgu == PackedFormat::NVFP4 && Ly.fdn == PackedFormat::NVFP4 &&
+        ink_es_moe(q_, InkEsArgs{Ly.gu, Ly.gus, Ly.gua, Ly.gud, sel_, e0, en, TK, row(NM), act_, h, I, c_.gate_cap, c_.up_cap},
+                   InkEsArgs{Ly.dn, Ly.dns, Ly.dna, Ly.dnd, sel_, e0, en, TK, act_, dbuf_, h, I, 0.f, 0.f}))
+        return;
     if (Ly.guX) {   // DPAS decode (tools/inkling2_moe_gemm.cpp ink_xexp)
         ink_xexp(q_, InkXArgs{Ly.guX, Ly.gusX, Ly.gua, Ly.gud, sel_, e0, en, TK, 2 * I, h, row(NM), 0, act_, 1, c_.gate_cap, c_.up_cap, xlut_});
         ink_xexp(q_, InkXArgs{Ly.dnX, Ly.dnsX, Ly.dna, Ly.dnd, sel_, e0, en, TK, h, I, act_, size_t(I), dbuf_, 0, 0.f, 0.f, xlut_});
@@ -1741,7 +1755,8 @@ void Engine::run(int M) {
                        gsm_dense(Ly.Wp + size_t(NA + NB) * h, NC, h, xs[2], projC_, M);
             }()) {
         } else if (M == 1) {
-            if (Ly.WpQ) gemvt8<0>(Ly.WpQ, Ly.WpS, NA + NB + NC, h, 4, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
+            static const int ksp = std::getenv("INK_KS_WP") ? std::atoi(std::getenv("INK_KS_WP")) : 2;   // MEASURED 11-24: Wp+Wo 235 -> 204 ms (KS 4 -> 2)
+            if (Ly.WpQ) gemvt8<0>(Ly.WpQ, Ly.WpS, NA + NB + NC, h, ksp, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
             else gemvt<0>(Ly.WpT, NA + NB + NC, h, 2, row(nrm[0]), projA_, NA, row(nrm[1]), projB_, NA + NB, row(nrm[2]), projC_);
         } else {
             const uint16_t* xb[3] = {nb_, same ? nb_ : nb_ + size_t(MM) * h, same ? nb_ : nb_ + 2 * size_t(MM) * h};
@@ -2110,7 +2125,10 @@ void Engine::run(int M) {
             allreduce(row(Z), size_t(M) * h);
         } else if (M == 1 && i4_ && i4_gemv(Ly.Wo4, 0, h, aoutb_, row(Z), 1)) {
         } else if (M == 1 && gsm_ && gsm_dense(Ly.Wo, h, Q, aoutb_, row(Z), 1)) {
-        } else if (M == 1 && Ly.WoQ) gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        } else if (M == 1 && Ly.WoQ) {
+            static const int kso = std::getenv("INK_KS_WO") ? std::atoi(std::getenv("INK_KS_WO")) : 8;
+            gemvt8<0>(Ly.WoQ, Ly.WoS, h, Q, kso, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
+        }
         else if (M == 1) gemvt<0>(Ly.WoT, h, Q, 8, aout_, row(Z), h, nullptr, nullptr, h, nullptr, nullptr);
         else if (M <= 8) gemvtm<0>(Ly.WoT, h, Q, 8, M, aout_, aout_, aout_, Q, row(Z), h, h, nullptr, 0, h, nullptr, 0, h);
         else dense(Ly.Wo, h, Q, aout_, Q, aoutb_, row(Z), h, M, true);

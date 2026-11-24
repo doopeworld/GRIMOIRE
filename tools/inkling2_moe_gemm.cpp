@@ -10,9 +10,12 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/bfloat16.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 #include "b70/formats.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <functional>
 #include <cstdint>
 #include <vector>
 
@@ -442,4 +445,184 @@ sycl::event ink_xexp_pack(sycl::queue& q, const uint8_t* pay, const uint8_t* scl
         const size_t n = t * 16 + lane, kb = gi * 8 + c;
         scales[i] = scl[e * per + n * (K / 16) + kb];
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Decode experts = GRIMOIRE's Ornith ESIMD decode MoE (src/moe_kernels.cpp moe_gu_esimd / moe_dn_esimd, the
+// llm-scaler shape, MEASURED there 266/248 -> 477/484 GB/s) on Inkling's NVFP4 rows as stored (no repack):
+// a thread streams whole rows with contiguous 64-byte block loads, keeps its activation slice in registers split
+// even / odd K (= low / high nibble), decodes E2M1 in the ALU (nibble bits -> fp16 = value x 2^-14, the 2^14 folded
+// into the scale), no tables, no barrier in the loop.  NVFP4 scale = E4M3 per 16 values x outer (amax / den);
+// weights are not rounded to bf16 one by one (vLLM-style dequant), the sums are.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+namespace es2 = sycl::ext::intel::esimd;
+template <int N>
+SYCL_ESIMD_FUNCTION inline void nv_e2m1_split(es2::simd<uint8_t, N> b, es2::simd<float, N>& lo, es2::simd<float, N>& hi) {
+    es2::simd<uint16_t, N> u = b;
+    es2::simd<uint16_t, N> l = ((u & 0x7) << 9) | ((u & 0x8) << 12);
+    es2::simd<uint16_t, N> hb = ((u & 0x70) << 5) | ((u & 0x80) << 8);
+    es2::simd<sycl::half, N> lh = l.template bit_cast_view<sycl::half>();
+    es2::simd<sycl::half, N> hh = hb.template bit_cast_view<sycl::half>();
+    lo = lh;
+    hi = hh;
+}
+SYCL_ESIMD_FUNCTION inline es2::simd<float, 8> nv_e4m3x8(es2::simd<uint8_t, 8> sb) {
+    es2::simd<uint32_t, 8> b = sb;
+    const es2::simd<uint32_t, 8> e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 24;
+    es2::simd<uint32_t, 8> bits = s | ((e + 120u) << 23) | (m << 20);
+    es2::simd<float, 8> v = bits.template bit_cast_view<float>().read();
+    es2::simd<float, 8> sub = es2::simd<float, 8>(m) * (1.f / 512.f);
+    sub.merge(-sub, s != 0u);
+    v.merge(sub, e == 0u);
+    return v;
+}
+// one 128-value step of one NVFP4 row: acc[8] += sum over the 8 scale blocks (16 values each)
+template <int KP>
+SYCL_ESIMD_FUNCTION inline void nv4_row_step(const uint8_t* prow, const uint8_t* srow, int st, es2::simd<float, KP / 2>& xe,
+                                            es2::simd<float, KP / 2>& xo, float so, es2::simd<float, 8>& acc) {
+    es2::simd<uint8_t, 64> pb = es2::block_load<uint8_t, 64>(prow + st * 64);
+    es2::simd<uint8_t, 8> sb = es2::block_load<uint8_t, 8>(srow + st * 8, es2::properties{es2::alignment<4>});
+    es2::simd<float, 64> wl, wh;
+    nv_e2m1_split<64>(pb, wl, wh);
+    es2::simd<float, 8> sc = nv_e4m3x8(sb) * so;
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        es2::simd<float, 8> part = wl.template select<8, 1>(8 * b) * xe.template select<8, 1>(st * 64 + 8 * b) +
+                                   wh.template select<8, 1>(8 * b) * xo.template select<8, 1>(st * 64 + 8 * b);
+        acc += part * float(sc[b]);
+    }
+}
+inline float es_bfr(float x) SYCL_ESIMD_FUNCTION {
+    uint32_t u = sycl::bit_cast<uint32_t>(x);
+    u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+    return sycl::bit_cast<float>(u);
+}
+inline float es_th(float v) SYCL_ESIMD_FUNCTION { const float t = sycl::exp(-2.f * (v < 0.f ? -v : v)); const float r = (1.f - t) / (1.f + t); return v < 0.f ? -r : r; }
+template <int R, int KS, int H> class InkEsGU;
+template <int R, int I> class InkEsDN;
+}
+
+struct InkEsArgs {
+    const uint8_t* pay; const uint8_t* scl;     // NVFP4 rows as stored: [local expert][rows][K/2], [..][rows][K/16]
+    const float* amax; const float* den;
+    const int* sel; int e0, en, topk;
+    const float* x; float* out;                 // gate_up: x [H] -> act [slot][I];  down: act [slot][I] -> dbuf [slot][H]
+    int H, I; float gcap, ucap;
+};
+
+// gate_up + Inkling's softcapped SwiGLU.  Work-group = KS threads splitting H; a thread owns R (gate, up) row pairs
+// (checkpoint rows 2i, 2i+1) of one slot.  act = bf(gcap*tanh(g/gcap) * sigmoid(g) * ucap*tanh(u/ucap)), g,u = bf(sum).
+template <int R, int KS, int H>
+static sycl::event es_gu(sycl::queue& q, const InkEsArgs& a) {
+    constexpr int KP = H / KS;
+    static_assert(KP % 128 == 0, "K slice: whole 128-value steps");
+    const int rg = a.I / R, nwg = a.topk * rg;
+    return q.submit([&](sycl::handler& cgh) {
+        const InkEsArgs g = a;
+        cgh.parallel_for<InkEsGU<R, KS, H>>(sycl::nd_range<1>(size_t(nwg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es2::slm_init<KS * R * 2 * 4>();
+            const int t = int(it.get_local_id(0)), wg = int(it.get_group(0));
+            const int slot = wg / rg, i0 = (wg % rg) * R, kb = t * KP;
+            const int e = g.sel[slot];
+            if (e < g.e0 || e >= g.e0 + g.en) return;            // uniform per work-group
+            const int64_t el = e - g.e0, rb = H / 2, rs = H / 16;
+            const float so = g.amax[e] / g.den[0] * 16384.f;
+            es2::simd<float, KP> xs = es2::block_load<float, KP>(g.x + kb);
+            es2::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+            es2::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+            es2::simd<float, 8> ga[R], ua[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) { ga[r] = 0.f; ua[r] = 0.f; }
+#pragma unroll
+            for (int st = 0; st < KP / 128; ++st)
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int64_t gr = el * 2 * g.I + 2 * (i0 + r), ur = gr + 1;
+                    nv4_row_step<KP>(g.pay + gr * rb + kb / 2, g.scl + gr * rs + kb / 16, st, xe, xo, so, ga[r]);
+                    nv4_row_step<KP>(g.pay + ur * rb + kb / 2, g.scl + ur * rs + kb / 16, st, xe, xo, so, ua[r]);
+                }
+            es2::simd<float, 2 * R> red;
+#pragma unroll
+            for (int r = 0; r < R; ++r) { red[2 * r] = es2::reduce<float>(ga[r], std::plus<>()); red[2 * r + 1] = es2::reduce<float>(ua[r], std::plus<>()); }
+            if constexpr (KS > 1) {
+                es2::slm_block_store<float, 2 * R>(t * 2 * R * 4, red);
+                es2::barrier();
+                if (t != 0) return;
+                red = 0.f;
+#pragma unroll
+                for (int j = 0; j < KS; ++j) red += es2::slm_block_load<float, 2 * R>(j * 2 * R * 4);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float gg = es_bfr(red[2 * r]), uu = es_bfr(red[2 * r + 1]);
+                const float sg = gg >= 0.f ? 1.f / (1.f + sycl::exp(-gg)) : sycl::exp(gg) / (1.f + sycl::exp(gg));
+                g.out[int64_t(slot) * g.I + i0 + r] = es_bfr((g.gcap * es_th(gg / g.gcap)) * sg * (g.ucap * es_th(uu / g.ucap)));
+            }
+        });
+    });
+}
+
+// down: one thread per (slot, R output rows) over the whole reduction (I); the slot's activation in registers.
+// dbuf[slot][row] = bf(sum); slots this card does not own write zeros (two-card partial sums).
+template <int R, int I>
+static sycl::event es_dn(sycl::queue& q, const InkEsArgs& a) {
+    static_assert(I % 128 == 0, "");
+    const int S = a.topk;
+    return q.submit([&](sycl::handler& cgh) {
+        const InkEsArgs g = a;
+        cgh.parallel_for<InkEsDN<R, I>>(sycl::nd_range<1>(size_t(g.H / R) * S, S), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            const int s = int(it.get_local_id(0)), o0 = int(it.get_group(0)) * R;
+            const int e = g.sel[s];
+            float* y = g.out + int64_t(s) * g.H + o0;
+            if (e < g.e0 || e >= g.e0 + g.en) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) y[r] = 0.f;
+                return;
+            }
+            const int64_t el = e - g.e0, rb = I / 2, rs = I / 16;
+            const float so = g.amax[e] / g.den[0] * 16384.f;
+            es2::simd<float, I> hs = es2::block_load<float, I>(g.x + int64_t(s) * I);
+            es2::simd<float, I / 2> he = hs.template select<I / 2, 2>(0);
+            es2::simd<float, I / 2> ho = hs.template select<I / 2, 2>(1);
+            es2::simd<float, 8> acc[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.f;
+#pragma unroll
+            for (int st = 0; st < I / 128; ++st)
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int64_t row = el * g.H + o0 + r;
+                    nv4_row_step<I>(g.pay + row * rb, g.scl + row * rs, st, he, ho, so, acc[r]);
+                }
+#pragma unroll
+            for (int r = 0; r < R; ++r) y[r] = es_bfr(es2::reduce<float>(acc[r], std::plus<>()));
+        });
+    });
+}
+
+// Inkling 2 Mini shapes: H 2304 (18 steps of 128 -> KS 9, two steps a thread, as Ornith's KS 8 at H 2048), I 1152.
+bool ink_es_moe(sycl::queue& q, const InkEsArgs& gu, const InkEsArgs& dn) {
+    if (gu.H != 2304 || gu.I != 1152) return false;
+    // INK_ES_GU = <R><KS> (row pairs a thread, threads splitting H): 29 (Ornith-like, default), 26, 23, 13, 43, 16, 46
+    static const int cfg = std::getenv("INK_ES_GU") ? std::atoi(std::getenv("INK_ES_GU")) : 11;   // MEASURED 11-24 (us): 11 57.4, 12 59.4, 13 61.5, 29 80.1
+    switch (cfg) {
+        case 26: es_gu<2, 6, 2304>(q, gu); break;
+        case 23: es_gu<2, 3, 2304>(q, gu); break;
+        case 13: es_gu<1, 3, 2304>(q, gu); break;
+        case 43: es_gu<4, 3, 2304>(q, gu); break;
+        case 16: es_gu<1, 6, 2304>(q, gu); break;
+        case 46: es_gu<4, 6, 2304>(q, gu); break;
+        case 19: es_gu<1, 9, 2304>(q, gu); break;
+        case 12: es_gu<1, 2, 2304>(q, gu); break;
+        case 11: es_gu<1, 1, 2304>(q, gu); break;
+        case 22: es_gu<2, 2, 2304>(q, gu); break;
+        default: es_gu<2, 9, 2304>(q, gu); break;
+    }
+    // INK_ES_DN = R output rows a thread: 2 (default), 1, 4
+    static const int rdn = std::getenv("INK_ES_DN") ? std::atoi(std::getenv("INK_ES_DN")) : 2;
+    if (rdn == 1) es_dn<1, 1152>(q, dn);
+    else if (rdn == 4) es_dn<4, 1152>(q, dn);
+    else es_dn<2, 1152>(q, dn);
+    return true;
 }
