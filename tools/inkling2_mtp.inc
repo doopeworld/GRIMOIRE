@@ -914,7 +914,7 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
     if (mtime) { q_.wait(); const auto t = std::chrono::steady_clock::now(); mtp_ms_[0] += std::chrono::duration<double, std::milli>(t - tA).count(); tA = t; }
     q_.memcpy(tok_, d_.dtok, 8 * sizeof(int));
     verify_ = all_logits_ = true;
-    run(8);
+    run_seg(8);
     verify_ = all_logits_ = false;
     int nx[8], dr[8];
     q_.memcpy(dr, d_.dtok, 8 * sizeof(int));

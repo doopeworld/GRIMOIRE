@@ -47,7 +47,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -297,6 +297,21 @@ public:
     std::vector<int> mtp_step(int t, const int* forced = nullptr);
     bool use_graph = true;
     int gpar_ = 0, gex_ = 0;   // two-card graph: mailbox count at capture, exchanges inside
+    // two cards: a step recorded as a chain of graphs split at its exchanges (each segment ends with the copy-out of
+    // its exchange; the next one starts with the add); replay = per segment one graph launch + the host exchange.
+    // Keyed by M (1 decode, 8 verify).  INK_NO_SEG=1: kernels submitted one by one (old).
+    struct SegStep {
+        std::vector<std::unique_ptr<sycl_ext::command_graph<sycl_ext::graph_state::executable>>> g;
+        std::vector<int> slot; std::vector<size_t> n;   // per exchange: slot index (from a multiple of NS), floats
+    };
+    SegStep seg_[9];
+    bool seg_rec_ = false;
+    std::unique_ptr<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>> seg_cur_;
+    SegStep* seg_dst_ = nullptr;
+    bool seg_on_ = !std::getenv("INK_NO_SEG");
+  public:
+    void run_seg(int M);   // run(M) through the recorded chain (records it the first time)
+  private:
     bool taps_on = false;
 
 private:
@@ -366,6 +381,8 @@ private:
     bool i8v_ = i8_ && !std::getenv("INK_NO_I8V");   // verify (2..8 rows) dense projections: b70::launch_fp8_smallm on int8
     int8_t* unR_ = nullptr;
     int8_t* rowq(const int8_t* tiled, int N, int K, int Kp);
+    float* projAll_ = nullptr;   // verify, sliding visits: [8][NA + NB + NC] from one INT8 launch
+    void split_proj(int NA, int NB, int NC, int M);
     bool i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M);
     // INK_GSM=1: decode / verify dense projections through Grimoire's own small-M ESIMD kernels (libgrimoire_gemm:
     // launch_bf16_smallm, the Qwen / Ornith decode + verify path) on the row-major BF16 weights
@@ -654,6 +671,7 @@ void Engine::load() {
     xgS_ = dev_.zeros<uint16_t>(128 * size_t(h_)); actSb_ = dev_.zeros<uint16_t>(128 * size_t(c_.inter));
     logitsM_ = dev_.zeros<float>(8 * size_t(c_.output_vocab));
     if (i8v_) logitsR_ = dev_.zeros<float>(8 * size_t(vrows_));
+    if (i8v_) { int mx = 0; for (const auto& Ly : L_) mx = std::max(mx, Ly.NA + Ly.NB + Ly.NC); projAll_ = dev_.zeros<float>(8 * size_t(mx)); }
     amxm_v_ = dev_.zeros<float>(8 * 64); amxm_i_ = dev_.zeros<int>(8 * 64);
     g_info_ = dev_.zeros<int>(1024);
     {
@@ -811,6 +829,19 @@ int8_t* Engine::rowq(const int8_t* T, int N, int K, int Kp) {
     });
     q_.wait();
     return d;
+}
+
+void Engine::split_proj(int NA, int NB, int NC, int M) {
+    const float* src = projAll_;
+    float *a = projA_, *b = projB_, *c = projC_;
+    const int N = NA + NB + NC;
+    q_.parallel_for<InkSplitP>(sycl::range<1>(size_t(M) * N), [=](sycl::id<1> id) {
+        const int m = int(id[0] / N), r = int(id[0] % N);
+        const float v = src[id[0]];
+        if (r < NA) a[size_t(m) * NA + r] = v;
+        else if (r < NA + NB) b[size_t(m) * NB + (r - NA)] = v;
+        else c[size_t(m) * NC + (r - NA - NB)] = v;
+    });
 }
 
 bool Engine::i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M) {
@@ -1886,6 +1917,22 @@ void Engine::allreduce(float* buf, size_t n) {
         });
         return;
     }
+    if (seg_rec_ && n <= size_t(64) * h_) {
+        // recording: the copy-out closes this segment; the add opens the next one (no host work now)
+        const int k = x.counter[me]++ % TPX::NS;
+        float* mine = x.hb[me][k];
+        q_.memcpy(mine, buf, n * sizeof(float));
+        seg_cur_->end_recording(q_);
+        seg_dst_->g.push_back(std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(seg_cur_->finalize()));
+        seg_dst_->slot.push_back(k);
+        seg_dst_->n.push_back(n);
+        seg_cur_ = std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>>(q_.get_context(), q_.get_device());
+        seg_cur_->begin_recording(q_);
+        const float* in = x.ib[me][k];
+        q_.parallel_for<InkAddRoundS>(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i[0]] = bfr(buf[i[0]] + in[i[0]]); });
+        return;
+    }
+    if (seg_rec_) throw std::runtime_error("segment recording: large exchange");
     const int k = x.counter[me]++ % TPX::NS;
     float* mine = x.hb[me][k];
     const float* theirs = x.hb[peer][k];
@@ -1957,6 +2004,52 @@ int Engine::final_token(int m) {
     return (v1 > v0 || (v1 == v0 && i1 < i0)) ? i1 : i0;
 }
 
+void Engine::run_seg(int M) {
+    if (world_ == 1 || !seg_on_ || M > 8 || (tpx_ && tpx_->box[0])) { run(M); return; }
+    TPX& x = *tpx_;
+    const int me = rank_, peer = 1 - rank_;
+    SegStep& S = seg_[M];
+    auto align = [&] { x.counter[me] = (x.counter[me] + TPX::NS - 1) / TPX::NS * TPX::NS; };
+    if (S.g.empty()) {
+        align();
+        const int c0 = x.counter[me];
+        q_.wait();
+        seg_dst_ = &S;
+        seg_cur_ = std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>>(q_.get_context(), q_.get_device());
+        seg_cur_->begin_recording(q_);
+        seg_rec_ = true;
+        try { run(M); } catch (...) { seg_rec_ = false; seg_cur_->end_recording(q_); throw; }
+        seg_rec_ = false;
+        seg_cur_->end_recording(q_);
+        S.g.push_back(std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::executable>>(seg_cur_->finalize()));
+        seg_cur_.reset();
+        x.counter[me] = c0;   // recording exchanged nothing
+        if (rank_ == 0) std::printf("two-card step M=%d recorded: %zu segments\n", M, S.g.size());
+    }
+    align();
+    const int c0 = x.counter[me];
+    const size_t ns = S.g.size();
+    for (size_t j = 0; j < ns; ++j) {
+        sycl::event ev = q_.ext_oneapi_graph(*S.g[j]);
+        if (j + 1 == ns) break;
+        const int k = S.slot[j];
+        if ((c0 + int(j)) % TPX::NS != k) throw std::runtime_error("segment replay: slot order");
+        g_tp_stage[me] = 1;
+        const auto t0 = std::chrono::steady_clock::now();
+        ev.wait();
+        const auto t1 = std::chrono::steady_clock::now();
+        g_tp_wait_ms[me][0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        ++g_tp_n[me];
+        std::memcpy(x.ib[peer][k], x.hb[me][k], S.n[j] * sizeof(float));
+        g_tp_stage[me] = 2;
+        x.bar.arrive_and_wait();
+        g_tp_wait_ms[me][1] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        g_tp_stage[me] = 3;
+        g_tp_progress = now_ms();
+    }
+    x.counter[me] = c0 + int(ns) - 1;
+}
+
 int Engine::step(int token, std::vector<float>* logits_out) {
     want_logits_ = logits_out != nullptr;
     if (pos_ >= limit_) throw std::runtime_error("context full");
@@ -1978,7 +2071,8 @@ int Engine::step(int token, std::vector<float>* logits_out) {
     if (replay) {
         q_.ext_oneapi_graph(*gexec_);
         if (world_ > 1) tpx_->mcount[rank_] += gex_;
-    } else run(1);
+    } else if (world_ > 1 && !logits_out) run_seg(1);
+    else run(1);
     if (logits_out) {
         logits_out->resize(c_.output_vocab);
         q_.memcpy(logits_out->data(), logits_, size_t(c_.output_vocab) * sizeof(float)).wait();
@@ -2125,7 +2219,13 @@ void Engine::run(int M) {
             rms(nb, M);
         }
         const int NA = Ly.NA, NB = Ly.NB, NC = Ly.NC;
-        if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && [&] {
+        if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && same && projAll_ && [&] {
+                // one input for all three segments (sliding visits): one launch over NA + NB + NC rows, then the three
+                // segments are views of the [M][NA + NB + NC] result
+                return i8_small(Ly.WpR, Ly.WpS, 0, NA + NB + NC, kp_, xpad_, projAll_, M);
+            }()) {
+            split_proj(NA, NB, NC, M);
+        } else if (i8v_ && M >= 2 && M <= 8 && Ly.WpR && [&] {
                 const uint16_t* xs[3] = {xpad_, same ? xpad_ : xpad_ + size_t(8) * kp_, same ? xpad_ : xpad_ + 2 * size_t(8) * kp_};
                 return i8_small(Ly.WpR, Ly.WpS, 0, NA, kp_, xs[0], projA_, M) && i8_small(Ly.WpR, Ly.WpS, NA, NB, kp_, xs[1], projB_, M) &&
                        i8_small(Ly.WpR, Ly.WpS, NA + NB, NC, kp_, xs[2], projC_, M);
@@ -2553,7 +2653,7 @@ void Engine::run(int M) {
             if (next_bank >= kMaxBankRows) throw std::runtime_error("bank rows exhausted");
             bank_row = BANK0 + next_bank++;
         }
-        static const bool rmn_off = std::getenv("INK_NO_RMN") != nullptr;
+        static const bool rmn_off = !std::getenv("INK_RMN");   // fused residual/mix/norm: opt-in (measured slower, not bit-identical)
         if (M == 1 && !rmn_off && h <= 3072 && c_.conv >= 2) {
             // fused residual + MLP mix (+ norm when no message gate follows)
             if (bank_row >= 0) bank.push_back(bank_row);

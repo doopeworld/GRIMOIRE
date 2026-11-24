@@ -239,7 +239,7 @@ sycl::event ink_xexp(sycl::queue& q, const InkXArgs& g) {
 // from L1 with one 2-D load per 32 K.  Groups from InkGroup: gi[0] = used experts, gi[1 + u] = expert id,
 // gi[129 + u] .. gi[130 + u] = its slots.  EPI 1: softcapped SwiGLU -> bf16 act [slot][Ne/2]; EPI 2: bf(out) as fp32.
 // ---------------------------------------------------------------------------------------------------------------
-namespace { template <int F, int EPI> class InkMoeSmE; }
+namespace { template <int F, int EPI, int KS> class InkMoeSmE; }
 struct InkSmArgs {
     const uint8_t* pay; const uint8_t* scl; int Ne, K, rows_total;
     const uint16_t* A; int slots;
@@ -252,7 +252,7 @@ struct InkSmArgs {
     int alu = 1;   // NVFP4 nibble decode: 1 ALU bit trick, 0 SLM table
     int own = -1;  // >= 0: every expert on this card; used expert u is this card's iff u % 2 == own
 };
-template <int F, int EPI>
+template <int F, int EPI, int KS>
 static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
     // 11-24 v2: weights decode to fp16 with NO per-weight arithmetic (NVFP4: byte -> fp16 pair from a 1 KB SLM table;
     // MXFP8: E4M3 byte -> fp16 bits = value x 2^-8), fp16 DPAS per 16-K (NVFP4) / 32-K (MXFP8) block, the block's
@@ -263,16 +263,17 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
     const int nG = g.Ne / (32 * TNT);
     return q.submit([&](sycl::handler& h) {
         const InkSmArgs a = g;
-        h.parallel_for<InkMoeSmE<F, EPI>>(sycl::nd_range<1>(size_t(a.U) * nG * TNT, TNT), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        h.parallel_for<InkMoeSmE<F, EPI, KS>>(sycl::nd_range<1>(size_t(a.U) * nG * TNT * KS, TNT * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
             namespace es = sycl::ext::intel::esimd;
             namespace xmx = sycl::ext::intel::esimd::xmx;
             using hf = sycl::half;
             using bfx = sycl::ext::oneapi::bfloat16;
             constexpr auto PFH = sycl::ext::oneapi::experimental::properties{es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
-            es::slm_init<1024>();
-            const int lid = int(it.get_local_id(0)), grp = int(it.get_group(0));
+            es::slm_init<1024 + (KS - 1) * TNT * 1024>();   // LUT, then the K-split partial sums
+            const int lid0 = int(it.get_local_id(0)), grp = int(it.get_group(0));
+            const int lid = lid0 % TNT, ks = lid0 / TNT;     // ks: this thread's K slice (KS threads per 32 columns)
             const int u = grp / nG, ng = grp % nG;
-            if (F == 0 && lid < 8) es::slm_block_store<uint32_t, 32>(lid * 128, es::block_load<uint32_t, 32>(a.lut + lid * 32));
+            if (F == 0 && lid0 < 8) es::slm_block_store<uint32_t, 32>(lid0 * 128, es::block_load<uint32_t, 32>(a.lut + lid0 * 32));
             if (F == 0) es::barrier();
             if (u >= a.gi[0]) return;
             const int e = a.gi[1 + u];
@@ -303,11 +304,12 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                 n0a = es::gather<uint32_t, 16>(sclw, so0); n0b = es::gather<uint32_t, 16>(sclw, so0 + 4u);
                 n1a = es::gather<uint32_t, 16>(sclw, so1); n1b = es::gather<uint32_t, 16>(sclw, so1 + 4u);
             };
-            if (F == 0 && whole && dbuf) load_step(0);
-            for (int k = 0; k < a.K; k += 128) {
+            const int KK = a.K / KS, kbeg = ks * KK, kend = kbeg + KK;
+            if (F == 0 && whole && dbuf) load_step(kbeg);
+            for (int k = kbeg; k < kend; k += 128) {
                 if (F == 0 && whole && dbuf) {
                     // fall through: the buffers are consumed below, then refilled after the copy
-                } else if (k + 128 < a.K) {
+                } else if (k + 128 < kend) {
                     if constexpr (F == 0) {
                         es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 128) / 8, rh0, PFH);
                         es::prefetch_2d<uint32_t, 16, 16>(payw, PW, PH, PP, (k + 128) / 8, rh1, PFH);
@@ -323,7 +325,7 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                 es::simd<uint32_t, 16> s0a, s0b, s1a, s1b;
                 if (F == 0 && whole && dbuf) {
                     st0 = nx0; st1 = nx1; s0a = n0a; s0b = n0b; s1a = n1a; s1b = n1b;
-                    if (k + 128 < a.K) load_step(k + 128);
+                    if (k + 128 < kend) load_step(k + 128);
                 } else {
                 if constexpr (F == 0) {
                     if (whole) {
@@ -429,6 +431,13 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
                     }
                 }
             }
+            if constexpr (KS > 1) {   // K-split partials meet in SLM, summed in slice order by the slice-0 thread
+                if (ks > 0) es::slm_block_store<float, 256>(1024u + unsigned((ks - 1) * TNT + lid) * 1024u, acc);
+                es::barrier();
+                if (ks > 0) return;
+#pragma unroll
+                for (int j = 1; j < KS; ++j) acc += es::slm_block_load<float, 256>(1024u + unsigned((j - 1) * TNT + lid) * 1024u);
+            }
             const unsigned OH = unsigned(p0 + np) - 1;   // rows past this expert's slots are clipped by the 2-D store
             if constexpr (EPI == 1) {
                 constexpr float L2E = 1.4426950408889634f;
@@ -481,6 +490,21 @@ static sycl::event ink_moe_small_impl(sycl::queue& q, const InkSmArgs& g) {
     });
 }
 sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int epi) {
-    if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1>(q, g) : ink_moe_small_impl<0, 2>(q, g);
-    return epi == 1 ? ink_moe_small_impl<1, 1>(q, g) : ink_moe_small_impl<1, 2>(q, g);
+    static const int ksel = [] { const char* e = std::getenv("INK_SM_KS"); return e ? std::atoi(e) : 3; }();
+    int ks = 1;
+    for (int c : {6, 3, 2}) if (c <= ksel && g.K % (128 * c) == 0) { ks = c; break; }
+    if (ks == 6) {
+        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 6>(q, g) : ink_moe_small_impl<0, 2, 6>(q, g);
+        return epi == 1 ? ink_moe_small_impl<1, 1, 6>(q, g) : ink_moe_small_impl<1, 2, 6>(q, g);
+    }
+    if (ks == 3) {
+        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 3>(q, g) : ink_moe_small_impl<0, 2, 3>(q, g);
+        return epi == 1 ? ink_moe_small_impl<1, 1, 3>(q, g) : ink_moe_small_impl<1, 2, 3>(q, g);
+    }
+    if (ks == 2) {
+        if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 2>(q, g) : ink_moe_small_impl<0, 2, 2>(q, g);
+        return epi == 1 ? ink_moe_small_impl<1, 1, 2>(q, g) : ink_moe_small_impl<1, 2, 2>(q, g);
+    }
+    if (fmt == 0) return epi == 1 ? ink_moe_small_impl<0, 1, 1>(q, g) : ink_moe_small_impl<0, 2, 1>(q, g);
+    return epi == 1 ? ink_moe_small_impl<1, 1, 1>(q, g) : ink_moe_small_impl<1, 2, 1>(q, g);
 }
