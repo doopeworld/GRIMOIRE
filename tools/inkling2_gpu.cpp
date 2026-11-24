@@ -60,6 +60,7 @@ struct InkAttnArgs {
     const uint16_t* bias;   // [M][H][E] bf16 = bf(sum_r rel[r] * table[r][d])
 };
 sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g);
+sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g);
 sycl::event ink_dense_bf16(sycl::queue& q, const uint16_t* W, int N, int K, const uint16_t* x, float* y, int M);
 struct InkXArgs {
     const uint8_t* codes; const uint8_t* scales;
@@ -2213,7 +2214,26 @@ void Engine::run(int M) {
                     for (int e = 0; e < 16; ++e) o[e] = tobf(b[e]);
                     *reinterpret_cast<sycl::vec<uint16_t, 16>*>(bs + mj * E + d0) = o;
                 });
-                ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
+                static const bool att_es = !std::getenv("INK_NO_ATTES");   // ESIMD flash (GRIMOIRE flash_esimd design)
+                static const bool att_cmp = std::getenv("INK_ATT_CMP") != nullptr;
+                if (att_es && att_cmp && D == 128 && cap % 16 == 0) {   // debug: ESIMD vs the joint_matrix kernel on the same inputs
+                    static int ncmp = 0;
+                    float* o2 = sycl::malloc_device<float>(size_t(M) * Q, q_);
+                    uint16_t* b2 = sycl::malloc_device<uint16_t>(size_t(M) * Q, q_);
+                    ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, o2, b2, Q, posd, M, bs});
+                    ink_attn_esimd(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
+                    q_.wait();
+                    std::vector<float> h1(size_t(M) * Q), h2(size_t(M) * Q);
+                    q_.memcpy(h1.data(), o2, h1.size() * 4).wait();
+                    q_.memcpy(h2.data(), aout, h2.size() * 4).wait();
+                    double md = 0, mx = 0; size_t nd = 0, worst = 0;
+                    for (size_t k = 0; k < h1.size(); ++k) { const double d = std::fabs(double(h1[k]) - h2[k]); if (d > md) { md = d; worst = k; } if (d > 0) ++nd; mx = std::max(mx, double(std::fabs(h1[k]))); }
+                    if (ncmp++ < 60) std::printf("attcmp visit %d sliding %d M %d: max|d| %.5f (max|ref| %.3f) at row %zu col %zu, %zu of %zu differ\n", vi, int(v.sliding), M, md, mx, worst / Q, worst % Q, nd, h1.size());
+                    sycl::free(o2, q_); sycl::free(b2, q_);
+                } else if (att_es && D == 128 && cap % 16 == 0)
+                    ink_attn_esimd(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
+                else
+                    ink_attn_prompt(q_, InkAttnArgs{pA, NA, oq, orel, osink, og, H, groups, E, table, kc, vc, cap, K, win, scale, aout, aoutb, Q, posd, M, bs});
             } else if (M >= 16) {
                 // prompt rows: a work-group = 16 consecutive query rows of one head (one sub-group each); every 16-key
                 // tile of K / V goes through SLM once for all 16 rows.  Same per-score arithmetic as the M <= 8 path.

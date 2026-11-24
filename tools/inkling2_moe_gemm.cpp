@@ -316,6 +316,14 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
             // all 32 bias values of this lane for a key block, loaded up front (independent loads, clamped index)
             float bv[TM][4];
             auto load_bias = [&](int k0) {
+                // whole block at distance >= E for every row of this sub-group: no bias (full layers, old keys)
+                if (base + m0 - (k0 + BN - 1) >= a.E) {
+#pragma unroll
+                    for (int r = 0; r < TM; ++r)
+#pragma unroll
+                        for (int c4 = 0; c4 < 4; ++c4) bv[r][c4] = 0.f;
+                    return;
+                }
 #pragma unroll
                 for (int r = 0; r < TM; ++r) {
                     const int m = sycl::min(m0 + r, a.M - 1);
@@ -328,50 +336,19 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
                     }
                 }
             };
-            float mx[TM], l[TM];
+            // single pass, online softmax (flash attention): running max m and sum l per row, the output rescaled only
+            // when a row's max grows; weights p = bf16(exp(s - m)) feed the matrix unit; sink and 1 / sum at the end
+            float m_[TM], l_[TM];
 #pragma unroll
-            for (int r = 0; r < TM; ++r) { mx[r] = -INFINITY; l[r] = 0.f; }
+            for (int r = 0; r < TM; ++r) { m_[r] = -INFINITY; l_[r] = 0.f; }
             const bool any = m0 < a.M;
-            fetch_kv(lo, false);
-            for (int k0 = lo; k0 <= hi; k0 += BN) {
-                sycl::group_barrier(grp);
-                store_kv(false);
-                sycl::group_barrier(grp);
-                if (k0 + BN <= hi) fetch_kv(k0 + BN, false);
-                if (!any) continue;
-                qk();
-#pragma unroll
-                for (int n = 0; n < BN / TN; ++n) matrix::joint_matrix_store(sg, s[n], pSf + n * TN, BN, matrix::layout::row_major);
-                load_bias(k0);
-                sycl::group_barrier(sg);
-#pragma unroll
-                for (int r = 0; r < TM; ++r) {
-                    const int m = m0 + r, pos = base + m;
-                    const int first = pos + 1 - sycl::min(pos + 1, a.win);
-#pragma unroll
-                    for (int c4 = 0; c4 < 4; ++c4) {
-                        const int col = c4 * 16 + lane, kp = k0 + col;
-                        if (m < a.M && kp >= first && kp <= pos) {
-                            const float sc = score(Sf[r * BN + col], bv[r][c4]);
-                            if (sc > mx[r]) { l[r] = l[r] * sycl::exp(mx[r] - sc) + 1.f; mx[r] = sc; } else l[r] += sycl::exp(sc - mx[r]);
-                        }
-                    }
-                }
-                sycl::group_barrier(sg);
-            }
-            float high[TM], sum[TM];
-#pragma unroll
-            for (int r = 0; r < TM; ++r) {
-                const int m = m0 + r;
-                const float gm = sycl::reduce_over_group(sg, mx[r], sycl::maximum<float>());
-                const float ls = sycl::reduce_over_group(sg, mx[r] == -INFINITY ? 0.f : l[r] * sycl::exp(mx[r] - gm), sycl::plus<float>());
-                const float sink = m < a.M ? bfr_(a.A[size_t(m) * a.NA + a.osink + j]) : 0.f;
-                high[r] = sycl::fmax(sink, gm);
-                sum[r] = sycl::exp(sink - high[r]) + ls * sycl::exp(gm - high[r]);
-            }
             matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN> o[D / TN];
 #pragma unroll
             for (int n = 0; n < D / TN; ++n) matrix::joint_matrix_fill(sg, o[n], 0.0f);
+            auto pick = [](const float (&v)[TM], int r) { float x = v[0];
+#pragma unroll
+                for (int k = 1; k < TM; ++k) if (r == k) x = v[k];
+                return x; };
             fetch_kv(lo, true);
             for (int k0 = lo; k0 <= hi; k0 += BN) {
                 sycl::group_barrier(grp);
@@ -384,22 +361,42 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
                 for (int n = 0; n < BN / TN; ++n) matrix::joint_matrix_store(sg, s[n], pSf + n * TN, BN, matrix::layout::row_major);
                 load_bias(k0);
                 sycl::group_barrier(sg);
-                float w[TM][4];
+                float alpha[TM];
+                bool grew = false;
 #pragma unroll
                 for (int r = 0; r < TM; ++r) {
                     const int m = m0 + r, pos = base + m;
                     const int first = pos + 1 - sycl::min(pos + 1, a.win);
+                    float sc4[4], bm = -INFINITY;
 #pragma unroll
                     for (int c4 = 0; c4 < 4; ++c4) {
                         const int col = c4 * 16 + lane, kp = k0 + col;
-                        w[r][c4] = (m < a.M && kp >= first && kp <= pos) ? bfr_(sycl::exp(score(Sf[r * BN + col], bv[r][c4]) - high[r]) / sum[r]) : 0.f;
+                        const bool ok = m < a.M && kp >= first && kp <= pos;
+                        sc4[c4] = ok ? score(Sf[r * BN + col], bv[r][c4]) : -INFINITY;
+                        bm = sycl::fmax(bm, sc4[c4]);
                     }
+                    bm = sycl::reduce_over_group(sg, bm, sycl::maximum<float>());
+                    const float mn = sycl::fmax(m_[r], bm);
+                    alpha[r] = (m_[r] == -INFINITY) ? 0.f : sycl::exp(m_[r] - mn);
+                    grew = grew || (mn > m_[r] && m_[r] != -INFINITY);
+                    float ps = 0.f, pw[4];
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) {
+                        pw[c4] = sc4[c4] == -INFINITY ? 0.f : bfr_(sycl::exp(sc4[c4] - mn));
+                        ps += pw[c4];
+                    }
+                    ps = sycl::reduce_over_group(sg, ps, sycl::plus<float>());
+                    // the weights' row r overlaps score rows <= r only, all read already (rows go in order)
+#pragma unroll
+                    for (int c4 = 0; c4 < 4; ++c4) Ps[r * BN + c4 * 16 + lane] = b70::f32_to_bf16(pw[c4]).bits;
+                    l_[r] = l_[r] * alpha[r] + ps;
+                    m_[r] = mn;
                 }
-                sycl::group_barrier(sg);   // all scores read before the bf16 weights overwrite them
+                if (grew) {
 #pragma unroll
-                for (int r = 0; r < TM; ++r)
-#pragma unroll
-                    for (int c4 = 0; c4 < 4; ++c4) Ps[r * BN + c4 * 16 + lane] = b70::f32_to_bf16(w[r][c4]).bits;
+                    for (int n = 0; n < D / TN; ++n)
+                        ix::joint_matrix_apply(sg, o[n], [&](float& x, size_t r, size_t) { x *= pick(alpha, int(r)); });
+                }
                 sycl::group_barrier(sg);
 #pragma unroll
                 for (int kk = 0; kk < BN / TKB; ++kk) {
@@ -414,12 +411,22 @@ sycl::event ink_attn_prompt(sycl::queue& q, const InkAttnArgs& g) {
                 }
             }
             if (!any) return;
+            // the sink joins the softmax: out = o * exp(m - mf) / (l * exp(m - mf) + exp(sink - mf))
+            float fin[TM];
+#pragma unroll
+            for (int r = 0; r < TM; ++r) {
+                const int m = m0 + r;
+                const float sink = m < a.M ? bfr_(a.A[size_t(m) * a.NA + a.osink + j]) : 0.f;
+                const float mf = sycl::fmax(m_[r], sink);
+                const float em = m_[r] == -INFINITY ? 0.f : sycl::exp(m_[r] - mf);
+                fin[r] = em / (l_[r] * em + sycl::exp(sink - mf));
+            }
 #pragma unroll
             for (int n = 0; n < D / TN; ++n)
                 ix::joint_matrix_apply(sg, o[n], [&](float& x, size_t r, size_t c) {
                     const int m = m0 + int(r), col = n * TN + int(c);
                     if (m < a.M) {
-                        const float ov = bfr_(bfr_(x) * sigm_(bfr_(a.A[size_t(m) * a.NA + a.og + j * D + col])));
+                        const float ov = bfr_(bfr_(x * pick(fin, int(r))) * sigm_(bfr_(a.A[size_t(m) * a.NA + a.og + j * D + col])));
                         a.aout[size_t(m) * a.Q + j * D + col] = ov;
                         a.aoutb[size_t(m) * a.Q + j * D + col] = b70::f32_to_bf16(ov).bits;
                     }
@@ -850,4 +857,186 @@ sycl::event ink_moe_nv_esimd(sycl::queue& q, const InkNvEsArgs& g) {
                                                es::simd<float, 128>(acc.template select<128, 1>((rb * 2 + hh) * 128)));
         });
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Prompt attention, ESIMD flash (the design of GRIMOIRE's flash_esimd, src/gemm_fast.cpp): one hardware thread owns
+// 8 query rows of one head; Q (8 x 128 bf16) stays in registers, K^T / V tiles come straight from the [cap][K] bf16
+// cache with 2-D block loads (K transposed, V VNNI-transformed; no SLM, no barrier), scores and probabilities stay in
+// registers (DPAS 8 x 16 accumulators), O (8 x 128 fp32) is rescaled per row (online softmax, exp2).  Inkling's score
+// = bf(bf(bf(q.k) * scale) + bias[distance]) with the precomputed bf16 bias (InkBias), the sink joins the softmax at
+// the end, output = bf(bf(o / sum) * sigmoid(bf(gate))) as ink_attn_prompt.  TPW threads = TPW row tiles of one head.
+// ---------------------------------------------------------------------------------------------------------------
+namespace { inline int imin_(int x, int y) { return x < y ? x : y; } }
+namespace { template <int BK, int TPW> class InkAttE; }
+template <int BK, int TPW>
+static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
+    constexpr int RB = 8, D = 128, DT = D / 16, NB = BK / 16;
+    const int tiles = (g.M + RB - 1) / RB, nrb = (tiles + TPW - 1) / TPW;
+    return q.submit([&](sycl::handler& h) {
+        const InkAttnArgs a = g;
+        h.parallel_for<InkAttE<BK, TPW>>(sycl::nd_range<1>(size_t(nrb) * a.H * TPW, TPW), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            using bfx = sycl::ext::oneapi::bfloat16;
+            constexpr float NINF = -std::numeric_limits<float>::infinity();
+            constexpr float LOG2E = 1.4426950408889634f;
+            const int gi = int(it.get_group(0)), lt = int(it.get_local_id(0));
+            const int rb = nrb - 1 - gi / a.H, j = gi % a.H;            // heaviest row blocks first
+            const int r0 = (rb * TPW + lt) * RB;
+            if (r0 >= a.M) return;
+            const int base = *a.posd;
+            const int rl = imin_(a.M - 1, r0 + RB - 1);
+            const int p0 = base + r0, pl = base + rl;
+            const int first0 = p0 + 1 - imin_(p0 + 1, a.win);
+            const int firstl = pl + 1 - imin_(pl + 1, a.win);
+            const int klo = first0 & ~15, khi = pl;
+            const int hd = (j / a.groups) * D;
+            const unsigned AW = unsigned(a.NA) * 4 - 1, AH = unsigned(a.M) - 1;
+            es::simd<bfx, RB * D> qv;                                    // [dt][8 rows][16]
+#pragma unroll
+            for (int dt = 0; dt < DT; ++dt)
+                qv.template select<128, 1>(dt * 128) = es::simd<bfx, 128>(es::load_2d<float, 16, 8>(a.A, AW, AH, AW, a.oq + j * D + dt * 16, r0));
+            const uint32_t* kw = reinterpret_cast<const uint32_t*>(a.kc);
+            const uint16_t* vw = a.vc;
+            const unsigned KB = unsigned(a.K) * 2 - 1;
+            es::simd<float, RB * D> o = 0.0f;                            // [dt][8][16]
+            es::simd<float, RB> mrow = NINF, lrow = 0.0f;
+            const es::simd<int, 16> col(0, 1);
+            for (int s0 = klo; s0 <= khi; s0 += BK) {
+                es::simd<float, NB * RB * 16> sc = 0.0f;                 // [b][8][16]
+#pragma unroll
+                for (int b = 0; b < NB; ++b) {
+                    const int kc0 = s0 + b * 16;
+                    if (kc0 <= khi) {
+                        const int row = kc0 % a.cap;
+                        const unsigned hgt = unsigned(kc0 + 15 <= khi ? a.cap : row + (khi - kc0) + 1) - 1;   // rows past khi read as 0
+#pragma unroll
+                        for (int dt = 0; dt < DT; ++dt) {
+                            es::simd<uint32_t, 128> kt = es::load_2d<uint32_t, 8, 16, 1, true, false>(kw, KB, hgt, KB, (hd + dt * 16) / 2, row);
+                            sc.template select<128, 1>(b * 128) = xmx::dpas<8, 8, float, float, bfx, bfx>(
+                                es::simd<float, 128>(sc.template select<128, 1>(b * 128)), es::simd<bfx, 256>(kt.template bit_cast_view<bfx>()),
+                                es::simd<bfx, 128>(qv.template select<128, 1>(dt * 128)));
+                        }
+                    }
+                }
+                const bool nobias = p0 - (s0 + BK - 1) >= a.E;
+                const bool needmask = (s0 + BK - 1 > p0) || (s0 < firstl) || (r0 + RB > a.M);
+#pragma unroll
+                for (int b = 0; b < NB; ++b)
+#pragma unroll
+                    for (int r = 0; r < RB; ++r) {
+                        const int kc0 = s0 + b * 16;
+                        es::simd<float, 16> v = sc.template select<16, 1>((b * RB + r) * 16);
+                        v = es::simd<float, 16>(es::simd<bfx, 16>(v));
+                        v = es::simd<float, 16>(es::simd<bfx, 16>(v * a.scale));
+                        const int m = imin_(r0 + r, a.M - 1), pos = base + m;
+                        if (!nobias) {
+                            const es::simd<int, 16> dist = (pos - kc0) - col;
+                            const es::simd<int, 16> dc = es::max(es::min(dist, es::simd<int, 16>(a.E - 1)), es::simd<int, 16>(0));
+                            const es::simd<uint32_t, 16> off = (es::simd<uint32_t, 16>(dc) + unsigned((m * a.H + j) * a.E)) * 2u;
+                            es::simd<uint16_t, 16> bw = es::gather<uint16_t, 16>(a.bias, off);
+                            es::simd<uint32_t, 16> bu = es::simd<uint32_t, 16>(bw) << 16;
+                            es::simd<float, 16> bf = bu.template bit_cast_view<float>().read();
+                            bf.merge(es::simd<float, 16>(0.0f), (dist < 0) | (dist >= a.E));
+                            v = es::simd<float, 16>(es::simd<bfx, 16>(v + bf));
+                        }
+                        if (needmask) {
+                            if (r0 + r >= a.M) v = NINF;
+                            else {
+                                const int first = pos + 1 - imin_(pos + 1, a.win);
+                                const es::simd<int, 16> kp = col + kc0;
+                                v.merge(es::simd<float, 16>(NINF), (kp > pos) | (kp < first));
+                            }
+                        }
+                        sc.template select<16, 1>((b * RB + r) * 16) = v;
+                    }
+                es::simd<float, RB> bm;
+#pragma unroll
+                for (int r = 0; r < RB; ++r) {
+                    es::simd<float, 16> v = sc.template select<16, 1>(r * 16);
+#pragma unroll
+                    for (int b = 1; b < NB; ++b) v = es::max(v, es::simd<float, 16>(sc.template select<16, 1>((b * RB + r) * 16)));
+                    bm[r] = es::hmax<float>(v);
+                }
+                es::simd<float, RB> mn = es::max(mrow, bm), ms = mn;
+                ms.merge(es::simd<float, RB>(0.0f), mn == NINF);
+                es::simd<float, RB> corr = es::exp2((mrow - ms) * LOG2E), rs;
+#pragma unroll
+                for (int r = 0; r < RB; ++r) {
+                    const float msr = ms[r];
+                    es::simd<float, 16> sum = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        es::simd<float, 16> p = es::exp2((es::simd<float, 16>(sc.template select<16, 1>((b * RB + r) * 16)) - msr) * LOG2E);
+                        p = es::simd<float, 16>(es::simd<bfx, 16>(p));   // the weight the matrix unit sees
+                        sc.template select<16, 1>((b * RB + r) * 16) = p;
+                        sum += p;
+                    }
+                    rs[r] = es::reduce<float>(sum, std::plus<>());
+                }
+                lrow = lrow * corr + rs;
+                mrow = mn;
+                float cr[RB];
+#pragma unroll
+                for (int r = 0; r < RB; ++r) cr[r] = corr[r];
+#pragma unroll
+                for (int dt = 0; dt < DT; ++dt)
+#pragma unroll
+                    for (int r = 0; r < RB; ++r) o.template select<16, 1>((dt * RB + r) * 16) *= cr[r];
+                es::simd<bfx, NB * RB * 16> pb = sc;
+#pragma unroll
+                for (int b = 0; b < NB; ++b) {
+                    const int kc0 = s0 + b * 16;
+                    if (kc0 <= khi) {
+                        const int row = kc0 % a.cap;
+                        const unsigned hgt = unsigned(kc0 + 15 <= khi ? a.cap : row + (khi - kc0) + 1) - 1;
+#pragma unroll
+                        for (int dt = 0; dt < DT; dt += 2) {
+                            es::simd<uint16_t, 512> vv = es::load_2d<uint16_t, 16, 16, 2, false, true>(vw, KB, hgt, KB, hd + dt * 16, row);
+#pragma unroll
+                            for (int u = 0; u < 2; ++u)
+                                o.template select<128, 1>((dt + u) * 128) = xmx::dpas<8, 8, float, float, bfx, bfx>(
+                                    es::simd<float, 128>(o.template select<128, 1>((dt + u) * 128)),
+                                    es::simd<bfx, 256>(vv.template select<256, 1>(u * 256).template bit_cast_view<bfx>()),
+                                    es::simd<bfx, 128>(pb.template select<128, 1>(b * 128)));
+                        }
+                    }
+                }
+            }
+            // sink (log2 units) joins the softmax; then the output gate
+            const es::simd<int, RB> ri(0, 1);
+            const es::simd<int, RB> mr = es::min(ri + r0, es::simd<int, RB>(a.M - 1));
+            const es::simd<uint32_t, RB> soff = (es::simd<uint32_t, RB>(mr) * unsigned(a.NA) + unsigned(a.osink + j)) * 4u;
+            es::simd<float, RB> sk = es::gather<float, RB>(a.A, soff);
+            sk = es::simd<float, RB>(es::simd<bfx, RB>(sk));
+            const es::simd<float, RB> mf = es::max(mrow, sk);
+            const es::simd<float, RB> em = es::exp2((mrow - mf) * LOG2E);
+            const es::simd<float, RB> fin = em / (lrow * em + es::exp2((sk - mf) * LOG2E));
+            float fr[RB];
+#pragma unroll
+            for (int r = 0; r < RB; ++r) fr[r] = fin[r];
+            const unsigned OW = unsigned(a.Q) * 4 - 1, OB = unsigned(a.Q) * 2 - 1;
+#pragma unroll
+            for (int dt = 0; dt < DT; ++dt) {
+                es::simd<float, 128> gt = es::load_2d<float, 16, 8>(a.A, AW, AH, AW, a.og + j * D + dt * 16, r0);
+                gt = es::simd<float, 128>(es::simd<bfx, 128>(gt));
+                const es::simd<float, 128> sg = 1.0f / (1.0f + es::exp2(gt * -LOG2E));
+                es::simd<float, 128> ov = o.template select<128, 1>(dt * 128);
+#pragma unroll
+                for (int r = 0; r < RB; ++r) ov.template select<16, 1>(r * 16) = ov.template select<16, 1>(r * 16) * fr[r];
+                ov = es::simd<float, 128>(es::simd<bfx, 128>(ov));
+                ov = es::simd<float, 128>(es::simd<bfx, 128>(ov * sg));
+                es::store_2d<float, 16, 8>(a.aout, OW, AH, OW, j * D + dt * 16, r0, ov);
+                es::simd<bfx, 128> ob(ov);
+                es::store_2d<uint16_t, 16, 8>(a.aoutb, OB, AH, OB, j * D + dt * 16, r0, ob.template bit_cast_view<uint16_t>().read());
+            }
+        });
+    });
+}
+sycl::event ink_attn_esimd(sycl::queue& q, const InkAttnArgs& g) {
+    static const int tpw = [] { const char* e = std::getenv("INK_ATT_TPW"); return e ? std::atoi(e) : 8; }();
+    static const int bk = [] { const char* e = std::getenv("INK_ATT_BK"); return e ? std::atoi(e) : 64; }();
+    if (bk == 32) return tpw == 16 ? ink_attn_es_impl<32, 16>(q, g) : ink_attn_es_impl<32, 8>(q, g);
+    return tpw == 16 ? ink_attn_es_impl<64, 16>(q, g) : ink_attn_es_impl<64, 8>(q, g);
 }
