@@ -95,3 +95,28 @@ other card 3.3 ms (experts split by id are unbalanced per visit) + ~5 ms host ro
 Verify GPU work per card: experts ~10 ms (~330 GB/s), small M=8 kernels ~6 ms (not split), attention 2.2, dense 1.8.
 Next, in order: experts replicated on both cards + used experts split by parity; exchange straight into the
 peer's slot; M=8 small-kernel fusion; faster verify expert kernel.
+
+## 11-24 evening, continued (commits 11bb39f .. 1077102)
+
+| two B70 (measured) | value |
+|---|---|
+| MTP code2 (code answer) | **251 tok/s**, 6.08 tok/step, 24.2 ms/step (draft 2.6, verify ~21.4) |
+| MTP chat1 (384 tok) | **132 tok/s**, 3.17 tok/step, 24.0 ms/step |
+| plain decode | 92-94 tok/s |
+| one B70: MTP code2 / plain | 177 tok/s (33.3 ms/step) / 79 |
+
+What moved it (each measured, flags = the old path):
+- every expert on both cards, used experts split by parity (INK_NO_EPREP): cards wait less on each other;
+- verify attention on the ESIMD flash kernel, 32/64-key slices + merge (INK_OLD_ATTB, INK_NO_ATTSPLIT, INK_ATT_CHUNK);
+- verify experts K-split 6, interleaved slices on two cards (GRIMOIRE int4_smallm ilv), parity grid (INK_SM_KS);
+- INT8 drafter layers + head, drafter vocabulary split across the cards (INK_DRAFT_BF16, INK_DRAFT_FULL);
+- ESIMD DPAS gate blend (INK_NO_BLENDE); bias table inside InkPost (INK_SEP_BIAS); verify ring inputs stored
+  by InkPost / InkResid / InkMlpConv (INK_SEP_HISTV); graph chains split at the exchanges (INK_NO_SEG);
+  exchange partial copied straight into the peer's slot (INK_SEG_HOSTCOPY); decode add folded (INK_SEP_ADD).
+- Tried and slower / no gain: fused top-k + grouping work-group (INK_ROUTEGRP), 128-GRF verify experts with the
+  bf16 decode, L1 prefetch two steps ahead (INK_SM_PF2), spin-wait on segment events (INK_SEG_SPIN),
+  folding the exchange add into 8-row verify kernels (4 PCIe reads a value).
+- Bug caught by the forced-wrong-drafts check: folded ring store fell through to the prompt ring update.
+Two-card verify step per card: experts ~9 ms (~380 GB/s), INT8 small-M ~2.2, attention ~1, ~5 ms of small
+kernels that do not shrink with two cards, ~2.5 ms idle at 96 exchanges. 300 tok/s on code needs ~20 ms/step.
+Hardware counters (unitrace -q) fail in the container (metric init assertion).
