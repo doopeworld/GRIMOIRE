@@ -12,6 +12,7 @@
 #include "b70/inkling2.hpp"
 #include "b70/formats.hpp"
 #include "b70/weights.hpp"
+#include "b70/imatrix.hpp"
 #include "kernels.hpp"
 #include "inkling2_sycl.hpp"
 
@@ -40,7 +41,7 @@ using bf16x = sycl::ext::oneapi::bfloat16;
 template <int M> class InkGemv;
 class InkMix; class InkRms; class InkGateCat; class InkGateBlend; class InkEmbed; class InkPost; class InkAtt1; class InkAtt2;
 class InkAttB; class InkAtt3; class InkResid; class InkTopk; class InkMlpConv; class InkArg1; class InkArg2; class InkPos; class InkGu; class InkDown;
-class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
+class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; class InkGateLow; class InkRouteTopk; class InkAddRoundH; class InkMixS; class InkBias; class InkHist; class InkGather; class InkCombine; class InkDqNv; class InkDqMx; class InkActP; class InkOutB; class InkLowB; class InkGateBlendM; class InkAttT; class InkAddRound; class InkPartial;
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
@@ -226,6 +227,7 @@ private:
     float* elist_ = nullptr;
     uint16_t* bias_ = nullptr;
     uint32_t* xlut_ = nullptr;   // ink_xexp byte tables
+    int* route_cnt_ = nullptr;    // fused router: finished work-groups (reset by the last)
     float* tbl_d_ = nullptr;
     void allreduce(float* buf, size_t n);  // buf = bf(buf + peer's buf), both cards same bits
     int final_token(int m = 0);
@@ -277,6 +279,10 @@ private:
     uint16_t *xpad_ = nullptr, *xpadU_ = nullptr;   // padded bf16 inputs [3][8][kp_], [8][kp_]
     Q4 un4_;
     Q4 quant4(const uint16_t* src, int N, int K);
+    // INK_IMATRIX=<gguf>: importance per input channel (llama.cpp imatrix) for the INT4 rounding; parts = row counts
+    // with their GGUF tensor name ("" = none)
+    Q4 quant4(const uint16_t* src, int N, int K, const std::vector<std::pair<int, std::string>>& parts);
+    std::unique_ptr<b70::ImportanceMatrix> imx_;
     bool i4_gemv(const Q4& w, int r0, int n, const uint16_t* X, float* Y, int M);
     template <int MODE> void gemvt(const uint16_t* T, int N, int K, int KS, const float* x0, float* y0, int end0, const float* x1, float* y1, int end1,
                                    const float* x2, float* y2);
@@ -294,6 +300,7 @@ private:
                                   const float* x2, float* y2, float cap = 0.f);
     void mix(const MixBatch& b, int M, int m0 = 0);
     void mix_small(const MixBatch& b, int M, int m0);
+    void resid_mix_norm(const uint16_t* aconv, float* ahist, int br, const MixJob& J, const uint16_t* nw, int nout);
     void rms(const NormBatch& b, int M, int m0 = 0);
     void gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M);
     void experts_decode(const Layer& Ly);
@@ -346,7 +353,7 @@ void Engine::load() {
         q_.memcpy(unembed_, src, size_t(vrows_) * h_ * 2).wait();
         unembedT_ = tiled(src, vrows_, h_);
         if (i8_) quant_tiled(unembedT_, vrows_, h_, unembedQ_, unembedS_);
-        if (i4_ && (i4parts_ & 4)) un4_ = quant4(src, vrows_, h_);
+        if (i4_ && (i4parts_ & 4)) un4_ = quant4(src, vrows_, h_, {{vrows_, "output.weight"}});
     }
     fnorm_ = up<uint16_t>(root + "norm.weight");
     oquery_ = up<float>(root + "attn_res.output_query");
@@ -386,7 +393,10 @@ void Engine::load() {
         q_.memcpy(Ly.Wp, stage.data(), stage.size() * 2).wait();
         Ly.WpT = tiled(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_);
         if (i8_) quant_tiled(Ly.WpT, Ly.NA + Ly.NB + Ly.NC, h_, Ly.WpQ, Ly.WpS);
-        if (i4_ && (i4parts_ & 1)) Ly.Wp4 = quant4(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_);
+        if (i4_ && (i4parts_ & 1)) {
+            const std::string b = "blk." + std::to_string(i) + ".";
+            Ly.Wp4 = quant4(stage.data(), Ly.NA + Ly.NB + Ly.NC, h_, {{Ly.NA, b + "attn_q.weight"}, {Ly.NB, b + "attn_k.weight"}, {Ly.NC, b + "attn_v.weight"}});
+        }
         {   // this card's columns of the attention output projection
             const uint16_t* src = reinterpret_cast<const uint16_t*>(host(t + "wo_ud.weight"));
             std::vector<uint16_t> wo(size_t(h_) * Qr);
@@ -395,7 +405,7 @@ void Engine::load() {
             q_.memcpy(Ly.Wo, wo.data(), wo.size() * 2).wait();
             Ly.WoT = tiled(wo.data(), h_, Qr);
             if (i8_) quant_tiled(Ly.WoT, h_, Qr, Ly.WoQ, Ly.WoS);
-            if (i4_ && (i4parts_ & 2)) Ly.Wo4 = quant4(wo.data(), h_, Qr);
+            if (i4_ && (i4parts_ & 2)) Ly.Wo4 = quant4(wo.data(), h_, Qr, {{h_, "blk." + std::to_string(i) + ".attn_output.weight"}});
         }
         Ly.Wr = up<uint16_t>(s + "mlp.gate.weight");
         Ly.WrT = tiled(reinterpret_cast<const uint16_t*>(host(s + "mlp.gate.weight")), c_.experts, h_);
@@ -502,6 +512,7 @@ void Engine::load() {
     act_ = dev_.zeros<float>(TK * c_.inter);
     dbuf_ = dev_.zeros<float>(TK * h_);
     logits_ = dev_.zeros<float>(std::max(c_.output_vocab, c_.vocab));
+    route_cnt_ = dev_.zeros<int>(16);
     if (i4_) { kp_ = (h_ + 511) / 512 * 512; xpad_ = dev_.zeros<uint16_t>(size_t(3) * 8 * kp_); xpadU_ = dev_.zeros<uint16_t>(size_t(8) * kp_); }
     bestv_ = dev_.zeros<float>(16);
     if (world_ > 1) {
@@ -591,8 +602,45 @@ uint16_t* Engine::tiled(const uint16_t* src, int N, int K) {
     return d;
 }
 
-Q4 Engine::quant4(const uint16_t* src, int N, int K) {
+Q4 Engine::quant4(const uint16_t* src, int N, int K) { return quant4(src, N, K, {{N, std::string()}}); }
+
+Q4 Engine::quant4(const uint16_t* src, int N, int K, const std::vector<std::pair<int, std::string>>& parts) {
     const int Kp = (K + 511) / 512 * 512;
+    if (!imx_ && std::getenv("INK_IMATRIX")) {
+        imx_ = std::make_unique<b70::ImportanceMatrix>();
+        std::string err;
+        if (!imx_->load(std::getenv("INK_IMATRIX"), err)) throw std::runtime_error("INK_IMATRIX: " + err);
+        std::printf("imatrix: %zu entries from %s\n", imx_->entries(), std::getenv("INK_IMATRIX"));
+    }
+    bool any = false;
+    for (auto& p : parts) any = any || (imx_ && !p.second.empty() && imx_->find(p.second, K, false));
+    if (any) {
+        // each part quantized with its own importance (K padded with zero importance), rows concatenated
+        std::vector<uint8_t> pay, sc, zz;
+        int64_t rb = 0; int rs = 0; int r0 = 0;
+        for (auto& p : parts) {
+            std::vector<float> f(size_t(p.first) * Kp, 0.f), imp(Kp, 0.f);
+            for (int n = 0; n < p.first; ++n)
+                for (int k = 0; k < K; ++k) f[size_t(n) * Kp + k] = bfw(src[size_t(r0 + n) * K + k]);
+            const float* iv = imx_ ? imx_->find(p.second, K) : nullptr;
+            if (iv) std::copy(iv, iv + K, imp.begin());
+            else std::fill(imp.begin(), imp.begin() + K, 1.f);
+            const b70::PackedWeight pw = b70::quantize(f.data(), p.first, Kp, b70::Fmt::INT4, imp.data());
+            rb = pw.row_bytes; rs = pw.row_scales;
+            pay.insert(pay.end(), pw.payload.begin(), pw.payload.end());
+            sc.insert(sc.end(), pw.scales_raw.begin(), pw.scales_raw.end());
+            zz.insert(zz.end(), pw.zeros.begin(), pw.zeros.end());
+            r0 += p.first;
+        }
+        if (r0 != N) throw std::runtime_error("quant4: parts do not cover the rows");
+        Q4 w;
+        w.N = N; w.K = Kp; w.rb = rb; w.rs = rs;
+        w.pay = dev_.alloc<uint8_t>(pay.size()); w.sc = dev_.alloc<uint16_t>(sc.size() / 2); w.z = dev_.alloc<uint8_t>(std::max<size_t>(zz.size(), 1));
+        q_.memcpy(w.pay, pay.data(), pay.size()); q_.memcpy(w.sc, sc.data(), sc.size());
+        if (!zz.empty()) q_.memcpy(w.z, zz.data(), zz.size());
+        q_.wait();
+        return w;
+    }
     std::vector<float> f(size_t(N) * Kp, 0.f);
     for (int n = 0; n < N; ++n)
         for (int k = 0; k < K; ++k) f[size_t(n) * Kp + k] = bfw(src[size_t(n) * K + k]);
@@ -833,6 +881,100 @@ void Engine::dense(const uint16_t* W, int N, int K, const float* x, size_t ldx, 
     }
 }
 
+// M = 1: residual = sconv(z) (+ hidden, or a bank push of hidden), the MLP bank mix and, when nout >= 0, its norm --
+// one work-group, three launches' work (InkResid + InkMixS + InkRms).  A thread writes RES / the bank row for its own
+// elements and reads only those back, and every reduction runs in the separate kernels' order: same bits.
+void Engine::resid_mix_norm(const uint16_t* aconv, float* ahist, int br, const MixJob& J, const uint16_t* nw, int nout) {
+    float* pool = pool_;
+    const int h = h_;
+    const size_t RS = rs_;
+    const float f = 1.f / std::sqrt(float(h));
+    const int* posd = pos_d_;
+    const int taps = c_.conv;
+    const float cs = 1.f / std::sqrt(float(1 + c_.conv)), eps = c_.eps;
+    q_.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(64 * 2 * kMixRows), cgh);
+        sycl::local_accessor<float, 1> tot(sycl::range<1>(2 * kMixRows), cgh);
+        cgh.parallel_for<InkRMN>(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int lid = int(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const int sgid = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+            const int pos = *posd;
+            // residual (InkResid, M = 1)
+            for (int ch = lid; ch < h; ch += 1024) {
+                const float* zr = pool + size_t(Z) * RS;
+                const float x = bfr(zr[ch]);
+                float sum = 0.f;
+                for (int lag = 0; lag <= sycl::min(pos, taps - 1); ++lag) {
+                    const float xl = lag == 0 ? x : ahist[size_t((pos - lag) % (taps - 1)) * h + ch];
+                    sum += xl * bfw(aconv[ch * taps + taps - 1 - lag]);
+                }
+                const float out = bfr((x + sum) * cs);
+                ahist[size_t(pos % (taps - 1)) * h + ch] = x;
+                const float hid = pool[size_t(HID) * RS + ch];
+                if (br >= 0) { pool[size_t(br) * RS + ch] = hid; pool[size_t(RES) * RS + ch] = out; }
+                else pool[size_t(RES) * RS + ch] = out + hid;
+            }
+            // bank mix (InkMixS)
+            const int n = J.n;
+            float ss[kMixRows], qd[kMixRows];
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r) { ss[r] = 0.f; qd[r] = 0.f; }
+            for (int i = lid; i < h; i += 1024) {
+                const float qv = J.query[i];
+#pragma unroll
+                for (int r = 0; r < kMixRows; ++r)
+                    if (r < n) { const float v = pool[size_t(J.rows[r]) * RS + i]; ss[r] = sycl::fma(v, v, ss[r]); qd[r] = sycl::fma(qv, v, qd[r]); }
+            }
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) {
+                    const float a = sycl::reduce_over_group(sg, ss[r], sycl::plus<float>());
+                    const float c = sycl::reduce_over_group(sg, qd[r], sycl::plus<float>());
+                    if (lane == 0) { red[sgid * 2 * kMixRows + r] = a; red[sgid * 2 * kMixRows + kMixRows + r] = c; }
+                }
+            sycl::group_barrier(it.get_group());
+            if (lid < 2 * kMixRows) { float t = 0.f; for (int g = 0; g < 64; ++g) t += red[g * 2 * kMixRows + lid]; tot[lid] = t; }
+            sycl::group_barrier(it.get_group());
+            float inv[kMixRows], sc[kMixRows];
+            float high = -INFINITY;
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) { inv[r] = 1.f / sycl::sqrt(tot[r] / float(h) + 1e-6f); sc[r] = tot[kMixRows + r] * inv[r] * f; high = sycl::fmax(high, sc[r]); }
+            float sum = 0.f;
+#pragma unroll
+            for (int r = 0; r < kMixRows; ++r)
+                if (r < n) { sc[r] = sycl::exp(sc[r] - high); sum += sc[r]; }
+            float* out = pool + size_t(J.out) * RS;
+            float o3[3];
+            float nss = 0.f;
+#pragma unroll
+            for (int t = 0; t < 3; ++t) {
+                const int i = lid + t * 1024;
+                o3[t] = 0.f;
+                if (i >= h) continue;
+                float o = 0.f;
+#pragma unroll
+                for (int r = 0; r < kMixRows; ++r)
+                    if (r < n) o += (pool[size_t(J.rows[r]) * RS + i] * inv[r]) * (sc[r] / sum);
+                out[i] = o;
+                o3[t] = o;
+                nss += o * o;
+            }
+            if (nout < 0) return;
+            // its norm (InkRms, M = 1: the same per-thread sum and group reduction)
+            nss = sycl::reduce_over_group(it.get_group(), nss, sycl::plus<float>());
+            const float rr = 1.f / sycl::sqrt(nss / float(h) + eps);
+            float* y = pool + size_t(nout) * RS;
+#pragma unroll
+            for (int t = 0; t < 3; ++t) {
+                const int i = lid + t * 1024;
+                if (i < h) y[i] = bfr((o3[t] * rr) * bfw(nw[i]));
+            }
+        });
+    });
+}
+
 void Engine::mix_small(const MixBatch& b, int M, int m0) {
     float* pool = pool_;
     const int h = h_;
@@ -993,6 +1135,31 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
     const int h = h_, rank = c_.gate_rank, MM = mmax_;
     const size_t RS = rs_;
     const float eps = c_.eps;
+    static const bool old_gates = std::getenv("INK_OLD_GATES") != nullptr;
+    if (M == 1 && !old_gates && b.count <= 3) {
+        // decode: low[j][r] = bf(cdown[r] . [bf(cur * ir), bf(msg * im)]) -- one 256-thread work-group per output row,
+        // each recomputing the two norms exactly as InkGateCat (same per-thread order and group reduction): one
+        // launch over rank x jobs work-groups instead of InkGateCat (one work-group a job) + a 4-work-group GEMV
+        struct CD { const uint16_t* w[3]; } cd{};
+        for (int j = 0; j < b.count; ++j) cd.w[j] = Ly.cdown[ctrl[j]];
+        q_.parallel_for<InkGateLow>(sycl::nd_range<1>(size_t(b.count) * rank * 256, 256), [=](sycl::nd_item<1> it) {
+            const int gi = int(it.get_group(0)), jb = gi / rank, r = gi % rank;
+            const GateJob& J = b.j[jb];
+            const int lid = int(it.get_local_id(0));
+            const float* cur = pool + size_t(J.cur) * RS;
+            const float* msg = pool + size_t(J.msg) * RS;
+            float sc = 0.f, sm = 0.f;
+            for (int i = lid; i < h; i += 256) { sc += cur[i] * cur[i]; sm += msg[i] * msg[i]; }
+            sc = sycl::reduce_over_group(it.get_group(), sc, sycl::plus<float>());
+            sm = sycl::reduce_over_group(it.get_group(), sm, sycl::plus<float>());
+            const float ir = 1.f / sycl::sqrt(sc / float(h) + eps), im = 1.f / sycl::sqrt(sm / float(h) + eps);
+            const uint16_t* wr = cd.w[jb] + size_t(r) * 2 * h;
+            float acc = 0.f;
+            for (int i = lid; i < h; i += 256) acc += bfr(cur[i] * ir) * bfw(wr[i]) + bfr(msg[i] * im) * bfw(wr[h + i]);
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (lid == 0) low[size_t(jb) * MM * rank + r] = bfr(acc);
+        });
+    } else {
     q_.parallel_for<InkGateCat>(sycl::nd_range<1>(size_t(b.count) * M * 256, 256), [=](sycl::nd_item<1> it) {
         const int gi = int(it.get_group(0)), jb = gi / M, m = gi % M;
         const GateJob& J = b.j[jb];
@@ -1018,6 +1185,7 @@ void Engine::gates(const GateBatch& b, const Layer& Ly, const int* ctrl, int M) 
             gemvtm<0>(Ly.cdownT[ctrl[j]], rank, 2 * h, 32, M, xj, xj, xj, 2 * h, low + size_t(j) * MM * rank, rank, rank, nullptr, 0, rank, nullptr, 0, rank);
         }
         else dense(Ly.cdown[ctrl[j]], rank, 2 * h, xcat + size_t(j) * MM * 2 * h, 2 * h, xcatb + size_t(j) * MM * 2 * h, low + size_t(j) * MM * rank, rank, M, true);
+    }
     if (M >= 32) {
         // prompt rows: gain / forget as two GEMMs over the BF16-rounded low rows (K = rank), then an elementwise blend
         if (!gate_g_) { gate_g_ = dev_.alloc<float>(size_t(MM) * h); gate_f_ = dev_.alloc<float>(size_t(MM) * h); lowb_ = dev_.alloc<uint16_t>(size_t(MM) * rank); }
@@ -2137,6 +2305,22 @@ void Engine::run(int M) {
             if (next_bank >= kMaxBankRows) throw std::runtime_error("bank rows exhausted");
             bank_row = BANK0 + next_bank++;
         }
+        static const bool rmn_off = std::getenv("INK_NO_RMN") != nullptr;
+        if (M == 1 && !rmn_off && h <= 3072 && c_.conv >= 2) {
+            // fused residual + MLP mix (+ norm when no message gate follows)
+            if (bank_row >= 0) bank.push_back(bank_row);
+            resid_mix_norm(Ly.aconv, sl.ahist, bank_row, job(bank, RES, Ly.mq, XM), Ly.nm, v.has_message ? -1 : NM);
+            int xm = XM;
+            if (v.has_message) {
+                GateBatch gb{};
+                int ctrl[1] = {3};
+                gb.j[0] = GateJob{XM, M3, GM, Ly.cgain[3], Ly.cforget[3]};
+                gb.count = 1;
+                gates(gb, Ly, ctrl, M);
+                xm = GM;
+                NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, nullptr}; nb.count = 1; rms(nb, M);
+            }
+        } else {
         {   // residual = sconv(z); bank push or + hidden
             const uint16_t* w = Ly.aconv;
             float* hist = sl.ahist;
@@ -2175,9 +2359,68 @@ void Engine::run(int M) {
             xm = GM;
         }
         { NormBatch nb{}; nb.j[0] = NormJob{xm, Ly.nm, NM, M >= 2 ? nmb_ : nullptr}; nb.count = 1; rms(nb, M); }
+        }
         mark(3);
         // router: sigmoid scores, top-k by score + bias, weights = scale * score / sum, sorted by expert id
-        if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
+        static const bool old_route = std::getenv("INK_OLD_ROUTE") != nullptr;
+        const bool fused_route = M == 1 && !old_route && c_.experts <= 128;
+        if (fused_route) {
+            // decode: one 256-thread work-group per expert computes its logit; the last work-group to finish (device
+            // counter) does InkTopk's selection -- one launch instead of an 8-work-group GEMV + a top-k kernel
+            const uint16_t* Wr = Ly.Wr;
+            const float* x = row(NM);
+            float* lg = rlog_;
+            const float* bias = Ly.rbias;
+            int* sel = sel_;
+            float* wts = wts_;
+            int* cnt = route_cnt_;
+            const int En = c_.experts, TK = c_.top_k;
+            const float rscale = c_.route_scale;
+            q_.submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> key(sycl::range<1>(128), cgh), score(sycl::range<1>(128), cgh);
+                sycl::local_accessor<int, 1> byrank(sycl::range<1>(16), cgh);
+                sycl::local_accessor<float, 1> total(sycl::range<1>(1), cgh);
+                sycl::local_accessor<int, 1> last(sycl::range<1>(1), cgh);
+                cgh.parallel_for<InkRouteTopk>(sycl::nd_range<1>(size_t(En) * 256, 256), [=](sycl::nd_item<1> it) {
+                    auto g = it.get_group();
+                    const int ex = int(it.get_group(0)), lid = int(it.get_local_id(0));
+                    const uint16_t* wr = Wr + size_t(ex) * h;
+                    float acc = 0.f;
+                    for (int i = lid; i < h; i += 256) acc += bfw(wr[i]) * x[i];
+                    acc = sycl::reduce_over_group(g, acc, sycl::plus<float>());
+                    if (lid == 0) {
+                        lg[ex] = acc;
+                        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                        sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space> c(*cnt);
+                        last[0] = c.fetch_add(1) == En - 1 ? 1 : 0;
+                    }
+                    sycl::group_barrier(g);
+                    if (!last[0]) return;
+                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                    const int e = lid;
+                    if (e < En) {
+                        const float lv = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(lg[e]).load();
+                        const float sc = sigm(lv); score[e] = sc; key[e] = sc + bias[e];
+                    }
+                    sycl::group_barrier(g);
+                    int rank = 1 << 30;
+                    if (e < En) {
+                        rank = 0;
+                        for (int f = 0; f < En; ++f) rank += (key[f] > key[e] || (key[f] == key[e] && f < e)) ? 1 : 0;
+                        if (rank < TK) byrank[rank] = e;
+                    }
+                    sycl::group_barrier(g);
+                    if (e == 0) { float s2 = 0.f; for (int r2 = 0; r2 < TK; ++r2) s2 += score[byrank[r2]]; total[0] = s2; *cnt = 0; }
+                    sycl::group_barrier(g);
+                    if (rank < TK) {
+                        int at = 0;
+                        for (int r2 = 0; r2 < TK; ++r2) at += byrank[r2] < e ? 1 : 0;
+                        sel[at] = e;
+                        wts[at] = rscale * (score[e] / (total[0] + 1e-20f));
+                    }
+                });
+            });
+        } else if (M == 1) gemvt<1>(Ly.WrT, c_.experts, h, 32, row(NM), rlog_, c_.experts, nullptr, nullptr, c_.experts, nullptr, nullptr);
         else if (M <= 8) gemvtm<1>(Ly.WrT, c_.experts, h, 32, M, row(NM), row(NM), row(NM), h, rlog_, c_.experts, c_.experts, nullptr, 0, c_.experts, nullptr, 0, c_.experts);
         else dense(Ly.Wr, c_.experts, h, row(NM), h, nmb_, rlog_, c_.experts, M, false);
         {
@@ -2187,7 +2430,7 @@ void Engine::run(int M) {
             float* wts = wts_;
             const int En = c_.experts, TK = c_.top_k;
             const float rscale = c_.route_scale;
-            q_.submit([&](sycl::handler& cgh) {
+            if (!fused_route) q_.submit([&](sycl::handler& cgh) {
                 sycl::local_accessor<float, 1> key(sycl::range<1>(128), cgh), score(sycl::range<1>(128), cgh);
                 sycl::local_accessor<int, 1> byrank(sycl::range<1>(16), cgh);
                 sycl::local_accessor<float, 1> total(sycl::range<1>(1), cgh);
