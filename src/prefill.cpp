@@ -2223,6 +2223,130 @@ static sycl::event launch_dflash2_block_attention_split(
     });
 }
 
+// 11-25: the drafter's attention as (KV head, key slice) work-groups.  Every query row
+// that reads one KV head (the block's rows x the heads of its group: 8 x 4 for the
+// Qwen3.8-27B drafter) runs in ONE work-group, a sub-group per row, so each 16-key
+// K / V tile is decoded into SLM once for all of them, and q sits in SLM.  ~128 keys
+// a slice, then a merge.  The kernels above re-read q from global memory inside the
+// dot product and, under 512 keys, walked the whole range in a few work-groups: the
+// attention stage grew from 0.66 to 1.75-1.88 ms of a ~4.4 ms draft over a request
+// (MEASURED, DFLASH timing, 300-700 keys).  Same scores and softmax; the partial sums
+// add in a different order.  GRIMOIRE_DFLASH_ATTN_V2=0: the kernels above.
+static sycl::event launch_dflash2_block_attention_gqa(
+    sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int context_len,
+    int num_heads, int num_kv_heads, int seq_cap, int sliding_window, bool causal,
+    float softmax_scale, int begin, int end, float* part, int splits, int slice,
+    const std::vector<sycl::event>& deps) {
+    constexpr int HD=128, KT=16, KPAD=HD+1, DPL=HD/SG_SIZE, PW=HD+2;
+    const int hpg=num_heads/num_kv_heads, rows=tokens*hpg, WG=rows*SG_SIZE;
+    const sycl::event e=q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float,1> qs(size_t(rows)*HD,h), ks(size_t(KT)*KPAD,h),
+            vs(size_t(KT)*HD,h), lut(256,h);
+        h.parallel_for(sycl::nd_range<1>(size_t(num_kv_heads)*splits*WG,WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg=it.get_sub_group();
+                const int lane=int(sg.get_local_id()[0]),r=int(sg.get_group_id()[0]);
+                const int lid=int(it.get_local_id(0)),g=int(it.get_group(0));
+                const int kvh=g/splits,sp=g%splits;
+                const int t=r/hpg,qh=kvh*hpg+r%hpg;           // this sub-group's row: token t, head qh
+                float* qsl=qs.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* ksl=ks.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* vsl=vs.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* lt=lut.template get_multi_ptr<sycl::access::decorated::no>().get();
+                for(int x=lid;x<256;x+=WG)lt[x]=e4m3_to_f32(uint8_t(x));
+                for(int x=lid;x<rows*HD;x+=WG){
+                    const int rr=x/HD,d=x%HD;
+                    qsl[x]=qv[(int64_t(rr/hpg)*num_heads+kvh*hpg+rr%hpg)*HD+d];
+                }
+                const uint8_t* kh=k_cache+int64_t(kvh)*HD*seq_cap;
+                const uint8_t* vh=v_cache+int64_t(kvh)*seq_cap*HD;
+                const int s_lo=begin+sp*slice,s_hi=sycl::min(end,s_lo+slice);
+                const int query_end=causal?context_len+t+1:end;
+                const int query_begin=sliding_window>0?sycl::max(0,query_end-sliding_window):0;
+                float acc[DPL];
+                #pragma unroll
+                for(int j=0;j<DPL;++j)acc[j]=0.0f;
+                float m=-std::numeric_limits<float>::infinity(),l=0.0f;
+                for(int s0=s_lo;s0<s_hi;s0+=KT){
+                    sycl::group_barrier(it.get_group());   // lut / q ready, the last tile read
+                    for(int x=lid;x<KT*HD;x+=WG){
+                        {   // K is [d][s]: one dim's 16 keys are 16 contiguous bytes
+                            const int d=x/KT,k=x%KT,s=s0+k;
+                            ksl[k*KPAD+d]=s<s_hi?lt[kh[int64_t(d)*seq_cap+s]]:0.0f;
+                        }
+                        {   // V is [s][d]: one key's dims are contiguous
+                            const int k=x/HD,d=x%HD,s=s0+k;
+                            vsl[k*HD+d]=s<s_hi?lt[vh[int64_t(s)*HD+d]]:0.0f;
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+                    const int s=s0+lane;
+                    float score=-std::numeric_limits<float>::infinity();
+                    if(s<s_hi&&s>=query_begin&&s<query_end){
+                        const float* qr=qsl+r*HD;
+                        const float* kr=ksl+lane*KPAD;
+                        float a0=0.0f,a1=0.0f,a2=0.0f,a3=0.0f;
+                        #pragma unroll 8
+                        for(int d=0;d<HD;d+=4){
+                            a0=sycl::fma(qr[d],kr[d],a0);
+                            a1=sycl::fma(qr[d+1],kr[d+1],a1);
+                            a2=sycl::fma(qr[d+2],kr[d+2],a2);
+                            a3=sycl::fma(qr[d+3],kr[d+3],a3);
+                        }
+                        score=((a0+a1)+(a2+a3))*softmax_scale;
+                    }
+                    const float mb=sycl::reduce_over_group(sg,score,sycl::maximum<float>());
+                    const float mn=sycl::fmax(m,mb);
+                    const float corr=sycl::isinf(m)?0.0f:sycl::exp(m-mn);
+                    const float p=sycl::isinf(score)?0.0f:sycl::exp(score-mn);
+                    l=sycl::fma(l,corr,sycl::reduce_over_group(sg,p,sycl::plus<float>()));
+                    #pragma unroll
+                    for(int j=0;j<DPL;++j)acc[j]*=corr;
+                    for(int k=0;k<KT;++k){
+                        const float pk=sycl::select_from_group(sg,p,k);
+                        #pragma unroll
+                        for(int j=0;j<DPL;++j)
+                            acc[j]=sycl::fma(pk,vsl[k*HD+lane+j*SG_SIZE],acc[j]);
+                    }
+                    m=mn;
+                }
+                float* pp=part+((size_t(sp)*tokens+t)*num_heads+qh)*PW;
+                #pragma unroll
+                for(int j=0;j<DPL;++j)pp[lane+j*SG_SIZE]=acc[j];
+                if(lane==0){pp[HD]=m;pp[HD+1]=l;}
+            });
+    });
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(e);
+        h.parallel_for(sycl::nd_range<1>(size_t(tokens)*num_heads*SG_SIZE,SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int lane=int(it.get_local_id(0)),th=int(it.get_group(0));   // t * num_heads + head
+                const size_t stride=size_t(tokens)*num_heads*PW;
+                float mx=-std::numeric_limits<float>::infinity();
+                for(int sp=0;sp<splits;++sp)mx=sycl::fmax(mx,part[sp*stride+size_t(th)*PW+HD]);
+                float acc[DPL];
+                #pragma unroll
+                for(int j=0;j<DPL;++j)acc[j]=0.0f;
+                float l=0.0f;
+                if(!sycl::isinf(mx))
+                    for(int sp=0;sp<splits;++sp){
+                        const float* pp=part+sp*stride+size_t(th)*PW;
+                        if(sycl::isinf(pp[HD]))continue;            // a slice with no key for this row
+                        const float c=sycl::exp(pp[HD]-mx);
+                        l=sycl::fma(pp[HD+1],c,l);
+                        #pragma unroll
+                        for(int j=0;j<DPL;++j)acc[j]=sycl::fma(c,pp[lane+j*SG_SIZE],acc[j]);
+                    }
+                const float inv=l>0.0f?1.0f/l:0.0f;
+                float* o=out+size_t(th)*HD;
+                #pragma unroll
+                for(int j=0;j<DPL;++j)o[lane+j*SG_SIZE]=acc[j]*inv;
+            });
+    });
+}
+
 sycl::event launch_dflash2_block_attention(
     sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int context_len,
@@ -2234,6 +2358,26 @@ sycl::event launch_dflash2_block_attention(
     const int begin=(causal&&sliding_window>0)
         ? std::max(0,context_len+1-sliding_window)
         : (sliding_window>0 ? std::max(0,end-sliding_window) : 0);
+    static const bool v2=[]{const char* e=std::getenv("GRIMOIRE_DFLASH_ATTN_V2");return !(e&&*e=='0');}();
+    if(v2&&head_dim==128&&num_kv_heads>0&&num_heads%num_kv_heads==0&&tokens>=1&&
+       tokens*(num_heads/num_kv_heads)<=64&&end>begin){
+        constexpr int KT=16;
+        const int keys=end-begin;
+        const int splits2=std::max(1,std::min(16,(keys+127)/128));
+        const int slice=((keys+splits2-1)/splits2+KT-1)/KT*KT;
+        static float* part=nullptr; static size_t part_cap=0;
+        const size_t need=size_t(splits2)*tokens*num_heads*(128+2);
+        if(need>part_cap){
+            q.wait();                         // nothing in flight may still use the old one
+            if(part)sycl::free(part,q);
+            part=sycl::malloc_device<float>(need,q);
+            part_cap=part?need:0;
+        }
+        if(part)
+            return launch_dflash2_block_attention_gqa(q,qv,k_cache,v_cache,out,tokens,context_len,
+                num_heads,num_kv_heads,seq_cap,sliding_window,causal,softmax_scale,begin,end,
+                part,splits2,slice,deps);
+    }
     // ~256 keys per slice: 8 slices of a 2048-key window
     const int splits=std::min(16,(end-begin)/256);
     if(split_keys&&tokens>=1&&tokens<=16&&splits>=2){
