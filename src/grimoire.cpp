@@ -11450,7 +11450,10 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         return !(e&&*e=='0'); }();
     std::vector<int> copy_cap(size_t(n),0);
     std::vector<char> use_copy(size_t(n),0);
-    if(copies && copies->size()==size_t(n) && !dflash2.ok)
+    // DFlash2 too since 2026-11-25 (GRIMOIRE_COPY_DFLASH=0 = copies only with the MTP head): the drafter's first
+    // token plays the head's role in the agreement check below.
+    static const bool copy_dflash=[] { const char* e=std::getenv("GRIMOIRE_COPY_DFLASH"); return !(e&&*e=='0'); }();
+    if(copies && copies->size()==size_t(n) && (!dflash2.ok || copy_dflash))
         for(int row=0;row<n;++row) {
             const auto& c=(*copies)[size_t(row)];
             bool valid=!c.empty();
@@ -11460,7 +11463,7 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
             copy_cap[size_t(row)]=std::max(0,std::min({copy_depth,copy_rows/n-1,int(c.size()),max_seq-p-1,
                 remaining[size_t(row)]-1}));
             // a copy no deeper than the head's own drafts buys nothing and can only lose them
-            const int mtp_depth=std::max(0,std::min({max_depth,max_seq-p-1,remaining[size_t(row)]-1}));
+            const int mtp_depth=std::max(0,std::min({dflash2.ok?dflash_block_rows()-1:max_depth,max_seq-p-1,remaining[size_t(row)]-1}));
             if(copy_cap[size_t(row)]<=mtp_depth) copy_cap[size_t(row)]=0;
             if(!copy_agree && copy_cap[size_t(row)]>0) use_copy[size_t(row)]=1;
         }
@@ -11566,7 +11569,11 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
                 std::vector<int32_t> draft;
                 if(!dflash_draft(block[0],pos,draft) || draft.empty())
                     throw std::runtime_error("batched DFlash proposal failed");
-                block.insert(block.end(),draft.begin(),draft.begin()+std::min(depth,int(draft.size())));
+                // the drafter agrees with the copy's first token (or no agreement is asked): verify the copy
+                if(copy_cap[size_t(row)]>0 && (use_copy[size_t(row)] || draft[0]==(*copies)[size_t(row)][0]))
+                    use_copy[size_t(row)]=1;
+                else
+                    block.insert(block.end(),draft.begin(),draft.begin()+std::min(depth,int(draft.size())));
             } else if(batched) {
                 if(!use_copy[size_t(row)])
                     block.insert(block.end(),drafted[size_t(row)].begin(),drafted[size_t(row)].end());
@@ -16707,9 +16714,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     // behaviour is exactly as before.  The row loop is the same math the
     // single-token decode path already runs.
     static const bool no_matrix = !device_can_matrix(q);
+    // ON by default since 2026-11-25 (GRIMOIRE_DFLASH_INT4_SMALLM=0 = the SIMT batched GEMV): one B70, Swift-1.5
+    // W4A16 + z-lab DFlash2, 8 rows: draft 37.6 -> 5.2 ms, step 69 -> 37 ms, tokens/step unchanged (2.5-4.2);
+    // BetterBench quick weighted decode 59.1 -> 112.4 tok/s.  Only the drafter's proposals use it; output stays exact.
     static const bool draft_i4_smallm=[] {
         const char* e=std::getenv("GRIMOIRE_DFLASH_INT4_SMALLM");
-        return e && *e=='1' && !std::getenv("GRIMOIRE_SMALLM_GEMV");
+        return (!e || *e!='0') && !std::getenv("GRIMOIRE_SMALLM_GEMV");
     }();
     auto mm=[&](const DevQuant& w,const float* x,float* y,int rows){
         if(cfg.is_muse&&w.fp16){
@@ -24793,7 +24803,8 @@ void GrimoireScheduler::run() {
                     return v&&*v?float(std::atof(v)):0.8f; }();
                 std::vector<std::pair<int,int>> copy_result;
                 std::vector<std::vector<int32_t>> copies;
-                if(spec_now && copy_on && !e.dflash2.ok) {
+                static const bool copy_dflash_s=[]{ const char* v=std::getenv("GRIMOIRE_COPY_DFLASH"); return !(v&&*v=='0'); }();
+                if(spec_now && copy_on && (!e.dflash2.ok || copy_dflash_s)) {
                     copies.resize(which.size());
                     for(size_t i=0;i<which.size();++i) {
                         auto& j=active[which[i]];
