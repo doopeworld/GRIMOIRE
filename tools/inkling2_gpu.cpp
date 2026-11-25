@@ -54,7 +54,7 @@ class InkQuantT; template <int> class InkGemvT8; class InkMail; class InkRMN; cl
 template <int M> class InkGemvM;
 template <int M> class InkGemvT;
 template <int M> class InkGemvTM;
-class InkAgAsm; class InkAgTo16; class InkAgFrom16; class InkCombineR; class InkTopK1; class InkTopK2; class InkDXB; class InkNormRoute; class InkCopyOut; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
+class InkAgAsm; class InkAgTo16; class InkAgFrom16; class InkCombineR; class InkDAttS; class InkDAttM; class InkTopK1; class InkTopK2; class InkDXB; class InkNormRoute; class InkCopyOut; class InkResidV; class InkMlpConvV; class InkSplitP; class InkAddRoundS; class InkFoldQ; class InkFinB; class InkPosV2; class InkRouteGrp; class InkArgC1; class InkArgC2; class InkGroupP; class InkGateBlend2; class InkRowQ; class InkGatherS; class InkGroup; class InkGuS; class InkDownS; class InkCombS; class InkCommit; class InkCopy; class InkMixNorm; class InkKVCtx;
 class InkDEmbed; class InkDNorm; class InkAddRes; class InkQKRope; class InkDAtt; class InkSilu; class InkRnnIn; class InkRnn; class InkFold; class InkArgM1; class InkArgMV; class InkHistV; class InkPosV;
 
 struct InkAttnArgs {
@@ -419,6 +419,7 @@ private:
     int8_t* rowq(const int8_t* tiled, int N, int K, int Kp);
     float* projAll_ = nullptr;   // verify, sliding visits: [8][NA + NB + NC] from one INT8 launch
     float* attpart_ = nullptr; size_t attpart_n_ = 0;   // verify attention key-split partials
+    float* dpart_ = nullptr;   // drafter full-attention key-split partials [64 slices][8 rows][24 heads][130]
     bool post_bias_done_ = false;   // this visit's bias table came from InkPost
     bool route_deferred_ = false;   // verify rows: experts_small does the router top-k (InkRouteGrp)
     int nr_in_ = -1;                // 2..8 rows: the MLP norm's input row when InkNormRoute does norm + router + top-k
@@ -506,7 +507,7 @@ private:
     void commit_verify(int p, int a);
     void argmax_rows(const float* lg, int V, int n, int* out);
     // DSpark drafter
-    struct DLayer { uint16_t *Wqkv, *Wkvc, *Wo, *Wgu, *Wd, *nin, *npost, *qn, *kn, *knc, *dfn, *kc, *vc; bool sliding;
+    struct DLayer { uint16_t *Wqkv, *Wkvc, *Wo, *Wgu, *Wd, *nin, *npost, *qn, *kn, *knc, *dfn, *kc, *vc; bool sliding; int cap = 0;   // cap: K/V ring rows (sliding layers: 2048 >= window 1024 + 8)
                     int8_t *Q8[4] = {}; float* S8[4] = {}; int N8[4] = {}, K8[4] = {}, KP8[4] = {};   // INT8 qkv / o / gu / d (row-major, K padded)
                     int8_t* T8[4] = {}; };                                                          // the same, decode tiles
     struct Draft {
@@ -2660,9 +2661,12 @@ void Engine::run(int M) {
                     if (att_split && M <= 8) {   // verify rows: one thread per (head, 256-key slice), then a merge
                         // slices sized like GRIMOIRE's verify attention (~768 threads, >= 32 keys a slice): MEASURED 11-24
                         static const int chunk_env = std::getenv("INK_ATT_CHUNK") ? std::atoi(std::getenv("INK_ATT_CHUNK")) : 64;
-                        const int chunk = chunk_env == 32 ? 32 : (chunk_env / 64) * 64, nsplit = (std::min(win, limit_) + 15 + chunk) / chunk;
+                        // at most INK_ATT_NSMAX (256) slices: a long context widens each slice in the kernel instead of
+                        // launching (and merging) limit / 64 slices on every step (262K context: 4,097 slices, 818 MB of partials)
+                        static const int nsmax = std::getenv("INK_ATT_NSMAX") ? std::max(8, std::atoi(std::getenv("INK_ATT_NSMAX"))) : 256;
+                        const int chunk = chunk_env == 32 ? 32 : (chunk_env / 64) * 64, nsplit = std::min(nsmax, (std::min(win, limit_) + 15 + chunk) / chunk);
                         if (!attpart_) {   // once, for the widest case (graph chains keep the pointer)
-                            attpart_n_ = size_t((limit_ + 15 + 32) / 32) * std::max(c_.local.heads, c_.full.heads) * 8 * 130;
+                            attpart_n_ = size_t(std::min(nsmax, (limit_ + 15 + 32) / 32)) * std::max(c_.local.heads, c_.full.heads) * 8 * 130;
                             attpart_ = dev_.alloc<float>(attpart_n_);
                         }
                         if (size_t(nsplit) * H * 8 * 130 > attpart_n_) throw std::runtime_error("attention partials");

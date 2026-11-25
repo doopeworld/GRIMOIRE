@@ -1043,8 +1043,14 @@ static sycl::event ink_attn_es_impl(sycl::queue& q, const InkAttnArgs& g) {
             const int first0 = p0 + 1 - imin_(p0 + 1, a.win);
             const int firstl = pl + 1 - imin_(pl + 1, a.win);
             const int klo0 = first0 & ~15, khi = pl;
-            const int klo = SPLIT ? klo0 + sp * a.chunk : klo0;
-            const int kend = SPLIT ? imin_(khi, klo + a.chunk - 1) : khi;   // blocks never cross a slice (chunk % BK == 0)
+            // split mode: a.nsplit slices of at least a.chunk keys; a longer live span widens every slice (multiple of BK)
+            int sch = a.chunk;
+            if constexpr (SPLIT) {
+                const int need = (khi - klo0 + a.nsplit) / a.nsplit;
+                if (need > sch) sch = (need + BK - 1) / BK * BK;
+            }
+            const int klo = SPLIT ? klo0 + sp * sch : klo0;
+            const int kend = SPLIT ? imin_(khi, klo + sch - 1) : khi;   // blocks never cross a slice (sch % BK == 0)
             const int hd = (j / a.groups) * D;
             const unsigned AW = unsigned(a.NA) * 4 - 1, AH = unsigned(a.M) - 1;
             es::simd<bfx, RB * D> qv;                                    // [dt][8 rows][16]
