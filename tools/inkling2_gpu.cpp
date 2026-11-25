@@ -323,7 +323,7 @@ public:
     struct Samp { float temp = 0.f, top_p = 1.f; int top_k = 0; };
     struct Dist { int n = 0; int id[KC]; double p[KC]; };   // processed distribution over the kept candidates
     bool sample_drafts = !std::getenv("INK_GREEDY_DRAFTS");   // sampling requests: drafts drawn from the drafter's q (exact p/q test)
-    std::vector<int> mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng);
+    std::vector<int> mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng, const int* forced = nullptr, int nf = 0);
     int sample_last(const Samp& sp, std::mt19937_64& rng);   // after prefill: the next token drawn from the last row
     int pos() const { return pos_; }
     int last_rows() const { return last_rows_; }   // verify rows of the last mtp_step_s
@@ -3470,13 +3470,40 @@ int serve_main(int argc, char** argv) {
         };
         emit({t});
         const auto t1 = std::chrono::steady_clock::now();
+        // COPY DRAFTS (2026-11-25): when the conversation's last INK_COPY_MIN tokens (opt-in, e.g. 8; default 0 = off) appeared before,
+        // the up to 7 tokens that followed them are verified instead of the drafter's guesses, and the drafter is skipped
+        // (edits and quotes repeat their context).  Both ranks hold the same history, so they pick the same drafts.
+        static const int copy_min = std::getenv("INK_COPY_MIN") ? std::atoi(std::getenv("INK_COPY_MIN")) : 0;
+        std::vector<int> hv(R.ids.begin(), R.ids.end());
+        hv.push_back(t);
+        long copy_steps = 0, copy_kept = 0;
+        auto lookup = [&](int* cp) -> int {
+            const int n = int(hv.size());
+            if (copy_min <= 0 || n < copy_min + 1) return 0;
+            const int* tail = hv.data() + n - copy_min;
+            const int lo = std::max(0, n - 65536);
+            for (int j = n - copy_min - 1; j >= lo; --j) {     // the most recent earlier occurrence
+                if (hv[size_t(j)] != tail[0] || !std::equal(tail, tail + copy_min, hv.data() + j)) continue;
+                const int c = std::min(7, n - (j + copy_min));
+                for (int k = 0; k < c; ++k) cp[k] = hv[size_t(j + copy_min + k)];
+                return c;
+            }
+            return 0;
+        };
         if (is_stop_tok(t)) reason = "stop";
         else for (int k = 0; ngen < R.max_new; ++k) {
             if (E.pos() + 8 > E.limit()) break;
             if (r == 0 && g_term && g_stop_step.load() == INT_MAX) g_stop_step = k + 1;   // rank 1 sees it before step k + 1
             if (k >= g_stop_step.load()) break;
             const auto ts0 = std::chrono::steady_clock::now();
-            const auto got = sampled ? E.mtp_step_s(t, sp, rng) : E.mtp_step(t);
+            int cp[8];
+            const int nc = lookup(cp);
+            const bool use_copy = nc >= 2;
+            if (use_copy && !sampled) for (int c = nc; c < 7; ++c) cp[c] = cp[nc - 1];
+            const auto got = sampled ? E.mtp_step_s(t, sp, rng, use_copy ? cp : nullptr, nc)
+                                     : E.mtp_step(t, use_copy ? cp : nullptr);
+            if (use_copy) { ++copy_steps; copy_kept += long(got.size()) - 1; }
+            hv.insert(hv.end(), got.begin(), got.end());
             const int vr = sampled ? E.last_rows() : 8;
             ++rcnt[vr];
             rms_[vr] += ms_since(ts0);
@@ -3502,6 +3529,8 @@ int serve_main(int argc, char** argv) {
             std::snprintf(b, sizeof(b), " %s %zu %d %.1f %.1f %d %d,%d,%d,%d,%d,%d,%d,%d%s\n", reason, R.ids.size(), ngen, pms, ms_since(t1), steps,
                           hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8], b2);
             write_all(fd, "END " + R.id + b);
+            if (copy_steps) std::fprintf(stderr, "copy drafts: %ld of %d steps, %.2f kept a step\n", copy_steps, steps,
+                                         double(copy_kept) / double(copy_steps));
         }
     };
     // warm-up (records the two-card segment graphs, loads the drafter)

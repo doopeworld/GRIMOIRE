@@ -1359,16 +1359,26 @@ int Engine::sample_last(const Samp& sp, std::mt19937_64& rng) {
 
 // mtp_step with sampling: the drafts are the drafter's argmax; draft d at row i is kept with probability p_i(d)
 // (exact speculative sampling for a deterministic draft), else row i's token is drawn from p_i without d.
-std::vector<int> Engine::mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng) {
+// forced (nf >= 1): copy drafts from the conversation (serve_main's n-gram lookup) instead of the drafter -- the drafter
+// is skipped; they are deterministic drafts, kept with probability p_i(d) like the drafter's argmax.
+std::vector<int> Engine::mtp_step_s(int t, const Samp& sp, std::mt19937_64& rng, const int* forced, int nf) {
     const int p = pos_;
     if (p + 8 > limit_) throw std::runtime_error("context full");
-    const bool sq = sample_drafts;
-    if (sq) { dsp_ = &sp; drng_ = &rng; }
-    dmax_ = vrows_fix_ - 1;
-    draft_block(t, p);
-    dmax_ = 7;
-    dsp_ = nullptr; drng_ = nullptr;
-    const int M = (sq ? dn_ : vrows_fix_ - 1) + 1;   // verify rows: t + the drafts
+    const bool sq = sample_drafts && !forced;
+    int dt[8] = {t};
+    int M;
+    if (forced) {
+        M = std::min(std::max(nf, 1), 7) + 1;
+        for (int k = 1; k < M; ++k) dt[k] = forced[k - 1];
+        q_.memcpy(d_.dtok, dt, size_t(M) * sizeof(int));
+    } else {
+        if (sq) { dsp_ = &sp; drng_ = &rng; }
+        dmax_ = vrows_fix_ - 1;
+        draft_block(t, p);
+        dmax_ = 7;
+        dsp_ = nullptr; drng_ = nullptr;
+        M = (sq ? dn_ : vrows_fix_ - 1) + 1;   // verify rows: t + the drafts
+    }
     last_rows_ = M;
     q_.memcpy(tok_, d_.dtok, size_t(M) * sizeof(int));
     verify_ = all_logits_ = true;
