@@ -10,7 +10,7 @@ The aim is straightforward: make high-performance local LLM inference possible o
 
 > **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
 >
-> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default; **v1.10.4** (2026-11-05) makes MXFP4 speculative decoding faster (Qwen3.8-27B MXFP4 + MTP: +26% for one user), lets 4-bit models use the overlapped two-GPU prompt path (Qwen3.8-27B GPTQ on two B70s: pp4096 1,733 -> 3,093), halves the two-GPU decode exchange, and keeps Flash-Next fast on a busy machine ([details](#served-image-validation-2026-11-05-v1104)). **v1.10.6** (2026-11-13) makes speculative decoding serve several users at once on one and two cards: Swift-1.5 Qwen3.8-27B GPTQ-Int4 on two B70s scores **133.6** in BetterBench against vLLM's 131.0 on the same machine and wins at 1, 2, 4 and 8 users; it also runs Qwen3.8-27B-Uncensored (FP8 as INT8) on two cards with a 262K context ([details](#release-v1106-2026-11-13)). v1.10.6's source joined main on 2026-11-15 together with **copy drafting** and faster long prompts (no release image yet, [details](#on-main-since-2026-11-15-no-release-image-yet)). **v1.10.8** (2026-11-17) reads prompts faster on one and two cards (one B70 4K: 2,698 tok/s, two B70s 3,480), fixes Qwen3.8 INT8 on one card and speeds up Flash-Next on long prompts ([details](#release-v1108-2026-11-17)). **v1.10.9** (2026-11-18) makes Qwen3.8-Flash-Next write much faster at long context (two B70s, after a 60K prompt: 31 -> 46 tok/s), loads Flash-Next 4-bit on two cards and speeds up one-card speculative decoding ([details](#release-v1109-2026-11-18)). **v1.10.10** adds opt-in pooled KV for supported single-GPU profiles and reduces Flash-Next MTP verification time on two cards ([benchmark results](tools/bench/pp1117/RESULTS-2026-11-20.md)). **v1.10.11** (2026-11-24) adds an OpenAI-compatible server for **Inkling 2 Mini** on one or two Arc Pro B70s: 250.8 tok/s on a code answer with MTP, 5,557 tok/s reading a 32K prompt ([details](#v11011-inkling-2-mini-server)).
+> **main is the current code.** Two-GPU tensor parallel, Intel oneDNN for the prompt GEMMs and the Qwen3.8-Flash-Next two-card speed-ups were merged into main on 2026-10-28 (before, they were on the `dual-1022` / `onednn-1025` branches) and are in release **v1.10.0**. **GGUF support** joined main on 2026-10-29 (it was on `feature/gguf-battlemage`) and is in release **v1.10.1**; **v1.10.2** includes the native GGUF decode and prompt speed-ups and MTP on GGUF; **v1.10.3** adds three opt-in speed modes and changes no default; **v1.10.4** (2026-11-05) makes MXFP4 speculative decoding faster (Qwen3.8-27B MXFP4 + MTP: +26% for one user), lets 4-bit models use the overlapped two-GPU prompt path (Qwen3.8-27B GPTQ on two B70s: pp4096 1,733 -> 3,093), halves the two-GPU decode exchange, and keeps Flash-Next fast on a busy machine ([details](#served-image-validation-2026-11-05-v1104)). **v1.10.6** (2026-11-13) makes speculative decoding serve several users at once on one and two cards: Swift-1.5 Qwen3.8-27B GPTQ-Int4 on two B70s scores **133.6** in BetterBench against vLLM's 131.0 on the same machine and wins at 1, 2, 4 and 8 users; it also runs Qwen3.8-27B-Uncensored (FP8 as INT8) on two cards with a 262K context ([details](#release-v1106-2026-11-13)). v1.10.6's source joined main on 2026-11-15 together with **copy drafting** and faster long prompts (no release image yet, [details](#on-main-since-2026-11-15-no-release-image-yet)). **v1.10.8** (2026-11-17) reads prompts faster on one and two cards (one B70 4K: 2,698 tok/s, two B70s 3,480), fixes Qwen3.8 INT8 on one card and speeds up Flash-Next on long prompts ([details](#release-v1108-2026-11-17)). **v1.10.9** (2026-11-18) makes Qwen3.8-Flash-Next write much faster at long context (two B70s, after a 60K prompt: 31 -> 46 tok/s), loads Flash-Next 4-bit on two cards and speeds up one-card speculative decoding ([details](#release-v1109-2026-11-18)). **v1.10.10** adds opt-in pooled KV for supported single-GPU profiles and reduces Flash-Next MTP verification time on two cards ([benchmark results](tools/bench/pp1117/RESULTS-2026-11-20.md)). **v1.10.11** (2026-11-24) adds an OpenAI-compatible server for **Inkling 2 Mini** on one or two Arc Pro B70s: 250.8 tok/s on a code answer with MTP, 5,557 tok/s reading a 32K prompt ([details](#v11011-inkling-2-mini-server)). **v1.10.12** (2026-11-25) gives it a 262,144-token context on two B70s and makes decode with a long context much faster (87.8 tok/s after a 216K-token prompt, was 14.3).
 
 ## v1.10.11: Inkling 2 Mini server
 
@@ -22,15 +22,16 @@ Arc B580 (G21); every other model runs as in v1.10.10.
 docker run -d --name grimoire-inkling --stop-timeout 60 \
   --device /dev/dri/renderD128 --device /dev/dri/renderD129 \
   -v /path/to/Inkling-2-Mini:/model:ro -p 6911:6911 \
-  --entrypoint grimoire-inkling grimoire-b70:v1.10.11
+  -e INK_CTX=262144 --entrypoint grimoire-inkling grimoire-b70:v1.10.12
 ```
 
 | two Arc Pro B70, Inkling-2-Mini-Uncensored (measured on the v1.10.11 image) | |
 |---|---|
 | decode with MTP, code answer (no thinking, temperature 0) | **250.8 tok/s** (6.08 tokens / step) |
 | reading a prompt, pipeline mode, 16K / 32K | **5,484 / 5,557 tok/s** |
-| [BetterBench](https://github.com/GGZ14/BetterBench) quick (temperature 0.7, top-p 0.95, top-k 20), weighted decode | 134.1 tok/s |
+| [BetterBench](https://github.com/GGZ14/BetterBench) quick (temperature 0.7, top-p 0.95, top-k 20), weighted decode | 134.1 tok/s (v1.10.12: 141.8) |
 | BetterBench prefill 2K / 8K, TTFT p50 | 2,864 / 3,604 tok/s, 162 ms |
+| v1.10.12, 262K context: decode after a 27.8K / 110.7K / 216.4K-token prompt | 129.2 / 131.5 / 87.8 tok/s |
 
 BetterBench answers start with long thinking (the template's default effort is 0.9), where the drafter is right
 ~2.9 tokens per step instead of ~6.1 on a direct code answer; that is the difference between the two decode numbers.
@@ -457,11 +458,12 @@ answers are not token-identical to the default, so treat it as a throughput opti
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.11/grimoire-b70-v1.10.11.tar.gz
-docker load < grimoire-b70-v1.10.11.tar.gz              # -> grimoire-b70:v1.10.11
-docker tag grimoire-b70:v1.10.11 grimoire-b70:latest    # the commands below use :latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.10.12/grimoire-b70-v1.10.12.tar.gz
+docker load < grimoire-b70-v1.10.12.tar.gz              # -> grimoire-b70:v1.10.12
+docker tag grimoire-b70:v1.10.12 grimoire-b70:latest    # the commands below use :latest
 ```
 
+v1.10.12 ([above](#v11011-inkling-2-mini-server)) runs the Inkling 2 Mini server with a 262K context on two B70s.
 v1.10.11 ([above](#v11011-inkling-2-mini-server)) adds the Inkling 2 Mini server to v1.10.10 (pooled KV, faster
 Flash-Next MTP on two cards).
 v1.10.9 ([above](#release-v1109-2026-11-18)) makes Qwen3.8-Flash-Next write much faster at long context (two B70s,
