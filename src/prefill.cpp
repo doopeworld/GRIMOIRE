@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -1225,6 +1226,158 @@ sycl::event launch_causal_conv1d_split_groups(sycl::queue& q, const float* x,
           else if(c<2*qk_size)kv[int64_t(t)*qk_size+c-qk_size]=y;
           else vv[int64_t(t)*v_size+c-2*qk_size]=y;
           h0=h1;h1=h2;h2=xt;
+        }
+      });});
+}
+
+// Draft trees (2026-11-25): launch_causal_conv1d_split_groups over one conversation's tree rows.  Row t's
+// window is its three nearest ancestors' inputs, oldest first; past the anchor (index -1, -2, -3) the ring's
+// newest, middle and oldest entries.  The same four products in the same order as the chain kernel.
+sycl::event launch_causal_conv1d_split_tree(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, int slot, const DnTree& t,
+    int channels, float* qv, float* kv, float* vv, int qk_size, int v_size,
+    float* save_base, const std::vector<sycl::event>& deps){
+    return q.submit([&](sycl::handler& hd){hd.depends_on(deps);
+      const DnTree tt=t;
+      hd.parallel_for(sycl::range<1>(size_t(channels)),[=](sycl::id<1>id){
+        const int c=int(id[0]),ch=channels;
+        const bf16_t*w=weight+int64_t(c)*4;
+        const float w0=bf16_to_f32(w[0]),w1=bf16_to_f32(w[1]),
+                    w2=bf16_to_f32(w[2]),w3=bf16_to_f32(w[3]);
+        const float*ring=ring_base+int64_t(slot)*ring_stride+int64_t(c)*3;
+        const float r0=ring[0],r1=ring[1],r2=ring[2];
+        if(save_base){
+          float*sv=save_base+int64_t(c)*3;
+          sv[0]=r0;sv[1]=r1;sv[2]=r2;
+        }
+        auto in=[&](int a)->float{ return a>=0?x[int64_t(a)*ch+c]:(a==-1?r2:(a==-2?r1:r0)); };
+        for(int r=0;r<tt.n;++r){
+          const int p1=tt.parent[r];
+          const int p2=p1>=0?tt.parent[p1]:p1-1;
+          const int p3=p2>=0?tt.parent[p2]:p2-1;
+          const float h0=in(p3),h1=in(p2),h2=in(p1);
+          const float xt=x[int64_t(r)*ch+c];
+          float acc=0.0f;
+          acc=sycl::fma(h0,w0,acc);
+          acc=sycl::fma(h1,w1,acc);
+          acc=sycl::fma(h2,w2,acc);
+          acc=sycl::fma(xt,w3,acc);
+          const float y=acc/(1.0f+sycl::exp(-acc));
+          if(c<qk_size)qv[int64_t(r)*qk_size+c]=y;
+          else if(c<2*qk_size)kv[int64_t(r)*qk_size+c-qk_size]=y;
+          else vv[int64_t(r)*v_size+c-2*qk_size]=y;
+        }
+      });});
+}
+
+// Draft trees: row r's attention over its own ancestors (and itself), the keys the verify wrote at positions
+// pos0 + row.  A sub-group per (row, head); log2-domain m, unnormalised l and acc -- the units of the matrix-
+// engine verify's partials, so launch_verify_merge_tail adds it as one more split.
+sycl::event launch_verify_tree_tail(sycl::queue& q, const AttnParams& p, const DnTree& t, int pos0,
+                                    float* tail_m, float* tail_l, float* tail_acc,
+                                    const std::vector<sycl::event>& deps){
+    const AttnParams pp=p; const DnTree tt=t;
+    const int H=p.num_heads, HD=p.head_dim, G=p.num_heads/p.num_kv_heads;
+    if(HD%SG_SIZE||HD/SG_SIZE>MAX_DPL) throw std::invalid_argument("launch_verify_tree_tail: head_dim");
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+      h.parallel_for(sycl::nd_range<1>(size_t(tt.n)*H*SG_SIZE,SG_SIZE),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+          const auto sg=it.get_sub_group();
+          const int lane=int(sg.get_local_id()[0]);
+          const int rh=int(it.get_group(0)),r=rh/H,hh=rh%H,kvh=hh/G;
+          const int dpl=HD/SG_SIZE;
+          const float* qr=pp.q+(int64_t(r)*H+hh)*HD;
+          float qv[MAX_DPL],acc[MAX_DPL];
+          #pragma unroll
+          for(int j=0;j<MAX_DPL;++j){qv[j]=j<dpl?qr[lane+j*SG_SIZE]:0.0f;acc[j]=0.0f;}
+          const uint8_t* kh=pp.k_cache+int64_t(kvh)*HD*pp.seq_cap;
+          const uint8_t* vh=pp.v_cache+int64_t(kvh)*pp.seq_cap*HD;
+          const float sc=pp.softmax_scale*1.4426950408889634f;
+          float m=-std::numeric_limits<float>::infinity(),l=0.0f;
+          for(int a=r;a>=0;a=tt.parent[a]){
+            const int s=pos0+a;
+            float dot=0.0f;
+            #pragma unroll
+            for(int j=0;j<MAX_DPL;++j)if(j<dpl)
+              dot=sycl::fma(qv[j],e4m3_to_f32(kh[int64_t(lane+j*SG_SIZE)*pp.seq_cap+s]),dot);
+            dot=sycl::reduce_over_group(sg,dot,sycl::plus<float>())*sc;
+            const float mn=sycl::fmax(m,dot);
+            const float corr=sycl::isinf(m)?0.0f:sycl::exp2(m-mn);
+            const float e=sycl::exp2(dot-mn);
+            l=sycl::fma(l,corr,e);
+            #pragma unroll
+            for(int j=0;j<MAX_DPL;++j)if(j<dpl)
+              acc[j]=sycl::fma(e,e4m3_to_f32(vh[int64_t(s)*HD+lane+j*SG_SIZE]),acc[j]*corr);
+            m=mn;
+          }
+          const int64_t ti=int64_t(r)*H+hh;
+          #pragma unroll
+          for(int j=0;j<MAX_DPL;++j)if(j<dpl)tail_acc[ti*HD+lane+j*SG_SIZE]=acc[j];
+          if(lane==0){tail_m[ti]=m;tail_l[ti]=l;}
+        });});
+}
+
+sycl::event launch_verify_merge_tail(sycl::queue& q, const AttnParams& p, int rows, int splits_max,
+                                     const float* tail_m, const float* tail_l, const float* tail_acc,
+                                     const std::vector<sycl::event>& deps){
+    const AttnParams pp=p;
+    const int smax=splits_max,HD=p.head_dim;
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+      h.parallel_for(sycl::range<1>(size_t(rows)*pp.num_heads*HD),[=](sycl::id<1> idx){
+        const int64_t i=int64_t(idx[0]);
+        const int d=int(i%HD);
+        const int64_t rh=i/HD;
+        const float* pm=pp.part_m+rh*smax;
+        const float* pl=pp.part_l+rh*smax;
+        const float tm=tail_m[rh];
+        float mx=tm;
+        for(int s=0;s<smax;++s)mx=sycl::fmax(mx,pm[s]);
+        float lsum=0.0f,acc=0.0f;
+        for(int s=0;s<smax;++s){
+          const float ms=pm[s];
+          if(sycl::isinf(ms))continue;
+          const float e=sycl::exp2(ms-mx);
+          lsum+=pl[s]*e;
+          acc+=pp.partials[(rh*smax+s)*HD+d]*e;
+        }
+        if(!sycl::isinf(tm)){
+          const float e=sycl::exp2(tm-mx);
+          lsum+=tail_l[rh]*e;
+          acc+=tail_acc[rh*HD+d]*e;
+        }
+        pp.out[rh*HD+d]=lsum>0.0f?acc/lsum:0.0f;
+      });});
+}
+
+sycl::event launch_rows_compact(sycl::queue& q, float* base, int layers, int64_t layer_stride,
+                                int64_t row_stride, int64_t row_elems, const TreePath& path,
+                                const std::vector<sycl::event>& deps){
+    const TreePath pt=path;
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+      h.parallel_for(sycl::range<2>(size_t(layers),size_t(row_elems)),[=](sycl::id<2> id){
+        float* b=base+int64_t(id[0])*layer_stride;
+        const int64_t e=int64_t(id[1]);
+        for(int i=1;i<pt.n;++i){
+          const int src=pt.row[i];
+          if(src!=i)b[int64_t(i)*row_stride+e]=b[int64_t(src)*row_stride+e];
+        }
+      });});
+}
+
+sycl::event launch_kv_compact(sycl::queue& q, const KvBases& b, int layers, int kv_heads, int head_dim,
+                              int seq_cap, int pos0, const TreePath& path,
+                              const std::vector<sycl::event>& deps){
+    const TreePath pt=path; const KvBases bb=b;
+    return q.submit([&](sycl::handler& h){h.depends_on(deps);
+      h.parallel_for(sycl::range<2>(size_t(layers),size_t(kv_heads)*head_dim),[=](sycl::id<2> id){
+        const int li=int(id[0]),kd=int(id[1]),kh=kd/head_dim,d=kd%head_dim;
+        uint8_t* K=bb.k[li]+(int64_t(kh)*head_dim+d)*seq_cap;         // [kv][dim][seq]
+        uint8_t* V=bb.v[li]+int64_t(kh)*seq_cap*head_dim+d;           // [kv][seq][dim]
+        for(int i=1;i<pt.n;++i){
+          const int src=pt.row[i];
+          if(src==i)continue;
+          K[pos0+i]=K[pos0+src];
+          V[int64_t(pos0+i)*head_dim]=V[int64_t(pos0+src)*head_dim];
         }
       });});
 }

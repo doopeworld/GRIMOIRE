@@ -1084,6 +1084,51 @@ sycl::event launch_deltanet_replay(sycl::queue& q, const DeltaNetParams& p, cons
 sycl::event launch_deltanet_replay_groups(sycl::queue& q, const DeltaNetParams& p, const DnGroups& g,
                                           int64_t state_stride, const float* saved,
                                           const std::vector<sycl::event>& deps = {});
+// DRAFT TREES (2026-11-25, GRIMOIRE_DFLASH_TREE): the verify rows of ONE conversation are a tree
+// instead of a chain -- parent[r] < r, parent[0] = -1 (the anchor).  Row r continues from its
+// parent's recurrent state: the row before it, or a state the parent saved when it ran (save[p] =
+// 0 .. kDnTreeSaves-1; -1 = none).  A chain-shaped tree computes what the chain kernels compute.
+constexpr int kDnTreeRows = 32, kDnTreeSaves = 4;
+struct DnTree {
+    int32_t n = 0;
+    int8_t parent[kDnTreeRows];
+    int8_t save[kDnTreeRows];
+};
+// launch_deltanet_verify_rows for one conversation's tree: the state p.state + slot * state_stride
+// is only read; each row's inputs are saved for the commit's replay as there.
+sycl::event launch_deltanet_verify_tree(sycl::queue& q, const DeltaNetParams& p, const DnTree& t, int slot,
+                                        int64_t state_stride, float* saved,
+                                        const std::vector<sycl::event>& deps = {});
+// launch_causal_conv1d_split_groups for one conversation's tree: row r's window is its three nearest
+// ancestors' inputs (past the anchor: the ring), the ring copied to save_base and not shifted.
+sycl::event launch_causal_conv1d_split_tree(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, int slot, const DnTree& t,
+    int channels, float* qv, float* kv, float* vv, int qk_size, int v_size,
+    float* save_base, const std::vector<sycl::event>& deps = {});
+// The tree rows' own keys: row r attends to its ancestors and itself, stored at positions pos0 + row
+// of the FP8 cache p.k_cache / p.v_cache (that slot's bases, K [kv][dim][seq_cap], V [kv][seq_cap][dim]).
+// One partial per (row, head) in the verify partials' units (log2-domain m, unnormalised sums).
+sycl::event launch_verify_tree_tail(sycl::queue& q, const AttnParams& p, const DnTree& t, int pos0,
+                                    float* tail_m, float* tail_l, float* tail_acc,
+                                    const std::vector<sycl::event>& deps = {});
+// launch_verify_merge plus one more partial per (row, head): the tree tail.
+sycl::event launch_verify_merge_tail(sycl::queue& q, const AttnParams& p, int rows, int splits_max,
+                                     const float* tail_m, const float* tail_l, const float* tail_acc,
+                                     const std::vector<sycl::event>& deps = {});
+// The accepted tree path made a prefix: for i = 1 .. n-1, row i takes row row[i] (row[i] >= i; rows
+// copied in increasing i by the work-item that owns the element, so no row is read after it is
+// overwritten).  Row r of layer l at base + l * layer_stride + r * row_stride, row_elems floats.
+struct TreePath { int32_t n = 0; int8_t row[kDnTreeRows]; };
+sycl::event launch_rows_compact(sycl::queue& q, float* base, int layers, int64_t layer_stride,
+                                int64_t row_stride, int64_t row_elems, const TreePath& path,
+                                const std::vector<sycl::event>& deps = {});
+// The same for the FP8 KV caches of up to kKvCompactLayers attention layers (each layer's slot bases):
+// position pos0 + row[i] -> pos0 + i.
+constexpr int kKvCompactLayers = 32;
+struct KvBases { uint8_t* k[kKvCompactLayers]; uint8_t* v[kKvCompactLayers]; };
+sycl::event launch_kv_compact(sycl::queue& q, const KvBases& b, int layers, int kv_heads, int head_dim,
+                              int seq_cap, int pos0, const TreePath& path,
+                              const std::vector<sycl::event>& deps = {});
 // launch_causal_conv1d_split_prefill(tokens = 1) for `rows` rows in one
 // launch, kernel width 4 only: row r convolves x[r] over its own ring
 // (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.

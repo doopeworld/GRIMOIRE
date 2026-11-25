@@ -589,6 +589,127 @@ static sycl::event dn_replay_groups_sg(sycl::queue& q_, const DeltaNetParams& p,
     });
 }
 
+// Draft trees (2026-11-25): dn_verify_sg's arithmetic over one conversation's tree rows.  Row r starts
+// from its parent's state -- the registers when the parent is the row before it, else the copy the parent
+// saved (t.save[parent], at most kDnTreeSaves).  So row r's output is what the chain of its ancestors
+// computes, the same expressions on the same values.
+template <int PL>
+static sycl::event dn_verify_tree_sg(sycl::queue& q_, const DeltaNetParams& p, const DnTree& t, int slot,
+                                     int64_t state_stride, float* saved,
+                                     const std::vector<sycl::event>& deps) {
+    const int KD = p.k_dim, VD = p.v_dim;
+    const int wg_threads   = kDnRowsPerWG * SG_SIZE;
+    const int wgs_per_head = VD / kDnRowsPerWG;
+    const int per_group    = p.n_heads * wgs_per_head;
+    const int64_t srow     = deltanet_saved_row_floats(p);
+
+    return q_.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetParams pp = p;
+        const DnTree tt = t;
+        const float* const S0 = p.state + int64_t(slot) * state_stride;
+        float* const sv_base = saved;
+        const int wph = wgs_per_head;
+
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(per_group) * size_t(wg_threads), size_t(wg_threads)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  sgid = int(sg.get_group_id()[0]);
+                const int  gid  = int(it.get_group(0));
+                const int  head = gid / wph;
+                const int  row  = (gid % wph) * kDnRowsPerWG + sgid;
+                const int  nk    = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+                const int  khead = (nk == pp.n_heads) ? head : head / (pp.n_heads / nk);
+                const bool k_owner = row == 0 && (nk == pp.n_heads || head % (pp.n_heads / nk) == 0);
+                const int64_t voff = int64_t(nk) * KD;
+                const int64_t aoff = voff + int64_t(pp.n_heads) * VD;
+
+                const float* S = S0 + (int64_t(head) * VD + row) * KD;
+                float sv[PL], s0[PL], s1[PL], s2[PL], s3[PL];
+                #pragma unroll
+                for (int u = 0; u < PL; ++u) {
+                    sv[u] = S[u * SG_SIZE + lane];
+                    s0[u] = s1[u] = s2[u] = s3[u] = 0.0f;
+                }
+                const int nr = tt.n;
+                float kn[PL], qn[PL], an = 0.0f, bn = 0.0f, vn = 0.0f;
+                auto fetch = [&](int r) {
+                    const float* kr = pp.k + (int64_t(r) * nk + khead) * KD;
+                    const float* qr = pp.q + (int64_t(r) * nk + khead) * KD;
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) { kn[u] = kr[u * SG_SIZE + lane]; qn[u] = qr[u * SG_SIZE + lane]; }
+                    an = pp.a[int64_t(r) * pp.n_heads + head];
+                    bn = pp.beta[int64_t(r) * pp.n_heads + head];
+                    vn = pp.v[(int64_t(r) * pp.n_heads + head) * VD + row];
+                };
+                if (nr > 0) fetch(0);
+                for (int r = 0; r < nr; ++r) {
+                    const int par = tt.parent[r];
+                    if (r > 0 && par != r - 1) {          // a branch: the parent's saved state
+                        const int ps = tt.save[par];
+                        #pragma unroll
+                        for (int u = 0; u < PL; ++u)
+                            sv[u] = ps == 0 ? s0[u] : ps == 1 ? s1[u] : ps == 2 ? s2[u] : s3[u];
+                    }
+                    float kv[PL], qv[PL];
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) { kv[u] = kn[u]; qv[u] = qn[u]; }
+                    const float av = an, bv = bn, vi = vn;
+                    if (r + 1 < nr) fetch(r + 1);
+                    float w = 0.0f;
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) w = sycl::fma(sv[u], kv[u], w);
+                    w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
+
+                    const float corr = bv * (vi - av * w);
+                    float o = 0.0f;
+                    #pragma unroll
+                    for (int u = 0; u < PL; ++u) {
+                        const float sN = sycl::fma(av, sv[u], corr * kv[u]);
+                        sv[u] = sN;
+                        o = sycl::fma(sN, qv[u], o);
+                    }
+                    o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
+                    if (lane == 0)
+                        pp.out[(int64_t(r) * pp.n_heads + head) * VD + row] = o * sycl::rsqrt(float(KD));
+                    const int ms = tt.save[r];            // a later row branches from this one
+                    if (ms >= 0) {
+                        #pragma unroll
+                        for (int u = 0; u < PL; ++u) {
+                            if (ms == 0) s0[u] = sv[u];
+                            else if (ms == 1) s1[u] = sv[u];
+                            else if (ms == 2) s2[u] = sv[u];
+                            else s3[u] = sv[u];
+                        }
+                    }
+                    // this row's inputs, for the commit's replay
+                    float* sr = sv_base + int64_t(r) * srow;
+                    if (lane == 0) sr[voff + int64_t(head) * VD + row] = vi;
+                    if (row == 0 && lane == 0) {
+                        sr[aoff + head] = av;
+                        sr[aoff + pp.n_heads + head] = bv;
+                    }
+                    if (k_owner) {
+                        #pragma unroll
+                        for (int u = 0; u < PL; ++u) sr[int64_t(khead) * KD + u * SG_SIZE + lane] = kv[u];
+                    }
+                }
+            });
+    });
+}
+
+sycl::event launch_deltanet_verify_tree(sycl::queue& q_, const DeltaNetParams& p, const DnTree& t, int slot,
+                                        int64_t state_stride, float* saved,
+                                        const std::vector<sycl::event>& deps) {
+    switch (p.k_dim / SG_SIZE) {
+        case 4:  return dn_verify_tree_sg<4> (q_, p, t, slot, state_stride, saved, deps);
+        case 8:  return dn_verify_tree_sg<8> (q_, p, t, slot, state_stride, saved, deps);
+        default: return dn_verify_tree_sg<16>(q_, p, t, slot, state_stride, saved, deps);
+    }
+}
+
 sycl::event launch_deltanet_replay_groups(sycl::queue& q_, const DeltaNetParams& p, const DnGroups& g,
                                           int64_t state_stride, const float* saved,
                                           const std::vector<sycl::event>& deps) {

@@ -93,6 +93,7 @@ namespace sycl_ext = sycl::ext::oneapi::experimental;
 #include <thread>
 #include <atomic>
 #include <tuple>
+#include <queue>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -4332,7 +4333,11 @@ struct Grimoire {
     // spans: rows come in runs of consecutive tokens of one sequence each (a
     // batched admission of several prompts, admit_batch); verify: one run of
     // speculative candidates.  Neither: one token per sequence (decode).
-    struct SeqBatch { const int* slot; const int* pos; bool verify=false; bool spans=false; };
+    // Draft trees (GRIMOIRE_DFLASH_TREE, 2026-11-25): parent != null makes the rows ONE conversation's tree
+    // (parent[0] = -1, parent[r] < r); pos[r] is then the row's logical position (anchor + depth: rope,
+    // sampling) and spos[r] = anchor + r where its K / V and drafter features are stored.
+    struct SeqBatch { const int* slot; const int* pos; bool verify=false; bool spans=false;
+                      const int* spos=nullptr; const int8_t* parent=nullptr; };
     // allow_exact_restore: whether an exact-match cache hit may REBIND
     // the live slot out from under the caller (external audit,
     // 2026-09-21).  The serial single-conversation path
@@ -4461,6 +4466,13 @@ struct Grimoire {
             return e&&*e&&std::atoi(e)!=0; }();
         return on;
     }
+    // Draft trees (GRIMOIRE_DFLASH_TREE): with tree_capture set, dflash_draft also leaves its
+    // candidates here -- tree_ids [step][16] target ids, tree_scores [step][16 previous][16] selector
+    // scores (step 0: every previous row is the anchor's) -- for decode_spec_batch's tree.
+    bool tree_capture=false;
+    int tree_steps=0;
+    std::vector<int32_t> tree_ids;
+    std::vector<float> tree_scores;
     // GRIMOIRE_SAMPLE_GUMBEL=1: coupled drafts (b70/sampling.hpp).  The target
     // samples by Gumbel-max keyed by (seed, position, token) and the drafters (MTP,
     // DFlash2) add the same noise to their own logit / T, so a sampled request's
@@ -11382,6 +11394,7 @@ int Grimoire::decode_solo(int32_t tok, int slot, int position) {
 // condition reset() already gives every request today.
 long g_spec_batch_steps=0, g_spec_batch_proposals=0, g_spec_batch_accepted=0, g_spec_batch_sequences=0;
 long g_copy_rows=0, g_copy_declined=0, g_copy_proposed=0, g_copy_accepted=0;
+long g_tree_steps=0, g_tree_rows=0, g_tree_kept=0, g_tree_branch=0;   // draft trees: steps, rows, kept, off the first line
 
 // MTP draft depth when GRIMOIRE_MTP_K is not set.  MEASURED 2026-10-06,
 // Qwen3.8-27B GPTQ-Int4 + its BF16 MTP head drafting in MXFP4, served,
@@ -11397,6 +11410,68 @@ constexpr int kMtpDefaultDepth = 4;
 struct SpecTiming { double draft=0, verify=0, commit=0; long steps=0, rows=0, cand=0, emitted=0, ctx=0; };
 static SpecTiming g_spec_t;
 static const bool g_spec_timing=std::getenv("GRIMOIRE_SPEC_TIMING")!=nullptr;
+
+// DRAFT TREES (2026-11-25, GRIMOIRE_DFLASH_TREE=k): one conversation verifies a best-first tree of up to k
+// drafts instead of DFlash2's single line.  Node v at depth d takes its children from step d's 16 candidates,
+// scored softmax(selector score [d][v's candidate][c] / T) -- the root's row is the anchor's -- and nodes are
+// taken in order of path probability, depth <= max_depth, at most kDnTreeSaves branch points (the DeltaNet
+// tree kernel's saved states).  With coupled drafts (gumbel) the scores carry the target's noise, so each
+// node's best child is the coupled pick.  Rows in insertion order: a parent precedes its children.
+struct DraftTreeRows { std::vector<int32_t> tok; std::vector<int8_t> parent, depth; };
+static DraftTreeRows build_draft_tree(int32_t anchor, const std::vector<int32_t>& ids,
+        const std::vector<float>& scores, int steps, int budget, int max_depth, float inv_t,
+        const SamplingOptions* gumbel, uint64_t pos1) {
+    constexpr int C = 16, WIDTH = 4;          // candidates per step; children pushed per node
+    struct Node { int32_t tok; int parent, depth, cand; double lp; };
+    std::vector<Node> nodes{{anchor, -1, 0, -1, 0.0}};
+    using Entry = std::tuple<double, int, int>;  // path log-probability, parent, candidate
+    std::priority_queue<Entry> pq;
+    auto push_children = [&](int v) {
+        const int d = nodes[size_t(v)].depth;
+        if (d >= max_depth || d >= steps) return;
+        const int prev = d == 0 ? 0 : nodes[size_t(v)].cand;
+        const float* row = scores.data() + (size_t(d) * C + size_t(prev)) * C;
+        double x[C], mx = -1e300, z = 0.0;
+        for (int c = 0; c < C; ++c) {
+            x[c] = double(row[c]) * inv_t;
+            if (gumbel) x[c] += double(-std::log(-std::log(sampling_gumbel_uniform(gumbel->seed,
+                pos1 + uint64_t(d), ids[size_t(d) * C + size_t(c)]))));
+            mx = std::max(mx, x[c]);
+        }
+        for (int c = 0; c < C; ++c) z += std::exp(x[c] - mx);
+        int order[C];
+        for (int c = 0; c < C; ++c) order[c] = c;
+        std::partial_sort(order, order + WIDTH, order + C, [&](int a, int b) { return x[a] > x[b]; });
+        for (int k = 0; k < WIDTH; ++k) {
+            const int c = order[k];
+            pq.emplace(nodes[size_t(v)].lp + (x[c] - mx - std::log(z)), v, c);
+        }
+    };
+    push_children(0);
+    while (int(nodes.size()) < budget + 1 && !pq.empty()) {
+        const auto [lp, v, c] = pq.top();
+        pq.pop();
+        const int d = nodes[size_t(v)].depth;
+        nodes.push_back({ids[size_t(d) * C + size_t(c)], v, d + 1, c, lp});
+        push_children(int(nodes.size()) - 1);
+    }
+    // at most kDnTreeSaves rows with a child other than the next row; the last row is a leaf, so dropping
+    // rows from the end keeps a tree
+    auto branch_points = [&]() {
+        std::vector<char> b(nodes.size(), 0);
+        for (size_t c = 1; c < nodes.size(); ++c)
+            if (nodes[c].parent != int(c) - 1) b[size_t(nodes[c].parent)] = 1;
+        return int(std::count(b.begin(), b.end(), 1));
+    };
+    while (nodes.size() > 1 && branch_points() > kDnTreeSaves) nodes.pop_back();
+    DraftTreeRows t;
+    for (const auto& nd : nodes) {
+        t.tok.push_back(nd.tok);
+        t.parent.push_back(int8_t(nd.parent));
+        t.depth.push_back(int8_t(nd.depth));
+    }
+    return t;
+}
 
 bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         const std::vector<int>& slots, const std::vector<int>& positions,
@@ -11575,6 +11650,19 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
                 "  MTP device chaining: %d draft depths, %d sequences, one proposal readback\n",dmax,n);}
         }
     }
+    // GRIMOIRE_DFLASH_TREE=k (0 = off, the default until measured): one conversation alone verifies a best-first
+    // tree of up to k DFlash2 drafts (build_draft_tree).  Needs the selector's candidates, the DeltaNet verify
+    // that saves inputs (dn_verify_fused), kernel-4 convs and the matrix-engine verify attention's dim-major
+    // FP8 cache; one card.
+    static const int tree_budget=[] { const char* e=std::getenv("GRIMOIRE_DFLASH_TREE");
+        return std::clamp(e&&*e?std::atoi(e):0,0,kDnTreeRows-1); }();
+    const bool tree_ok=tree_budget>0 && n==1 && dflash2.ok && dflash2.selector_ok && dflash2.selector_top_k==16 &&
+        dn_verify_fused && spec_dn_inputs && spec_conv_inputs && cfg.conv_kernel==4 && !tp_ranked() &&
+        !pp_enabled() && !tp_enabled() && !kv_kmajor_flag() && !kv_k8_flag() && !cfg.is_moe() && !cfg.is_muse &&
+        !mtp.ok && !draft_slots.empty();
+    bool tree_now=false;
+    DraftTreeRows tree;
+    std::vector<int> tree_store;
     for(int row=0;row<n;++row) {
         sync(); bind_seq_slot(slots[size_t(row)]);
         pos=positions[size_t(row)]; set_cursor(pos);
@@ -11587,11 +11675,23 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         if(depth>0) {
             if(dflash2.ok) {
                 std::vector<int32_t> draft;
-                if(!dflash_draft(block[0],pos,draft) || draft.empty())
+                tree_capture=tree_ok && depth>=2;
+                tree_steps=0;                          // set only by this call's capture
+                const bool drafted=dflash_draft(block[0],pos,draft);
+                tree_capture=false;
+                if(!drafted || draft.empty())
                     throw std::runtime_error("batched DFlash proposal failed");
                 // the drafter agrees with the copy's first token (or no agreement is asked): verify the copy
                 if(copy_cap[size_t(row)]>0 && (use_copy[size_t(row)] || draft[0]==(*copies)[size_t(row)][0]))
                     use_copy[size_t(row)]=1;
+                else if(tree_ok && depth>=2 && tree_steps>0) {
+                    const auto& so=sampling_uses_slots?slot_sampling.at(size_t(seq_slot)):current_sampling;
+                    tree=build_draft_tree(block[0],tree_ids,tree_scores,tree_steps,tree_budget,
+                        std::min(depth,tree_steps),so.enabled()?1.0f/so.temperature:1.0f,
+                        gumbel_draft_options(seq_slot),uint64_t(pos)+1);
+                    block=tree.tok;
+                    tree_now=block.size()>1;
+                }
                 else
                     block.insert(block.end(),draft.begin(),draft.begin()+std::min(depth,int(draft.size())));
             } else if(batched) {
@@ -11618,10 +11718,14 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         lengths.push_back(int(block.size()));
         for(size_t k=0;k<block.size();++k) {
             candidates.push_back(block[k]); candidate_slots.push_back(seq_slot);
-            candidate_positions.push_back(pos+int(k));
+            // a tree row: rope and sampling at the anchor's position + its depth, K / V and the drafter's
+            // features stored at the anchor's position + its row
+            candidate_positions.push_back(pos+(tree_now?int(tree.depth[k]):int(k)));
+            if(tree_now) tree_store.push_back(pos+int(k));
         }
     }
     SeqBatch batch{candidate_slots.data(),candidate_positions.data(),true};
+    if(tree_now){ batch.spos=tree_store.data(); batch.parent=tree.parent.data(); }
     std::vector<int32_t> verified;
     spec_hidden_valid=false;
     if(g_spec_timing) { sync(); st1=spec_clock::now(); }
@@ -11633,9 +11737,57 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     const size_t dn_n=size_t(cfg.lin_v_heads)*cfg.lin_v_dim*cfg.lin_k_dim;
     ++g_spec_batch_steps; g_spec_batch_sequences+=n;
     std::vector<int> acc_n(size_t(n),1);
+    // A DRAFT TREE: the target's choice after each kept row names the child that is kept next.  The kept path
+    // is then moved to rows 0 .. len-1 of every per-row buffer the commit and the drafter read (the DeltaNet
+    // and conv inputs, the hidden states, the drafter's features, every attention layer's K / V), and of the
+    // host arrays -- from there on it is a chain prefix of `len` rows.
+    int tree_len=0;
+    if(tree_now){
+        const int M=int(candidates.size());
+        std::vector<int> path{0};
+        for(int cur=0;;){
+            int next=-1;
+            for(int c=cur+1;c<M;++c)
+                if(tree.parent[size_t(c)]==cur && candidates[size_t(c)]==verified[size_t(cur)]){ next=c; break; }
+            if(next<0) break;
+            path.push_back(next); cur=next;
+        }
+        tree_len=int(path.size());
+        bool moved=false;
+        for(int i=1;i<tree_len;++i) moved|=path[size_t(i)]!=i;
+        ++g_tree_steps; g_tree_rows+=M; g_tree_kept+=tree_len-1; g_tree_branch+=moved?1:0;
+        if(moved){
+            TreePath tp{}; tp.n=tree_len;
+            for(int i=0;i<tree_len;++i) tp.row[i]=int8_t(path[size_t(i)]);
+            const int tslot=slots[0], pos0=positions[0];
+            int dn_layers=0,conv_layers=0;
+            for(const auto& l:L){ if(l.dn_state) ++dn_layers; if(l.conv_ring) ++conv_layers; }
+            const int channels=2*cfg.lin_k_heads*cfg.lin_k_dim+cfg.lin_v_heads*cfg.lin_v_dim;
+            launch_rows_compact(q,spec_dn_inputs,dn_layers,int64_t(kSpecBatch)*spec_dn_row_floats,
+                                int64_t(spec_dn_row_floats),int64_t(spec_dn_row_floats),tp);
+            launch_rows_compact(q,spec_conv_inputs,conv_layers,int64_t(kSpecBatch)*channels,channels,channels,tp);
+            launch_rows_compact(q,spec_hidden_steps,1,0,cfg.hidden,cfg.hidden,tp);
+            const int64_t tw=int64_t(dflash2.target_layers.size())*cfg.hidden;
+            if(float* aux=draft_slots[size_t(tslot)].aux)
+                launch_rows_compact(q,aux+int64_t(pos0)*tw,1,0,tw,tw,tp);
+            KvBases kb{}; int na=0,kvh=0,hd=0;
+            for(auto& l:L) if(l.k_base && l.v_base && l.kv_slot){
+                if(na==kKvCompactLayers) throw std::runtime_error("draft tree: too many attention layers");
+                kb.k[na]=l.k_base+size_t(tslot)*l.kv_slot; kb.v[na]=l.v_base+size_t(tslot)*l.kv_slot;
+                kvh=l.kv_heads; hd=l.head_dim; ++na;
+            }
+            if(na) launch_kv_compact(q,kb,na,kvh,hd,max_seq,pos0,tp);
+            for(int i=1;i<tree_len;++i){          // path[i] >= i and increasing: in place, in order
+                candidates[size_t(i)]=candidates[size_t(path[size_t(i)])];
+                verified[size_t(i)]=verified[size_t(path[size_t(i)])];
+            }
+        }
+    }
     for(int row=0;row<n;++row) {
         const int first=begin[size_t(row)], count=lengths[size_t(row)];
         int accepted=1;
+        if(tree_now) accepted=tree_len;       // n == 1
+        else
         while(accepted<count && candidates[size_t(first+accepted)]==verified[size_t(first+accepted-1)])
             ++accepted;
         g_spec_batch_proposals+=count-1; g_spec_batch_accepted+=accepted-1;
@@ -11658,6 +11810,10 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
             g_copy_rows,g_copy_declined,g_copy_proposed,g_copy_accepted,
             100.0*double(g_copy_accepted)/double(std::max(1L,g_copy_proposed)),
             double(g_copy_accepted)/double(std::max(1L,g_copy_rows)));
+        if(g_tree_steps)
+            std::fprintf(stderr,"tree stats: %ld tree steps, %.2f rows, %.2f kept/step, %.1f%% kept a branch\n",
+                g_tree_steps,double(g_tree_rows)/double(g_tree_steps),double(g_tree_kept)/double(g_tree_steps),
+                100.0*double(g_tree_branch)/double(g_tree_steps));
     }
     // Several conversations (11-05): every conversation's DeltaNet replay in one launch per layer
     // (launch_deltanet_replay_groups) and every conv ring rebuilt in one more -- the same arithmetic
@@ -17275,6 +17431,14 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         launch_dflash2_path_walk(q,dflash2.sel_scores,dflash2.sel_ids,
             dflash2.draft_ids,steps,TK,{},g?1.0f/g->temperature:0.0f,
             g?g->seed:0,uint64_t(position)+1,g&&draft_topp?g->top_p:1.0f);
+        if(tree_capture && TK==K){
+            // a draft tree (decode_spec_batch): every step's 16 candidates and the selector's scores
+            tree_steps=steps;
+            tree_ids.resize(size_t(steps)*K);
+            tree_scores.resize(size_t(steps)*TK*TK);
+            q.memcpy(tree_ids.data(),dflash2.sel_ids,tree_ids.size()*sizeof(int32_t));
+            q.memcpy(tree_scores.data(),dflash2.sel_scores,tree_scores.size()*sizeof(float));
+        }
     }else for(int r=0;r<M-1;++r){
         const SamplingOptions* g=vocab_map?nullptr:gumbel_draft_options(seq_slot);
         if(g)launch_sample_logits(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
@@ -20345,7 +20509,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         for(size_t a=0;a+1<tokens.size();++a)
             for(size_t b=a+1;b<tokens.size();++b)
                 if(seqb->slot[a]==seqb->slot[b]) {
-                    if(!seqb->verify || seqb->pos[b]-seqb->pos[a]!=int(b-a))
+                    const int* sp=seqb->spos?seqb->spos:seqb->pos;      // a tree: its storage positions
+                    if(!seqb->verify || sp[b]-sp[a]!=int(b-a))
                         throw std::invalid_argument("batch rows share a slot without a contiguous verify block");
                 }
         const std::string why=batch_unsupported_reason();
@@ -20365,7 +20530,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             std::array<int, 64> needed{};
             for (size_t row = 0; row < tokens.size(); ++row) {
                 auto& end = needed[size_t(seqb->slot[row])];
-                end = std::max(end, seqb->pos[row] + 1);
+                end = std::max(end, (seqb->spos ? seqb->spos : seqb->pos)[row] + 1);
             }
             for (int slot = 0; slot < n_seq_slots; ++slot)
                 if (needed[size_t(slot)]) ensure_kv(slot, needed[size_t(slot)]);
@@ -20562,7 +20727,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         if (rows_len_buf && rows_len_host) {
             rows_len_ev.wait();
-            for (int r = 0; r < M; ++r) rows_len_host[r] = seqb->pos[r] + 1;
+            for (int r = 0; r < M; ++r)
+                rows_len_host[r] = seqb->parent ? seqb->spos[0] : seqb->pos[r] + 1;   // a tree: the context
             rows_len_ev = q.memcpy(rows_len_buf, rows_len_host, size_t(M) * sizeof(int32_t));
             rows_len_dev = rows_len_buf;
         }
@@ -21902,7 +22068,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         for(int r=0;r<M;++r)
                             launch_dflash_store_tap(q,bh+int64_t(r)*H,
                                 draft_slots[size_t(seqb->slot[r])].aux,1,H,
-                                int(dflash2.target_layers.size()),seqb->pos[r],int(tap),{},
+                                int(dflash2.target_layers.size()),(seqb->spos?seqb->spos:seqb->pos)[r],int(tap),{},
                                 cfg.is_muse);
                     } else launch_dflash_store_tap(q,bh,dflash2.target_aux,M,H,
                         int(dflash2.target_layers.size()),start_pos,int(tap),{},cfg.is_muse);
@@ -22001,6 +22167,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         return !(e&&*e=='0'); }();
                     DnGroups cg{};
                     bool cg_ok=conv_grouped && causal_conv1d_rows_ok(cfg.conv_kernel);
+                    if(seqb->parent){
+                        // a draft tree (decode_spec_batch checked kernel 4): each row over its ancestors
+                        DnTree tr{}; tr.n=M;
+                        for(int r=0;r<M;++r){ tr.parent[r]=seqb->parent[r]; tr.save[r]=-1; }
+                        launch_causal_conv1d_split_tree(q,t0,d.la_conv,d.conv_base,int64_t(d.conv_slot),
+                            seqb->slot[0],tr,ch,t1,t2,t3,qs,vs,batch_conv_steps+spec_coff[li]);
+                        cg_ok=false; cg.n=-1;
+                    }else
                     for(int r=0;r<M && cg_ok;){
                         int n=1;
                         while(r+n<M && seqb->slot[r+n]==seqb->slot[r] &&
@@ -22009,7 +22183,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         cg.row0[cg.n]=r; cg.nrows[cg.n]=n; cg.slot[cg.n]=seqb->slot[r]; ++cg.n;
                         r+=n;
                     }
-                    if(cg_ok)
+                    if(cg.n<0){}                          // the tree above
+                    else if(cg_ok)
                         launch_causal_conv1d_split_groups(q,t0,d.la_conv,d.conv_base,int64_t(d.conv_slot),cg,ch,
                             t1,t2,t3,qs,vs,batch_conv_steps+spec_coff[li],int64_t(spec_conv_elems));
                     else
@@ -22136,6 +22311,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     sp.state=seqb?d.dn_base:d.dn_state;
                     const size_t dn_n=size_t(Hv)*Dv*Dk;
                     float* saved=spec_dn_inputs+(spec_doff[li]/dn_n)*kSpecBatch*spec_dn_row_floats;
+                    if(seqb && seqb->parent){
+                        // a draft tree: each row from its parent's state (a branch point keeps a copy)
+                        DnTree tr{}; tr.n=M; int saves=0;
+                        for(int r=0;r<M;++r){ tr.parent[r]=seqb->parent[r]; tr.save[r]=-1; }
+                        for(int c=1;c<M;++c){
+                            const int pr=seqb->parent[c];
+                            if(pr!=c-1 && tr.save[pr]<0){
+                                if(saves==kDnTreeSaves) throw std::runtime_error("draft tree: too many branch points");
+                                tr.save[pr]=int8_t(saves++);
+                            }
+                        }
+                        launch_deltanet_verify_tree(q,sp,tr,seqb->slot[0],int64_t(d.dn_slot),saved,{});
+                    }else
                     launch_deltanet_verify_rows(q,sp,g,seqb?int64_t(d.dn_slot):0,saved,{});
                 }else if(seqb||M<=16){
                     for(int t=0;t<M;++t){
@@ -22406,7 +22594,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     for(int c0=0;c0<M;c0+=kMaxRowSlots){
                         const int cn=std::min(kMaxRowSlots,M-c0);
                         RowSlots rc{};
-                        for(int r=0;r<cn;++r){ rc.slot[r]=seqb->slot[c0+r]; rc.pos[r]=seqb->pos[c0+r]; }
+                        const int* kvp=seqb->spos?seqb->spos:seqb->pos;    // a tree: its storage positions
+                        for(int r=0;r<cn;++r){ rc.slot[r]=seqb->slot[c0+r]; rc.pos[r]=kvp[c0+r]; }
                         launch_kv_append_rows(q,t3+int64_t(c0)*KH,t4+int64_t(c0)*KH,d.k_base,d.v_base,int64_t(d.kv_slot),
                             rc,cn,d.kv_heads,d.head_dim,max_seq);
                     }
@@ -22427,7 +22616,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         launch_qk_norm_rope_batched(q,qr,kr,d.q_norm,d.k_norm,1,
                             cfg.n_heads,d.kv_heads,d.head_dim,P,d.rope_theta,
                             d.partial_rope,cfg.rms_eps);
-                    launch_kv_append_batched(q,kr,vr,kc,vc,1,P,d.kv_heads,
+                    launch_kv_append_batched(q,kr,vr,kc,vc,1,seqb->spos?seqb->spos[r]:P,d.kv_heads,
                         d.head_dim,max_seq);
                 }
             }else{
@@ -22507,6 +22696,39 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 bool use_vdpas = verify_dpas && seqb->verify && !exact_verify && M<=kSpecBatch &&
                                  verify_dpas_ok(apr);
                 int len_max = 1;
+                if(seqb->parent){
+                    // A DRAFT TREE (2026-11-25): the matrix-engine kernel over the context only (every row's
+                    // length is the anchor's storage position, rows_len_dev), then each row over its own
+                    // ancestors' keys (launch_verify_tree_tail), merged as one more split.
+                    if(!use_vdpas || d_lens!=rows_len_dev || M>kDnTreeRows)
+                        throw std::runtime_error("draft tree: the verify attention needs the matrix-engine kernel");
+                    const int pos0=seqb->spos[0], tslot=seqb->slot[0];
+                    VerifyGroups tg{}; tg.n=1; tg.row0[0]=0; tg.nrows[0]=M; tg.slot[0]=tslot;
+                    const int smax=verify_dpas_splits(apr,tg,pos0);
+                    launch_verify_attn_dpas(q,apr,tg,int64_t(d.kv_slot),d_lens,smax,{},pos0);
+                    static float *tail_m=nullptr,*tail_l=nullptr,*tail_acc=nullptr;
+                    static size_t tail_cap=0;
+                    const size_t need=size_t(kDnTreeRows)*cfg.n_heads;
+                    if(need*size_t(d.head_dim)>tail_cap){
+                        q.wait();
+                        if(tail_m)sycl::free(tail_m,q);
+                        if(tail_l)sycl::free(tail_l,q);
+                        if(tail_acc)sycl::free(tail_acc,q);
+                        tail_m=sycl::malloc_device<float>(need,q);
+                        tail_l=sycl::malloc_device<float>(need,q);
+                        tail_acc=sycl::malloc_device<float>(need*size_t(d.head_dim),q);
+                        if(!tail_m||!tail_l||!tail_acc) throw std::bad_alloc();
+                        tail_cap=need*size_t(d.head_dim);
+                    }
+                    AttnParams ta=apr;
+                    ta.k_cache=d.k_base+size_t(tslot)*d.kv_slot;
+                    ta.v_cache=d.v_base+size_t(tslot)*d.kv_slot;
+                    DnTree tr{}; tr.n=M;
+                    for(int r=0;r<M;++r){ tr.parent[r]=seqb->parent[r]; tr.save[r]=-1; }
+                    launch_verify_tree_tail(q,ta,tr,pos0,tail_m,tail_l,tail_acc);
+                    launch_verify_merge_tail(q,apr,M,smax,tail_m,tail_l,tail_acc);
+                    use_vdpas=false;
+                }else
                 for(int r=0; use_vdpas && r<M; ++r){
                     len_max = std::max(len_max, seqb->pos[r]+1);
                     if(vg.n>0 && seqb->slot[r]==vg.slot[vg.n-1] && seqb->pos[r]==seqb->pos[r-1]+1){
@@ -22515,7 +22737,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     if(vg.n==kMaxVerifyGroups){ use_vdpas=false; break; }
                     vg.row0[vg.n]=r; vg.nrows[vg.n]=1; vg.slot[vg.n]=seqb->slot[r]; ++vg.n;
                 }
-                if(use_vdpas){
+                if(seqb->parent){}                       // the tree above
+                else if(use_vdpas){
                     const int smax=verify_dpas_splits(apr,vg,len_max);
                     launch_verify_attn_dpas(q,apr,vg,int64_t(d.kv_slot),d_lens,smax,{},len_max);
                     launch_verify_merge(q,apr,M,smax);
