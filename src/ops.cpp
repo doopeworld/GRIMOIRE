@@ -30,6 +30,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <limits>
 #include "kernels.hpp"
+#include "b70/sampling.hpp"
 #include "kv_k8.hpp"
 #include "b70/int8_embedding.hpp"
 #include "gemv_step.hpp"
@@ -1920,7 +1921,8 @@ sycl::event launch_dflash2_selector_edges(
 sycl::event launch_dflash2_path_walk(
     sycl::queue& q, const float* scores, const int32_t* candidate_ids,
     int32_t* tokens, int steps, int top_k,
-    const std::vector<sycl::event>& deps) {
+    const std::vector<sycl::event>& deps,
+    float inv_t, uint64_t seed, uint64_t position0, float top_p) {
     return q.submit([&](sycl::handler& h){
         h.depends_on(deps);
         h.single_task([=](){
@@ -1929,7 +1931,31 @@ sycl::event launch_dflash2_path_walk(
                 const float* row=scores+(int64_t(step)*top_k+previous)*top_k;
                 float best=-std::numeric_limits<float>::infinity();
                 int pick=top_k;
-                for(int c=0;c<top_k;++c)if(row[c]>best){best=row[c];pick=c;}
+                // a coupled draft keeps the target's nucleus: candidate c only if the
+                // softmax(score / T) mass ranked before it is under top_p (as the sampler)
+                float mx=-std::numeric_limits<float>::infinity(),total=0.0f;
+                const bool nucleus=inv_t>0&&top_p<1.0f;
+                if(nucleus){
+                    for(int c=0;c<top_k;++c)mx=sycl::fmax(mx,row[c]*inv_t);
+                    for(int c=0;c<top_k;++c)total+=sycl::exp(row[c]*inv_t-mx);
+                }
+                for(int c=0;c<top_k;++c){
+                    float v=row[c];
+                    if(nucleus){
+                        const float wc=sycl::exp(v*inv_t-mx);
+                        float before=0.0f;
+                        for(int j=0;j<top_k;++j){
+                            const float wj=sycl::exp(row[j]*inv_t-mx);
+                            if(wj>wc||(wj==wc&&j<c))before+=wj;
+                        }
+                        if(!(before<top_p*total))continue;
+                    }
+                    // coupled draft (b70/sampling.hpp): score / T + the target's noise at
+                    // this position, so the walk guesses the token the target will draw
+                    if(inv_t>0)v=v*inv_t-sycl::log(-sycl::log(b70::sampling_gumbel_uniform(
+                        seed,position0+uint64_t(step),candidate_ids[int64_t(step)*top_k+c])));
+                    if(v>best){best=v;pick=c;}
+                }
                 if(pick==top_k)pick=0;
                 tokens[step]=candidate_ids[int64_t(step)*top_k+pick];
                 previous=pick;

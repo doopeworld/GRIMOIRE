@@ -4461,10 +4461,30 @@ struct Grimoire {
             return e&&*e&&std::atoi(e)!=0; }();
         return on;
     }
+    // GRIMOIRE_SAMPLE_GUMBEL=1: coupled drafts (b70/sampling.hpp).  The target
+    // samples by Gumbel-max keyed by (seed, position, token) and the drafters (MTP,
+    // DFlash2) add the same noise to their own logit / T, so a sampled request's
+    // drafts guess the target's draw.  Exact: the draw never depends on a draft.
+    static bool gumbel_sampling_enabled() {
+        static const bool on=[] { const char* e=std::getenv("GRIMOIRE_SAMPLE_GUMBEL");
+            return e&&*e&&std::atoi(e)!=0; }();
+        return on;
+    }
+    // The options a coupled draft for the bound slot uses, or null: greedy drafts.
+    const SamplingOptions* gumbel_draft_options(int slot) const {
+        if(!gumbel_sampling_enabled()||(tp_ranked()&&tp_rank!=0))return nullptr;
+        const auto& options=sampling_uses_slots?slot_sampling.at(size_t(slot)):current_sampling;
+        return options.enabled()?&options:nullptr;
+    }
     sycl::event proposal_choice(const float* logits,int n,int32_t* token,float* value,
                                int slot,int position,bool from_draft,
                                const std::vector<sycl::event>& deps={}) {
         const auto& options=sampling_uses_slots?slot_sampling.at(size_t(slot)):current_sampling;
+        if(const auto* g=gumbel_draft_options(slot)) {
+            (void)from_draft;
+            return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
+                *g,uint64_t(position),deps,nullptr,nullptr,0,nullptr,true);
+        }
         if(coupled_sampling_enabled()&&options.enabled()&&(!tp_ranked()||tp_rank==0)) {
             coupled_sampling_store.ensure(q);
             if(!from_draft)++sampling_epoch.at(size_t(slot));
@@ -4485,11 +4505,11 @@ struct Grimoire {
         // subsequent forward pass. Draft proposals keep their greedy policy.
         if(options.enabled()&&(!tp_ranked()||tp_rank==0)) {
             const int actual_slot=slot>=0?slot:seq_slot;
-            const auto* proposal=allow_coupling&&coupled_sampling_enabled()&&mtp.ok&&!dflash2.ok?
-                coupled_sampling_store.record(actual_slot,uint64_t(position)):nullptr;
+            const auto* proposal=allow_coupling&&coupled_sampling_enabled()&&!gumbel_sampling_enabled()&&
+                mtp.ok&&!dflash2.ok?coupled_sampling_store.record(actual_slot,uint64_t(position)):nullptr;
             return launch_sample_logits(q,logits,n,token,value,sampling_workspace,
                 options,uint64_t(position),deps,nullptr,proposal,
-                sampling_epoch.at(size_t(actual_slot)));
+                sampling_epoch.at(size_t(actual_slot)),nullptr,gumbel_sampling_enabled());
         }
         return launch_argmax(q,logits,n,token,value,deps);
     }
@@ -17067,6 +17087,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                                         M,QH,KVH,HD,position,theta,1.0f,eps,{},0.0f);
             launch_kv_append_batched(q,dflash2.k,dflash2.v,d.k_cache,d.v_cache,
                                      M,position,KVH,HD,max_seq);
+            draft_mark("qk norm rope + kv append");
             // the key range in slices on separate work-groups (prefill.cpp)
             launch_dflash2_block_attention(q,dflash2.q,d.k_cache,d.v_cache,
                 dflash2.attn,M,position,QH,KVH,HD,max_seq,
@@ -17074,7 +17095,7 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 1.0f/std::sqrt(float(HD)),{},true);
         }
         checkpoint("block attention");
-        draft_mark("attention convert");
+        draft_mark("block attention");
         dump_f32("13_L"+std::to_string(li)+"_attn",dflash2.attn,size_t(M)*QW);
         mm(d.o,dflash2.attn,dflash2.proj,M);
         draft_mark("o proj");
@@ -17245,10 +17266,21 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         launch_dflash2_selector_edges(q,dflash2.predecessor,dflash2.successor,
             dflash2.sel_ids,dflash2.sel_unary,dflash2.sel_hidden,
             int32_t(bonus_token),dflash2.sel_scores,steps,TK,rank,{});
+        // a sampled request with GRIMOIRE_SAMPLE_GUMBEL=1: draft row r guesses the
+        // target's draw at position + 1 + r (verify row r samples pos[r] + 1)
+        const SamplingOptions* g=gumbel_draft_options(seq_slot);
+        // GRIMOIRE_GUMBEL_DRAFT_TOPP=0: coupled drafts over all 16 candidates
+        static const bool draft_topp=[]{const char* e=std::getenv("GRIMOIRE_GUMBEL_DRAFT_TOPP");
+            return !(e&&*e=='0');}();
         launch_dflash2_path_walk(q,dflash2.sel_scores,dflash2.sel_ids,
-            dflash2.draft_ids,steps,TK,{});
+            dflash2.draft_ids,steps,TK,{},g?1.0f/g->temperature:0.0f,
+            g?g->seed:0,uint64_t(position)+1,g&&draft_topp?g->top_p:1.0f);
     }else for(int r=0;r<M-1;++r){
-        launch_argmax(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
+        const SamplingOptions* g=vocab_map?nullptr:gumbel_draft_options(seq_slot);
+        if(g)launch_sample_logits(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
+                 s.d_tok,s.d_val,sampling_workspace,*g,uint64_t(position)+1+uint64_t(r),{},
+                 nullptr,nullptr,0,nullptr,true);
+        else launch_argmax(q,dflash2.logits+int64_t(r)*draft_stride,draft_vocab,
                       s.d_tok,s.d_val,{});
         if(vocab_map){
             const int32_t* map=vocab_map;
@@ -17261,6 +17293,12 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     draft_tokens.resize(M-1);
     q.memcpy(draft_tokens.data(),dflash2.draft_ids,
              size_t(M-1)*sizeof(int32_t)).wait();
+    // Coupled drafts need the request's sampling options, which only TP rank 0
+    // holds: the workers take rank 0's block so every rank verifies the same rows.
+    if(gumbel_sampling_enabled()&&tp_ranked()&&!tp_sync_tokens(draft_tokens)){
+        std::fprintf(stderr,"TP rank %d: coupled draft block sync failed\n",tp_rank);
+        return false;
+    }
     draft_mark("argmax + readback");
     if(dumping){
         std::fprintf(stderr,"  dflash dump: draft_ids");

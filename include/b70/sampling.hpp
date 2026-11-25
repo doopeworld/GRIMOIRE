@@ -30,6 +30,18 @@ inline uint64_t sampling_mix(uint64_t v) {
 inline float sampling_uniform_f32(uint64_t seed,uint64_t position) {
     return (float(sampling_mix(seed+UINT64_C(0x9e3779b97f4a7c15)*(position+1))>>41)+0.5f)*0x1p-23f;
 }
+// Coupled drafts (GRIMOIRE_SAMPLE_GUMBEL=1): the target draws a sampled token as
+// the argmax over its kept set of log w + g, with g = -log(-log(u)) and u keyed by
+// (seed, absolute position, token id).  Gumbel-max is distributed exactly as the
+// kept set's renormalised weights, and the draw depends on (seed, position) only,
+// never on the drafts.  A drafter that adds the same g to its own logit / T picks
+// the token the target will draw whenever their distributions agree, so more of
+// its drafts are accepted than with a greedy draft (accepted with p(draft)).
+inline float sampling_gumbel_uniform(uint64_t seed,uint64_t position,int32_t token) {
+    const uint64_t h=sampling_mix(seed^sampling_mix((position+1)*UINT64_C(0x9e3779b97f4a7c15)^
+        (uint64_t(uint32_t(token))*UINT64_C(0xd6e8feb86659fd93))));
+    return (float(uint32_t(h>>40))+0.5f)*0x1p-24f;
+}
 inline double sampling_uniform(uint64_t seed,uint64_t position) {
     return (double(sampling_mix(seed+UINT64_C(0x9e3779b97f4a7c15)*(position+1))>>11)+0.5)*0x1p-53;
 }

@@ -38,13 +38,19 @@ struct CoupledSamplingStore {
     }
     void release(sycl::queue& q){if(records)sycl::free(records,q);records=nullptr;}
 };
+// The Gumbel noise of a coupled draw (b70/sampling.hpp); host and device.
+inline float sampling_gumbel(uint64_t seed,uint64_t position,int32_t token) {
+    return -sycl::log(-sycl::log(sampling_gumbel_uniform(seed,position,token)));
+}
+// gumbel: draw by Gumbel-max over the kept set (coupled drafts) instead of
+// the inverse CDF.  Both are exact; a seed gives a different text in each.
 inline sycl::event launch_sample_logits(sycl::queue& q,const float* logits,int n,
     int32_t* output,float* output_value,SamplingWorkspace& workspace,
     SamplingOptions options,uint64_t position,
     const std::vector<sycl::event>& deps={},
     SparseSamplingDistribution* save=nullptr,
     const SparseSamplingDistribution* reference=nullptr,uint64_t epoch=0,
-    int32_t* acceptance=nullptr) {
+    int32_t* acceptance=nullptr,bool gumbel=false) {
     options.validate();workspace.ensure(q);
     constexpr int G=SamplingWorkspace::groups,W=SamplingWorkspace::width;
     float* pv=workspace.values;int32_t* pi=workspace.indices;
@@ -100,7 +106,15 @@ inline sycl::event launch_sample_logits(sycl::queue& q,const float* logits,int n
                 float mass=0;int keep=0;
                 do{mass+=scores[keep++];}while(keep<k&&mass<options.top_p*total);
                 int token=-1;
-                if(!save&&!reference) {
+                if(!save&&!reference&&gumbel) {
+                    float best=-std::numeric_limits<float>::infinity();int chosen=0;
+                    for(int j=0;j<keep;++j){
+                        if(!(scores[j]>0))continue;
+                        const float v=sycl::log(scores[j])+sampling_gumbel(options.seed,position,ids[j]);
+                        if(v>best){best=v;chosen=j;}
+                    }
+                    token=ids[chosen];if(acceptance)*acceptance=0;
+                } else if(!save&&!reference) {
                     const float draw=sampling_uniform_f32(options.seed,position)*mass;
                     float cumulative=0;int chosen=keep-1;
                     for(int j=0;j<keep;++j){cumulative+=scores[j];if(draw<cumulative){chosen=j;break;}}

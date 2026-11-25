@@ -926,10 +926,13 @@ sycl::event launch_dflash2_selector_edges(
     const float* projected_hidden, int32_t anchor_token,
     float* scores, int steps, int top_k, int rank,
     const std::vector<sycl::event>& deps = {});
+// inv_t > 0: coupled sampled drafts -- each step picks argmax of score * inv_t
+// plus the Gumbel noise the target's sampler uses at position0 + step.
 sycl::event launch_dflash2_path_walk(
     sycl::queue& q, const float* scores, const int32_t* candidate_ids,
     int32_t* tokens, int steps, int top_k,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {},
+    float inv_t = 0.0f, uint64_t seed = 0, uint64_t position0 = 0, float top_p = 1.0f);
 sycl::event launch_embed_batched(sycl::queue& q, const bf16_t* table,
     const int32_t* tokens, float* out, int count, int hidden,
     const std::vector<sycl::event>& deps = {});
