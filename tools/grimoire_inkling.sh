@@ -4,6 +4,9 @@
 #   INK_MODEL   model directory (default /model)                     PORT / HOST   (default 6911 / 0.0.0.0)
 #   INK_CARDS   1 or 2 (default: the number of visible GPUs)         INK_CTX       context tokens (default 32768)
 #   INK_CHUNK   prompt rows per pass (default 4096)                  INK_NAME      model name in the API (inkling-2-mini)
+#   INK_DFLASH2 the DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2, ~1.3x faster decode than the built-in DSpark
+#               head): used automatically when it sits next to the model (<models>/Inkling-2-Mini-DFlash2) or in
+#               <model>/dflash2; INK_DFLASH2=<dir> names it, INK_DFLASH2=0 keeps DSpark
 #   INK_*       engine switches (see the engine source), e.g. INK_DRAFT_TAU (0.25), INK_NO_EPREP=1 (two cards with
 #               half the experts each: needed when one card cannot hold all experts, e.g. two Arc Pro B60)
 # docker stop: the front end exits, the engine ends the running request at a decode-step boundary and quits (give the
