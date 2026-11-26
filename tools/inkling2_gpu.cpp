@@ -13,6 +13,7 @@
 #include "b70/formats.hpp"
 #include "b70/weights.hpp"
 #include "b70/imatrix.hpp"
+#include "b70/json.hpp"
 #include "kernels.hpp"
 #include "inkling2_sycl.hpp"
 
@@ -526,6 +527,41 @@ private:
     void mix_norm_taps(int alpha_row, const uint16_t* w, int m0, int rows, float* out, uint16_t* outb);
     void draft_commit(int p0, int m0, int rows);
     void draft_block(int t, int p);
+    // DFlash2 drafter (tools/inkling2_df2.inc; INK_DFLASH2=<dir>): replaces the DSpark head when loaded
+    struct F2W { int8_t* Q = nullptr; float* S = nullptr; int N = 0, K = 0, Kp = 0; };   // INT8 row-major, K padded to 512
+    struct F2Layer {
+        F2W qkv, o, gu, d, ca, cm;   // ca / cm: attention / MLP convolution kernel projections
+        uint16_t *kvW = nullptr, *baseA = nullptr, *baseM = nullptr, *nin = nullptr, *npost = nullptr, *qn = nullptr, *kn = nullptr;
+        uint16_t *kc = nullptr, *vc = nullptr;   // context K / V rings [cap][kv heads x 128]
+    };
+    struct F2 {
+        bool ok = false;
+        int L = 0, heads = 0, kvh = 0, inter = 0, win = 0, cap = 0, topk = 0, rank = 0, mask = 0;
+        float eps = 1e-6f, theta = 1e4f, softcap = 30.f;
+        std::vector<F2Layer> Ly;
+        uint16_t *fcW = nullptr, *hnorm = nullptr, *norm = nullptr, *hpW = nullptr, *pred = nullptr, *succ = nullptr;
+        float *maskE = nullptr, *r = nullptr, *x = nullptr, *xc = nullptr, *cp = nullptr, *qkv = nullptr, *att = nullptr, *o = nullptr;
+        float *gu = nullptr, *act = nullptr, *fin = nullptr, *hp = nullptr, *sc = nullptr, *part = nullptr, *base = nullptr;
+        uint16_t *xb = nullptr, *bk = nullptr, *bv = nullptr, *finb = nullptr;
+        float *cat = nullptr, *ctx = nullptr, *ctxn = nullptr, *kv = nullptr;
+        uint16_t *catb = nullptr, *ctxb = nullptr;
+        int* cid = nullptr;
+        float* cval = nullptr;
+    };
+    static constexpr int kF2NS = 32;   // drafter attention: key slices per KV head
+    F2 f2_{};
+    std::shared_ptr<b70::SafeTensors> f2_st_;
+    int f2h_id_[7 * 16] = {};
+    float f2h_v_[7 * 16] = {}, f2h_sc_[7 * 16 * 16] = {};
+    void load_df2(const std::string& dir);
+    F2W f2_quant(const uint16_t* src, int N, int K);
+    void f2_mm(const F2W& w, const float* x, int ldx, float* y, int M);
+    void f2_embed(int tok, float* dst, int rows);
+    void f2_block(int t, int p);
+    void f2_commit(int p0, int m0, int rows);
+  public:
+    void load_drafter(const std::string& model_dir);   // INK_DFLASH2=<dir>: DFlash2, else the release's DSpark (mtp.safetensors)
+    bool df2() const { return f2_.ok; }
 };
 
 void Engine::load() {
@@ -3360,6 +3396,7 @@ void Engine::run(int M) {
 }
 
 #include "inkling2_mtp.inc"
+#include "inkling2_df2.inc"
 
 std::vector<int> read_ids(const char* path) {
     std::ifstream in(path);
@@ -3538,7 +3575,7 @@ int serve_main(int argc, char** argv) {
     ServeReq shared;
     bool quit = false;
     auto warm = [&](int r) {
-        eng[r]->load_mtp(model + "/mtp.safetensors");
+        eng[r]->load_drafter(model);
         g_tp_progress = now_ms();
         ServeReq w; w.id = "warm"; w.max_new = 40; w.temp = 0.7f; w.top_p = 0.95f; w.top_k = 20; w.seed = 1;
         for (int i = 0; i < 300; ++i) w.ids.push_back(1000 + (i * 7919) % 50000);
@@ -3744,7 +3781,7 @@ int main(int argc, char** argv) try {
         const int n = argc > 6 ? std::atoi(argv[6]) : 128;
         const int chunk = argc > 7 ? std::atoi(argv[7]) : 2048;
         Engine eng(q, argv[1], ctx, chunk);
-        eng.load_mtp(std::string(argv[1]) + "/mtp.safetensors");
+        eng.load_drafter(argv[1]);
         std::vector<int> p(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), size_t(pp)));
         // plain greedy
         int nx = eng.prefill(p);
@@ -3955,7 +3992,7 @@ int main(int argc, char** argv) try {
         const bool mtp_mode = mode == "tpmtp";
         auto work_mtp = [&](int r) {
             Engine& E = *eng[r];
-            E.load_mtp(std::string(argv[1]) + "/mtp.safetensors");
+            E.load_drafter(argv[1]);
             g_tp_progress = now_ms();
             const int n = tg;
             std::vector<int> p(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), size_t(pps[0])));

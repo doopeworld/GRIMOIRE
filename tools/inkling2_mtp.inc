@@ -650,6 +650,7 @@ void Engine::mix_norm_taps(int alpha_row, const uint16_t* w, int m0, int rows, f
 
 // Context K/V of the drafter for target rows m0.. at positions p0.. ; f_rnn from the last row.
 void Engine::draft_commit(int p0, int m0, int rows) {
+    if (f2_.ok) { f2_commit(p0, m0, rows); return; }
     const int h = h_;
     static bool dumped = false;
     const bool dump = !dumped && rows >= 32 && std::getenv("INK_DUMP");
@@ -754,6 +755,7 @@ int ink_draw_residual(const Engine::Dist& P, const Engine::Dist& Q, double u) {
 // One draft block at positions p..p+7: row 0 = target embedding of t, rows 1..7 = mask_embed.
 // Writes drafts to d_.dtok[1..7] (d_.dtok[0] = t).
 void Engine::draft_block(int t, int p_in) {
+    if (f2_.ok) { f2_block(t, p_in); return; }
     static const int pshift = std::getenv("INK_POSSHIFT") ? std::atoi(std::getenv("INK_POSSHIFT")) : 0;
     const int p = p_in + pshift;
     const int h = h_, V = c_.output_vocab;
@@ -1194,18 +1196,21 @@ std::vector<int> Engine::mtp_step(int t, const int* forced) {
         int dt[8] = {t};
         for (int k = 0; k < 7; ++k) dt[1 + k] = forced[k];
         q_.memcpy(d_.dtok, dt, sizeof(dt));
-    } else draft_block(t, p);
+    } else { dn_ = 7; draft_block(t, p); }
+    // DFlash2 with INK_F2_GTAU: verify only up to the first unlikely draft (dn_ drafts); else all 7
+    const int M = forced || !f2_.ok ? 8 : dn_ + 1;
+    last_rows_ = M;
     if (mtime) { q_.wait(); const auto t = std::chrono::steady_clock::now(); mtp_ms_[0] += std::chrono::duration<double, std::milli>(t - tA).count(); tA = t; }
     q_.memcpy(tok_, d_.dtok, 8 * sizeof(int));
     verify_ = all_logits_ = true;
-    run_seg(8);
+    run_seg(M);
     verify_ = all_logits_ = false;
-    int nx[8], dr[8];
+    int nx[8] = {-1, -1, -1, -1, -1, -1, -1, -1}, dr[8];
     q_.memcpy(dr, d_.dtok, 8 * sizeof(int));
-    final_tokens(8, nx);
+    final_tokens(M, nx);
     if (mtime) { q_.wait(); const auto t = std::chrono::steady_clock::now(); mtp_ms_[1] += std::chrono::duration<double, std::milli>(t - tA).count(); tA = t; }
     int a = 0;
-    while (a < 7 && nx[a] == dr[a + 1]) ++a;
+    while (a < M - 1 && nx[a] == dr[a + 1]) ++a;
     static int dbg = std::getenv("INK_DEBUG") ? std::atoi(std::getenv("INK_DEBUG")) : 0;
     if (dbg > 0) {
         --dbg;
