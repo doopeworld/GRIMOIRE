@@ -58,9 +58,25 @@ inline void f2_head_norm_rope(sycl::sub_group sg, const float* in, float* outf, 
 }
 }  // namespace
 
+// INK_DFLASH2=<dir>: that DFlash2 drafter; INK_DFLASH2=0: the release's DSpark head; unset: DFlash2 when a drafter
+// folder sits next to the model (<model>/../Inkling-2-Mini-DFlash2 or <model>/dflash2) and INK_I8 is on, else DSpark.
+// MEASURED 11-26 (two B70, BetterBench quick, Inkling-2-Mini-Uncensored): DFlash2 179.2 vs DSpark 139.7 weighted.
 void Engine::load_drafter(const std::string& model) {
     const char* e = std::getenv("INK_DFLASH2");
-    if (e && *e && std::string(e) != "0") load_df2(e);
+    std::string dir;
+    if (e && *e) { if (std::string(e) != "0") dir = e; }
+    else if (i8v_) {
+        std::string m = model;
+        while (m.size() > 1 && m.back() == '/') m.pop_back();
+        const auto slash = m.find_last_of('/');
+        const std::string parent = slash == std::string::npos ? "." : slash == 0 ? "/" : m.substr(0, slash);
+        for (const std::string& c : {parent + "/Inkling-2-Mini-DFlash2", m + "/dflash2"}) {
+            struct stat sb{};
+            if (::stat((c + "/config.json").c_str(), &sb) == 0 && ::stat((c + "/model.safetensors").c_str(), &sb) == 0) { dir = c; break; }
+        }
+        if (!dir.empty()) std::printf("dflash2 drafter found at %s (INK_DFLASH2=0: the DSpark head)\n", dir.c_str());
+    }
+    if (!dir.empty()) load_df2(dir);
     else load_mtp(model + "/mtp.safetensors");
 }
 
@@ -69,6 +85,17 @@ void Engine::load_drafter(const std::string& model) {
 Engine::F2W Engine::f2_quant(const uint16_t* src, int N, int K) {
     F2W w;
     w.N = N; w.K = K; w.Kp = (K + 511) / 512 * 512;
+    // INK_F2_I4=1: GRIMOIRE's INT4 (RTN, group 128) for the drafter's linears: half the bytes of INT8 on every draft
+    static const bool i4 = std::getenv("INK_F2_I4") && std::atoi(std::getenv("INK_F2_I4")) == 1;
+    if (i4) { w.q4 = quant4(src, N, K); return w; }
+    // INK_F2_BF16=1: the checkpoint's BF16 weights through b70::launch_bf16_smallm (twice INT8's bytes)
+    static const bool bf = std::getenv("INK_F2_BF16") && std::atoi(std::getenv("INK_F2_BF16")) == 1;
+    if (bf) {
+        w.Kp = K;
+        w.B = dev_.alloc<uint16_t>(size_t(N) * K);
+        q_.memcpy(w.B, src, size_t(N) * K * 2).wait();
+        return w;
+    }
     w.Q = dev_.alloc<int8_t>(size_t(N) * w.Kp);
     w.S = dev_.alloc<float>(N);
     uint16_t* tmp = sycl::malloc_device<uint16_t>(size_t(N) * K, q_);
@@ -101,6 +128,8 @@ void Engine::f2_mm(const F2W& w, const float* x, int ldx, float* y, int M) {
         const size_t m = id[0] / Kp, k = id[0] % Kp;
         xb[id[0]] = k < size_t(K) ? tobf(x[m * ldx + k]) : uint16_t(0);
     });
+    if (w.q4.pay) { if (!i4_gemv(w.q4, 0, w.N, xb, y, M)) throw std::runtime_error("dflash2: INT4 GEMV refused"); return; }
+    if (w.B) { if (!gsm_dense(w.B, w.N, K, xb, y, M)) throw std::runtime_error("dflash2: BF16 GEMV refused"); return; }
     if (!i8_small(w.Q, w.S, 0, w.N, Kp, xb, y, M)) throw std::runtime_error("dflash2: INT8 GEMV refused");
 }
 
@@ -228,8 +257,8 @@ void Engine::load_df2(const std::string& dir) {
     F.ok = true;
     mtp_ = true;
     taps_on = true;
-    std::printf("dflash2 drafter loaded (%d layers, block 8, selector top-%d rank %d, window %d, mask %d, INT8 layers); device total %.2f GiB\n",
-                F.L, F.topk, F.rank, F.win, F.mask, dev_.bytes / 1073741824.0);
+    std::printf("dflash2 drafter loaded (%d layers, block 8, selector top-%d rank %d, window %d, mask %d, %s layers); device total %.2f GiB\n",
+                F.L, F.topk, F.rank, F.win, F.mask, F.Ly[0].qkv.q4.pay ? "INT4" : F.Ly[0].qkv.B ? "BF16" : "INT8", dev_.bytes / 1073741824.0);
 }
 
 // rows[0] = embed_norm(embed[tok]); with rows == 8 the other 7 rows are the mask row (maskE)
@@ -488,16 +517,33 @@ void Engine::f2_block(int t, int p) {
         for (int c = 1; c < 16; ++c) if (row[c] > row[best]) best = c;
         int pick = best;
         if (samp) {
+            // q = softmax(score / T) over the 16 candidates; INK_F2_QTRUNC=1 also applies the request's top-k / top-p
+            // to q (vLLM order), so drafts avoid tokens outside the target's own support (any q keeps the output exact)
+            static const bool qtrunc = std::getenv("INK_F2_QTRUNC") && std::atoi(std::getenv("INK_F2_QTRUNC")) == 1;
             const double T = std::max(1e-5, double(dsp_->temp));
-            for (int c = 0; c < 16; ++c) { pr[c] = std::exp((double(row[c]) - mx) / T); s += pr[c]; }
+            for (int c = 0; c < 16; ++c) pr[c] = std::exp((double(row[c]) - mx) / T);
+            int ord[16];
+            for (int c = 0; c < 16; ++c) ord[c] = c;
+            std::stable_sort(ord, ord + 16, [&](int a, int b) { return row[a] > row[b]; });
+            int k = 16;
+            if (qtrunc && dsp_->top_k > 0 && dsp_->top_k < 16) k = dsp_->top_k;
+            double tot = 0.0;
+            for (int j = 0; j < k; ++j) tot += pr[ord[j]];
+            int keep = k;
+            if (qtrunc && dsp_->top_p < 1.f) {
+                double c = 0.0;
+                for (int j = 0; j < k; ++j) { c += pr[ord[j]] / tot; if (c >= double(dsp_->top_p)) { keep = j + 1; break; } }
+            }
+            for (int j = 0; j < keep; ++j) s += pr[ord[j]];
             Dist& d = dq_[e];
-            d.n = 16;
-            for (int c = 0; c < 16; ++c) { d.id[c] = f2h_id_[e * 16 + c]; d.p[c] = pr[c] / s; }
+            d.n = keep;
+            for (int j = 0; j < keep; ++j) { d.id[j] = f2h_id_[e * 16 + ord[j]]; d.p[j] = pr[ord[j]] / s; }
             const double u = U(*drng_);
             double acc = 0.0;
-            pick = 15;
-            for (int c = 0; c < 16; ++c) { acc += d.p[c]; if (u < acc) { pick = c; break; } }
-            dcum *= d.p[pick];
+            int jp = keep - 1;
+            for (int j = 0; j < keep; ++j) { acc += d.p[j]; if (u < acc) { jp = j; break; } }
+            pick = ord[jp];
+            dcum *= d.p[jp];
         } else if (dsp_) {   // temperature 0 through mtp_step_s: a point-mass q
             Dist& d = dq_[e];
             d.n = 1; d.id[0] = f2h_id_[e * 16 + best]; d.p[0] = 1.0;

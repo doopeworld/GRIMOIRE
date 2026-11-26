@@ -528,7 +528,7 @@ private:
     void draft_commit(int p0, int m0, int rows);
     void draft_block(int t, int p);
     // DFlash2 drafter (tools/inkling2_df2.inc; INK_DFLASH2=<dir>): replaces the DSpark head when loaded
-    struct F2W { int8_t* Q = nullptr; float* S = nullptr; int N = 0, K = 0, Kp = 0; };   // INT8 row-major, K padded to 512
+    struct F2W { int8_t* Q = nullptr; float* S = nullptr; int N = 0, K = 0, Kp = 0; Q4 q4; uint16_t* B = nullptr; };   // INT8 row-major, K padded to 512 (or INT4 / BF16)
     struct F2Layer {
         F2W qkv, o, gu, d, ca, cm;   // ca / cm: attention / MLP convolution kernel projections
         uint16_t *kvW = nullptr, *baseA = nullptr, *baseM = nullptr, *nin = nullptr, *npost = nullptr, *qn = nullptr, *kn = nullptr;
@@ -4007,8 +4007,10 @@ int main(int argc, char** argv) try {
             int nx = E.prefill(p);
             std::vector<int> plain{nx};
             E.sync_all();
+            // INK_TP_PLAIN_N=k: only k plain tokens (profiles of the MTP phase)
+            const int npl = std::getenv("INK_TP_PLAIN_N") ? std::max(2, std::min(n, std::atoi(std::getenv("INK_TP_PLAIN_N")))) : n;
             auto t0 = std::chrono::steady_clock::now();
-            for (int g = 1; g < n; ++g) { nx = E.step(nx); plain.push_back(nx); }
+            for (int g = 1; g < npl; ++g) { nx = E.step(nx); plain.push_back(nx); }
             const double tpl = ms_since(t0);
             E.reset();
             nx = E.prefill(p);
@@ -4029,11 +4031,11 @@ int main(int argc, char** argv) try {
                                                                 double(g_tp_n[c]) / steps, g_tp_wait_ms[c][0], g_tp_wait_ms[c][1], eng[c]->mtp_ms_[0], eng[c]->mtp_ms_[1], eng[c]->mtp_ms_[2]);
             spec.resize(n);
             int same = 0;
-            while (same < n && plain[same] == spec[same]) ++same;
+            while (same < npl && plain[same] == spec[same]) ++same;
             if (r == 0) {
                 std::printf("two cards, prompt %d tokens, %d new tokens\n", int(p.size()), n);
-                std::printf("plain head:"); for (int g = 0; g < std::min(n, 16); ++g) std::printf(" %d", plain[g]);
-                std::printf("\nplain greedy: %.1f tok/s\n", 1000.0 * (n - 1) / tpl);
+                std::printf("plain head:"); for (int g = 0; g < std::min(npl, 16); ++g) std::printf(" %d", plain[g]);
+                std::printf("\nplain greedy: %.1f tok/s\n", 1000.0 * (npl - 1) / tpl);
                 std::printf("MTP: %.1f tok/s, %d steps, %.2f tokens/step, %.1f ms/step\n", 1000.0 * (n - 1) / ts, steps, double(n - 1) / steps, ts / steps);
                 std::printf("MTP output equals plain greedy for the first %d of %d tokens\n", same, n);
             }
