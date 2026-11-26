@@ -53,7 +53,10 @@ bench 142.6 vs 148.2 us a visit but 1 ms/step slower in the engine).
 `grimoire-b70:v1.10.14-rc1` (f92f54d5) = v1.10.13 + inkling2_gpu + libink_xexp.so of 2fd3605 for G31 + G21
 (`grimoire-runs/ink-rel-1126`, Dockerfile `grimoire-runs/image-ink-1126`). Validation:
 `ink-1123/validate_ink_image2.sh` (Ian's template layout: /mnt/storage/Models at /models, 262144 context, two B70).
-NOT published — waits for Ian's yes. Ian's GRIMOIRE-DUAL-INKLING2 template needs no change besides the image tag.
+VALIDATED 11-26 (two B70, 262144 context, Ian's template layout): drafter found automatically, 26.95 GiB a card,
+greedy answers coherent, BetterBench quick weighted **173.5** (v1.10.12 image: 141.8), concurrency 1/2/4/8 aggregate
+157.0 / 154.7 / 156.6 / 153.8 (v1.10.12: 124.9 / 123.5 / 125.9 / 121.9), prefill 2K / 8K 2,870 / 3,609 (unchanged),
+docker stop -> exit 0, "serve: quit", GPUs free. NOT published — waits for Ian's yes. Ian's GRIMOIRE-DUAL-INKLING2 template needs no change besides the image tag.
 
 ## Next
 
