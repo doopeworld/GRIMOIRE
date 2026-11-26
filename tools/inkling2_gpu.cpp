@@ -973,6 +973,8 @@ void Engine::split_proj(int NA, int NB, int NC, int M) {
 
 bool Engine::i8_small(const int8_t* W, const float* S, int r0, int n, int Kp, const uint16_t* X, float* Y, int M) {
     if (!W) return false;
+    static const int abl = std::getenv("INK_ABL") ? std::atoi(std::getenv("INK_ABL")) : 0;
+    if ((abl & 2) && verify_) return true;   // DEBUG ablation (wrong output): skip the verify rows' INT8 dense GEMVs
     b70::QuantWeight w;
     w.fmt = b70::Fmt::INT8; w.N = n; w.K = Kp; w.row_bytes = Kp; w.row_scales = 1;
     w.payload = reinterpret_cast<const uint8_t*>(W) + size_t(r0) * Kp;

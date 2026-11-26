@@ -504,6 +504,15 @@ sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int
     const int ksel = kenv > 0 ? kenv : 6;   // MEASURED 11-24: one card KS 3/6 = 38.4/38.3 ms (KS 1 48.0); two cards KS 6 ilv 24.8 vs KS 3 25.2 ms/step (down K 1152 -> 3)
     int ks = 1;
     for (int c : {6, 3, 2}) if (c <= ksel && g.K % (128 * c) == 0) { ks = c; break; }
+    // INK_SM_KSG / INK_SM_KSD (1, 2, 3, 6, 9): the K split of the gate_up / down kernel alone; with interleaved slices
+    // (two cards) the split need not divide K (a slice takes steps ks, ks + KS, ..); 9 runs with 4 column threads
+    static const int kg = [] { const char* e = std::getenv("INK_SM_KSG"); return e ? std::atoi(e) : 0; }();
+    static const int kd = [] { const char* e = std::getenv("INK_SM_KSD"); return e ? std::atoi(e) : 0; }();
+    // MEASURED 11-26: two cards KSG 2 / KSD 1 = 142.6 vs 148.2 us a visit in bench_ink_sm, but SLOWER in the engine
+    // (tpmtp code2 25.2-25.3 vs 24.1-24.4 ms/step): opt-in only
+    const int kov = epi == 1 ? kg : kd;
+    const bool ilv = (g.alu & 32) || g.own >= 0;
+    if ((kov == 1 || kov == 2 || kov == 3 || kov == 6 || kov == 9) && (ilv || g.K % (128 * kov) == 0) && g.K >= 128 * kov) ks = kov;
     static const int tenv = [] { const char* e = std::getenv("INK_SM_TNT"); return e ? std::atoi(e) : 8; }();
     int tnt = 8;
     if ((tenv == 4 || tenv == 12 || tenv == 24) && (g.Ne / 32) % tenv == 0 && tenv * ks <= 64) tnt = tenv;
@@ -521,6 +530,9 @@ sycl::event ink_moe_small_esimd(sycl::queue& q, const InkSmArgs& g, int fmt, int
         if (tnt == 24) return go(KSc, T24{});
         return go(KSc, T8{});
     };
+    using I9 = std::integral_constant<int, 9>;
+    if (ks == 9 && (g.Ne / 32) % 4 == 0) return go(I9{}, T4{});
+    if (ks == 9) ks = 6;
     if (ks == 6) return by_tnt(I6{});
     if (ks == 3) return by_tnt(I3{});
     if (ks == 2) return by_tnt(I2{});

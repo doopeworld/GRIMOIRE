@@ -226,8 +226,10 @@ void Engine::experts_small(const Layer& Ly, int M) {
             ++calls; sum += nd; rows += M;
             if (calls % 480 == 0) std::printf("smstat: %ld verify visits, %.1f distinct experts per visit, %.2f rows\n", calls, double(sum) / calls, double(rows) / calls);
         }
-        ink_moe_small_esimd(q_, InkSmArgs{Ly.gu, Ly.gus, 2 * I, h, wen_ * 2 * I, xg, slots, actSb_, gi, e0, en, Ly.gua, Ly.gud, nvlut16_, gcap, ucap, U, sm_alu, own_}, fg, 1);
-        ink_moe_small_esimd(q_, InkSmArgs{Ly.dn, Ly.dns, h, I, wen_ * h, actSb_, slots, dbuf, gi, e0, en, Ly.dna, Ly.dnd, nvlut16_, 0.f, 0.f, U, sm_alu_dn, own_}, fd, 2);
+        // INK_ABL (DEBUG, wrong output): bit 1 skips the verify expert kernels, bit 4 the down kernel only, bit 8 gate_up only -- wall-time ablation
+        static const int abl = std::getenv("INK_ABL") ? std::atoi(std::getenv("INK_ABL")) : 0;
+        if (!(abl & 9)) ink_moe_small_esimd(q_, InkSmArgs{Ly.gu, Ly.gus, 2 * I, h, wen_ * 2 * I, xg, slots, actSb_, gi, e0, en, Ly.gua, Ly.gud, nvlut16_, gcap, ucap, U, sm_alu, own_}, fg, 1);
+        if (!(abl & 5)) ink_moe_small_esimd(q_, InkSmArgs{Ly.dn, Ly.dns, h, I, wen_ * h, actSb_, slots, dbuf, gi, e0, en, Ly.dna, Ly.dnd, nvlut16_, 0.f, 0.f, U, sm_alu_dn, own_}, fd, 2);
     }
     if (!es_ok && rep_) throw std::runtime_error("verify experts: replicated experts need the ESIMD kernels");
     if (!es_ok) {
