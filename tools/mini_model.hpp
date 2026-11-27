@@ -656,10 +656,10 @@ inline Arch gemma4_wide(int L = 6) {
 //
 // Layer 0 and 2 are linear_attention, 1 and 3 full attention, so one model
 // carries both kinds and the boundary between them.
-inline Arch hybrid(int L = 4, bool mtp = false) {
+inline Arch hybrid(int L = 4, bool mtp = false, int DK = 16) {
     const int H=64, Q=64, KV=32, I=128, V=128;
-    const int LK=2, LV=2, DK=16, DV=16, CONV=4;      // linear-attn geometry
-    const int QKV = 2*LK*DK + LV*DV;                 // 2*2*16 + 2*16 = 96
+    const int LK=2, LV=2, DV=16, CONV=4;
+    const int QKV = 2*LK*DK + LV*DV;
     std::ostringstream c;
     c << R"JSON({
   "model_type": "qwen3_next", "hidden_size": 64, "num_hidden_layers": )JSON" << L
@@ -668,7 +668,7 @@ inline Arch hybrid(int L = 4, bool mtp = false) {
   "intermediate_size": 128, "rms_norm_eps": 1e-06,
   "tie_word_embeddings": false, "rope_theta": 1000000.0,
   "linear_num_key_heads": 2, "linear_num_value_heads": 2,
-  "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+  "linear_key_head_dim": )JSON" << DK << R"JSON(, "linear_value_head_dim": 16,
   "linear_conv_kernel_dim": 4,
   "layer_types": [)JSON";
     for (int l = 0; l < L; ++l)

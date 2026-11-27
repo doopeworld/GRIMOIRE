@@ -1038,6 +1038,11 @@ struct DevQuant {
     bool has_i4() const { return i4 && i4s; }
     int output_rows() const { return full_N ? full_N : w.N; }
     bool tp_sharded() const { return full_N > 0; }
+    // Keep the small projections on the same FP32 arithmetic when prompt
+    // chunks and decode batches use different row counts.
+    bool small_projection() const {
+        return w.payload && !has_i4() && output_rows() <= 512 && w.K <= 256;
+    }
     void release(sycl::queue& q) {
         if (i4)  sycl::free(i4, q);
         if (i4s) sycl::free(i4s, q);
@@ -4023,7 +4028,7 @@ struct Grimoire {
         return last;
     }
 
-    void gemm_tp(const DevQuant& w, const float* x, float* y, int rows);
+    void gemm_tp(const DevQuant& w, const float* x, float* y, int rows, bool decode = false);
 
     sycl::event gemv_any(const DevQuant& dq, const float* x, float* y,
                          const std::vector<sycl::event>& deps) {
@@ -4939,7 +4944,7 @@ int Grimoire::pp_sync_token(int token) {
 // exchange carries [rows][N_r] from each rank at once.  The wire layout is
 // rank r's block of rows*N_r floats, with N_r from the same (width*r)/world
 // partition tp_shard_rows() cuts and tp_allgather() assumes.
-void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
+void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows, bool decode) {
     const int width=w.output_rows(), N=w.w.N, K=w.w.K;
     if(rows<=0) return;
     if(w.row_begin!=(width*tp_rank)/tp_world || N!=(width*(tp_rank+1))/tp_world-w.row_begin)
@@ -4961,6 +4966,9 @@ void Grimoire::gemm_tp(const DevQuant& w, const float* x, float* y, int rows) {
     if(N>0) {
         if(w.has_i4())
             launch_gemv_int4sym_batch(q,w.i4,w.i4s,x,tp_scratch,N,K,rows,{});
+        // Match the unbatched TP decode's FP32 input to each local projection.
+        else if(decode || w.small_projection())
+            launch_gemv_batch(q,w.w,x,tp_scratch,rows,{});
         else if(device_can_matrix(q)) {
             const size_t act_elems=size_t(rows)*size_t(K);
             if(!tp_act || act_elems>tp_act_elems) {
@@ -17906,7 +17914,8 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     const int M = int(tokens.size());
     if (M <= 0 || (!seqb && pos + M > max_seq)) return false;
     if (next_tokens && !seqb) return false;
-    if ((tp_enabled() || pp_enabled()) && !seqb) return false;
+    if (!seqb && ((pp_enabled() && (pp_spec || pp_dflash)) ||
+                  (tp_enabled() && (mtp.ok || dflash2.ok)))) return false;
     const int start_pos = pos;
     // allow_exact_restore threaded through from prefill() -- see the
     // matching note in prefill_muse(); same gap, same reason it is
@@ -18012,9 +18021,10 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
 
     bool ok = true;
     auto mmg = [&](const DevQuant& w, const float* x, float* y) {
-        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
+        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M,seqb != nullptr); return; }
         if (!ok) return;
         if (w.w.N <= 0) { ok = false; return; }
+        if (w.small_projection()) { launch_gemv_batch(q, w.w, x, y, M, none); return; }
         // Correctness-only path for a device with no matrix hardware.
         if (noxmx) { launch_gemm_batched(q, w.w, x, y, M, none); return; }
 
@@ -18298,13 +18308,18 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     // -- the logits are in vocabulary and the length is right, and only a
     // token-for-token diff against sequential decode shows it (rule 12).
     // This is forward_gemma4()'s tail: final norm, head, then softcap.
-    launch_rmsnorm_residual_batched(q, h + int64_t(M - 1) * H, nullptr,
-        nullptr, fnorm, h2, 1, H, eps, nullptr, none);
-    gemv_any(lm_head, h2, s.logits, none);
-    // final_logit_softcapping.  Monotonic, so greedy picks the same token
-    // either way -- but not a no-op for sampling, and sequential applies it.
-    if (cfg.logit_softcap > 0.0f)
-        launch_logit_softcap(q, s.logits, cfg.logit_softcap, cfg.vocab, none);
+    if (!last) {
+        if (!pp_send_hidden(h, size_t(M) * H)) {
+            cleanup();
+            throw std::runtime_error("prompt hidden send failed");
+        }
+    } else {
+        launch_rmsnorm_residual_batched(q, h + int64_t(M - 1) * H, nullptr,
+            nullptr, fnorm, h2, 1, H, eps, nullptr, none);
+        gemv_any(lm_head, h2, s.logits, none);
+        if (cfg.logit_softcap > 0.0f)
+            launch_logit_softcap(q, s.logits, cfg.logit_softcap, cfg.vocab, none);
+    }
 
     // The UNNORMALISED hidden state of the last processed token is left in
     // s.h, the cursor moves by M, and a full prompt from position 0
@@ -19675,6 +19690,7 @@ bool Grimoire::prefill_qwen4_exp(const std::vector<int32_t>& tokens,
     auto mm = [&](const DevQuant& w, const float* x, float* y) {
         if (!ok) return;
         if (w.w.N <= 0) { ok = false; return; }
+        if (w.small_projection()) { launch_gemv_batch(q, w.w, x, y, MR, none); return; }
         if (noxmx) { launch_gemm_batched(q, w.w, x, y, MR, none); return; }
         if (w.has_i4() && q4_w4a8 && a8 && a8s && (w.w.N % 256) == 0) {
             launch_quantize_rows_int8(q, x, a8, a8s, MR, w.w.K, none);
@@ -21138,7 +21154,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // the prompt GEMM's whole-weight bf16 dequant (verify 80 -> 236 ms).  MEASURED 2026-11-12, one
     // B70, 8 users: tokens/step 8.00 of 8 sequences.  Batched admission (spans) stays a prompt.
     const bool verify_shape = (seqb && seqb->verify) || (next_tokens && !(seqb && seqb->spans));
-    const bool dense_pure = !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && !cfg.is_moe() &&
+    const bool dense_pure = !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && H > 256 && !cfg.is_moe() &&
         !verify_shape &&
         !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
         !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
@@ -21237,9 +21253,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // llama-benchy tg128 at 1 user: 30.1 tok/s through the grouped one-tile
     // kernel below, 50.8 with these GEMMs -- plain decode is 33.2.
     // GRIMOIRE_MTP_EXACT_VERIFY=1 still keeps the GEMV (exact_verify).
-    const bool verify_rows = next_tokens != nullptr || (seqb && seqb->verify);
+    // Admission returns first-token IDs too, but its spans are prompts.
+    const bool verify_rows = verify_shape;
     const bool smallm_dpas = smallm_dpas_env == 1 ||
-        (smallm_dpas_env < 0 && ((seqb && !seqb->verify) || verify_rows));
+        (smallm_dpas_env < 0 && verify_rows);
+    static const bool stable_mx_verify = [] {
+        const char* e = std::getenv("GRIMOIRE_MX_SMALLM_STABLE");
+        return e && *e == '1';
+    }();
     // GRIMOIRE_SMALLM_VERIFY=1 (debug, synchronizes): once per shape, run the
     // reference next to the DPAS kernels and print max|diff| / max|ref|.
     static const bool smallm_verify = std::getenv("GRIMOIRE_SMALLM_VERIFY") != nullptr;
@@ -21254,7 +21275,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                      what,N,K,M,mx,md,mx>0?md/mx:md);
     };
     auto mm=[&](const DevQuant& w,const float* x,float* y){
-        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
+        if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M,verify_shape); return; }
+        if(w.small_projection()) { launch_gemv_batch(q,w.w,x,y,M,{}); return; }
         const bool dpas_bf = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && bf16_smallm_ok(w.w,M,nullptr,y);
         // INT4 (GPTQ, AutoRound, GRIMOIRE's own): the w4a16 DPAS GEMM.  The
@@ -21293,8 +21315,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // 17..32 rows fell to one decode GEMV per row (verify_a16 below).
         const bool dnnl_small = smallm_dnnl && M>=2 && M<=kSpecBatch && !exact_verify && !smallm_gemv &&
                                 !w.has_i4() && onednn_gemm_ok(w.w,M);
-        const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || dpas_nq || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
-                             !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
+        const bool dpas_mx = smallm_dpas && (M >= 2 || (stable_mx_verify && verify_rows)) &&
+                             !exact_verify && !smallm_gemv && !w.has_i4() &&
+                             mxfp4_smallm_ok(w.w, M, nullptr, y);
+        const bool dpas_ok = dnnl_small || dpas_bf || dpas_i4 || dpas_f8 || dpas_nq || dpas_mx;
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
             const size_t need=size_t(M)*size_t(w.w.K);
@@ -22300,14 +22324,6 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     DeltaNetParams sp{};
                     sp.q=t1; sp.k=t2; sp.v=t3; sp.a=alpha; sp.beta=beta; sp.out=t0;
                     sp.n_heads=Hv; sp.k_dim=Dk; sp.v_dim=Dv; sp.n_k_heads=Hk;
-                    DnGroups g{};
-                    for(int t=0;t<M;++t){
-                        const int slot=seqb?seqb->slot[t]:0;
-                        if(g.n>0 && slot==g.slot[g.n-1] && (!seqb || seqb->pos[t]==seqb->pos[t-1]+1)){
-                            ++g.nrows[g.n-1]; continue;
-                        }
-                        g.row0[g.n]=t; g.nrows[g.n]=1; g.slot[g.n]=slot; ++g.n;
-                    }
                     sp.state=seqb?d.dn_base:d.dn_state;
                     const size_t dn_n=size_t(Hv)*Dv*Dk;
                     float* saved=spec_dn_inputs+(spec_doff[li]/dn_n)*kSpecBatch*spec_dn_row_floats;
@@ -22323,8 +22339,30 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                             }
                         }
                         launch_deltanet_verify_tree(q,sp,tr,seqb->slot[0],int64_t(d.dn_slot),saved,{});
-                    }else
-                    launch_deltanet_verify_rows(q,sp,g,seqb?int64_t(d.dn_slot):0,saved,{});
+                    }else{
+                        const int64_t stride=seqb?int64_t(d.dn_slot):0;
+                        DnGroups groups{};
+                        for(int t=0;t<M;++t){
+                            const int slot=seqb?seqb->slot[t]:0;
+                            if(groups.n>0 && slot==groups.slot[groups.n-1] &&
+                               (!seqb || seqb->pos[t]==seqb->pos[t-1]+1)){
+                                ++groups.nrows[groups.n-1];
+                                continue;
+                            }
+                            // Up to 64 conversations can verify together, while one
+                            // kernel launch carries at most 32 groups. Row offsets
+                            // stay absolute because both launches share the scratch.
+                            if(groups.n==kMaxRowSlots){
+                                launch_deltanet_verify_rows(q,sp,groups,stride,saved,{});
+                                groups.n=0;
+                            }
+                            groups.row0[groups.n]=t;
+                            groups.nrows[groups.n]=1;
+                            groups.slot[groups.n]=slot;
+                            ++groups.n;
+                        }
+                        launch_deltanet_verify_rows(q,sp,groups,stride,saved,{});
+                    }
                 }else if(seqb||M<=16){
                     for(int t=0;t<M;++t){
                         DeltaNetParams sp{};

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <vector>
 using namespace b70;
 namespace b70 {
@@ -180,6 +181,27 @@ int main() {
                g_spec_batch_proposals<=proposed0)
                 throw std::runtime_error("batch never verified drafts from overlapping sequences");
         }
+        // 33 live sequences cross the fused DeltaNet kernel's 32-group limit.
+        // A 64-wide key activates that kernel. All rows have independent state
+        // and the same prompt, so they must agree across the launch boundary.
+        const auto wide_dir = std::filesystem::path(tmp) / "hybrid-wide-batch";
+        mini::write_model(wide_dir, mini::hybrid(2, true, 64));
+        ::setenv("GRIMOIRE_SEQ_SLOTS", "33", 1);
+        ::setenv("GRIMOIRE_MTP", "1", 1);
+        ::unsetenv("GRIMOIRE_DFLASH_MODEL");
+        {
+            std::unique_ptr<Grimoire, decltype(&grimoire_delete)> e(load(wide_dir), grimoire_delete);
+            const Replies wide_prompts(33, prompts.front());
+            Replies replies;
+            const long before = g_spec_batch_sequences;
+            if (grimoire_serve_generate_batch(*e, wide_prompts, 3, -1, replies, -1) != 33 ||
+                g_spec_batch_sequences - before < 33 || replies.size() != 33)
+                throw std::runtime_error("wide batch did not verify all 33 sequences");
+            for (const auto& reply : replies)
+                if (reply.size() != 3 || reply != replies.front())
+                    throw std::runtime_error("wide batch differs across DeltaNet groups");
+        }
+        std::puts("hybrid-wide-batch: 33 sequences agree");
         std::puts("ALL PASS");
         return 0;
     } catch(const std::exception& ex) {

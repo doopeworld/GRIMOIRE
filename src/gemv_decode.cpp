@@ -1524,11 +1524,13 @@ sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_
 // kernel and plan.  GRIMOIRE_MX_SMALLM_KS=<n> (diagnostic) forces n K slices.
 sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
                                     float* Y, int M, const std::vector<sycl::event>& deps) {
+    static const bool stable = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_STABLE");
+        return e && *e == '1'; }();
     static const bool old = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_256");
         return e && *e == '1'; }();
     static const int force_ks = [] { const char* e = std::getenv("GRIMOIRE_MX_SMALLM_KS");
         return (e && *e) ? std::atoi(e) : 0; }();
-    if (old || M > 8) return launch_mxfp4_smallm(q, w, X, Y, M, deps);
+    if (old || (M > 8 && !stable)) return launch_mxfp4_smallm(q, w, X, Y, M, deps);
     const int K = w.K;
     // INT4's rule without its "wide outputs: 4 slices" clause: 256-K slices unless K is long.
     // MEASURED (mx4rows_probe SWEEP, M = 7 / 4): Qwen3.8-27B gate_up 4 -> 20 slices 195.2 ->
@@ -1545,7 +1547,9 @@ sycl::event launch_mxfp4_smallm_fast(sycl::queue& q, const QuantWeight& w, const
     KS = (K + kc - 1) / kc;
     int TPT = 1;
     while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
-    return mxfp4_smallm_k_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
+    // Keep the reduction order when the number of live rows crosses eight.
+    if (M <= 8) return mxfp4_smallm_k_impl<1>(q, w, X, Y, M, KS, kc, TPT, deps);
+    return mxfp4_smallm_k_impl<2>(q, w, X, Y, M, KS, kc, TPT, deps);
 }
 
 // FP8 E4M3 at 2..8 rows (speculative verify, batched decode): the DPAS

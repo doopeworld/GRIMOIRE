@@ -286,6 +286,9 @@ int main(int argc, char** argv) {
         const Fmt fmt = fs_ == "fp8" ? Fmt::FP8_E4M3 : Fmt::BF16;
         return run_rank(argv[1], std::string(argv[2]) == "-" ? "" : argv[2], fmt);
     }
+    // Ranks inherit the uncached reference configuration. The cache arm
+    // explicitly enables it in its workers.
+    ::setenv("GRIMOIRE_PREFIX_CACHE", "0", 1);
 
     std::printf("=== a resident pipeline, batching with cancellation ===\n");
     std::printf("three requests down one pipeline, answered at RANK 0,\n"
@@ -374,23 +377,16 @@ int main(int argc, char** argv) {
                   "so a later request did not survive the one before it");
         }
 
-        // TP + prefix cache, over growing conversations (run_turns).  The
-        // reference is one process with the cache OFF: resuming must answer
-        // exactly what re-reading answers.  Muse refuses the cache, so its
-        // row checks the tokens and does not demand a resume.
+        // Compare cache reuse against re-reading on the same two ranks.
+        // The check above already compares one and two GPUs. Muse cannot
+        // resume from the prefix cache, so only check its output.
         {
-            const std::string ref_turns = (dir/"single-turns.txt").string();
+            const std::string ref_turns = (dir/"TP2-uncached-turns.txt").string();
             const std::string out_turns = (dir/"TP2-turns.txt").string();
             const std::string sock = (dir/"TP2-turns.sock").string();
             const bool expect_reuse = std::string(c.arch.name) != "muse";
             const auto devices=sycl::device::get_devices(sycl::info::device_type::gpu);
-            if(!devices.empty() && devices.size()<2) {
-                std::printf("TP2+cache SKIPPED: insufficient GPUs ");
-            } else if (!wait_ok({spawn(self, dir.string(), ref_turns, c.fmt,
-                            {"GRIMOIRE_DEVICE_ANY=1",
-                             "GRIMOIRE_BATCH_PARALLEL_TURNS=1"})}, "single turns")) {
-                ++g_fail; std::printf("single-process turns FAILED ");
-            } else {
+            const auto run_tp_turns = [&](bool cache, const std::string& output) {
                 std::vector<pid_t> pids;
                 for (int r = 1; r >= 0; --r) {
                     std::vector<std::string> env{
@@ -398,25 +394,28 @@ int main(int argc, char** argv) {
                         "GRIMOIRE_TP_WORLD_SIZE=2",
                         "GRIMOIRE_TP_SOCKET=" + sock,
                         "GRIMOIRE_DEVICE_ANY=1",
-                        "GRIMOIRE_PREFIX_CACHE=1",
+                        cache ? "GRIMOIRE_PREFIX_CACHE=1" : "GRIMOIRE_PREFIX_CACHE=0",
                         "GRIMOIRE_BATCH_PARALLEL_TURNS=1"};
-                    if (expect_reuse) env.push_back("GRIMOIRE_EXPECT_REUSE=1");
-                    pids.push_back(spawn(self, dir.string(), r == 0 ? out_turns : "-",
+                    if (cache && expect_reuse) env.push_back("GRIMOIRE_EXPECT_REUSE=1");
+                    pids.push_back(spawn(self, dir.string(), r == 0 ? output : "-",
                                          c.fmt, env));
                 }
+                return wait_ok(pids, cache ? "TP2+cache" : "TP2 uncached turns");
+            };
+            if(!devices.empty() && devices.size()<2) {
+                std::printf("TP2+cache SKIPPED: insufficient GPUs ");
+            } else if (!run_tp_turns(false, ref_turns) || !run_tp_turns(true, out_turns)) {
+                ++g_fail; std::printf("TP2+cache FAILED ");
+            } else {
                 const auto want = read_tokens(ref_turns);
-                if (!wait_ok(pids, "TP2+cache")) {
-                    ++g_fail; std::printf("TP2+cache FAILED ");
-                } else {
-                    const auto got = read_tokens(out_turns);
-                    const bool match = !want.empty() && got == want;
-                    std::printf("TP2+cache %s ", match ? "match" : "DIFFERS");
-                    if (!match)
-                        std::printf("\n    single %s\n    tp2    %s\n",
-                                    join(want).c_str(), join(got).c_str());
-                    CHECK(match, "a TP conversation resumed from the prefix cache "
-                                 "answered differently from re-reading it");
-                }
+                const auto got = read_tokens(out_turns);
+                const bool match = !want.empty() && got == want;
+                std::printf("TP2+cache %s ", match ? "match" : "DIFFERS");
+                if (!match)
+                    std::printf("\n    uncached %s\n    cached   %s\n",
+                                join(want).c_str(), join(got).c_str());
+                CHECK(match, "a TP conversation resumed from the prefix cache "
+                             "answered differently from re-reading it on the same ranks");
             }
         }
         std::printf("\n");
