@@ -1,0 +1,10 @@
+# GRIMOIRE v1.10.14 = v1.10.13 + the Inkling 2 Mini server with the DFlash2 drafter (branch inkling-df2-1126, 2fd3605),
+# Arc Pro B70 (G31) + B60 / B580 (G21).  DFlash2 is used when incoai/Inkling-2-Mini-DFlash2 sits next to the model.
+#   docker run --device ... --entrypoint grimoire-inkling -e INK_MODEL=/models/Inkling-2-Mini -v <models>:/models:ro -p 6911:6911
+FROM grimoire-b70:v1.10.13
+COPY --chmod=0755 inkling2_gpu libink_xexp.so /grimoire/inkling/
+COPY --chmod=0755 grimoire_inkling.sh /usr/local/bin/grimoire-inkling
+LABEL org.opencontainers.image.version=v1.10.14 \
+      org.opencontainers.image.revision=0bf1dae \
+      org.grimoire.branch=inkling-df2-1126 \
+      org.grimoire.targets=intel_gpu_bmg_g31,intel_gpu_bmg_g21
