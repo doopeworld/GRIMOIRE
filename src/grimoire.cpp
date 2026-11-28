@@ -948,6 +948,77 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
     return d;
 }
 
+// GRIMOIRE_EMBED_HOST=1 (see the embedding upload in build()).
+static bool embed_host_requested() {
+    const char* e=std::getenv("GRIMOIRE_EMBED_HOST");
+    return e && std::strcmp(e,"1")==0;
+}
+
+// dev_copy_t's read, into PINNED HOST memory and nowhere else: the file is
+// read (or converted to bf16 on the CPU) straight into a sycl::malloc_host
+// buffer that the kernels then index over PCIe.  No device allocation and no
+// host->device copy of the tensor at any point.  GGUF is not handled here
+// (build() keeps a GGUF table on the device before calling this).
+template <typename T>
+T* host_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
+               const char* what, bool* ok) {
+    if (!r.ok()) {
+        std::printf("\n  MISSING tensor: %s\n", what);
+        std::fflush(stdout);
+        *ok = false;
+        return nullptr;
+    }
+    if (r.gguf) {
+        std::printf("\n  host copy of GGUF tensor %s is not supported\n", what);
+        std::fflush(stdout);
+        *ok = false;
+        return nullptr;
+    }
+    const size_t src_bytes = size_t(ck.bytes(r));
+    const size_t count = std::is_same_v<T, bf16_t> ? size_t(r.t.numel())
+                                                    : src_bytes / sizeof(T);
+    const size_t bytes = count * sizeof(T);
+    if (src_bytes == 0 || (!std::is_same_v<T, bf16_t> && (src_bytes % sizeof(T)) != 0)) {
+        std::printf("\n  BAD tensor %s: %zu bytes, element size %zu\n",
+                    what, bytes, sizeof(T));
+        std::fflush(stdout);
+        *ok = false;
+        return nullptr;
+    }
+    T* h = sycl::malloc_host<T>(count, q);
+    if (!h) {
+        std::printf("\n  pinned host alloc FAILED for %s (%.2f MiB)\n",
+                    what, double(bytes) / 1048576.0);
+        std::fflush(stdout);
+        *ok = false;
+        return nullptr;
+    }
+    std::string rerr;
+    bool read_ok = true;
+    if constexpr (std::is_same_v<T, bf16_t>) {
+        if (r.t.dtype == STDtype::BF16) {
+            read_ok = ck.read_raw(r, h, rerr);
+        } else {
+            // Same conversion as dev_copy_t, written into the pinned buffer.
+            std::vector<float> f32(count);
+            read_ok = r.native ? ck.read_native_f32(r, f32.data(), rerr) :
+                      ck.shards[r.shard]->read_f32(r.t, f32.data(), rerr);
+            if (read_ok)
+                for (size_t i = 0; i < count; ++i) h[i] = f32_to_bf16(f32[i]);
+        }
+    } else {
+        read_ok = ck.read_raw(r, h, rerr);
+    }
+    if (!read_ok) {
+        std::printf("\n  read failed for %s: %s\n", what, rerr.c_str());
+        std::fflush(stdout);
+        sycl::free(h, q);
+        *ok = false;
+        return nullptr;
+    }
+    return h;
+}
+
 // Weight upload pacing for multi-GPU: a rank of several (GRIMOIRE_PP_RANK /
 // GRIMOIRE_TP_RANK set) uploads in 16 MB pieces at no more than
 // GRIMOIRE_UPLOAD_MBPS on average (default 2000; 0 = unpaced), instead of
@@ -3508,6 +3579,9 @@ struct Grimoire {
     int8_t*  embed_i8 = nullptr;
     bf16_t*  embed_i8_scales = nullptr;
     int embed_begin = 0, embed_count = 0;
+    // GRIMOIRE_EMBED_HOST=1: embed / embed_i8 are pinned host memory
+    // (sycl::malloc_host), not device memory, and are not in `bytes`.
+    bool     embed_host = false;
     bf16_t*  fnorm = nullptr;
     sycl::half* fnorm_f16 = nullptr;
     DevQuant lm_head;
@@ -7516,6 +7590,53 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     const bool tied_head = cfg.tie_embeddings && !ck.lm_head.ok();
     const bool need_embed = !pp_enabled() || pp_rank == 0 || last_stage_drafts
                          || (tied_head && pp_rank == pp_world - 1);
+    // GRIMOIRE_EMBED_HOST=1: the token-embedding table in PINNED HOST memory.
+    //
+    // What: embed (bf16) or embed_i8 (int8-embed checkpoints) is allocated
+    // with sycl::malloc_host and filled there straight from the file (a bf16
+    // table stored as another dtype is converted on the CPU, into that
+    // buffer).  The lookup kernels (launch_embed*, ops.cpp / prefill.cpp)
+    // just index the pointer, so they read the rows over PCIe unchanged --
+    // the same thing GRIMOIRE_DFLASH_TAPS_HOST already relies on.  The int8
+    // table's per-row bf16 scales stay on the device (0.5 MiB; every element
+    // reads its row's scale, which would triple the PCIe reads).
+    //
+    // Why: a lookup reads one row per decoded token and M rows per prompt
+    // chunk, but the table holds VRAM all the time -- Qwen3.8-27B 248,320 x
+    // 5,120 = 2.37 GiB bf16 / 1.18 GiB int8.  Off the card it is room for KV
+    // slots and prompt scratch (the pooled-KV 4-user 64K case).  It also
+    // avoids the table's host->device upload altogether.
+    //
+    // Measure, with and without: the startup "embedding table in host
+    // memory" line, "resident" GiB, KV slots / pooled-KV budget and the
+    // prefill chunk cap; llama-benchy pp4096 / pp65536 / tg128 (one row is
+    // ~10 KB a token over PCIe: expected noise for decode, ~0.65 GB per 64K
+    // prompt); greedy output byte-identical.
+    //
+    // Default OFF (unset = the device table, byte-for-byte as before).  Not
+    // used, with one stderr line, for: TP / PP / Megatron ranks (sharded or
+    // per-stage tables, peer copies), tied embeddings (the lm_head IS the
+    // table and reads all of it every token), GGUF (the table is decoded by
+    // dev_copy_t's GGUF path, not verified here), and when system RAM would
+    // drop under an 8 GiB reserve (pinned pages cannot be swapped).
+    if(need_embed && embed_host_requested()){
+        const size_t host_bytes = size_t(ck.embed.t.numel()) *
+                                  (ck.embed.int8_embedding ? 1 : sizeof(bf16_t));
+        constexpr uint64_t host_reserve = uint64_t(8) << 30;
+        const char* why = nullptr;
+        if(tp_ranked() || pp_enabled())
+            why = "tensor / pipeline parallel ranks are not supported";
+        else if(cfg.tie_embeddings)
+            why = "tied embeddings: the lm_head reads this table";
+        else if(ck.embed.gguf)
+            why = "GGUF embedding tables are not supported";
+        else if(host_history_available_ram() < host_reserve + host_bytes)
+            why = "not enough available system RAM (8 GiB reserve)";
+        if(why)
+            std::fprintf(stderr, "  GRIMOIRE_EMBED_HOST=1 ignored (%s); embedding table stays on the GPU\n", why);
+        else
+            embed_host = true;
+    }
     if(need_embed && ck.embed.int8_embedding){
         if(tied_head || cfg.is_muse){
             err="resident INT8 embedding requires an untied BF16 embedding path";
@@ -7533,16 +7654,19 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         scales.t.begin+=uint64_t(embed_begin)*sizeof(uint16_t);
         scales.t.end=scales.t.begin+uint64_t(embed_count)*sizeof(uint16_t);
         scales.t.shape={embed_count,1};
-        embed_i8=dev_copy_t<int8_t>(q,ck,codes,"embed_tokens.INT8",&ok);
+        embed_i8=embed_host ? host_copy_t<int8_t>(q,ck,codes,"embed_tokens.INT8",&ok)
+                            : dev_copy_t<int8_t>(q,ck,codes,"embed_tokens.INT8",&ok);
         // Match the reference's .to(bfloat16) BEFORE its multiplication.
         embed_i8_scales=dev_copy_t<bf16_t>(q,ck,scales,"embed_tokens.BF16_scales",&ok);
         if(!ok){err="INT8 embedding upload failed";return false;}
-        acct(size_t(embed_count)*(size_t(H)+sizeof(bf16_t)));
-        std::printf("resident INT8 [%d,%d), BF16 lookup/output, %.2f GiB; ",
+        acct(size_t(embed_count)*((embed_host ? 0 : size_t(H))+sizeof(bf16_t)));
+        std::printf("%s INT8 [%d,%d), BF16 lookup/output, %.2f GiB; ",
+                    embed_host ? "host" : "resident",
                     embed_begin,embed_begin+embed_count,
                     double(size_t(embed_count)*(size_t(H)+sizeof(bf16_t)))/1073741824.0);
     }else if(need_embed)
-        embed=dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
+        embed=embed_host ? host_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok)
+                         : dev_copy_t<bf16_t>(q,ck,ck.embed,"embed_tokens",&ok);
     if (!ok) { err = "embed upload failed"; return false; }
     if(!embed_i8){embed_begin=0;embed_count=cfg.vocab;}
     if(tp_enabled() && !embed_i8){
@@ -7555,7 +7679,10 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
         sycl::free(embed,q);embed=local;
     }
     std::printf("ok\n");
-    if(embed)acct(size_t(embed_count)*H*sizeof(bf16_t));
+    if(embed&&!embed_host)acct(size_t(embed_count)*H*sizeof(bf16_t));
+    if(embed_host)
+        std::printf("  embedding table in host memory (%.2f GiB freed on the GPU)\n",
+                    double(size_t(embed_count)*H*(embed_i8 ? 1 : sizeof(bf16_t)))/1073741824.0);
 
     std::printf("  final_norm    ... ");
     std::fflush(stdout);
@@ -13120,10 +13247,12 @@ void Grimoire::release() {
     // A tied lm_head points AT embed; freeing both would double-free.
     if (tied_lm_head) { lm_head.payload = nullptr; lm_head.w.payload = nullptr; }
     lm_head.release(q);
+    // sycl::free also releases the GRIMOIRE_EMBED_HOST malloc_host table.
     if (embed) sycl::free(embed, q);
     if (embed_i8) sycl::free(embed_i8, q);
     if (embed_i8_scales) sycl::free(embed_i8_scales, q);
     embed=nullptr; embed_i8=nullptr; embed_i8_scales=nullptr;
+    embed_host=false;
     if (fnorm) sycl::free(fnorm, q);
     if (fnorm_f16) sycl::free(fnorm_f16, q);
     if (spec_dn_state) sycl::free(spec_dn_state, q);
