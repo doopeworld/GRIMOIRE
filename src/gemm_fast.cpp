@@ -3803,8 +3803,20 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     // prompts admitted together (240 rows) 320 -> 229 ms; 2.2K / 1.3K-token prompts 1,213 / 789 -> 1,446 / 830 ms.
     static const int i4_dnnl_prompt_max = [] { const char* e = std::getenv("GRIMOIRE_I4_ONEDNN_PROMPT_MAX");
         return e && *e ? std::atoi(e) : 512; }();
-    if (M <= i4_dnnl_prompt_max && w.fmt == Fmt::INT4 && M > 16 && w.N >= 2048 && !i4a8_ok(w, M) &&
-        onednn_int4_ok(q, w, M)) {
+    // GRIMOIRE_I4A8G=<32|64|128> (opt-in, onednn_gemm.cpp): the INT4 prompt GEMMs I4A8 does not take (17 to
+    // 1535 rows: interleaved prompt chunks, admission batches, short prompts) as int8 activations with group
+    // scales x the INT4 weights as stored, instead of bf16.  MEASURED 2026-11-22, one B70, Swift INT4 + MTP K6,
+    // llama-benchy pp4096 at 2 / 4 / 8 users: prompt 1,942 / 1,929 / 1,946 -> 2,291 / 2,323 / 2,334 tok/s;
+    // single prompts 4K-64K unchanged (I4A8 keeps the rows it takes: on this path they ran 1-7% slower).
+    // Logits vs the bf16 path at 1.6K-8K-token prefixes: KL 0.0011-0.0022 (I4A8 0.0010-0.0015).
+    const bool i4a8_takes = i4a8_ok(w, M);
+    // (the cheap shape tests first: decode GEMMs, M <= 16, never reach the once-per-shape check)
+    const bool a8g = M > 16 && w.N >= 2048 && w.fmt == Fmt::INT4 && !i4a8_takes && onednn_i4a8g_group() > 0 &&
+                     w.K % onednn_i4a8g_group() == 0 &&
+                     onednn_int4_a8g_ok(q, w, EPI == 2, M, EPI == 1 ? 512 : 0);   // 512: the SwiGLU row chunk below
+    if ((M <= i4_dnnl_prompt_max || a8g) && w.fmt == Fmt::INT4 && M > 16 && w.N >= 2048 &&
+        !i4a8_takes && onednn_int4_ok(q, w, M)) {
+        auto* const i4gemm = a8g ? &onednn_gemm_int4_a8g : &onednn_gemm_int4;
         sycl::event e;
         if constexpr (EPI == 1) {
             // SwiGLU: gate|up rows into f32, 512 rows at a time, then the epilogue's rounding
@@ -3815,12 +3827,12 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
             std::vector<sycl::event> d = deps;
             for (int r0 = 0; r0 < M; r0 += PR) {
                 const int rows = std::min(PR, M - r0);
-                e = onednn_gemm_int4(q, w, x + size_t(r0) * K, y, rows, false, d);
+                e = i4gemm(q, w, x + size_t(r0) * K, y, rows, false, d);
                 e = swiglu_rows(q, y, static_cast<sycl_bf16*>(out) + size_t(r0) * (N / 2), rows, N / 2, {e});
                 d = {e};
             }
         } else {
-            e = onednn_gemm_int4(q, w, x, static_cast<float*>(out), M, EPI == 2, deps);
+            e = i4gemm(q, w, x, static_cast<float*>(out), M, EPI == 2, deps);
         }
         if (timed) { lap(stage_times().main, t0); ++stage_times().calls; }
         return e;

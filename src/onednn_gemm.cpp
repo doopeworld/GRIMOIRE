@@ -470,6 +470,197 @@ sycl::event onednn_gemm_int4(sycl::queue& q, const QuantWeight& w, const sycl_bf
     return e;
 }
 
+// =====================================================================
+// GRIMOIRE_I4A8G=<32|64|128> (opt-in, 2026-11-22): INT4 prompt GEMMs as int8 activations x the INT4
+// weights as stored.  Each activation row is quantized to int8 with one f32 scale per G-wide K group;
+// oneDNN's matmul takes the u4 weights with their own group scales / zero points, s8 x int4 on the
+// DPAS units (fpmath strict: no implicit down-conversion; the s8 x u4 kernels are the integer ones, an f32
+// fallback would be several times slower than the bf16 path, and this one is faster).  Against I4A8 (one
+// scale per row, weights requantized to rotated int8 per call) the weights are exact and an outlier only
+// coarsens its own group; there is no per-call weight conversion (~75 ms a prompt), so it also pays below
+// I4A8's 1536 rows.
+// MEASURED 2026-11-22, one B70, M 4096, standalone probe linked against oneAPI 2026.1's oneDNN 3.11
+// (i4a8g_probe / i4a8g_check): gate_up 34816x5120 12.1 -> 6.5 ms, down 5120x17408 4.5 -> 2.8 ms against
+// the bf16 x u4 primitive above; output against a float64 reference of the same int8 / u4 operands: rms
+// rel 5e-8..9e-8.  End to end (the image, oneDNN 3.14): see gemm_fast.cpp.
+// =====================================================================
+namespace {
+struct I4GPrim { dnnl::matmul prim; dnnl::memory::desc src, wei, dst, scr, smd, zmd, asd; };
+
+const I4GPrim& i4g_prim(Ctx& c, sycl::queue& q, const QuantWeight& w, int M, int ga, bool acc) {
+    static std::map<std::tuple<int, int, int, int, int, int>, I4GPrim> prims;
+    const int g = i4_group(w);
+    const auto k = std::make_tuple(M, w.N, w.K, g, ga, acc ? 1 : 0);
+    auto it = prims.find(k);
+    if (it != prims.end()) return it->second;
+    const auto t0 = std::chrono::steady_clock::now();
+    I4GPrim p;
+    p.src = dnnl::memory::desc({M, w.K}, dt::s8, tag::ab);
+    p.wei = dnnl::memory::desc({w.K, w.N}, dt::u4, tag::ba);
+    p.dst = dnnl::memory::desc({M, w.N}, dt::f32, tag::ab);
+    p.smd = dnnl::memory::desc({w.K / g, w.N}, dt::bf16, tag::ab);
+    p.zmd = dnnl::memory::desc({w.K / g, w.N}, dt::u8, tag::ab);
+    p.asd = dnnl::memory::desc({M, w.K / ga}, dt::f32, tag::ab);
+    dnnl::primitive_attr attr;
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    attr.set_deterministic(true);
+    attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), {g, 1}, dt::bf16);
+    attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), {g, 1}, dt::u8);
+    attr.set_scales(DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, ga}, dt::f32);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::strict, true);
+    if (acc) {
+        dnnl::post_ops po;
+        po.append_sum(1.0f);
+        attr.set_post_ops(po);
+    }
+    dnnl::matmul::primitive_desc pd(c.eng, p.src, p.wei, p.dst, attr);
+    if (std::string(pd.impl_info_str()).find(":ref:") != std::string::npos)
+        throw std::runtime_error("oneDNN INT4 a8g: only a reference implementation for this shape");
+    p.scr = pd.scratchpad_desc();
+    p.prim = dnnl::matmul(pd);
+    grow(q, c.scratch, c.scratch_cap, p.scr.get_size(), "scratchpad");
+    static const bool verbose = std::getenv("GRIMOIRE_ONEDNN_VERBOSE") != nullptr;
+    if (verbose)
+        std::fprintf(stderr, "  oneDNN matmul int4 x s8 g%d/a%d M=%d N=%d K=%d%s: %s, scratchpad %zu B, created in %.1f ms\n",
+                     g, ga, M, w.N, w.K, acc ? " (+=)" : "", pd.impl_info_str(), p.scr.get_size(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return prims.emplace(k, std::move(p)).first->second;
+}
+
+// x [M][K] bf16 -> int8 rows + one f32 scale per (row, G-wide group): scale = max|x| / 127 of the group,
+// q = rint(x / scale).  One sub-group of 16 lanes per group, G / 16 (<= 8) elements a lane.
+sycl::event quant_groups(sycl::queue& q, const sycl_bf16* x, int M, int K, int G, int8_t* x8, float* as,
+                         const std::vector<sycl::event>& deps) {
+    const int NG = K / G, E = G / 16;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(M) * NG * 16, 16), [=](sycl::nd_item<1> it)
+                       [[sycl::reqd_sub_group_size(16)]] {
+            const size_t grp = it.get_group(0);
+            const int lane = int(it.get_local_id(0));
+            const size_t base = grp * size_t(G) + size_t(lane) * E;     // rows are K wide, groups tile them
+            float v[8];
+            float mx = 0.0f;
+            for (int i = 0; i < E; ++i) { v[i] = float(x[base + i]); mx = sycl::fmax(mx, sycl::fabs(v[i])); }
+            mx = sycl::reduce_over_group(it.get_sub_group(), mx, sycl::maximum<float>());
+            const float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+            const float inv = 1.0f / s;
+            for (int i = 0; i < E; ++i)
+                x8[base + i] = int8_t(sycl::clamp(sycl::rint(v[i] * inv), -127.0f, 127.0f));
+            if (lane == 0) as[grp] = s;
+        });
+    });
+}
+} // namespace
+
+int onednn_i4a8g_group() {
+    static const int g = [] {
+        const char* e = std::getenv("GRIMOIRE_I4A8G");
+        const int v = e && *e ? std::atoi(e) : 0;
+        if (e && *e && v != 0 && v != 32 && v != 64 && v != 128)
+            std::fprintf(stderr, "  GRIMOIRE_I4A8G=%s ignored (32, 64 or 128)\n", e);
+        return v == 32 || v == 64 || v == 128 ? v : 0;
+    }();
+    return g;
+}
+
+namespace {
+// The piece sizes onednn_gemm_int4_a8g runs (its tail rows run as one 32-row piece), as bits of kPiecesG.
+constexpr int kPiecesG[] = {1024, 512, 256, 128, 64, 32};
+unsigned a8g_pieces(int M) {
+    unsigned bits = 0;
+    int r0 = 0;
+    for (int i = 0; i < 6; ++i)
+        while (M - r0 >= kPiecesG[i]) { bits |= 1u << i; r0 += kPiecesG[i]; }
+    if (M > r0) bits |= 1u << 5;
+    return bits;
+}
+} // namespace
+
+// Whether every piece primitive a call of M rows (made in calls of at most `chunk` rows; 0 = one call) runs is a
+// fast kernel on this GPU / oneDNN, checked BEFORE any of its work is enqueued: where oneDNN offers only the
+// reference kernel for a piece, the shape keeps its previous path for good (a piece refused mid-call would fail
+// the request with the output half written).  Pieces are built on first need, so a short first prompt does not
+// pay for all six (~2 s of primitive creation).
+bool onednn_int4_a8g_ok(sycl::queue& q, const QuantWeight& w, bool accumulate, int M, int chunk) {
+    const int ga = onednn_i4a8g_group();
+    if (ga == 0 || w.K % ga != 0 || M <= 0 || !onednn_int4_ok(q, w, 32)) return false;
+    static std::map<std::tuple<int, int, int, int>, unsigned> built;   // pieces built per shape; ~0u = refused
+    std::lock_guard<std::mutex> lk(mu());
+    unsigned& have = built[std::make_tuple(w.N, w.K, i4_group(w), accumulate ? 1 : 0)];
+    if (have == ~0u) return false;
+    const unsigned need = chunk > 0 && M > chunk ? a8g_pieces(chunk) | a8g_pieces(M % chunk) : a8g_pieces(M);
+    try {
+        Ctx& c = ctx_for(q);
+        for (int i = 0; i < 6; ++i)
+            if (need & ~have & (1u << i)) {
+                (void)i4g_prim(c, q, w, kPiecesG[i], ga, accumulate);
+                have |= 1u << i;
+            }
+    } catch (const std::exception& ex) {
+        have = ~0u;
+        std::fprintf(stderr, "  i4a8g off for N=%d K=%d (%s); this shape keeps the bf16 / INT4 path\n", w.N, w.K, ex.what());
+        return false;
+    }
+    return true;
+}
+
+sycl::event onednn_gemm_int4_a8g(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y, int M,
+                                 bool accumulate, const std::vector<sycl::event>& deps) {
+    using namespace dnnl::sycl_interop;
+    const int ga = onednn_i4a8g_group();
+    if (ga == 0 || w.K % ga != 0) throw std::runtime_error("onednn_gemm_int4_a8g: GRIMOIRE_I4A8G off or K % group");
+    std::lock_guard<std::mutex> lk(mu());
+    Ctx& c = ctx_for(q);
+    const I4T& t = i4_transposed(q, w);
+    if (!t.ok) throw std::runtime_error("onednn_gemm_int4_a8g: weight not supported (check onednn_int4_ok first)");
+    const size_t K = size_t(w.K), N = size_t(w.N), NG = K / size_t(ga);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "  i4a8g: INT4 prompt GEMMs as int8 activations (one scale per %d values) x INT4 "
+                             "weights as stored\n", ga);
+    }
+    constexpr int T = 32;                         // staged tail rows
+    const int Mp = (M + T - 1) / T * T;
+    grow(q, c.x8, c.x8_cap, size_t(Mp) * K, "int8 activations");
+    grow(q, c.as, c.as_cap, size_t(Mp) * NG, "activation scales");
+    sycl::event e = quant_groups(q, x, M, int(K), ga, c.x8, c.as, deps);
+    auto run = [&](const I4GPrim& p, const int8_t* xin, const float* sin, float* yout,
+                   const std::vector<sycl::event>& d) {
+        std::unordered_map<int, dnnl::memory> args;
+        args[DNNL_ARG_SRC] = make_memory(p.src, c.eng, memory_kind::usm, const_cast<int8_t*>(xin));
+        args[DNNL_ARG_WEIGHTS] = make_memory(p.wei, c.eng, memory_kind::usm, const_cast<uint8_t*>(w.payload));
+        args[DNNL_ARG_DST] = make_memory(p.dst, c.eng, memory_kind::usm, yout);
+        args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC] = make_memory(p.asd, c.eng, memory_kind::usm, const_cast<float*>(sin));
+        args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS] = make_memory(p.smd, c.eng, memory_kind::usm, t.s);
+        args[DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS] = make_memory(p.zmd, c.eng, memory_kind::usm, t.z);
+        if (p.scr.get_size())
+            args[DNNL_ARG_SCRATCHPAD] = make_memory(p.scr, c.eng, memory_kind::usm, c.scratch);
+        return execute(p.prim, c.strm, args, d);
+    };
+    // The same fixed pieces as onednn_gemm_int4, so a new prompt length builds no primitive.  The tail runs
+    // as a 32-row primitive over the int8 rows past M (the buffers are padded to whole 32-row pieces; those
+    // rows hold earlier values, and their output rows are never copied out), its output staged.
+    std::vector<sycl::event> d = {e};
+    int r0 = 0;
+    for (const int P : kPiecesG)
+        while (M - r0 >= P) {
+            e = run(i4g_prim(c, q, w, P, ga, accumulate), c.x8 + size_t(r0) * K, c.as + size_t(r0) * NG,
+                    y + size_t(r0) * N, d);
+            d = {e};
+            r0 += P;
+        }
+    const int rem = M - r0;
+    if (rem > 0) {
+        grow(q, c.ys, c.ys_cap, size_t(T) * N, "staging");
+        if (accumulate) { e = q.memcpy(c.ys, y + size_t(r0) * N, size_t(rem) * N * sizeof(float), d); d = {e}; }
+        e = run(i4g_prim(c, q, w, T, ga, accumulate), c.x8 + size_t(r0) * K, c.as + size_t(r0) * NG, c.ys, d);
+        e = q.memcpy(y + size_t(r0) * N, c.ys, size_t(rem) * N * sizeof(float), {e});
+    }
+    return e;
+}
+
 bool onednn_gemm_ok(const QuantWeight& w, int M) {
     if (!enabled() || M <= 0 || !w.payload) return false;
     if (w.fmt == Fmt::FP8_E4M3 || w.fmt == Fmt::INT8)

@@ -13851,6 +13851,18 @@ int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
     const bool head_bf16 = hb && *hb == '1';
     const char* sp = std::getenv("GRIMOIRE_SCORE_PREFILL");
     const bool score_prefill = sp && std::atoi(sp) != 0;
+    // GRIMOIRE_SCORE_FROM=<pos> / GRIMOIRE_SCORE_STRIDE=<n> (prompt scoring only): write the logits of
+    // positions pos, pos + n, ... -- long prefixes reach the prompt GEMM paths that start at 1536 rows
+    // without prefilling every shorter prefix first.
+    const char* sf = std::getenv("GRIMOIRE_SCORE_FROM");
+    const char* ss = std::getenv("GRIMOIRE_SCORE_STRIDE");
+    const size_t score_from = score_prefill && sf ? size_t(std::max(0, std::atoi(sf))) : 0;
+    const size_t score_stride = score_prefill && ss ? size_t(std::max(1, std::atoi(ss))) : 1;
+    // GRIMOIRE_SCORE_WINDOW=<n> (prompt scoring only): each scored position is read through a fresh prompt of
+    // its last n tokens instead of the whole prefix -- the cost per position is flat, so a long text can be
+    // scored at every few tokens through prompts of one chosen length.
+    const char* sw = std::getenv("GRIMOIRE_SCORE_WINDOW");
+    const size_t score_window = score_prefill && sw ? size_t(std::max(0, std::atoi(sw))) : 0;
     Grimoire e;
     UploadOptions opt;
     opt.lm_head_fmt = proj_fmt;
@@ -13875,8 +13887,12 @@ int grimoire_score_dump(const std::string& dir, Fmt proj_fmt, int max_seq,
                 // Score the same position through a fresh prompt. Per-token
                 // decode never exercises activation quantization in prompt GEMMs.
                 prefix.push_back(ids[i]);
+                if (i < score_from || (i - score_from) % score_stride != 0) continue;
                 e.reset();
-                if(e.prefill(prefix,nullptr,nullptr,false))lg=e.s.logits;
+                if(score_window && prefix.size() > score_window){
+                    const std::vector<int32_t> win(prefix.end() - std::ptrdiff_t(score_window), prefix.end());
+                    if(e.prefill(win,nullptr,nullptr,false))lg=e.s.logits;
+                }else if(e.prefill(prefix,nullptr,nullptr,false))lg=e.s.logits;
             }else lg = e.forward(int(ids[i]));
             if (!lg) { std::printf("\nscore: forward failed at position %zu\n", i); std::fclose(out); return 1; }
             e.q.memcpy(host.data(), lg, size_t(V) * sizeof(float)).wait();
