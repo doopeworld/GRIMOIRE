@@ -423,7 +423,8 @@ one conversation slot, 262,144-token context, llama-benchy 0.4.0, the v1.10.6 re
 **What v1.10.6 changes:**
 
 - MTP drafts for up to 8 users at once; a verify pass holds at most 16 rows (`GRIMOIRE_SPEC_ROWS`); two users
-  draft 5 tokens deep (`GRIMOIRE_SPEC_DEPTHS`, default `15,5`).
+  draft 5 tokens deep (`GRIMOIRE_SPEC_DEPTHS`, default `15,5`; on one card now `15,3`, two-card / pipeline
+  runs keep `15,5`; an explicit `GRIMOIRE_SPEC_DEPTHS` sets both).
 - Sampled requests (temperature > 0) are admitted together, so several users get their first token sooner.
 - INT4 prompts up to 160 rows run in 32-row INT4 pieces (about half the time to first token on short prompts);
   opt-in `GRIMOIRE_I4A8=1` uses 8-bit activations for long INT4 prompts (+14-22% prefill, lossy).

@@ -11608,12 +11608,19 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     // MEASURED one B70, Swift INT4, copybench greedy, total tok/s, rows 16 -> rows 32 (depth): 8 users code-new
     // 308 -> 430, review 264 -> 365 (depth 1 -> 3); 4 users at depth 7 instead of 3 LOST (code-new 280 -> 216,
     // essay 207 -> 129), hence the cap of 3.
-    static const std::vector<int> depth_by_n=[] {
-        std::vector<int> v; const char* e=std::getenv("GRIMOIRE_SPEC_DEPTHS");
-        if(!e) e="15,5,4,3,3,3,3,3";
+    // ONE CARD (2026-11-23): two users draft 3 deep, not 5.  MEASURED one B70, Swift INT4 MTP K6, llama-benchy tg128 at
+    // 2 users (pp4096, 3 runs each, four independent server starts per arm): depth 3 157.7 / 159.2 / 160.0 / 159.6,
+    // depth 5 149.8 / 140.9 / 147.1 / 150.0 tok/s (+~10%); one user unchanged; depth 4 144, 6 130.  The "15,5" above
+    // stays for TP / PP, where it was measured.
+    auto parse_depths=[](const char* e) {
+        std::vector<int> v;
         for(const char* p=e; *p; ) { char* end=nullptr; const long x=std::strtol(p,&end,10);
             if(end==p) break; v.push_back(int(std::clamp<long>(x,0,15))); p=end; while(*p==','||*p==' ') ++p; }
-        return v; }();
+        return v; };
+    static const char* const depths_env=std::getenv("GRIMOIRE_SPEC_DEPTHS");
+    static const std::vector<int> depth_one=parse_depths(depths_env?depths_env:"15,3,4,3,3,3,3,3");
+    static const std::vector<int> depth_ranked=parse_depths(depths_env?depths_env:"15,5,4,3,3,3,3,3");
+    const std::vector<int>& depth_by_n=(tp_ranked()||pp_enabled())?depth_ranked:depth_one;
     int max_depth=std::max(0,std::min(requested,spec_rows/n-1));
     if(n>=1 && size_t(n)<=depth_by_n.size()) max_depth=std::min(max_depth,depth_by_n[size_t(n-1)]);
     // COPY DRAFTS (2026-11-14).  When a reply repeats its context -- copying or editing code, quoting a
