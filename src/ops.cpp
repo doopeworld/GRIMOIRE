@@ -33,6 +33,7 @@
 #include "b70/sampling.hpp"
 #include "kv_k8.hpp"
 #include "b70/int8_embedding.hpp"
+#include "b70/qgate_layout.hpp"
 #include "gemv_step.hpp"
 #include <climits>
 #include <cmath>
@@ -558,6 +559,30 @@ sycl::event launch_l2norm_heads(sycl::queue& q, float* x, int n_heads, int dim,
                 const int  head = int(it.get_group(0));
                 float* p = x + int64_t(head) * dim;
 
+                float ss = 0.0f;
+                for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
+                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                const float inv = sycl::rsqrt(ss + 1e-6f);
+                for (int i = lane; i < dim; i += SG_SIZE) p[i] *= inv;
+            });
+    });
+}
+
+// In-place FP32 q/k pair: one launch instead of two, identical arithmetic per
+// element (same fma order, same rsqrt on the same sum), no extra scaling.
+sycl::event launch_l2norm_heads_pair_f32(sycl::queue& q, float* a, float* b,
+                                         int n_heads, int dim,
+                                         const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(2) * n_heads * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int g = int(it.get_group(0));
+                const int head = g >= n_heads ? g - n_heads : g;
+                float* p = (g >= n_heads ? b : a) + int64_t(head) * dim;
                 float ss = 0.0f;
                 for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
                 ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
@@ -1612,12 +1637,10 @@ sycl::event launch_split_qgate(sycl::queue& q, const float* src, float* qout,
         h.depends_on(deps);
         h.parallel_for(sycl::range<1>(size_t(n_heads) * head_dim),
             [=](sycl::id<1> id) {
-                const int t    = int(id[0]);
-                const int head = t / head_dim;
-                const int d    = t % head_dim;
-                const int64_t base = int64_t(head) * 2 * head_dim;
-                qout[t] = src[base + d];
-                gout[t] = src[base + head_dim + d];
+                const auto i = int64_t(id[0]);
+                const auto p = qgate_offsets(i, head_dim);
+                qout[i] = src[p.q];
+                gout[i] = src[p.gate];
             });
     });
 }

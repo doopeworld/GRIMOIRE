@@ -59,6 +59,12 @@ struct Engine {
         ++reuses;reused_tokens+=n;
         history=snap;pos=n;return true;
     }
+    bool prefix_head_at_end(size_t, int) const { return false; }
+    int prefix_head_split(size_t, int) const { return 0; }
+    bool save_prefix_head(const std::vector<int32_t>&, bool = false) {
+        assert(false && "prompt-head caching is disabled in this fake");
+        return false;
+    }
     void save_prefix_now(const std::vector<int32_t>& ids){
         if(!snap_enabled)return;
         // The real engine snapshots DEVICE state, so a token list that

@@ -43,8 +43,11 @@
 //  math. If you want 4-bit weights AND the int8 XMX rate, use INT4.
 // =====================================================================
 #include "kernels.hpp"
+#include "b70/qfn_moe_offset_schedule.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace b70 {
 
@@ -74,15 +77,22 @@ inline int vnni_off_int8(int k, int n) { return (k >> 2) * WG_N * 4 + n * 4 + (k
 // ---------------------------------------------------------------------
 // Float pipeline
 // ---------------------------------------------------------------------
-template <Fmt F, int MPSG, int NPSG>
+template <Fmt F, int MPSG, int NPSG, bool Grouped = false, bool Prefetch = false,
+          bool OffsetSchedule = false>
 sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                      const sycl_bf16* x, float* y, int M,
-                     const std::vector<sycl::event>& deps) {
-    const int N = w.N, K = w.K;
-    constexpr int WGM = TM * MPSG * XMX_SUBGROUPS;
+                     const std::vector<sycl::event>& deps,
+                     const QfnMoeTile* tiles = nullptr, int tile_count = 0, int expert_width = 0,
+                     const int32_t* live_tiles = nullptr, const int32_t* offsets = nullptr,
+                     int workers = 0) {
+    const int N = Grouped ? expert_width : w.N, K = w.K;
+    constexpr int SG = Grouped ? qfn_moe_tile_rows / (TM * MPSG) : XMX_SUBGROUPS;
+    constexpr int WGM = TM * MPSG * SG;
     constexpr int WGN = TN * NPSG;
-    const int gm = (M + WGM - 1) / WGM;
+    static_assert(!OffsetSchedule || (Grouped && WGN == 64 && !Prefetch));
+    const int gm = OffsetSchedule ? workers : Grouped ? tile_count : (M + WGM - 1) / WGM;
     const int gn = (N + WGN - 1) / WGN;
+    const int experts = OffsetSchedule ? w.N / N : 0;
 
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
@@ -91,18 +101,15 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
         sycl::local_accessor<sycl_bf16, 1> slmA(WGM * WG_K_BF16, h);
         sycl::local_accessor<sycl_bf16, 1> slmB(WG_K_BF16 * WGN, h);
         // fp32 epilogue scratch, one TM x TN tile per sub-group
-        sycl::local_accessor<float, 1> slmEpi(XMX_SUBGROUPS * TM * TN, h);
+        sycl::local_accessor<float, 1> slmEpi(SG * TM * TN, h);
 
-        h.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(size_t(gm), size_t(gn) * XMX_SUBGROUPS * SG_SIZE),
-                              sycl::range<2>(1, size_t(XMX_SUBGROUPS) * SG_SIZE)),
-            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+        // Both schedulers execute this same tile body, including its complete
+        // increasing-K FP32 accumulation. Only the coordinates change.
+        const auto run_tile = [=](sycl::nd_item<2> it, int m_wg, int m_end, int64_t w_base, int n_wg) {
                 const auto sg    = it.get_sub_group();
                 const int  sgid  = int(sg.get_group_id()[0]);
                 const int  lane  = int(sg.get_local_id()[0]);
                 const int  lid   = int(it.get_local_id(1));
-                const int  m_wg  = int(it.get_group(0)) * WGM;
-                const int  n_wg  = int(it.get_group(1)) * WGN;
 
                 matrix::joint_matrix<sycl::sub_group, sycl_bf16,
                                      matrix::use::a, TM, TK_BF16,
@@ -122,30 +129,58 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                     }
                 }
 
+                // As in the Xe2 grouped vLLM kernel, prime six K tiles and
+                // then issue the next hint while consuming the current tile.
+                // Hints use the existing row-major A and packed B. They never
+                // stage operands, read padded rows, or change the DPAS loop.
+                constexpr int lookahead = 6 * WG_K_BF16;
+                const auto prefetch = [&](int k) {
+                    if constexpr (Prefetch) {
+                        static_assert(Grouped && WGN == 64 && MPSG == 1 && F == Fmt::INT4);
+                        namespace exp = sycl::ext::oneapi::experimental;
+                        const auto hint = exp::properties{exp::prefetch_hint_L1};
+                        const int ma = m_wg + sgid * TM;
+                        if (ma + TM <= m_end)
+                            matrix::joint_matrix_prefetch<TM, WG_K_BF16>(sg, x + int64_t(ma) * K + k,
+                                size_t(K), matrix::layout::row_major, hint);
+                        // Each aligned 64-byte packed strip supplies four K32
+                        // iterations. Hint it once; each SG covers 16 of 64 N rows.
+                        constexpr int packed_line = 64, line_k = 2 * packed_line;
+                        static_assert(SG * TN == WGN && line_k % WG_K_BF16 == 0);
+                        const int nb = n_wg + sgid * TN;
+                        if (k % line_k == 0 && nb + TN <= N)
+                            matrix::joint_matrix_prefetch<TN, packed_line>(sg,
+                                wc.payload + (w_base + nb) * wc.row_bytes + k / 2,
+                                size_t(wc.row_bytes), matrix::layout::row_major, hint);
+                    }
+                };
+                if constexpr (Prefetch)
+                    for (int k = 0; k < lookahead && k < K; k += WG_K_BF16) prefetch(k);
                 for (int k_wg = 0; k_wg < K; k_wg += WG_K_BF16) {
 
                     // ---- stage A: plain bf16 activations ----------------
-                    for (int i = lid; i < WGM * WG_K_BF16; i += XMX_SUBGROUPS * SG_SIZE) {
+                    for (int i = lid; i < WGM * WG_K_BF16; i += SG * SG_SIZE) {
                         const int mr = i / WG_K_BF16, kc = i % WG_K_BF16;
                         const int gmi = m_wg + mr, gki = k_wg + kc;
-                        slmA[i] = (gmi < M && gki < K)
+                        slmA[i] = (gmi < m_end && gki < K)
                                 ? x[int64_t(gmi) * K + gki] : sycl_bf16(0.0f);
                     }
 
                     // ---- stage B: dequantize straight into VNNI order ---
                     // Each thread owns whole (n, k-block) strips so the
                     // scale lookup is hoisted out of the element loop.
-                    for (int i = lid; i < WGN * WG_K_BF16; i += XMX_SUBGROUPS * SG_SIZE) {
+                    for (int i = lid; i < WGN * WG_K_BF16; i += SG * SG_SIZE) {
                         const int nc = i / WG_K_BF16, kc = i % WG_K_BF16;
-                        const int gni = n_wg + nc, gki = k_wg + kc;
+                        const int ni = n_wg + nc, gki = k_wg + kc;
+                        const int64_t gni = w_base + ni;
                         // The dispatch already specialized F.  Calling
                         // QuantWeight::at() here re-ran two seven-way
                         // switches for every staged element and dominated
                         // short-K projections.  Resolve layout and scale at
                         // compile time instead.
                         float v = 0.0f;
-                        if (gni < N && gki < K) {
-                            const uint8_t* row = wc.payload + int64_t(gni) * wc.row_bytes;
+                        if (ni < N && gki < K) {
+                            const uint8_t* row = wc.payload + gni * wc.row_bytes;
                             float scale = 1.0f;
                             if constexpr (F == Fmt::FP8_E4M3 || F == Fmt::FP8_E5M2 ||
                                           F == Fmt::INT8) {
@@ -167,6 +202,8 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                     }
 
                     sycl::group_barrier(it.get_group());
+                    if constexpr (Prefetch)
+                        if (k_wg + lookahead < K) prefetch(k_wg + lookahead);
 
                     // 4 A fragments x 4 B fragments = 16 MADs from 8
                     // loads. The B fragments are reused across all M
@@ -174,6 +211,7 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                     // arithmetic intensity comes from.
                     #pragma unroll
                     for (int kk = 0; kk < WG_K_BF16; kk += TK_BF16) {
+                        if (Grouped && m_wg + sgid * TM * MPSG >= m_end) continue;
                         #pragma unroll
                         for (int m = 0; m < MPSG; ++m) {
                             matrix::joint_matrix_load(
@@ -206,7 +244,7 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                 for (int j = 0; j < NPSG; ++j) {
                     const int m_base = m_wg + (sgid * MPSG + m) * TM;
                     const int n_base = n_wg + j * TN;
-                    if (m_base + TM <= M && n_base + TN <= N) {
+                    if (m_base + TM <= m_end && n_base + TN <= N) {
                         matrix::joint_matrix_store(
                             sg, accC[m][j],
                             sycl::address_space_cast<sycl::access::address_space::global_space,
@@ -230,12 +268,37 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                         sycl::group_barrier(sg);
                         for (int e = lane; e < TM * TN; e += SG_SIZE) {
                             const int r = e / TN, c = e % TN;
-                            if (m_base + r < M && n_base + c < N)
+                            if (m_base + r < m_end && n_base + c < N)
                                 y[int64_t(m_base + r) * N + n_base + c] = scratch[e];
                         }
                         sycl::group_barrier(sg);
                     }
                 }
+                }
+        };
+        h.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(size_t(gm), size_t(OffsetSchedule ? 1 : gn) * SG * SG_SIZE),
+                              sycl::range<2>(1, size_t(SG) * SG_SIZE)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int mg = int(it.get_group(0));
+                if constexpr (OffsetSchedule) {
+                    QfnMoeOffsetCursor cursor;
+                    // Workgroup-uniform coordinates and exit. Keep each
+                    // output tile whole; no dynamic counter or K splitting.
+                    for (int work = mg; ; work += gm) {
+                        const int m_tile = work / gn;
+                        const auto tile = cursor.find(m_tile, offsets, experts);
+                        if (tile.expert < 0) break;
+                        run_tile(it, tile.first_row, tile.first_row + tile.rows, int64_t(tile.expert) * N,
+                                 (work - m_tile * gn) * WGN);
+                    }
+                } else {
+                    if constexpr (Grouped) {
+                        if (live_tiles && mg >= *live_tiles) return;
+                    }
+                    const int m_wg = Grouped ? tiles[mg].first_row : mg * WGM;
+                    run_tile(it, m_wg, Grouped ? m_wg + tiles[mg].rows : M,
+                             Grouped ? int64_t(tiles[mg].expert) * N : 0, int(it.get_group(1)) * WGN);
                 }
             });
     });
@@ -466,6 +529,45 @@ sycl::event gemm_flt_dispatch(sycl::queue& q, const QuantWeight& w,
     }
 }
 } // namespace
+
+sycl::event launch_qfn_int4_grouped(sycl::queue& q, const QuantWeight& w, int expert_width,
+                                   const sycl_bf16* x, float* y, const QfnMoeTile* tiles,
+                                   int tile_count, const std::vector<sycl::event>& deps, bool wide_n,
+                                   const int32_t* live_tiles, bool prefetch) {
+    if (tile_count == 0) return {};
+    // GRIMOIRE_QFN_GROUPED_LIVE_TILES=1: the capacity grid launches tile_count
+    // workgroups (capacity/32) and every one past the live count loads the
+    // counter and exits. Read the live count back (one int, in-order queue) and
+    // launch only those. Same tiles, same order, same arithmetic.
+    if (live_tiles && std::getenv("GRIMOIRE_QFN_GROUPED_LIVE_TILES")) {
+        int live = 0;
+        q.memcpy(&live, live_tiles, sizeof live).wait_and_throw();
+        if (live > 0 && live < tile_count) tile_count = live;
+    }
+    if (w.fmt != Fmt::INT4 || expert_width <= 0 || w.N % expert_width != 0 ||
+        !w.payload || !w.scales || !w.zeros || !tiles || tile_count < 0)
+        throw std::invalid_argument("invalid QFN grouped INT4 GEMM operands");
+    if (prefetch) {
+        if (wide_n || w.K <= 0 || w.K % 128 || w.row_bytes % 64)
+            throw std::invalid_argument("QFN grouped K prefetch requires N64 tiles and aligned full packed strips");
+        return gemm_flt<Fmt::INT4, 1, 4, true, true>(q, w, x, y, 0, deps, tiles, tile_count, expert_width, live_tiles);
+    }
+    // One activation tile feeds twice as many columns. Each output still
+    // uses the same BF16 fragments and ordered K-loop, with no partial sums.
+    if (wide_n)
+        return gemm_flt<Fmt::INT4, 1, 8, true>(q, w, x, y, 0, deps, tiles, tile_count, expert_width, live_tiles);
+    return gemm_flt<Fmt::INT4, 1, 4, true>(q, w, x, y, 0, deps, tiles, tile_count, expert_width, live_tiles);
+}
+
+sycl::event launch_qfn_int4_offset_grouped(sycl::queue& q, const QuantWeight& w, int expert_width,
+                                          const sycl_bf16* x, float* y, const int32_t* offsets,
+                                          int workers, const std::vector<sycl::event>& deps) {
+    if (w.fmt != Fmt::INT4 || expert_width <= 0 || expert_width % 64 || w.N < expert_width ||
+        w.N % expert_width || !w.payload || !w.scales || !w.zeros || !offsets || workers <= 0)
+        throw std::invalid_argument("invalid QFN offset-scheduled N64 GEMM operands");
+    return gemm_flt<Fmt::INT4, 1, 4, true, false, true>(q, w, x, y, 0, deps, nullptr, 0,
+                                                     expert_width, nullptr, offsets, workers);
+}
 
 sycl::event launch_gemm_xmx(sycl::queue& q, const QuantWeight& w,
                             const sycl_bf16* x, float* y, int M,

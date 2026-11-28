@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Small, CPU-only control messages and Linux descriptor transfer for GPU IPC.
 #pragma once
+#include <array>
 #include <cerrno>
+#include <type_traits>
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
@@ -40,6 +42,20 @@ inline bool read_all(int fd, void* data, size_t bytes) {
 template<class T> bool exchange(int fd, bool first, const T& own, T& peer) {
     return first ? write_all(fd, &own, sizeof own) && read_all(fd, &peer, sizeof peer)
                  : read_all(fd, &peer, sizeof peer) && write_all(fd, &own, sizeof own);
+}
+// One small packet per peer and phase on dedicated stream sockets. Publish
+// to all peers before waiting for any of them. At most the current and next
+// phase can be pending for a peer; this is not a bulk payload path.
+template<class T, class Equal>
+bool exchange_small_fanout(const std::array<int, 4>& sockets, int rank, const T& own, Equal equal) {
+    static_assert(std::is_trivially_copyable_v<T> && sizeof(T) <= 64);
+    for (int p = 0; p < 4; ++p)
+        if (p != rank && !write_all(sockets[p], &own, sizeof own)) return false;
+    for (int p = 0; p < 4; ++p) if (p != rank) {
+        T peer{};
+        if (!read_all(sockets[p], &peer, sizeof peer) || !equal(own, peer)) return false;
+    }
+    return true;
 }
 // Exactly one byte carries SCM_RIGHTS; the opaque handle follows as ordinary
 // bytes. Descriptor numbers are process-local and must never be sent as ints.
