@@ -2844,7 +2844,8 @@ struct Grimoire {
         int budget = 0, eos = -1, eot = -1;
         bool shutdown = false;      // the last message a worker gets
         int kind = 0; // 0: generate, 1: shutdown, 2: admit slot, 3: batch step,
-                      // 4: cache a sequence, 5: speculative batch step (TP + MTP)
+                      // 4: cache a sequence, 5: speculative batch step (TP + MTP),
+                      // 6 / 7 / 8: interleaved admission begin / chunk / end (TP)
         std::vector<int32_t> slots, positions;
         std::vector<int32_t> remaining;   // kind 5: each row's token budget left
         // kind 5: copy drafts, per row [length, tokens...] (empty = none) -- rank 0 holds the
@@ -4740,7 +4741,7 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
     if (upstream < 0) return false;             // rank 0 has no upstream
     int32_t head[5] = {0,0,0,0,0};
     if (!fd_read_all(upstream, head, sizeof head)) return false;
-    if (head[0]<0 || head[0]>5) return false;
+    if (head[0]<0 || head[0]>8) return false;
     r.kind=head[0];
     r.shutdown = r.kind == 1;
     const int32_t n = head[1];
@@ -4752,6 +4753,8 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
     if ((r.kind==2 || rows) && n==0) return false;
     if (r.kind==2 && (head[2]<0 || head[2]>=n_seq_slots)) return false;
     if(r.kind==4 && (head[2]<0 || head[2]>=n_seq_slots || head[3]!=n)) return false;
+    if(r.kind>=6 && (head[2]<0 || head[2]>=n_seq_slots || head[3]<0 || head[3]>max_seq)) return false;
+    if((r.kind==6 || r.kind==7) && n==0) return false;
     r.budget = head[2]; r.eos = head[3]; r.eot = head[4];
     r.prompt.assign(size_t(n), 0);
     if (n && !fd_read_all(upstream, r.prompt.data(),
@@ -12452,14 +12455,33 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
 // move the cursor, so every chunk binds its slot and puts the cursor back.
 // One card only (interleave_ok()): under PP / TP every rank runs
 // admit_sequence() on the whole prompt in lockstep.
+// GRIMOIRE_TP_INTERLEAVE=1 (opt-in, 2026-11-22): tensor parallel too -- rank 0 sends every step of
+// the admission (begin / chunk / end, kinds 6-8) down the control pipe and the workers run the same
+// calls in the same order, so their collectives stay paired.  Without it a long prompt on two cards
+// is read in one go and every decoding user waits for it.  MEASURED 2026-11-23, two Arc Pro B70s, 2 slots,
+// Swift INT4 + MTP, greedy: user A decoding while user B sends a 32K / 60K-token prompt: A's longest pause
+// 17.3 / 32.6 s -> 1.2 / 1.4 s; B's first token 17.3 / 32.7 s -> 36.5 / 72.7 s (B's answers correct either way).
 bool Grimoire::interleave_ok() const {
-    return !pp_enabled() && !tp_ranked() && !dflash2.ok && !cfg.is_muse && !cfg.is_qwen4_exp;
+    static const bool tp_il = [] { const char* v = std::getenv("GRIMOIRE_TP_INTERLEAVE"); return v && *v == '1'; }();
+    return !pp_enabled() && (!tp_ranked() || tp_il) && !dflash2.ok && !cfg.is_muse && !cfg.is_qwen4_exp;
 }
 int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
                           const std::vector<bool>& busy, int& done, size_t kv_tokens) {
     int reused = 0;
     // not the whole prompt: the decode steps between this and the first token would overwrite restored logits
     const int slot = admit_pick_slot(prompt, busy, reused, false);
+    if (serving_control && tp_ranked() && comm_rank() == 0) {
+        PPRequest request;
+        request.kind = 6; request.budget = slot; request.eos = int(kv_tokens); request.prompt = prompt;
+        if (!pp_send_request(request))
+            throw std::runtime_error("interleaved admission broadcast failed");
+    }
+    if (tp_coordinated()) {         // as admit_sequence(): every rank reuses the same prefix or none
+        int common = reused;
+        if (!tp_agree(common))
+            throw std::runtime_error("TP admission agreement failed");
+        if (common < 0) reused = 0;
+    }
     try {
         admit_kv(slot, kv_tokens, busy, reused != 0);
         if (reused) {
@@ -12476,6 +12498,12 @@ int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
     return slot;
 }
 void Grimoire::admit_chunk(int slot, int done, const std::vector<int32_t>& chunk) {
+    if (serving_control && tp_ranked() && comm_rank() == 0) {
+        PPRequest request;
+        request.kind = 7; request.budget = slot; request.eos = done; request.prompt = chunk;
+        if (!pp_send_request(request))
+            throw std::runtime_error("interleaved admission broadcast failed");
+    }
     sync();
     bind_seq_slot(slot);
     pos = done; set_cursor(pos);
@@ -12492,6 +12520,12 @@ void Grimoire::admit_chunk(int slot, int done, const std::vector<int32_t>& chunk
     }
 }
 void Grimoire::admit_end(int slot) {
+    if (serving_control && tp_ranked() && comm_rank() == 0) {
+        PPRequest request;
+        request.kind = 8; request.budget = slot; request.eos = pos;   // the prompt's length, checked by the workers
+        if (!pp_send_request(request))
+            throw std::runtime_error("interleaved admission broadcast failed");
+    }
     sync();
     if(!draft_slots.empty()) q.memcpy(draft_slots[size_t(slot)].hidden,s.h,size_t(cfg.hidden)*sizeof(float)).wait();
 }
@@ -25528,6 +25562,24 @@ void grimoire_pp_worker_loop(Grimoire& e) {
                 if(e.admit_sequence(req.prompt,busy)!=req.budget)
                     throw std::runtime_error("pipeline admission slot mismatch");
                 (void)e.argmax_token(); // match rank 0's backward token hop
+                continue;
+            }
+            if (req.kind>=6) {
+                // rank 0 admits a long prompt in pieces between decode steps (interleave_ok)
+                if (req.kind==6) {
+                    std::vector<bool> busy(size_t(e.n_seq_slots),true);
+                    busy[size_t(req.budget)]=false;
+                    int done=0;
+                    if(e.admit_begin(req.prompt,busy,done,size_t(req.eos))!=req.budget)
+                        throw std::runtime_error("interleaved admission slot mismatch");
+                } else if (req.kind==7) {
+                    e.admit_chunk(req.budget,req.eos,req.prompt);
+                } else {
+                    if (e.pos != req.eos)
+                        throw std::runtime_error("interleaved admission: ranks disagree on the prompt length");
+                    e.admit_end(req.budget);
+                    (void)e.argmax_token(); // rank 0 takes the first token next
+                }
                 continue;
             }
             if (req.kind==3) {

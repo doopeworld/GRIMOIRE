@@ -159,6 +159,11 @@ MTP head drafts for all users in one pass (main): with 2 / 4 / 8 users speculati
 +16% on two cards and +14% at 4 users on one card (llama-benchy), answers identical to drafting
 one user at a time (`GRIMOIRE_MTP_BATCH_DRAFT=0`).
 
+`GRIMOIRE_TP_INTERLEAVE=1` (opt-in) reads a long prompt on two cards in 1,024-token chunks with the other
+users' decoding in between: their pauses during a 32K / 60K prompt fall from 17 / 33 s to ~1.3 s, and that
+prompt's own first token comes about twice as late.  Reading in chunks takes different GEMM paths, so its answer
+can differ in wording from the one-pass answer; with the switch off, output is unchanged.
+
 **Run the official FP8 checkpoint with `--proj int8`** (since v1.10.1; the older v1.10.0 image
 runs INT8 slower, use `--proj fp8` with that one): it is closer to
 the original model -- top-1 agreement with the BF16 original 98.0% against 94.9% with `--proj fp8`
