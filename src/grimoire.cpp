@@ -813,6 +813,7 @@ namespace {
 // whole number of elements. Previously a bad ref produced a segfault
 // with no indication of which of ~600 tensors was at fault.
 static size_t upload_piece_bytes();   // multi-GPU upload pacing, defined with dev_copy
+static bool upload_force_pageable();  // GRIMOIRE_UPLOAD_PAGEABLE, defined with dev_copy
 static void upload_pace(size_t n);
 
 template <typename T>
@@ -932,7 +933,7 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
     // DMA-able from either card.  Chunk it so the pinned buffer stays modest.
     {
         const size_t CH = upload_piece_bytes();   // pinned window (64 MB, 16 MB multi-GPU)
-        uint8_t* pin = sycl::malloc_host<uint8_t>(std::min(bytes, CH), q);
+        uint8_t* pin = upload_force_pageable() ? nullptr : sycl::malloc_host<uint8_t>(std::min(bytes, CH), q);
         if (pin) {
             for (size_t off = 0; off < bytes; off += CH) {
                 const size_t n = std::min(CH, bytes - off);
@@ -942,7 +943,12 @@ T* dev_copy_t(sycl::queue& q, const Qwen35Model& ck, const TensorRef& r,
             }
             sycl::free(pin, q);
         } else {
-            q.memcpy(d, stage.data(), bytes).wait();
+            // No pinned window: pageable pieces of the same size.  One copy of a whole large tensor (>= 512 MiB,
+            // e.g. a 248320 x 5120 embedding) makes the runtime map the host buffer as a single userptr, and on
+            // some boards (Arc Pro B70, xe, Threadripper PRO) the copy engine intermittently faults on such a
+            // mapping and the load hangs; pieces of upload_piece_bytes() stay far below that size.
+            for (size_t off = 0; off < bytes; off += CH)
+                q.memcpy(reinterpret_cast<uint8_t*>(d) + off, stage.data() + off, std::min(CH, bytes - off)).wait();
         }
     }
     return d;
@@ -962,6 +968,11 @@ static bool upload_ranked() {
     return r;
 }
 static size_t upload_piece_bytes() { return upload_ranked() ? (size_t(16) << 20) : (size_t(64) << 20); }
+// GRIMOIRE_UPLOAD_PAGEABLE=1 (diagnostic): skip the pinned staging window, as when malloc_host fails.
+static bool upload_force_pageable() {
+    static const bool v = [] { const char* e = std::getenv("GRIMOIRE_UPLOAD_PAGEABLE"); return e && *e == '1'; }();
+    return v;
+}
 static void upload_pace(size_t n) {
     static const double mbps = [] {
         const char* e = std::getenv("GRIMOIRE_UPLOAD_MBPS");
@@ -997,7 +1008,7 @@ T* dev_copy(sycl::queue& q, const void* src, size_t bytes) {
     if (PDIAG) { std::printf("[dc] malloc_device %.1f MiB OK; ", double(bytes)/1048576.0); std::fflush(stdout); }
     const size_t CH = upload_piece_bytes();
     uint8_t* pin = nullptr;
-    try { pin = sycl::malloc_host<uint8_t>(std::min(bytes, CH), q); }
+    try { pin = upload_force_pageable() ? nullptr : sycl::malloc_host<uint8_t>(std::min(bytes, CH), q); }
     catch (sycl::exception& e) { if(PDIAG){std::printf("malloc_host THREW: %s\n", e.what());std::fflush(stdout);} throw; }
     if (PDIAG) { std::printf("malloc_host OK; "); std::fflush(stdout); }
     if (pin) {
@@ -1012,7 +1023,10 @@ T* dev_copy(sycl::queue& q, const void* src, size_t bytes) {
         if (PDIAG) { std::printf("memcpy OK\n"); std::fflush(stdout); }
         sycl::free(pin, q);
     } else {
-        q.memcpy(d, src, bytes).wait();
+        // pageable pieces, never one large copy (see upload_tensor)
+        const uint8_t* s8 = static_cast<const uint8_t*>(src);
+        for (size_t off = 0; off < bytes; off += CH)
+            q.memcpy(reinterpret_cast<uint8_t*>(d) + off, s8 + off, std::min(CH, bytes - off)).wait();
     }
     return d;
 }
