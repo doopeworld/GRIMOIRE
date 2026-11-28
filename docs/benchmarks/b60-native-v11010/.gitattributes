@@ -1,0 +1,5 @@
+# Preserve archived evidence bytes on every checkout for SHA256SUMS.
+*.json -text
+*.csv -text
+*.ids -text
+SHA256SUMS text eol=lf
