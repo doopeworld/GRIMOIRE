@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
     // Level Zero sysman reports the card's free VRAM, which sizes prefill
     // chunks (Grimoire::prefill_token_budget); it must be on before SYCL starts.
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
-    std::string model_dir, host = "0.0.0.0", dflash_model;
+    std::string model_dir, host = "0.0.0.0", dflash_model, lora_dir;
     b70::Fmt proj_fmt = b70::Fmt::INT4;
     bool proj_explicit = false;
     int max_seq = 8192, port = 8000;
@@ -165,6 +165,7 @@ int main(int argc, char** argv) {
         else if (a == "--port" && i + 1 < argc) port = std::atoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--dflash-model" && i + 1 < argc) dflash_model = argv[++i];
+        else if (a == "--lora" && i + 1 < argc) lora_dir = argv[++i];
         else if (a == "--defer-moe-gather") defer_moe_gather = true;
         else if (a == "--bf16-qkv") bf16_qkv = true;
         else if (a == "--bf16-dn-qkv") bf16_dn_qkv = true;
@@ -175,6 +176,7 @@ int main(int argc, char** argv) {
                 "                  FORMAT includes native (GGUF Q4_K/Q6_K, MXFP4 base)\n"
                 "                  [--port N] [--host ADDR]\n"
                 "                  [--dflash-model <dir>]         speculative decode drafter\n"
+                "                  [--lora <dir>]                 PEFT LoRA adapter (dense trunk)\n"
                 "                  [--defer-moe-gather]           (Ornith only)\n"
                 "                  [--bf16-qkv] [--bf16-dn-qkv]   (Ornith only)\n\n"
                 "  Do NOT pass --defer-moe-gather/--bf16-qkv/--bf16-dn-qkv for Qwen:\n"
@@ -209,6 +211,8 @@ int main(int argc, char** argv) {
     // which the engine reads during build().
     if (!dflash_model.empty())
         setenv("GRIMOIRE_DFLASH_MODEL", dflash_model.c_str(), 1);
+    if (!lora_dir.empty())
+        setenv("GRIMOIRE_LORA", lora_dir.c_str(), 1);
     if (defer_moe_gather) setenv("GRIMOIRE_DEFER_MOE_GATHER", "1", 1);
     if (bf16_qkv) setenv("GRIMOIRE_BF16_QKV", "1", 1);
     if (bf16_dn_qkv) setenv("GRIMOIRE_BF16_DN_QKV", "1", 1);

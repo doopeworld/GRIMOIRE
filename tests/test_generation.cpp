@@ -70,6 +70,13 @@ struct Engine {
         snap=ids;
     }
     void sync(){}
+    // Prompt head (2026-11-16): the host simulation cannot model the device-side recurrent
+    // snapshot, so it runs with the head disabled -- the same shape the production engine
+    // takes when GRIMOIRE_PREFIX_HEAD is not set.  The head path is exercised by the real
+    // engine and the device gate.
+    bool prefix_head_at_end(size_t, int) const { return false; }
+    bool save_prefix_head(const std::vector<int32_t>&, bool = false) { return false; }
+    int prefix_head_split(size_t, int) const { return 0; }
     bool pp_enabled()const{return false;}
     void pp_expect_next_rows(int){}
     int argmax_token(){assert(!history.empty());return (history.back()+1)%cfg.vocab;}
