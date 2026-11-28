@@ -126,6 +126,42 @@ static std::string tool_calls_json(const std::vector<b70::ParsedToolCall>& calls
     return out+"]";
 }
 
+// GRIMOIRE_PREFIX_SHARED=1 (opt-in; the engine side is described at Grimoire::prefix_shared_on): how many of the
+// prompt's tokens belong to its system turn -- the system message and the tool list the template renders into it --
+// so the engine can keep its state there and let the next agent with the same system prompt copy it from another
+// slot instead of reading it.  The template has no "no generation prompt" switch and the tool template refuses a
+// conversation without a user turn, so the system turn is found as what two renders that differ only in a one-word
+// user message have in common (it ends with the user turn's opening).  Its tokens must be a prefix of the prompt's
+// own tokens, or there is no hint.  Rounded down to 64, and 0 below GRIMOIRE_PREFIX_SHARED_MIN (default 2048).
+static int shared_prefix_boundary(const b70::Tokenizer& tk, const std::vector<b70::ChatMessage>& messages,
+                                  const b70::ChatOptions& opt, const std::vector<int32_t>& ids) {
+    static const bool on = [] { const char* v = std::getenv("GRIMOIRE_PREFIX_SHARED");
+        return v && *v && std::atoi(v) != 0; }();
+    if (!on) return 0;
+    static const int min_tokens = [] { const char* v = std::getenv("GRIMOIRE_PREFIX_SHARED_MIN");
+        return v && *v ? std::max(64, std::atoi(v)) : 2048; }();
+    const bool has_system = !messages.empty() && messages[0].role == "system";
+    if ((!has_system && opt.tools.empty()) || ids.size() <= size_t(min_tokens)) return 0;
+    std::string a, b;
+    try {
+        std::vector<b70::ChatMessage> ma, mb;
+        if (has_system) { ma.push_back(messages[0]); mb.push_back(messages[0]); }
+        ma.push_back({"user", "a"});
+        mb.push_back({"user", "b"});
+        a = tk.apply_chat_template(ma, opt);
+        b = tk.apply_chat_template(mb, opt);
+    } catch (const std::exception&) {
+        return 0;
+    }
+    size_t common = 0;
+    while (common < a.size() && common < b.size() && a[common] == b[common]) ++common;
+    if (common == 0) return 0;
+    const std::vector<int32_t> head = tk.encode(a.substr(0, common), true);
+    if (head.empty() || head.size() > ids.size() || !std::equal(head.begin(), head.end(), ids.begin())) return 0;
+    const int boundary = int(head.size()) / 64 * 64;
+    return boundary >= min_tokens ? boundary : 0;
+}
+
 int main(int argc, char** argv) {
     // Line-buffered stdout: a served process writes to a pipe (docker logs), where
     // full buffering held the engine's printf lines (GRIMOIRE_SPEC_TIME, spec
@@ -338,13 +374,14 @@ int main(int argc, char** argv) {
         const bool think=chat&&!harmony_model&&request.chat.enable_thinking;
         const std::vector<b70::Json> tools=request.tools;
         const auto ids=tk.encode(prompt,true);
+        const int share_boundary=chat?shared_prefix_boundary(tk,request.messages,request.chat,ids):0;
         const int budget=b70::generation_budget(ids,request.max_tokens,max_seq,int(tk.vocab_size()));
         const auto sampling=request.sampling;
         const std::string model=json_escape(model_dir);
         const auto request_id=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         if(request.stream) {
             res.set_chunked_content_provider("text/event-stream",
-                [&,ids,budget,chat,model,request_id,think,tools,sampling](size_t,httplib::DataSink& sink) {
+                [&,ids,budget,chat,model,request_id,think,tools,sampling,share_boundary](size_t,httplib::DataSink& sink) {
                     auto send=[&](const std::string& payload) {
                         const auto line="data: "+payload+"\n\n";return sink.write(line.data(),line.size());
                     };
@@ -364,7 +401,8 @@ int main(int argc, char** argv) {
                         std::vector<int32_t> out;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
                             tk.eos(),tk.eos2(),out,
-                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling);
+                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling,
+                            share_boundary);
                         if(connected)connected=decoder.finish(emit);
                         std::string reason=b70::finish_reason_name(finish);
                         if(connected && !decoder.tool_call_text().empty()) {
@@ -393,7 +431,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> out;
             // a stop ends this request at its next token (the scheduler then cancels the job)
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling);
+                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling,share_boundary);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
             if(chat&&!tools.empty())decoder.enable_tools();

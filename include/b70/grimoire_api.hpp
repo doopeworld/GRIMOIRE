@@ -70,9 +70,11 @@ void grimoire_pp_shutdown(Grimoire&);
 int grimoire_scheduler_width(GrimoireScheduler&);
 // Blocking, and safe to call from several threads at once.  on_token is
 // called on the CALLING thread for each token; returning false from it
-// cancels the request and releases its slot.
+// cancels the request and releases its slot.  share_boundary: GRIMOIRE_PREFIX_SHARED's hint, the prompt
+// tokens up to the end of the system message (a multiple of 64; 0 = none), see Grimoire::prefix_shared_on.
 int grimoire_scheduler_generate(GrimoireScheduler&,
     const std::vector<int32_t>& prompt, int n_predict, int eos_id, int eot_id,
     std::vector<int32_t>& out, const std::function<bool(int32_t)>& on_token = {},
-    FinishReason* finish = nullptr, const SamplingOptions& sampling = {});
+    FinishReason* finish = nullptr, const SamplingOptions& sampling = {},
+    int share_boundary = 0);
 }

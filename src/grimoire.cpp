@@ -3387,6 +3387,13 @@ struct Grimoire {
         // hidden state and logits, so the same prompt again needs no row at all: restore, then the first token.
         bool head_output = false;
         float *head_hidden = nullptr, *head_logits = nullptr;
+        // SHARED BOUNDARY (GRIMOIRE_PREFIX_SHARED, see prefix_shared_on): the recurrent state after the first
+        // bnd_tokens.size() tokens -- the end of the system prompt the server named -- taken while the prompt is
+        // read.  Valid only while this slot's KV rows below bnd_tokens.size() still hold those tokens; another slot
+        // whose prompt starts with them copies those rows and this state instead of reading them (restore_shared).
+        bool bnd_valid = false;
+        std::vector<int32_t> bnd_tokens;
+        std::vector<PrefixLayerCache> bnd_layers;
     };
     // N conversations, not one.
     //
@@ -3470,7 +3477,7 @@ struct Grimoire {
     bool restore_prefix_upto(int n);
     bool save_prefix(const std::vector<int32_t>& tokens, bool output_valid = true);
     int admit_sequence(const std::vector<int32_t>& prompt, const std::vector<bool>& busy,
-                       size_t kv_tokens = 0);
+                       size_t kv_tokens = 0, int share_boundary = 0);
     int admit_pick_slot(const std::vector<int32_t>& prompt, const std::vector<bool>& busy, int& reused,
                         bool allow_full = true);
     bool interleave_ok() const;
@@ -3503,6 +3510,53 @@ struct Grimoire {
     // with its output (save_prefix_head(prompt, true)) -- no second prefill call (a 4K prompt was 4,032 + 65 rows,
     // the 65-row call ~70-100 ms).  Same switches as prefix_head_split; not with a DFlash drafter.
     bool prefix_head_at_end(size_t prompt_len, int reused) const;
+    // ---- SHARED PREFIX ACROSS SLOTS (GRIMOIRE_PREFIX_SHARED=1, opt-in, 2026-11-22) -----------------------------
+    // Agents usually open with the same long system prompt and tool list, each in a conversation of its own.  The
+    // cache above resumes a conversation from ITS OWN slot only (prefix_reuse matches idle slots, and admission runs
+    // in the slot it matched), so every new agent session re-read the whole system prompt while another slot --
+    // often a busy one, mid-answer -- already held it.
+    //   SAVE: grimoire-server names where the system turn ends (share_boundary: the prompt's tokens up to the end of
+    //     the system message, rounded down to 64, only when >= GRIMOIRE_PREFIX_SHARED_MIN, default 2048).  The read
+    //     is split there like the prompt-head split, and the recurrent state at that point is kept in the slot
+    //     (PrefixCache::bnd_*: one DeltaNet state + conv ring per layer, ~150 MiB a slot on Qwen3.8-27B, allocated
+    //     on first use and NOT counted in the slot fit at load).  The interleaved admission ends a chunk there.
+    //   REUSE: a new prompt that starts with another slot's boundary tokens, busy or idle, further than its own reuse
+    //     reaches, takes an idle slot, gets the source's KV rows below the boundary copied in (key-major: one
+    //     contiguous run per KV head, + the int8 keys' scales, + the MTP head's rows for acceptance), the boundary
+    //     state copied into its live state, and reads only the rest (restore_shared).  A busy source is safe to read:
+    //     a slot writes its KV only at and past its cursor, and its boundary is below it.  The destination keeps a
+    //     copy of the snapshot, so it can serve the next one too.
+    //   VALID only while the source's rows below the boundary are intact: a slot written from position p on drops a
+    //     boundary above p (prefix_bnd_keep), and clear_seq_slot, release_kv and a pool recycle drop it outright.
+    // Off by default; unset, none of this runs and every path is the one before.  One card only: never under TP /
+    // PP / the two-card pipeline, only with the key-major K cache (the dense hybrid models), only where
+    // prefix_cache_usable(), only with two or more slots.  NOT MEASURED YET.
+    static bool prefix_shared_requested() {
+        const char* e = std::getenv("GRIMOIRE_PREFIX_SHARED");
+        return e && *e && std::atoi(e) != 0;
+    }
+    bool prefix_shared_on() const;
+    // Where this prompt's boundary snapshot is taken (0 = none): the server's share_boundary, when it is a multiple
+    // of 64 inside the part still to read (past `reused`, before the last token).
+    int  prefix_share_split(int boundary, size_t prompt_len, int reused) const;
+    // The boundary snapshot of the bound slot after `tokens` (the prompt's first tokens.size() tokens).
+    bool save_prefix_boundary(const std::vector<int32_t>& tokens);
+    bool alloc_bnd_layers(PrefixCache& c);
+    // The longest boundary snapshot of ANY slot, busy or idle, that `tokens` starts with and that is longer than
+    // `longer_than` (src = its slot; 0 = none).
+    int  prefix_reuse_shared(const std::vector<int32_t>& tokens, int longer_than, int& src) const;
+    // Start slot dst from slot src's boundary snapshot (n tokens): cleared, KV rows copied, state restored, cursor n.
+    bool restore_shared(int src, int dst, int n);
+    // The interleaved admission's boundary snapshot, after the chunk that ended at it.
+    void admit_share_save(int slot, const std::vector<int32_t>& prompt, int boundary);
+    // Slot j is written from position p on: its boundary snapshot survives only if it ends at or below p.
+    void prefix_bnd_keep(int j, int p) {
+        if (j >= 0 && size_t(j) < prefix_slots.size() && prefix_slots[size_t(j)].bnd_valid &&
+            prefix_slots[size_t(j)].bnd_tokens.size() > size_t(std::max(0, p)))
+            prefix_slots[size_t(j)].bnd_valid = false;
+    }
+    // what admit_pick_slot chose: restore from slot shared_src's boundary snapshot of shared_n tokens (0 = no)
+    mutable int shared_src = -1, shared_n = 0;
 
     bf16_t*  embed = nullptr;
     int8_t*  embed_i8 = nullptr;
@@ -10793,6 +10847,7 @@ void Grimoire::clear_seq_slot(int j) {
     if (!prefix_slots.empty() && seq_slot < int(prefix_slots.size())) {
         prefix_slots[size_t(seq_slot)].valid = false;
         prefix_slots[size_t(seq_slot)].head_valid = false;   // a new conversation overwrites its KV rows
+        prefix_slots[size_t(seq_slot)].bnd_valid = false;    // ... and the boundary's (GRIMOIRE_PREFIX_SHARED)
     }
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
     const int qkv_ch = 2 * cfg.lin_k_heads * cfg.lin_k_dim + Hv * Dv;
@@ -11137,6 +11192,173 @@ bool Grimoire::save_prefix_head(const std::vector<int32_t>& tokens, bool with_ou
         c.used = ++prefix_clock;
     }
     return ok == 1;
+}
+
+// GRIMOIRE_PREFIX_SHARED (see the declaration): every condition the copy of another slot's KV rows relies on.
+bool Grimoire::prefix_shared_on() const {
+    if (!prefix_shared_requested() || n_seq_slots < 2) return false;
+    if (pipeline || tp_ranked() || tp_enabled() || pp_enabled()) return false;
+    // key-major K only: there a KV head's rows [0, n) are one contiguous run, as V's always are
+    if (!kv_kmajor_flag()) return false;
+    if (cfg.is_moe() || cfg.lin_v_heads <= 0 || dflash2.ok) return false;
+    return prefix_cache_usable();
+}
+
+int Grimoire::prefix_share_split(int boundary, size_t prompt_len, int reused) const {
+    if (boundary <= 0 || !prefix_shared_on()) return 0;
+    // on a 64-token boundary for the reason prefix_head_split gives; not when a reuse already covers it, and not the
+    // whole prompt (the last row gives the first token)
+    if (boundary % 64 != 0 || boundary <= reused || size_t(boundary) >= prompt_len) return 0;
+    return boundary;
+}
+
+bool Grimoire::alloc_bnd_layers(PrefixCache& c) {
+    if (!c.bnd_layers.empty()) return true;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
+    const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
+    const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
+        Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    c.bnd_layers.resize(L.size());
+    bool alloc = true;
+    for (size_t i = 0; i < L.size() && alloc; ++i) {
+        auto& h = c.bnd_layers[i];
+        if (L[i].dn_state && !(h.dn = sycl::malloc_device<float>(dn_bytes / sizeof(float), q))) alloc = false;
+        if (alloc && L[i].conv_ring && !(h.conv = sycl::malloc_device<float>(conv_bytes / sizeof(float), q))) alloc = false;
+    }
+    if (!alloc) {
+        for (auto& h : c.bnd_layers) for (float* p : {h.dn, h.conv}) if (p) sycl::free(p, q);
+        c.bnd_layers.clear();
+        std::fprintf(stderr, "  prefix boundary allocation failed\n");
+    }
+    return alloc;
+}
+
+bool Grimoire::save_prefix_boundary(const std::vector<int32_t>& tokens) {
+    if (!prefix_shared_on() || tokens.empty()) return false;
+    if (prefix_slots.empty()) prefix_slots.resize(size_t(n_seq_slots));
+    if (seq_slot < 0 || size_t(seq_slot) >= prefix_slots.size()) return false;
+    PrefixCache& c = prefix_slots[size_t(seq_slot)];
+    c.bnd_valid = false;
+    if (!alloc_bnd_layers(c)) return false;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
+    const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
+    const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
+        Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    for (size_t i = 0; i < L.size(); ++i) {
+        const auto& d = L[i]; auto& h = c.bnd_layers[i];
+        if (d.dn_state) { q.memcpy(h.dn, d.dn_state, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
+        if (d.conv_ring) { q.memcpy(h.conv, d.conv_ring, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
+    }
+    q.wait_and_throw();
+    c.bnd_tokens = tokens;
+    c.bnd_valid = true;
+    c.used = ++prefix_clock;
+    return true;
+}
+
+int Grimoire::prefix_reuse_shared(const std::vector<int32_t>& tokens, int longer_than, int& src) const {
+    src = -1;
+    if (!prefix_shared_on()) return 0;
+    int best = std::max(0, longer_than);
+    for (size_t sl = 0; sl < prefix_slots.size(); ++sl) {
+        const PrefixCache& c = prefix_slots[sl];
+        if (!c.bnd_valid || c.bnd_layers.size() != L.size()) continue;
+        const size_t n = c.bnd_tokens.size();
+        // at least one token left to read, as prefix_reuse leaves one
+        if (n == 0 || n >= tokens.size() || int(n) <= best) continue;
+        if (!std::equal(c.bnd_tokens.begin(), c.bnd_tokens.end(), tokens.begin())) continue;
+        best = int(n); src = int(sl);
+    }
+    return src >= 0 ? best : 0;
+}
+
+bool Grimoire::restore_shared(int src, int dst, int n) {
+    if (!prefix_shared_on() || src < 0 || dst < 0 || src == dst || n <= 0 ||
+        size_t(src) >= prefix_slots.size() || size_t(dst) >= prefix_slots.size()) return false;
+    PrefixCache& from = prefix_slots[size_t(src)];
+    if (!from.bnd_valid || from.bnd_tokens.size() != size_t(n) || from.bnd_layers.size() != L.size()) return false;
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
+    const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
+    const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
+        Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    sync();
+    // an empty destination, bound: zeroed recurrent state, no snapshots, its MTP rows zeroed, cursor 0
+    clear_seq_slot(dst);
+    // KV rows [0, rows) of one cache pair: key-major K and V are [kv head][max_seq][head_dim] bytes, so a head's
+    // rows are one contiguous run; the int8 keys' scales (GRIMOIRE_KV_K8) are float[kv head][max_seq] after the keys
+    const bool k8 = kv_k8_flag();
+    auto copy_rows = [&](uint8_t* kd, const uint8_t* ks, uint8_t* vd, const uint8_t* vs,
+                         int heads, int head_dim, size_t rows) {
+        const size_t head = size_t(max_seq) * size_t(head_dim), run = rows * size_t(head_dim);
+        for (int h = 0; h < heads; ++h) {
+            q.memcpy(kd + size_t(h) * head, ks + size_t(h) * head, run);
+            q.memcpy(vd + size_t(h) * head, vs + size_t(h) * head, run);
+        }
+        long bytes = long(2 * run * size_t(heads));
+        if (k8) {
+            float* sd = reinterpret_cast<float*>(kd + size_t(heads) * head);
+            const float* ss = reinterpret_cast<const float*>(ks + size_t(heads) * head);
+            for (int h = 0; h < heads; ++h)
+                q.memcpy(sd + size_t(h) * size_t(max_seq), ss + size_t(h) * size_t(max_seq), rows * sizeof(float));
+            bytes += long(rows * sizeof(float) * size_t(heads));
+        }
+        g_prefix_bytes_copied += bytes;
+    };
+    for (const auto& d : L) {
+        if (!d.kv_slot || !d.k_base || !d.v_base) continue;
+        copy_rows(d.k_base + size_t(dst) * d.kv_slot, d.k_base + size_t(src) * d.kv_slot,
+                  d.v_base + size_t(dst) * d.kv_slot, d.v_base + size_t(src) * d.kv_slot,
+                  d.kv_heads, d.head_dim, size_t(n));
+    }
+    // The MTP head's rows [0, n-1): row t pairs token t's hidden state with token t+1's embedding, so row n-1
+    // belongs to the source's own next token.  Acceptance only -- every draft is verified.
+    // Not with int8 keys: the head's cache layout past its keys is not checked here, and its scale area may not exist.
+    if (mtp.ok && n > 1 && !k8 && size_t(src) < draft_slots.size() && size_t(dst) < draft_slots.size()) {
+        const DraftSlot& a = draft_slots[size_t(src)];
+        const DraftSlot& b = draft_slots[size_t(dst)];
+        if (a.mk && a.mv && b.mk && b.mv)
+            copy_rows(b.mk, a.mk, b.mv, a.mv, mtp.L.kv_heads, mtp.L.head_dim, size_t(n - 1));
+    }
+    // the boundary state into the destination's live state, as restore_prefix_upto does from a slot's own snapshot
+    for (size_t i = 0; i < L.size(); ++i) {
+        auto& d = L[i]; const auto& c = from.bnd_layers[i];
+        if (d.dn_state) { q.memcpy(d.dn_state, c.dn, dn_bytes); g_prefix_bytes_copied += long(dn_bytes); }
+        if (d.conv_ring) { q.memcpy(d.conv_ring, c.conv, conv_bytes); g_prefix_bytes_copied += long(conv_bytes); }
+    }
+    // the destination's own copy of the snapshot: its rows [0, n) now hold the same tokens
+    PrefixCache& to = prefix_slots[size_t(dst)];
+    const bool keep = alloc_bnd_layers(to);
+    if (keep)
+        for (size_t i = 0; i < L.size(); ++i) {
+            const auto& a = from.bnd_layers[i]; auto& b = to.bnd_layers[i];
+            if (a.dn && b.dn) q.memcpy(b.dn, a.dn, dn_bytes);
+            if (a.conv && b.conv) q.memcpy(b.conv, a.conv, conv_bytes);
+        }
+    pos = n;
+    set_cursor(pos);
+    q.wait_and_throw();
+    if (keep) { to.bnd_tokens = from.bnd_tokens; to.bnd_valid = true; }
+    from.used = ++prefix_clock;
+    to.used = ++prefix_clock;
+    prefix_hit = dst;
+    prefix_hit_head = false;
+    ++g_prefix_tokens_reused_calls;
+    g_prefix_tokens_reused += n;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        std::fprintf(stderr, "  prefix cache: shared system-prompt reuse in use (GRIMOIRE_PREFIX_SHARED) -- slot %d "
+                     "copied %d tokens of KV and state from slot %d instead of reading them\n", dst, n, src);
+    }
+    std::printf("  prefix cache HIT (shared boundary, slot %d -> %d): %d tokens\n", src, dst, n);
+    return true;
+}
+
+void Grimoire::admit_share_save(int slot, const std::vector<int32_t>& prompt, int boundary) {
+    if (boundary <= 0 || size_t(boundary) > prompt.size()) return;
+    sync();
+    bind_seq_slot(slot);
+    save_prefix_boundary(std::vector<int32_t>(prompt.begin(), prompt.begin() + boundary));
 }
 
 // Move the live KV view onto slot j.  This is the whole of "switch
@@ -12185,7 +12407,8 @@ int Grimoire::prefix_slot_for_write() {
     if (prefix_hit >= 0 && size_t(prefix_hit) < prefix_slots.size())
         return prefix_hit;
     for (size_t i = 0; i < prefix_slots.size(); ++i)
-        if (!prefix_slots[i].valid && !prefix_slots[i].head_valid) return int(i);   // holds nothing reusable
+        if (!prefix_slots[i].valid && !prefix_slots[i].head_valid && !prefix_slots[i].bnd_valid)
+            return int(i);   // holds nothing reusable
     size_t lru = 0;
     for (size_t i = 1; i < prefix_slots.size(); ++i)
         if (prefix_slots[i].used < prefix_slots[lru].used) lru = i;
@@ -12213,6 +12436,7 @@ bool Grimoire::restore_prefix(const std::vector<int32_t>& tokens) {
     // its rows.  Only the recurrent state is copied -- see save_prefix()
     // for why those two are treated differently.
     bind_seq_slot(hit);
+    prefix_bnd_keep(hit, int(tokens.size()));      // generation writes from here on
     clear_drafter_cache();
     for (size_t i = 0; i < L.size(); ++i) {
         auto& d = L[i]; const auto& c = prefix_cache.layers[i];
@@ -12261,6 +12485,7 @@ bool Grimoire::restore_prefix_upto(int n) {
             g_prefix_bytes_copied += long((size_t(cfg.hidden) + size_t(cfg.vocab)) * sizeof(float));
         }
         c.valid = false;
+        prefix_bnd_keep(prefix_hit, n);        // rows from n on are rewritten (GRIMOIRE_PREFIX_SHARED)
         pos = n;
         set_cursor(pos);
         q.wait_and_throw();
@@ -12289,6 +12514,7 @@ bool Grimoire::restore_prefix_upto(int n) {
         q.memcpy(s.h, prefix_cache.hidden, size_t(cfg.hidden) * sizeof(float));
         g_prefix_bytes_copied += long(size_t(cfg.hidden) * sizeof(float));
     }
+    prefix_bnd_keep(prefix_hit, n);            // rows from n on are rewritten (GRIMOIRE_PREFIX_SHARED)
     pos = n;
     set_cursor(pos);
     q.wait_and_throw();
@@ -12317,8 +12543,8 @@ void Grimoire::release_kv(int slot, bool keep_prefix) {
     if (!kv_pool) return;
     if (size_t(slot) < prefix_slots.size()) {
         auto& cached = prefix_slots[size_t(slot)];
-        if (keep_prefix && (cached.valid || cached.head_valid)) return;
-        cached.valid = cached.head_valid = false;
+        if (keep_prefix && (cached.valid || cached.head_valid || cached.bnd_valid)) return;
+        cached.valid = cached.head_valid = cached.bnd_valid = false;
     }
     kv_pool->recycle(size_t(slot));
 }
@@ -12372,6 +12598,12 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
     if (cached)
         for (const auto* pr : prompts)
             if (prefix_reuse(*pr, &busy) > 0) return false;
+    // GRIMOIRE_PREFIX_SHARED: so does one that another slot's boundary snapshot covers (restore_shared)
+    if (cached && prefix_shared_on())
+        for (const auto* pr : prompts) {
+            int src = -1;
+            if (prefix_reuse_shared(*pr, 0, src) > 0) return false;
+        }
     // prompt k -> the k-th idle slot: the scheduler sets each request's sampling options on exactly those slots
     std::vector<int> pick;
     for (int i = 0; i < n_seq_slots && pick.size() < prompts.size(); ++i)
@@ -12424,6 +12656,7 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
                               const std::vector<bool>& busy, int& reused, bool allow_full) {
     if (busy.size() != size_t(n_seq_slots))
         throw std::invalid_argument("sequence ownership size mismatch");
+    shared_src = -1; shared_n = 0;
     sync();
     reused = prefix_reuse(prompt, &busy, allow_full);
     int slot = reused ? prefix_hit : -1;
@@ -12432,7 +12665,8 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
             if (busy[size_t(i)]) continue;
             if (slot < 0) slot = i;
             if (size_t(i) >= prefix_slots.size() ||
-                (!prefix_slots[size_t(i)].valid && !prefix_slots[size_t(i)].head_valid)) {
+                (!prefix_slots[size_t(i)].valid && !prefix_slots[size_t(i)].head_valid &&
+                 !prefix_slots[size_t(i)].bnd_valid)) {
                 slot = i; break;
             }
             if (prefix_slots[size_t(i)].used < prefix_slots[size_t(slot)].used)
@@ -12440,6 +12674,28 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
         }
     }
     if (slot < 0) throw std::runtime_error("no idle sequence slot");
+    // GRIMOIRE_PREFIX_SHARED: another slot's boundary snapshot, busy or idle, that reaches further than this
+    // prompt's own reuse.  The destination is an idle slot other than the source, picked as for a prompt that
+    // resumes nothing; reused = the snapshot's length, and the caller restores through restore_shared.
+    if (prefix_shared_on()) {
+        int src = -1;
+        const int n = prefix_reuse_shared(prompt, reused, src);
+        if (n > 0) {
+            int dst = -1;
+            for (int i = 0; i < n_seq_slots; ++i) {
+                if (busy[size_t(i)] || i == src) continue;
+                if (dst < 0) dst = i;
+                if (size_t(i) >= prefix_slots.size() ||
+                    (!prefix_slots[size_t(i)].valid && !prefix_slots[size_t(i)].head_valid &&
+                     !prefix_slots[size_t(i)].bnd_valid)) {
+                    dst = i; break;
+                }
+                if (prefix_slots[size_t(i)].used < prefix_slots[size_t(dst)].used)
+                    dst = i;
+            }
+            if (dst >= 0) { shared_src = src; shared_n = n; reused = n; slot = dst; }
+        }
+    }
     return slot;
 }
 
@@ -12460,15 +12716,27 @@ int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
     int reused = 0;
     // not the whole prompt: the decode steps between this and the first token would overwrite restored logits
     const int slot = admit_pick_slot(prompt, busy, reused, false);
+    const int sh_src = shared_src, sh_n = shared_n;   // GRIMOIRE_PREFIX_SHARED (see admit_sequence)
     try {
-        admit_kv(slot, kv_tokens, busy, reused != 0);
-        if (reused) {
-            prefix_hit = slot;
-            if (!restore_prefix_upto(reused))
-                throw std::runtime_error("sequence prefix restore failed");
-        } else clear_seq_slot(slot);
+        if (sh_n) {
+            std::vector<bool> held = busy;
+            held[size_t(sh_src)] = true;
+            admit_kv(slot, kv_tokens, held, false);
+            if (!restore_shared(sh_src, slot, sh_n))
+                throw std::runtime_error("shared prefix restore failed");
+        } else {
+            admit_kv(slot, kv_tokens, busy, reused != 0);
+            if (reused) {
+                prefix_hit = slot;
+                if (!restore_prefix_upto(reused))
+                    throw std::runtime_error("sequence prefix restore failed");
+            } else clear_seq_slot(slot);
+        }
     } catch (...) {
-        if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
+        if (size_t(slot) < prefix_slots.size()) {
+            prefix_slots[size_t(slot)].valid=false;
+            prefix_slots[size_t(slot)].bnd_valid=false;
+        }
         release_kv(slot, false);
         throw;
     }
@@ -12497,9 +12765,11 @@ void Grimoire::admit_end(int slot) {
 }
 
 int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
-                            const std::vector<bool>& busy, size_t kv_tokens) {
+                            const std::vector<bool>& busy, size_t kv_tokens, int share_boundary) {
     int reused = 0;
     const int slot = admit_pick_slot(prompt, busy, reused);
+    // GRIMOIRE_PREFIX_SHARED: start from slot sh_src's boundary snapshot of sh_n tokens (0 = no; then reused == sh_n)
+    const int sh_src = shared_src, sh_n = shared_n;
     if(serving_control && (pp_enabled() || tp_ranked()) && comm_rank()==0) {
         PPRequest request;
         request.kind=2; request.budget=slot; request.prompt=prompt;
@@ -12524,9 +12794,19 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         }
     }
     try {
-        admit_kv(slot, std::max(kv_tokens, prompt.size()), busy, reused != 0);
+        if (sh_n) {
+            // the source must not be evicted to make room for the copy of its own rows
+            std::vector<bool> held = busy;
+            held[size_t(sh_src)] = true;
+            admit_kv(slot, std::max(kv_tokens, prompt.size()), held, false);
+        } else {
+            admit_kv(slot, std::max(kv_tokens, prompt.size()), busy, reused != 0);
+        }
         auto restore = [&] {
-            if (reused) {
+            if (sh_n) {
+                if (!restore_shared(sh_src, slot, sh_n))
+                    throw std::runtime_error("shared prefix restore failed");
+            } else if (reused) {
                 prefix_hit = slot;
                 if (!restore_prefix_upto(reused))
                     throw std::runtime_error("sequence prefix restore failed");
@@ -12576,15 +12856,28 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         // the prompt head (Grimoire::save_prefix_head), as generate_tokens() does for a lone request
         auto prefill_tail = [&]() -> bool {
             if (tail.empty()) return true;          // the whole prompt from a head at its end: logits restored
+            // GRIMOIRE_PREFIX_SHARED: read up to the system prompt's boundary, keep the state there, then go on
+            // from it as below (0 = no boundary here: from == reused and rest is tail, exactly as before)
+            int from = reused;
+            std::vector<int32_t> after;
+            const int bs = prefix_share_split(share_boundary, prompt.size(), reused);
+            if (bs > 0) {
+                if (!prefill_part(std::vector<int32_t>(prompt.begin() + reused, prompt.begin() + bs))) return false;
+                sync();
+                save_prefix_boundary(std::vector<int32_t>(prompt.begin(), prompt.begin() + bs));
+                after.assign(prompt.begin() + bs, prompt.end());
+                from = bs;
+            }
+            const std::vector<int32_t>& rest = bs > 0 ? after : tail;
             if (prefix_head_at_end(prompt.size(), reused)) {
-                if (!prefill_part(tail)) return false;
+                if (!prefill_part(rest)) return false;
                 sync();
                 save_prefix_head(prompt, true);
                 return true;
             }
             const int h = prefix_head_split(prompt.size(), reused);
-            if (h <= reused) return prefill_part(tail);
-            if (!prefill_part(std::vector<int32_t>(prompt.begin() + reused, prompt.begin() + h))) return false;
+            if (h <= from) return prefill_part(rest);
+            if (!prefill_part(std::vector<int32_t>(prompt.begin() + from, prompt.begin() + h))) return false;
             sync();
             save_prefix_head(std::vector<int32_t>(prompt.begin(), prompt.begin() + h));
             return prefill_part(std::vector<int32_t>(prompt.begin() + h, prompt.end()));
@@ -12599,7 +12892,10 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         if(!draft_slots.empty()) q.memcpy(draft_slots[size_t(slot)].hidden,s.h,size_t(cfg.hidden)*sizeof(float)).wait();
         return slot;
     } catch (...) {
-        if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
+        if (size_t(slot) < prefix_slots.size()) {
+            prefix_slots[size_t(slot)].valid=false;
+            prefix_slots[size_t(slot)].bnd_valid=false;
+        }
         release_kv(slot, false);
         throw;
     }
@@ -13141,6 +13437,9 @@ void Grimoire::release() {
                 if (p) sycl::free(p, q);
         if (pc.hidden) sycl::free(pc.hidden, q);
         if (pc.logits) sycl::free(pc.logits, q);
+        for (auto& c : pc.bnd_layers)
+            for (void* p : {(void*)c.dn, (void*)c.conv})
+                if (p) sycl::free(p, q);
     }
     prefix_slots.clear();
     prefix_hit = -1;
@@ -24759,8 +25058,11 @@ struct SchedJob {
     // Set by the submitting thread, read by the scheduler.
     std::vector<int32_t> prompt;
     int budget = 0, eos = -1, eot = -1;
+    // GRIMOIRE_PREFIX_SHARED: prompt tokens up to the end of the system message (grimoire-server; 0 = none)
+    int share_boundary = 0;
     // Scheduler-owned.
     int slot = -1, pos = 0, next = -1;
+    int share_at = 0;               // interleaved admission: where the boundary snapshot is taken (0 = none / taken)
     std::vector<int32_t> hist;      // copy drafts: prompt + reply, built as the reply grows
     // copy drafts: share of verified copy tokens kept (running), and the copy proposed this step
     float copy_score = 0.6f;
@@ -24959,6 +25261,7 @@ void GrimoireScheduler::run() {
                     int done = 0;
                     j->slot = e.admit_begin(j->prompt, slot_busy, done, j->prompt.size() + size_t(j->budget));
                     j->pos = done;
+                    j->share_at = e.prefix_share_split(j->share_boundary, j->prompt.size(), done);
                     e.slot_sampling.at(size_t(j->slot))=j->sampling;
                     ++e.sampling_epoch.at(size_t(j->slot));
                     slot_busy[size_t(j->slot)] = true;
@@ -24985,6 +25288,9 @@ void GrimoireScheduler::run() {
             const size_t free_slots = size_t(std::count(slot_busy.begin(), slot_busy.end(), false));
             for (auto& j : taking) {
                 if (cancelled(j) || group.size() >= free_slots) continue;
+                // GRIMOIRE_PREFIX_SHARED: a prompt with a system-prompt boundary is admitted on its own, so the
+                // second and later ones copy the first one's (restore_shared) instead of all reading it at once
+                if (j->share_boundary > 0 && e.prefix_shared_on()) continue;
                 if (tot + j->prompt.size() > size_t(admit_cap)) continue;
                 group.push_back(j); prompts.push_back(&j->prompt); tot += j->prompt.size();
                 if (e.kv_pool) kv_tokens.push_back(j->prompt.size() + size_t(j->budget));
@@ -25085,7 +25391,8 @@ void GrimoireScheduler::run() {
                 }
                 static const bool adm_timing = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
                 const auto adm_t0 = std::chrono::steady_clock::now();
-                slot = e.admit_sequence(j->prompt, slot_busy, j->prompt.size() + size_t(j->budget));
+                slot = e.admit_sequence(j->prompt, slot_busy, j->prompt.size() + size_t(j->budget),
+                                        j->share_boundary);
                 if (adm_timing)
                     std::fprintf(stderr, "    scheduler admit: slot %d, %zu prompt tokens, %.2f ms, %zu active\n",
                                  slot, j->prompt.size(),
@@ -25154,11 +25461,18 @@ void GrimoireScheduler::run() {
                 try {
                     const size_t total = j->prompt.size();
                     do {
-                        const size_t len = std::min(size_t(il_chunk), total - size_t(j->pos));
+                        size_t len = std::min(size_t(il_chunk), total - size_t(j->pos));
+                        // GRIMOIRE_PREFIX_SHARED: a chunk ends at the boundary, and the state there is kept
+                        if (j->share_at > j->pos && size_t(j->share_at) < size_t(j->pos) + len)
+                            len = size_t(j->share_at - j->pos);
                         const std::vector<int32_t> chunk(j->prompt.begin() + j->pos,
                                                          j->prompt.begin() + j->pos + long(len));
                         e.admit_chunk(j->slot, j->pos, chunk);
                         j->pos += int(len);
+                        if (j->share_at > 0 && j->pos == j->share_at) {
+                            e.admit_share_save(j->slot, j->prompt, j->share_at);
+                            j->share_at = 0;
+                        }
                     } while (active.empty() && size_t(j->pos) < total);
                     if (size_t(j->pos) == total) {
                         prefilling.erase(prefilling.begin());
@@ -25401,7 +25715,7 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
         const std::vector<int32_t>& prompt, int n_predict, int eos_id,
         int eot_id, std::vector<int32_t>& out,
         const std::function<bool(int32_t)>& on_token, FinishReason* finish,
-        const SamplingOptions& sampling) {
+        const SamplingOptions& sampling, int share_boundary) {
     sampling.validate();
     if(sampling.enabled()&&(sc.e.pp_enabled()||sc.e.tp_head_split||sc.e.dag||
                             sc.e.cfg.is_qwen4_exp||sc.e.cfg.is_muse||sc.e.cfg.is_k2||
@@ -25416,6 +25730,7 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
         j->sampling.seeded=true;
     }
     j->prompt = prompt;
+    j->share_boundary = std::max(0, share_boundary);
     // Thrown HERE, on the caller's thread, so a bad request is a 400 from
     // the handler that made it rather than a scheduler error with no
     // request attached.

@@ -596,6 +596,11 @@ at 2 or more, or disable MTP.
 - A long prompt that arrives while other requests are decoding is processed in chunks of 1,024
   tokens with the others' decoding in between (`GRIMOIRE_INTERLEAVE_CHUNK`, 0 = off): the others
   pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.
+- Opt-in: `-e GRIMOIRE_PREFIX_SHARED=1` (one GPU, Qwen3.5 / 3.8 dense, 2+ slots) lets agents that
+  share a long system prompt (2,048 tokens or more, `GRIMOIRE_PREFIX_SHARED_MIN`) read it once: a new conversation
+  copies another slot's cache up to the end of the system message, even while that slot is still answering.
+  Measured on one B70 (Swift INT4 + MTP): 4 agents with a 30K-token system prompt, last agent's first token
+  113 -> 13 s; the copied start answers byte-identically to reading the prompt itself.
 
 ### Models, downloads, launch flags and measured speed
 
