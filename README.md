@@ -723,14 +723,6 @@ BF16 (or FP8 / NVFP4) release with `--proj mxfp4` quantizes to the same MXFP4 fo
 and runs at the same speed (measured: 193 tok/s on Ornith from the FP8 and NVFP4 releases and
 from the converted copy). The converted copy only starts faster.
 
-## LoRA adapters (opt-in, dense trunks)
-
-GRIMOIRE can load a PEFT [LoRA](https://huggingface.co/docs/peft/lora) adapter on top of a dense
-(non-MoE) checkpoint: `--lora <dir>` on the CLI, `GRIMOIRE_LORA=<dir>` in the environment.
-It applies the adapter's q/k/v/o and gate/up/down deltas on every layer, on the trunk only.
-Details, the refused cases and the design are in [docs/lora.md](docs/lora.md). Install,
-image build and model-loading steps are in [docs/INSTALL.md](docs/INSTALL.md).
-
 ## GGUF support (main since 2026-10-29)
 
 GRIMOIRE reads GGUF files itself: its own parser and decoders, no llama.cpp inside.  Merged into

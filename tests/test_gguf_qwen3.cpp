@@ -16,11 +16,6 @@ static int checks=0, failures=0;
 #define CHECK(x) do { ++checks; if(!(x)){std::fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x);++failures;} }while(0)
 static std::string read(const char* path){std::ifstream f(path);return {std::istreambuf_iterator<char>(f),{}};}
 static void header(const char* path,const char* hf_path,bool moe){
-    // Skip like the qwen35 gate when the real header slice is absent.
-    if(access(path,F_OK)!=0 || access(hf_path,F_OK)!=0){
-        std::printf("SKIP header %s (absent)\n",path);
-        return;
-    }
     GGUFFile f;std::string err,j;
     CHECK(f.open(path,err,true));if(!err.empty()){std::fprintf(stderr,"%s\n",err.c_str());return;}
     CHECK(gguf_qwen3_config(f,read(hf_path),j,err));

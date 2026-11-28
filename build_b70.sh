@@ -210,7 +210,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
-     src/tokenizer.cpp src/lora.cpp src/lora_dev.cpp \
+     src/tokenizer.cpp \
      -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire \
   && echo "built  : bin/grimoire" \
@@ -231,7 +231,7 @@ icpx -fsycl -fsycl-targets="$TARGET" -O3 -std=c++20 \
      src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
-     src/tokenizer.cpp src/lora.cpp src/lora_dev.cpp \
+     src/tokenizer.cpp \
      -lpthread -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' \
      -o bin/grimoire-server \
   && echo "built  : bin/grimoire-server" \
@@ -249,7 +249,7 @@ icpx -fsycl -fsycl-targets=spir64 -O2 -std=c++20 \
      src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
      src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
      src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
-     src/tokenizer.cpp src/gemm_fast.cpp src/lora.cpp src/lora_dev.cpp -o bin/count_launches_probe \
+     src/tokenizer.cpp src/gemm_fast.cpp -o bin/count_launches_probe \
   && echo "built  : bin/count_launches_probe" \
   || echo "warn: count_launches_probe failed to build"
 
@@ -329,8 +329,7 @@ ENGINE_SRC=(src/grimoire.cpp src/qwen35_loader.cpp src/native_model.cpp
             src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp
             src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp
             src/deltanet.cpp src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp
-            src/ops.cpp src/prefill.cpp src/tokenizer.cpp src/gemm_fast.cpp
-            src/lora.cpp src/lora_dev.cpp)
+            src/ops.cpp src/prefill.cpp src/tokenizer.cpp src/gemm_fast.cpp)
 # These build for spir64 (JIT), not the AOT "$TARGET".  They are
 # CORRECTNESS gates: the kernel source is identical either way, and an
 # AOT device compile of the whole engine three more times would add

@@ -48,5 +48,5 @@ icpx -fsycl -fsycl-targets="$TARGETS" -O3 -std=c++20 \
   src/gguf.cpp src/gguf_decode.cpp src/gguf_qwen35.cpp \
   src/gemv_decode.cpp src/gemm_xmx.cpp src/attention.cpp src/deltanet.cpp \
   src/moe_kernels.cpp src/tiered_moe.cpp src/cpu_experts.cpp src/moe_ref.cpp src/ops.cpp src/prefill.cpp \
-  src/tokenizer.cpp src/lora.cpp src/lora_dev.cpp -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' -o bin/grimoire.new
+  src/tokenizer.cpp -Lbin -lgrimoire_gemm -lgrimoire_attn '-Wl,-rpath,$ORIGIN' -o bin/grimoire.new
 mv bin/grimoire.new bin/grimoire

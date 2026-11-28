@@ -335,7 +335,7 @@ template <Fmt F, int MB>
 static void fast_gemv_case(int K,int mc){
     constexpr int N=3;
     const HostQK w=host_qk(F,N,K);
-    std::vector<float> x(static_cast<size_t>(MB) * K, 0.0f);
+    std::vector<float> x(size_t(MB)*K);
     for(int m=0;m<mc;++m)for(int k=0;k<K;++k)
         x[size_t(m)*K+k]=float(((k*37+m*53+k/NativeGGUFBlock<F>::elems*11)%211)-105)/173.0f;
     const float* xp[MB];

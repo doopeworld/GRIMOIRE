@@ -168,14 +168,6 @@ bin/test_qwen4_exp_config: tests/test_qwen4_exp_config.cpp $(HOST_MODEL_SRC) $(w
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
 
-bin/test_lora: tests/test_lora.cpp src/lora.cpp src/safetensors.cpp include/b70/lora.hpp include/b70/safetensors.hpp include/b70/json.hpp include/b70/formats.hpp
-	@mkdir -p bin
-	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
-
-.PHONY: test_lora
-test_lora: bin/test_lora
-	./bin/test_lora
-
 bin/test_chat_effort: tests/test_chat_effort.cpp src/tokenizer.cpp src/gguf.cpp include/b70/tokenizer.hpp include/b70/json.hpp
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(filter %.cpp,$^) -o $@
@@ -203,7 +195,7 @@ bin/tok_dump: tools/tok_dump.cpp src/tokenizer.cpp src/gguf.cpp include/b70/toke
 .PHONY: tok_dump
 tok_dump: bin/tok_dump
 
-test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_gguf_qwen3 bin/test_qwen3_prefill_math bin/test_gguf_gemma4 bin/test_gguf_native bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gguf_tokenizer bin/test_kld bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config bin/test_lora
+test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin/test_gguf_qwen35 bin/test_gguf_qwen3 bin/test_qwen3_prefill_math bin/test_gguf_gemma4 bin/test_gguf_native bin/test_moe bin/test_deltanet bin/test_ops bin/test_tokenizer bin/test_tokenizer_golden bin/test_gguf_tokenizer bin/test_kld bin/test_gptq bin/test_k2_horizon bin/test_k2_config bin/test_dflash2_selector bin/test_dflash_config bin/test_agnes_config bin/test_gemma4_config bin/test_qwen4_exp_config
 	@echo "=========== formats ==========="; ./bin/test_formats
 	@echo ""; echo "=========== attention ==========="; ./bin/test_attention
 	@echo ""; echo "=========== safetensors ==========="; ./bin/test_safetensors
@@ -228,7 +220,6 @@ test: bin/test_formats bin/test_attention bin/test_safetensors bin/test_gguf bin
 	@echo ""; echo "=========== agnes-config ==========="; ./bin/test_agnes_config
 	@echo ""; echo "=========== gemma4-config ==========="; ./bin/test_gemma4_config
 	@echo ""; echo "=========== qwen4-exp-config ==========="; ./bin/test_qwen4_exp_config
-	@echo ""; echo "=========== lora ==========="; ./bin/test_lora
 
 clean:
 	rm -rf bin
@@ -246,8 +237,7 @@ NATIVE_DIR = bin/native-$(subst $(COMMA),+,$(SYCL_TARGET))
 NATIVE_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGET) -O2 -std=c++20 \
  -fno-fast-math -ffp-contract=fast -fno-math-errno -DGRIMOIRE_NATIVE_ONLY -Iinclude -Isrc
 NATIVE_SRC = grimoire qwen35_loader native_model safetensors gguf gguf_decode gguf_qwen35 quantize gptq \
- gemv_decode gemm_xmx gemm_fast attention attn_verify_dpas deltanet moe_kernels moe_ref ops prefill tokenizer lora lora_dev \
- tiered_moe cpu_experts
+ gemv_decode gemm_xmx gemm_fast attention deltanet moe_kernels moe_ref ops prefill tokenizer
 NATIVE_OBJ = $(addprefix $(NATIVE_DIR)/,$(addsuffix .o,$(NATIVE_SRC)))
 
 .PHONY: native

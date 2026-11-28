@@ -43,7 +43,7 @@ int grimoire_perplexity(const std::string& dir, Fmt proj_fmt,
 }
 
 int main(int argc, char** argv) {
-    std::string model, prompt, lora_dir;
+    std::string model, prompt;
     b70::Fmt pf = b70::Fmt::INT4;
     bool proj_explicit = false;
     int max_seq = 8192;
@@ -87,7 +87,6 @@ int main(int argc, char** argv) {
         else if ((a == "-n" || a == "--n-predict") && i + 1 < argc) n_predict = std::atoi(argv[++i]);
         else if (a == "--prefill-only" && i + 1 < argc) prefill_only = std::atoi(argv[++i]);
         else if (a == "--prefix-cache-test" && i + 1 < argc) prefix_cache_test = std::atoi(argv[++i]);
-        else if (a == "--lora" && i + 1 < argc) { lora_dir = argv[++i]; }
         else if (a == "--score-ids" && i + 1 < argc) score_ids = argv[++i];
         else if (a == "--score-out" && i + 1 < argc) score_out = argv[++i];
         else if (a == "--ppl" && i + 1 < argc) ppl_file = argv[++i];
@@ -115,7 +114,6 @@ int main(int argc, char** argv) {
               "           The linear layers do not grow with context.\n"
               "  -p       prompt to generate from. Without it, runs benchmarks.\n"
               "  -n       tokens to generate (default 128).\n"
-              "  --lora <dir>    load a PEFT LoRA adapter (dense trunk, single card)\n"
               "  --score-ids FILE --score-out FILE\n"
               "           feed the token ids in FILE (one per line) one at a time and write\n"
               "           the logits after each (fp32, vocab per position) -- for comparing\n"
@@ -141,7 +139,6 @@ int main(int argc, char** argv) {
         }
         pf = b70::Fmt::MXFP4;
     }
-    if (!lora_dir.empty()) setenv("GRIMOIRE_LORA", lora_dir.c_str(), 1);
     if (model.empty()) { std::printf("need -m/--model <model_dir_or_gguf>; see --help\n"); return 1; }
     if (!score_ids.empty() || !score_out.empty()) {
         if (score_ids.empty() || score_out.empty()) {
