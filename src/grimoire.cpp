@@ -3389,6 +3389,35 @@ struct Grimoire {
     uint64_t prefix_clock = 0;
     mutable int prefix_hit = -1;          // slot prefix_reuse() matched
     mutable bool prefix_hit_head = false; // ... and through its prompt-head snapshot
+    // HOST-RAM PREFIX SPILL (GRIMOIRE_PREFIX_HOST_GB; 0, the default, = off and none of this runs).  A snapshot about
+    // to die -- its slot cleared for another conversation (clear_seq_slot) or its shared-KV pages unmapped
+    // (release_kv) -- is copied to pinned host RAM: token ids, KV rows [0,N) of every attention layer (+ int8-key
+    // scales), the MTP head's rows, and each valid checkpoint's DeltaNet state, conv ring and output row.  An
+    // admission whose prompt starts with it restores it into a slot, which is then an ordinary resumable snapshot.
+    struct HostCkpt { bool on = false, output = false; std::vector<int32_t> tokens; };
+    struct HostPrefix {
+        HostCkpt ck[2];          // [0] the prompt+reply snapshot (valid), [1] the prompt head (head_valid)
+        int rows = 0;            // KV rows held: the longer checkpoint's
+        int pick = -1;           // the checkpoint a pending restore resumes from
+        std::vector<int> pages;  // indices into prefix_host_pages, in walk order
+        uint64_t used = 0;       // LRU stamp (prefix_clock)
+    };
+    std::vector<HostPrefix> prefix_host;
+    std::vector<uint8_t*> prefix_host_pages;    // pinned pages, allocated lazily up to the budget, reused
+    std::vector<int> prefix_host_free;
+    size_t prefix_host_budget = 0;              // in pages
+    int prefix_host_state = -1;                 // -1 undecided, 0 off, 1 on
+    mutable int prefix_hit_host = -1, prefix_hit_host_ck = 0;   // the host entry prefix_reuse() matched
+    HostPrefix prefix_host_pending;             // out of the store between admit_pick_slot and its restore
+    bool prefix_host_take = false;
+    // = upload_piece_bytes() on one card: the B70 copy engine faults on >= 512 MiB single transfers
+    static constexpr size_t kHostPage = size_t(64) << 20;
+    bool prefix_host_on();
+    void prefix_host_drop(HostPrefix& e);
+    size_t prefix_host_walk(int j, const HostPrefix& e, int restore_ck, size_t restore_rows,
+        const std::function<void(uint8_t*, size_t, size_t, size_t, size_t)>& fn) const;
+    void prefix_host_spill(int j);
+    bool prefix_host_restore(int j, int n);
     // How many conversations the KV cache has room for, and which one is
     // live.  Fixed at build() because the cache is allocated that deep:
     // reading the environment later would describe a cache that does not
@@ -3398,7 +3427,7 @@ struct Grimoire {
     std::unique_ptr<KvVirtualPool> kv_pool;
     void ensure_kv(int slot, int tokens);
     void admit_kv(int slot, size_t tokens, const std::vector<bool>& busy, bool reuse);
-    void release_kv(int slot, bool keep_prefix);
+    void release_kv(int slot, bool keep_prefix, bool spill = true);   // spill = false on error paths
     void clear_mtp_kv();
     void bind_seq_slot(int j);
     // Empty a named slot and leave it live.  See the definition for why
@@ -10701,6 +10730,7 @@ void Grimoire::reset() {
 // prompts long enough for that state to accumulate before any gate could
 // see it.
 void Grimoire::clear_seq_slot(int j) {
+    prefix_host_spill(j);       // the snapshot in j dies here (no-op unless GRIMOIRE_PREFIX_HOST_GB)
     bind_seq_slot(j);
     // A new sequence inherits nothing, this flag included: the buffer
     // still holds the previous request's states, and they describe a
@@ -10929,6 +10959,7 @@ bool Grimoire::save_prefix(const std::vector<int32_t>& tokens, bool output_valid
 int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
                           const std::vector<bool>* busy, bool allow_full) const {
     prefix_hit = -1;
+    prefix_hit_host = -1;
     if (!prefix_cache_usable()) return 0;
     int best = 0;
     for (size_t sl = 0; sl < prefix_slots.size(); ++sl) {
@@ -10957,6 +10988,25 @@ int Grimoire::prefix_reuse(const std::vector<int32_t>& tokens,
         if (n == 0 || (n >= tokens.size() && !whole_ok) || int(n) <= best) continue;
         if (!std::equal(c.head_tokens.begin(), c.head_tokens.end(), tokens.begin())) continue;
         best = int(n); prefix_hit = int(sl); prefix_hit_head = true;
+    }
+    // Host RAM (GRIMOIRE_PREFIX_HOST_GB): admission only (busy given) -- admit_pick_slot takes the entry and restores
+    // it; generate_tokens' restore knows only slots.  A host restore evicts a slot and copies rows back, so against
+    // an on-card match it must win by GRIMOIRE_PREFIX_HOST_MIN_GAIN (256) tokens.
+    if (busy && prefix_host_state == 1 && !prefix_host.empty()) {
+        static const int gain = [] { const char* v = std::getenv("GRIMOIRE_PREFIX_HOST_MIN_GAIN");
+            return v && *v ? std::max(1, std::atoi(v)) : 256; }();
+        int bar = best > 0 ? best + gain - 1 : 0;
+        for (size_t ei = 0; ei < prefix_host.size(); ++ei)
+            for (int ck = 0; ck < 2; ++ck) {
+                const HostCkpt& h = prefix_host[ei].ck[ck];
+                if (!h.on) continue;
+                const size_t n = h.tokens.size();
+                const bool whole_ok = allow_full && ck == 1 && h.output && n == tokens.size();
+                if (n == 0 || (n >= tokens.size() && !whole_ok) || int(n) <= bar) continue;
+                if (!std::equal(h.tokens.begin(), h.tokens.end(), tokens.begin())) continue;
+                bar = best = int(n); prefix_hit = -1; prefix_hit_head = ck == 1;
+                prefix_hit_host = int(ei); prefix_hit_host_ck = ck;
+            }
     }
     return best;
 }
@@ -12229,11 +12279,210 @@ void Grimoire::ensure_kv(int slot, int tokens) {
         throw std::runtime_error("shared KV cache budget exhausted");
 }
 
-void Grimoire::release_kv(int slot, bool keep_prefix) {
+bool Grimoire::prefix_host_on() {
+    if (prefix_host_state >= 0) return prefix_host_state == 1;
+    prefix_host_state = 0;
+    const char* v = std::getenv("GRIMOIRE_PREFIX_HOST_GB");
+    const double gb = v && *v ? std::atof(v) : 0.0;
+    if (!(gb > 0)) return false;
+    std::string why;
+    if (pipeline || tp_ranked() || pp_enabled()) why = "not under tensor or pipeline parallel";
+    else if (!prefix_cache_usable()) why = prefix_cache_unusable_reason();
+    else if (!kv_kmajor_flag()) why = "needs the key-major K cache";
+    const uint64_t avail = host_history_available_ram(), reserve = uint64_t(8) << 30;
+    const size_t room = avail > reserve ? size_t((avail - reserve) / kHostPage) : 0;
+    size_t pages = size_t(gb * 1073741824.0) / kHostPage;
+    if (why.empty() && std::min(pages, room) == 0) why = "no RAM above the 8 GiB reserve";
+    if (!why.empty()) {
+        std::printf("  prefix host: off (%s)\n", why.c_str());
+        return false;
+    }
+    if (room < pages) {
+        std::printf("  prefix host: %.1f GiB asked, %.1f GiB fit above the 8 GiB RAM reserve\n",
+                    gb, double(room * kHostPage) / 1073741824.0);
+        pages = room;
+    }
+    prefix_host_budget = pages;
+    prefix_host_state = 1;
+    std::printf("  prefix host: on, up to %.1f GiB of pinned RAM\n", double(pages * kHostPage) / 1073741824.0);
+    return true;
+}
+
+void Grimoire::prefix_host_drop(HostPrefix& e) {
+    for (int p : e.pages) prefix_host_free.push_back(p);
+    e.pages.clear();
+}
+
+// Every range a host entry of slot j holds, in ONE fixed order, packed into kHostPage pages (a piece never straddles
+// one): per attention layer and KV head the K run, its int8 scales (k8), the V run -- key-major [kv head][max_seq][dim],
+// rows [0,rows) -- then the MTP head's rows the same way, then per checkpoint each layer's DeltaNet state and conv
+// ring and its hidden/logits row.  fn(dev, page, offset, bytes, copy): `copy` <= bytes is what moves.  A spill
+// (restore_ck < 0) reads the slot's checkpoint buffers; a restore writes the LIVE state of the bound slot j, only
+// its own checkpoint and only rows [0,restore_rows) (pool pages are mapped up to the new request's length, which can
+// be shorter than the entry).  Returns the pages used.
+size_t Grimoire::prefix_host_walk(int j, const HostPrefix& e, int restore_ck, size_t restore_rows,
+        const std::function<void(uint8_t*, size_t, size_t, size_t, size_t)>& fn) const {
+    size_t page = 0, off = 0;
+    bool any = false;
+    auto put = [&](uint8_t* dev, size_t bytes, size_t copy) {
+        for (size_t o = 0; o < bytes; o += kHostPage) {
+            const size_t b = std::min(kHostPage, bytes - o);
+            if (off + b > kHostPage) { ++page; off = 0; }
+            fn(dev + o, page, off, b, copy > o ? std::min(b, copy - o) : 0);
+            off += b;
+            any = true;
+        }
+    };
+    const size_t rows = size_t(e.rows);
+    const size_t live = restore_ck < 0 ? rows : std::min(rows, restore_rows);
+    const bool k8 = kv_k8_flag();
+    auto kv = [&](uint8_t* k, uint8_t* v, int heads, int dim) {
+        const size_t run = size_t(max_seq) * size_t(dim);       // one KV head
+        const size_t scales = size_t(heads) * run;              // k8: float[kv head][max_seq] after the keys
+        for (int h = 0; h < heads; ++h) {
+            put(k + size_t(h) * run, rows * size_t(dim), live * size_t(dim));
+            if (k8) put(k + scales + size_t(h) * size_t(max_seq) * sizeof(float),
+                        rows * sizeof(float), live * sizeof(float));
+            put(v + size_t(h) * run, rows * size_t(dim), live * size_t(dim));
+        }
+    };
+    for (const auto& d : L)
+        if (d.kv_slot && d.k_base && d.v_base)
+            kv(d.k_base + size_t(j) * d.kv_slot, d.v_base + size_t(j) * d.kv_slot, d.kv_heads, d.head_dim);
+    if (mtp.ok && size_t(j) < draft_slots.size() && draft_slots[size_t(j)].mk && draft_slots[size_t(j)].mv)
+        kv(draft_slots[size_t(j)].mk, draft_slots[size_t(j)].mv, mtp.L.kv_heads, mtp.L.head_dim);
+    const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim, Dk = cfg.lin_k_dim;
+    const size_t dn_bytes = size_t(Hv) * Dv * Dk * sizeof(float);
+    const size_t conv_bytes = size_t(2 * cfg.lin_k_heads * cfg.lin_k_dim +
+        Hv * Dv) * (cfg.conv_kernel - 1) * sizeof(float);
+    const size_t hbytes = size_t(cfg.hidden) * sizeof(float), lbytes = size_t(cfg.vocab) * sizeof(float);
+    const PrefixCache& c = prefix_slots[size_t(j)];
+    for (int ck = 0; ck < 2; ++ck) {
+        if (!e.ck[ck].on) continue;
+        const bool restoring = restore_ck >= 0, mv = !restoring || restore_ck == ck;
+        for (size_t i = 0; i < L.size(); ++i) {
+            const auto& d = L[i];
+            const auto& pl = restoring ? PrefixLayerCache{} : (ck ? c.head_layers[i] : c.layers[i]);
+            if (d.dn_state)
+                put(reinterpret_cast<uint8_t*>(restoring ? d.dn_state : pl.dn), dn_bytes, mv ? dn_bytes : 0);
+            if (d.conv_ring)
+                put(reinterpret_cast<uint8_t*>(restoring ? d.conv_ring : pl.conv), conv_bytes, mv ? conv_bytes : 0);
+        }
+        if (e.ck[ck].output) {
+            float* hd = restoring ? s.h : (ck ? c.head_hidden : c.hidden);
+            float* lg = restoring ? s.logits : (ck ? c.head_logits : c.logits);
+            put(reinterpret_cast<uint8_t*>(hd), hbytes, mv ? hbytes : 0);
+            put(reinterpret_cast<uint8_t*>(lg), lbytes, mv ? lbytes : 0);
+        }
+    }
+    return any ? page + 1 : 0;
+}
+
+// Copy slot j's snapshot to host RAM before it dies.  STAGE 1: synchronous on q (~55 ms per 30K tokens measured for
+// the copy); stage 2 moves it off the critical path (a copy queue + write-behind at retire).
+void Grimoire::prefix_host_spill(int j) {
+    if (prefix_host_state == 0 || j < 0 || size_t(j) >= prefix_slots.size()) return;
+    const PrefixCache& c = prefix_slots[size_t(j)];
+    if (!(c.valid || c.head_valid) || !prefix_host_on()) return;
+    HostPrefix e;
+    if (c.valid && !c.tokens.empty() && c.layers.size() == L.size()) {
+        e.ck[0].on = true; e.ck[0].output = c.output_valid && c.hidden && c.logits; e.ck[0].tokens = c.tokens;
+    }
+    if (c.head_valid && !c.head_tokens.empty() && c.head_layers.size() == L.size()) {
+        e.ck[1].on = true; e.ck[1].output = c.head_output && c.head_hidden && c.head_logits;
+        e.ck[1].tokens = c.head_tokens;
+    }
+    if (e.ck[0].on && e.ck[1].on) {
+        // one set of KV rows serves both, so the shorter must be a prefix of the longer
+        const auto& a = e.ck[0].tokens; const auto& b = e.ck[1].tokens;
+        const auto& sh = a.size() < b.size() ? a : b; const auto& lo = a.size() < b.size() ? b : a;
+        if (!std::equal(sh.begin(), sh.end(), lo.begin())) return;
+    }
+    for (const auto& h : e.ck) if (h.on) e.rows = std::max(e.rows, int(h.tokens.size()));
+    if (e.rows <= 0 || e.rows > max_seq) return;
+    const size_t need = prefix_host_walk(j, e, -1, 0, [](uint8_t*, size_t, size_t, size_t, size_t) {});
+    if (!need || need > prefix_host_budget) return;          // larger than the whole budget: not spilled
+    int evicted = 0;
+    while (prefix_host_free.size() + (prefix_host_budget - prefix_host_pages.size()) < need && !prefix_host.empty()) {
+        size_t lru = 0;
+        for (size_t i = 1; i < prefix_host.size(); ++i)
+            if (prefix_host[i].used < prefix_host[lru].used) lru = i;
+        prefix_host_drop(prefix_host[lru]);
+        prefix_host.erase(prefix_host.begin() + long(lru));
+        ++evicted;
+    }
+    while (e.pages.size() < need) {
+        if (!prefix_host_free.empty()) { e.pages.push_back(prefix_host_free.back()); prefix_host_free.pop_back(); continue; }
+        uint8_t* p = nullptr;
+        if (prefix_host_pages.size() < prefix_host_budget &&
+            host_history_available_ram() > (uint64_t(8) << 30) + kHostPage) {
+            try { p = sycl::malloc_host<uint8_t>(kHostPage, q); } catch (...) { p = nullptr; }
+        }
+        if (!p) {
+            // the RAM reserve (or the allocator) ends the growth: the budget is what is held now
+            std::printf("  prefix host: budget capped at %.1f GiB (8 GiB RAM reserve)\n",
+                        double(prefix_host_pages.size() * kHostPage) / 1073741824.0);
+            prefix_host_budget = prefix_host_pages.size();
+            prefix_host_drop(e);
+            return;
+        }
+        prefix_host_pages.push_back(p);
+        e.pages.push_back(int(prefix_host_pages.size() - 1));
+    }
+    try {
+        const auto t0 = std::chrono::steady_clock::now();
+        sync();
+        size_t bytes = 0;
+        prefix_host_walk(j, e, -1, 0, [&](uint8_t* dev, size_t page, size_t off, size_t, size_t copy) {
+            if (!copy) return;
+            q.memcpy(prefix_host_pages[size_t(e.pages[page])] + off, dev, copy);
+            bytes += copy;
+        });
+        q.wait_and_throw();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        e.used = ++prefix_clock;
+        prefix_host.push_back(std::move(e));
+        std::printf("  prefix host: saved %d tokens (%.0f MiB) from slot %d in %.1f ms (%zu held, %d evicted)\n",
+                    prefix_host.back().rows, double(bytes) / 1048576.0, j, ms, prefix_host.size(), evicted);
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "  prefix host: spill of slot %d failed: %s\n", j, ex.what());
+        prefix_host_drop(e);
+    }
+}
+
+// Restore prefix_host_pending (taken by admit_pick_slot) into slot j, resuming at n: copy the rows and state back,
+// re-create the slot's device checkpoint from them (save_prefix / save_prefix_head), then resume through
+// restore_prefix_upto() exactly as an on-card hit at the same checkpoint does -- same n, same 64-token chunking of
+// the rest.  false = nothing usable (the caller reads the prompt cold).
+bool Grimoire::prefix_host_restore(int j, int n) {
+    HostPrefix e = std::move(prefix_host_pending);
+    prefix_host_pending = HostPrefix{};
+    struct GiveBack { Grimoire* g; HostPrefix* e; ~GiveBack() { g->prefix_host_drop(*e); } } give{this, &e};
+    const int ck = e.pick;
+    if (ck < 0 || ck > 1 || !e.ck[ck].on || int(e.ck[ck].tokens.size()) != n || e.pages.empty() ||
+        size_t(j) >= prefix_slots.size()) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    clear_seq_slot(j);           // binds j; what it held is spilled first, then its state zeroed
+    prefix_host_walk(j, e, ck, size_t(n), [&](uint8_t* dev, size_t page, size_t off, size_t, size_t copy) {
+        if (copy) q.memcpy(dev, prefix_host_pages[size_t(e.pages[page])] + off, copy);
+    });
+    q.wait_and_throw();
+    const HostCkpt& h = e.ck[ck];
+    if (!(ck ? save_prefix_head(h.tokens, h.output) : save_prefix(h.tokens, h.output))) return false;
+    prefix_hit = j;
+    prefix_hit_head = ck == 1;
+    if (!restore_prefix_upto(n)) return false;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("  prefix host: restored %d tokens into slot %d in %.1f ms\n", n, j, ms);
+    return true;
+}
+
+void Grimoire::release_kv(int slot, bool keep_prefix, bool spill) {
     if (!kv_pool) return;
     if (size_t(slot) < prefix_slots.size()) {
         auto& cached = prefix_slots[size_t(slot)];
         if (keep_prefix && (cached.valid || cached.head_valid)) return;
+        if (spill) prefix_host_spill(slot);       // before recycle() unmaps its rows
         cached.valid = cached.head_valid = false;
     }
     kv_pool->recycle(size_t(slot));
@@ -12310,7 +12559,7 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
             for (size_t k = 0; k < pick.size(); ++k)
                 admit_kv(pick[k], kv_tokens[k], reserved, false);
         } catch (...) {
-            for (int slot : pick) release_kv(slot, false);
+            for (int slot : pick) release_kv(slot, false, false);
             throw;
         }
     }
@@ -12324,7 +12573,7 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
         sync();
         for (int sl : pick) {
             clear_seq_slot(sl);
-            release_kv(sl, false);
+            release_kv(sl, false, false);
         }
         return false;
     }
@@ -12356,6 +12605,20 @@ int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
         }
     }
     if (slot < 0) throw std::runtime_error("no idle sequence slot");
+    // A host-RAM hit: the slot was picked above as for a fresh prompt.  The entry leaves the store now, so a spill on
+    // the way to its restore (this slot's own snapshot, a KV-pool victim) cannot evict it.
+    prefix_host_take = false;
+    prefix_host_drop(prefix_host_pending);   // one an earlier admission took and never restored (it threw)
+    prefix_host_pending = HostPrefix{};
+    if (reused && prefix_hit < 0) {
+        if (prefix_hit_host >= 0 && size_t(prefix_hit_host) < prefix_host.size()) {
+            prefix_host_pending = std::move(prefix_host[size_t(prefix_hit_host)]);
+            prefix_host_pending.pick = prefix_hit_host_ck;
+            prefix_host.erase(prefix_host.begin() + prefix_hit_host);
+            prefix_host_take = true;
+        } else reused = 0;
+        prefix_hit_host = -1;
+    }
     return slot;
 }
 
@@ -12376,16 +12639,20 @@ int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
     int reused = 0;
     // not the whole prompt: the decode steps between this and the first token would overwrite restored logits
     const int slot = admit_pick_slot(prompt, busy, reused, false);
+    const bool host = prefix_host_take;      // a host-RAM hit: the slot starts as a fresh prompt's would
+    prefix_host_take = false;
     try {
-        admit_kv(slot, kv_tokens, busy, reused != 0);
-        if (reused) {
+        admit_kv(slot, kv_tokens, busy, reused != 0 && !host);
+        if (host) {
+            if (!prefix_host_restore(slot, reused)) { clear_seq_slot(slot); reused = 0; }
+        } else if (reused) {
             prefix_hit = slot;
             if (!restore_prefix_upto(reused))
                 throw std::runtime_error("sequence prefix restore failed");
         } else clear_seq_slot(slot);
     } catch (...) {
         if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
-        release_kv(slot, false);
+        release_kv(slot, false, false);
         throw;
     }
     done = reused;
@@ -12439,10 +12706,16 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
             reused = 0;
         }
     }
+    bool host = prefix_host_take;            // a host-RAM hit (admit_pick_slot); never under TP / PP
+    prefix_host_take = false;
     try {
-        admit_kv(slot, std::max(kv_tokens, prompt.size()), busy, reused != 0);
+        admit_kv(slot, std::max(kv_tokens, prompt.size()), busy, reused != 0 && !host);
         auto restore = [&] {
-            if (reused) {
+            if (host) {
+                // once restored the slot is an ordinary snapshot: a retry below restores it on the card
+                host = false;
+                if (!prefix_host_restore(slot, reused)) { clear_seq_slot(slot); reused = 0; }
+            } else if (reused) {
                 prefix_hit = slot;
                 if (!restore_prefix_upto(reused))
                     throw std::runtime_error("sequence prefix restore failed");
@@ -12516,7 +12789,7 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         return slot;
     } catch (...) {
         if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
-        release_kv(slot, false);
+        release_kv(slot, false, false);
         throw;
     }
 }
@@ -13060,6 +13333,10 @@ void Grimoire::release() {
     }
     prefix_slots.clear();
     prefix_hit = -1;
+    for (uint8_t* p : prefix_host_pages) sycl::free(p, q);
+    prefix_host_pages.clear(); prefix_host_free.clear(); prefix_host.clear();
+    prefix_host_pending = HostPrefix{}; prefix_host_take = false;
+    prefix_host_state = -1; prefix_hit_host = -1;
 }
 
 } // namespace b70
@@ -24699,7 +24976,7 @@ void GrimoireScheduler::run() {
             } else if (size_t(j->slot)<e.prefix_slots.size()) {
                 e.prefix_slots[size_t(j->slot)].valid=false;
             }
-            try { e.release_kv(j->slot, cache); }
+            try { e.release_kv(j->slot, cache, false); }   // cache: kept; otherwise an error or cancel
             catch (const std::exception& ex) {
                 std::fprintf(stderr, "shared KV release failed: %s\n", ex.what());
             }
