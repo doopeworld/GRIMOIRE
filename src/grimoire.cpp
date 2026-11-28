@@ -48,6 +48,7 @@
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
 #include "b70/generation_control.hpp"
+#include "b70/tp_verify_pieces.hpp"
 #include "b70/qwen35.hpp"
 #include "b70/gguf_qwen35.hpp"
 #include "b70/dflash_config.hpp"
@@ -2725,6 +2726,7 @@ struct Grimoire {
         // PEER's bf16 partial into this card's VRAM (half the bytes of the fp32 sum over the link) and a kernel
         // adds it to this card's own partial, rounded the same way -- the same two fp32 operands, so the same bits.
         bool small_peer = false;
+        bool verify_one_rendezvous = false, verify_scope = false, verify_reported = false;
         uint8_t* sb_cpu = nullptr; float* sb_dev = nullptr; int sb_fd = -1; size_t sb_bytes = 0;
         TpPleRows* ple = nullptr;
         uint64_t ple_seq = 0;
@@ -5680,6 +5682,12 @@ bool Grimoire::tp_shm_setup(std::string& err){
             int pk=(pe&&*pe=='0')?0:1;
             if(!tp_agree_min(pk)){err="TP small all-reduce handshake failed";return false;}
             tshm.small_peer=tshm.small_bf16&&pk==1;
+            const char* once=std::getenv("GRIMOIRE_TP_VERIFY_ONE_RENDEZVOUS");
+            int one=once && std::strcmp(once,"1")==0;
+            if(!tp_agree(one) || one<0){err="TP verify rendezvous mode mismatch";return false;}
+            int eligible=one && tp_mega && tshm.small_peer && !std::getenv("GRIMOIRE_TP_SMALL_AR_TIME");
+            if(one && !tp_agree_min(eligible)){err="TP verify rendezvous handshake failed";return false;}
+            tshm.verify_one_rendezvous=eligible==1;
             if(tshm.small_peer)
                 std::printf("  TP small all-reduce: the peer's bf16 partial through the BAR, added on this card "
                             "(GRIMOIRE_TP_SMALL_PEER=0 = the CPU writes the sum)\n");
@@ -6620,10 +6628,16 @@ bool Grimoire::tp_small_allreduce(float* dev,size_t elems,uint64_t pre_tag,const
         uint16_t* const bar16=reinterpret_cast<uint16_t*>(bar);
         if(!kwait(ksend_bf16(dev,st16,elems),"TP small all-reduce (bf16)"))return false;
         if(st){tb=clk::now(); t_out+=std::chrono::duration<double,std::micro>(tb-t1).count();}
-        for(size_t k=0;k<np;++k){
-            const size_t o=k*P, n=std::min(P,elems-o);
+        const bool whole=tshm.verify_scope && peer16 && np>1;
+        const auto pieces=tp_verify_pieces(elems,P,whole);
+        if(whole && !tshm.verify_reported){
+            tshm.verify_reported=true;
+            std::fprintf(stderr,"  TP rank %d: single BF16 BAR rendezvous dispatched in verify\n",tp_rank);
+        }
+        for(size_t k=0;k<pieces.count;++k){
+            const size_t o=k*pieces.size, n=std::min(pieces.size,elems-o);
             std::memcpy(mine16+o,st16+o,n*sizeof(uint16_t));
-            const uint64_t c=++tshm.sp_cnt;
+            const uint64_t c=(tshm.sp_cnt+=pieces.credit);
             sflag(tp_rank)->store(c,std::memory_order_release);
             auto* f=sflag(peer); uint64_t spins=0; const auto tw=clk::now();
             while(f->load(std::memory_order_acquire)<c){
@@ -20603,6 +20617,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                        std::vector<int32_t>* next_tokens,
                        const SeqBatch* seqb,
                        bool allow_exact_restore) {
+    // Only the single-sequence candidate verifier (one anchor and up to six
+    // drafts). Ordinary prompt prefill and scheduler batches stay unchanged.
+    struct VerifyScope {
+        bool& flag; bool previous;
+        ~VerifyScope() { flag=previous; }
+    } verify_scope{tshm.verify_scope,tshm.verify_scope};
+    tshm.verify_scope=tshm.verify_one_rendezvous && !seqb && next_tokens &&
+        tokens.size()>1 && tokens.size()<=7;
     if(seqb){
         // A batch does not have ONE position, so the engine's cursor says
         // nothing about whether it fits.  Every row is checked against
