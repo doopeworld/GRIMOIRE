@@ -60,6 +60,8 @@
 #include "b70/gptq.hpp"
 #include "b70/imatrix.hpp"
 #include "b70/kld.hpp"
+#include "b70/lora.hpp"
+#include "b70/lora_dev.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/memory_export.hpp>
 #include <immintrin.h>
@@ -3292,6 +3294,19 @@ struct Grimoire {
         float   *ple_hist = nullptr, *ple_hist_base = nullptr;
     };
     std::vector<LayerDev> L;
+
+    // ---- LoRA adapter (opt-in, dense trunk only) ─────────────────────
+    // GRIMOIRE_LORA=<dir> loads a PEFT LoRA adapter at build() time.  The
+    // adapter is refused (build fails, the load is reported) for MoE trunks,
+    // for TP/PP modes, for the architecture-specific forwards (Muse/Gemma/
+    // Qwen4-Exp), and for adapters whose v deltas land on MoVA (k2_sparse)
+    // layers -- the engine never runs a model with a half-applied adapter.
+    // The host copy holds the blob and the per-layer views; the device copy
+    // holds the device views and the shared mid scratch.  The adapter is the
+    // trunk only: speculative/draft heads are never LoRA'd.
+    std::unique_ptr<lora::LoraAdapter> lora_host;
+    std::unique_ptr<lora::LoraDevice> lora;
+    std::string lora_name;
 
     // ---- Qwen4-Exp model-level state ---------------------------------
     // The tail mixer.  It replaces the final norm entirely (this model has
@@ -10661,6 +10676,75 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
                   "checkpoint)"
                 : "per-layer checkpoint k_norm");
     }
+    // ---- LoRA adapter (opt-in, dense trunk only) -----------------------
+    // GRIMOIRE_LORA=<dir> loads a PEFT LoRA adapter at build time.  The
+    // adapter exists only on the dense trunk path, single card, with no
+    // architecture-specific forward and no MoVA layers: anything else
+    // means part of the model silently runs without deltas.  The loader
+    // validates the geometry and packs the blob; the device upload is a
+    // plain copy of it.  The adapter is the trunk only -- speculative and
+    // draft heads are never LoRA'd by construction.
+    if (const char* lora_dir = std::getenv("GRIMOIRE_LORA"); lora_dir && *lora_dir) {
+        auto lora_fail = [&](const std::string& why) -> bool {
+            err = "lora: " + why;
+            lora_host = nullptr; lora = nullptr; lora_name.clear();
+            return false;
+        };
+        if (cfg.is_moe())
+            return lora_fail("MoE trunks are not supported (dense trunks only)");
+        if (cfg.is_k2)
+            return lora_fail("K2/MoVA models are not supported (their V is router-routed)");
+        if (tp_ranked() || pp_enabled())
+            return lora_fail("tensor/pipeline parallel is not supported");
+        if (cfg.is_muse || cfg.is_gemma4 || cfg.is_qwen4_exp) {
+            std::string which;
+            if (cfg.is_muse) which = "Muse (sandwich norms)";
+            else if (cfg.is_gemma4) which = "gemma-4 (dual-geometry layers)";
+            else which = "Qwen4-Exp (hyper-connections / indexer)";
+            return lora_fail("the " + which + " forward path is not supported");
+        }
+        int inter = 0;
+        for (const auto& dl : L) inter = std::max(inter, dl.sh_gu.output_rows() / 2);
+        if (inter <= 0)
+            return lora_fail("no dense intermediate width -- not a dense trunk?");
+        lora::LoraGeom geom;
+        geom.layers = cfg.n_layers;
+        geom.hidden = cfg.hidden;
+        geom.q_heads = cfg.n_heads;
+        geom.attn_output_gate = cfg.attn_out_gate;
+        geom.inter = inter;
+        geom.head_dim = cfg.head_dim;
+        geom.kv_heads = cfg.n_kv_heads;
+        geom.layer_head_dim.resize(size_t(cfg.n_layers));
+        geom.layer_kv_heads.resize(size_t(cfg.n_layers));
+        geom.full_attention.resize(size_t(cfg.n_layers), false);
+        for (int i = 0; i < cfg.n_layers; ++i) {
+            geom.layer_head_dim[size_t(i)] = cfg.layer_head_dim(i);
+            geom.layer_kv_heads[size_t(i)] = cfg.layer_kv_heads(i);
+            geom.full_attention[size_t(i)] = L[size_t(i)].kind == LayerKind::FULL_ATTN;
+        }
+        try {
+            lora_host = std::make_unique<lora::LoraAdapter>(lora_dir, geom);
+        } catch (const std::exception& e) {
+            return lora_fail(e.what());
+        }
+        // MoVA layers have no v_proj (V is the router-routed MoVA value):
+        // a v delta on one of those layers would be silently misplaced.
+        for (int i = 0; i < cfg.n_layers; ++i) {
+            if (L[size_t(i)].k2_sparse && lora_host->layer(i).v.present())
+                return lora_fail("layer " + std::to_string(i) +
+                                 " is a MoVA (k2_sparse) layer and the adapter carries a v delta");
+        }
+        lora_name = lora_host->name();
+        try {
+            lora = std::make_unique<lora::LoraDevice>(q, *lora_host, 1024);
+        } catch (const std::exception&) {
+            return lora_fail("device upload failed");
+        }
+        std::printf("  LoRA adapter    %s (r=%d, r16=%d, scale=%.3f) [%s]\n",
+                    lora_dir, lora_host->r(), lora_host->r16(), lora_host->scale(),
+                    lora_name.empty() ? "unnamed" : lora_name.c_str());
+    }
     if(ck.gguf_file)
         std::printf("  GGUF round-trip checks: A_log %llu mismatches/%llu, norms %llu mismatches/%llu; bf16 source %llu nonrepresentable/%llu\n",
             (unsigned long long)ck.gguf_a_mismatches,(unsigned long long)ck.gguf_a_checks,
@@ -13060,6 +13144,12 @@ void Grimoire::release() {
     }
     prefix_slots.clear();
     prefix_hit = -1;
+    // The LoRA blob and mid scratch are device memory too: nothing else in
+    // this path frees them, so the engine would stay resident after release().
+    // The host blob (lora_host) is plain memory and is simply torn down here.
+    lora = nullptr;
+    lora_host = nullptr;
+    lora_name.clear();
 }
 
 } // namespace b70
@@ -15429,6 +15519,14 @@ const float* Grimoire::forward(int token) {
                 if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
                 else gemv_any(d.v_proj, s.h2, s.bbuf, none);
             }
+            // LoRA: the deltas land on the projection outputs before anything reads them.
+            if (lora) {
+                const auto& lb = lora->layers[size_t(i)];
+                lora->apply(lb.q, s.h2, s.qkv, QD, 1);
+                lora->apply(lb.k, s.h2, s.zbuf, d.k_proj.output_rows(), 1);
+                if (!d.k2_sparse)
+                    lora->apply(lb.v, s.h2, s.bbuf, d.v_proj.output_rows(), 1);
+            }
             if (gated)
                 launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
                                    cfg.n_heads, d.head_dim, none);
@@ -15540,6 +15638,10 @@ const float* Grimoire::forward(int token) {
             if (i == probe_layer) probe("FA after gate", s.attn_out, qheads * d.head_dim);
             MK("  attn out gate");
             gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+            if (lora) {
+                const auto& lb = lora->layers[size_t(i)];
+                lora->apply(lb.o, s.attn_out, s.moe_y, H, 1);
+            }
             if (!tp_block_reduce(s.moe_y, size_t(H))) {
                 std::fprintf(stderr, "TP block all-reduce failed\n"); return nullptr; }
             if (i == probe_layer) probe("FA out", s.moe_y, H);
@@ -15727,10 +15829,19 @@ const float* Grimoire::forward(int token) {
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
             ffn_gemv(d, true, s.h2, s.sh_g, none);
+            if (lora) {
+                const auto& lb = lora->layers[size_t(i)];
+                lora->apply(lb.gate, s.h2, s.sh_g, 2 * FI, 1);
+                lora->apply(lb.up, s.h2, s.sh_g, 2 * FI, 1);
+            }
             MK("  ffn gate_up");
             launch_swiglu(q, s.sh_g, s.sh_g + FI, s.sh_g, FI, none);
             MK("  ffn swiglu");
             ffn_gemv(d, false, s.sh_g, s.moe_y, none);
+            if (lora) {
+                const auto& lb = lora->layers[size_t(i)];
+                lora->apply(lb.down, s.sh_g, s.moe_y, H, 1);
+            }
             if (!tp_block_reduce(s.moe_y, size_t(H))) {
                 std::fprintf(stderr, "TP block all-reduce failed\n"); return nullptr; }
             MK("  ffn down");
@@ -20889,7 +21000,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const bool parallel_prefill=!gguf_native_enabled(ck)&&!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_PREFILL") && xe2_dense_mxfp4;
     const bool parallel_shared=!gguf_native_enabled(ck)&&!tp_enabled() && std::getenv("GRIMOIRE_PARALLEL_SHARED") && xe2_dense_mxfp4;
     const bool need_aux=parallel_prefill||parallel_shared;
-    const bool norm_bf_only=!gguf_native_enabled(ck)&&!tp_enabled() && M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
+    const bool norm_bf_only=lora == nullptr && !gguf_native_enabled(ck)&&!tp_enabled() && M>=32&&xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&
         (!cfg.is_moe()||xe2_grouped_mxfp4)&&!need_aux;
     // Deferred gathering leaves the routed result permuted in moe_res and
     // makes the NEXT layer's input norm un-permute it
@@ -21154,7 +21265,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // the prompt GEMM's whole-weight bf16 dequant (verify 80 -> 236 ms).  MEASURED 2026-11-12, one
     // B70, 8 users: tokens/step 8.00 of 8 sequences.  Batched admission (spans) stays a prompt.
     const bool verify_shape = (seqb && seqb->verify) || (next_tokens && !(seqb && seqb->spans));
-    const bool dense_pure = !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && H > 256 && !cfg.is_moe() &&
+    const bool dense_pure = lora == nullptr && !tp_enabled() && !tp_mega && !pp_enabled() && M >= 32 && H > 256 && !cfg.is_moe() &&
         !verify_shape &&
         !exact_verify && !need_aux && !noxmx_gemm && !defer_moe_gather &&
         !xe2_dense_mxfp4 && !xe2_dense_mxfp4_f32 && !xe2_w4a8_f32 && !od &&
@@ -21761,6 +21872,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         pp_mark("  FFN down GEMM");
         return true;
     };
+    // The mid scratch may be grown to fit this prompt's rows, and a captured command
+    // graph bakes the mid pointer -- so this happens BEFORE recording begins.  A growth
+    // also means the decode command graph still holds the old pointer: it must re-record.
+    if(lora && lora->ensure_scratch(size_t(M))) graph_ok = false;
     std::unique_ptr<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>> pg;
     if(prefill_graph){
         moe_esimd_warmup(q);                       // its one-time upload waits
@@ -22431,7 +22546,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }else{
             const int QD=d.q_proj.output_rows();
             const bool gated=QD==2*cfg.n_heads*d.head_dim;
-            const bool bfqkv=std::getenv("GRIMOIRE_BF16_QKV")&&xe2_attention&&
+            const bool bfqkv=lora==nullptr&&std::getenv("GRIMOIRE_BF16_QKV")&&xe2_attention&&
                 xe2_dense_mxfp4&&xe2_dense_mxfp4_f32&&pos==0&&M>=32&&
                 d.q_proj.w.fmt==Fmt::MXFP4&&d.k_proj.w.fmt==Fmt::MXFP4&&
                 d.v_proj.w.fmt==Fmt::MXFP4&&d.o_proj.w.fmt==Fmt::MXFP4&&
@@ -22563,6 +22678,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     q.wait();
                 }
             } else mm(d.v_proj,bn,t4);
+            // LoRA: the deltas land on the projection outputs, before
+            // anything reads them (norm/RoPE, the KV cache, the attention
+            // kernel).  The queries/keys/values are full-attention layers
+            // only -- the loader refuses q/k/v deltas on non-full-attention
+            // layers, so the module is simply absent here.
+            if(lora){
+                const auto& lb=lora->layers[size_t(li)];
+                const int KD=d.k_proj.output_rows();
+                const int NV=d.v_proj.output_rows();
+                lora->apply(lb.q, bn, t0, QD, M);
+                lora->apply(lb.k, bn, t3, KD, M);
+                if(!d.k2_sparse)
+                    lora->apply(lb.v, bn, t4, NV, M);
+            }
             pp_mark("attn kv proj");
             if(seqb){
                 // ONE ROW AT A TIME, because each row sits at its own
@@ -22826,7 +22955,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_flash_decode(q,ap,{});
                     launch_flash_merge(q,ap,{});
                 }
-            }else if(xe2_attention && pos==0 && M>=32){
+            }else if(lora==nullptr && xe2_attention && pos==0 && M>=32){
                 const size_t qe=size_t(M)*cfg.n_heads*d.head_dim;
                 const size_t ke=size_t(M)*d.kv_heads*d.head_dim;
                 sycl_bf16* fq=xperm; sycl_bf16* fk=fq+qe; sycl_bf16* fv=fk+ke;
@@ -22952,6 +23081,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 if(gated) launch_gate_sigmoid_mul(q,t3,t2,M*cfg.n_heads*d.head_dim,{});
                 mm(d.o_proj,t3,r0);
             }
+            // LoRA: the o_proj delta lands on the output before the residual
+            // add / post-norm read it.  The attention output is the same
+            // x the projection read, so it is the same x the delta reads.
+            if(lora){
+                const auto& lb=lora->layers[size_t(li)];
+                lora->apply(lb.o, t3, r0, H, M);
+            }
             }
             pp_mark("full attention");
         }
@@ -23034,7 +23170,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // Megatron TP: o_proj / out_proj ran on this rank's heads only.
         if(!r0_in_h && !tp_block_reduce(r0,size_t(M)*H))
             throw std::runtime_error("TP prefill attention all-reduce failed");
-        const bool fused_ffn_quant=!exact_verify&&!d.moe_layer&&a8&&a8s&&
+        const bool fused_ffn_quant=lora==nullptr&&!exact_verify&&!d.moe_layer&&a8&&a8s&&
             xe2_w4a8_bf16&&d.sh_gu_i4&&d.sh_dn_i4;
         auto post_bf_ready=exact_verify
             ? norm_rows(bh,r0,nullptr,d.post_norm,bn)
@@ -23591,7 +23727,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             } else q.memset(r1,0,size_t(M)*H*sizeof(float));
             pp_mark("shared expert");
         }else{
-            if(!mlp_bf16(d.sh_gu,d.sh_down,r0,li)){
+            if(lora){
+                // Dense LoRA: the reference path, the deltas land on the
+                // gate|up buffer and on the down output.  The fused/bf16
+                // fast paths are off: the delta needs the fp32 gate|up
+                // buffer, which is the reference path's own.
+                const int FI=d.sh_gu.output_rows()/2;
+                const auto& lb=lora->layers[size_t(li)];
+                mm(d.sh_gu,bn,t0); pp_mark("  FFN gate_up");
+                lora->apply(lb.gate, bn, t0, 2 * FI, M);
+                lora->apply(lb.up, bn, t0, 2 * FI, M);
+                launch_swiglu_batched(q,t0,t1,M,FI); pp_mark("  FFN swiglu");
+                mm(d.sh_down,t1,r0);
+                lora->apply(lb.down, t1, r0, H, M);
+                pp_mark("dense FFN");
+            }else if(!mlp_bf16(d.sh_gu,d.sh_down,r0,li)){
                 const int FI=d.sh_gu.output_rows()/2;
                 // Fused SwiGLU (gemm_fast.cpp): the gate_up GEMM writes
                 // h = silu(g)*u as bf16 straight into the down projection's
