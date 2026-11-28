@@ -117,6 +117,7 @@ public:
 
     size_t stride(size_t bytes) const { return round_up(bytes); }
     size_t limit() const { return limit_; }
+    size_t used() const { return used_; }
     size_t mapped_bytes(size_t slot) const { return slots_[slot].bytes; }
 
     uint8_t* reserve(size_t heads, size_t dim, size_t divisor = 1) {

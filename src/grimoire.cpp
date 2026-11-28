@@ -10342,7 +10342,17 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
                         (size_t(max_seq) + max_seq / cfg.indexer_compress_ratio + 1);
                 }
             }
-            const double budget = room + double(mtp_bytes + indexer_bytes + flash_draft_bytes) -
+            // GRIMOIRE_KV_POOL_PREFILL_GB (default: min(4, 0.4 x room)): VRAM the pool leaves to prompt scratch.  The pool maps its
+            // pages as sequences grow, so the prompt chunk sized from free VRAM used to take the not yet mapped
+            // budget and a later growth failed ("Failed to allocate physical memory": one B70, Swift INT4, 8 slots,
+            // ctx 131072, every 32K / 64K rung of a multi-turn run).  ~1 MB of scratch a prompt token on
+            // Qwen3.8-27B: 4 GB keeps ~4K-token chunks, what GRIMOIRE_PREFILL_CHUNK=4096 did by hand.
+            // Default: 4 GB or 40% of the room, whichever is smaller (a B70 with Qwen3.8-27B INT4 keeps 4 GB, the tested
+            // value; a 12 GB card would otherwise give a third of its memory to scratch).
+            const char* pfr = std::getenv("GRIMOIRE_KV_POOL_PREFILL_GB");
+            const double pf_reserve = pfr && *pfr ? std::max(0.0, std::atof(pfr)) * gib
+                                                  : std::min(4.0 * gib, std::max(0.0, 0.4 * room));
+            const double budget = room - pf_reserve + double(mtp_bytes + indexer_bytes + flash_draft_bytes) -
                                   double(want - 1) * double(draft_slot_bytes - mtp_bytes);
             if (budget <= 0) { err = "no VRAM available for the shared KV cache"; return false; }
             kv_pool = std::make_unique<KvVirtualPool>(q, size_t(max_seq), size_t(want), size_t(budget));
@@ -11270,6 +11280,8 @@ int Grimoire::prefill_token_budget() {
     // handles worst.
     const double margin = (tp_ranked() || pp_enabled() ? 2.0 : 1.0) * 1073741824.0;
     free_b += double(pf_cache_bytes) - margin;
+    // Pooled KV maps its pages as sequences grow: the budget it has not mapped yet is not free for scratch.
+    if (kv_pool) free_b -= double(kv_pool->limit() - std::min(kv_pool->limit(), kv_pool->used()));
     long n = free_b > 0 ? long(free_b / per) : 0;
     n = std::clamp(n, 256L, 32768L) / 256 * 256;
     if (tp_mega && !tp_budget_live && tp_pf_cap > 0) n = std::min(n, long(tp_pf_cap));
