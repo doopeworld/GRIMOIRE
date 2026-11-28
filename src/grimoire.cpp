@@ -24948,7 +24948,17 @@ void GrimoireScheduler::run() {
         static const int il_chunk = [] {
             const char* v = std::getenv("GRIMOIRE_INTERLEAVE_CHUNK");
             return v && *v ? std::max(0, std::atoi(v)) : 1024; }();
-        if (il_chunk > 0 && batchable && std::none_of(taking.begin(),taking.end(),[](const auto& j){return j->sampling.enabled();}) && e.interleave_ok() && (!active.empty() || !prefilling.empty())) {
+        // Sampled requests too: the last chunk binds the slot and sets current_sampling before
+        // argmax_token(), which draws through target_choice() at the same position and epoch as
+        // the one-shot admission.  Excluding them (11-09) read a sampled long prompt in one go
+        // and stalled every decoding user for its whole prefill.  GRIMOIRE_INTERLEAVE_SAMPLED=0 =
+        // the old rule (sampled prompts are never interleaved).
+        static const bool il_sampled = [] {
+            const char* v = std::getenv("GRIMOIRE_INTERLEAVE_SAMPLED");
+            return !(v && *v == '0'); }();
+        if (il_chunk > 0 && batchable &&
+            (il_sampled || std::none_of(taking.begin(),taking.end(),[](const auto& j){return j->sampling.enabled();})) &&
+            e.interleave_ok() && (!active.empty() || !prefilling.empty())) {
             std::vector<std::shared_ptr<SchedJob>> rest;
             for (auto& j : taking) {
                 if (int(j->prompt.size()) <= il_chunk || cancelled(j) ||
@@ -25143,9 +25153,30 @@ void GrimoireScheduler::run() {
             else active.push_back(j);
         }
         admitted_round.clear();
+        // GRIMOIRE_INTERLEAVE_SHARE=<s> (opt-in, 0 < s <= 0.9; default 0 = one decode step per chunk): while a
+        // prompt is admitted in chunks, the decoding requests get at least the share s of the wall time -- the
+        // next chunk waits until the decode steps since the last one took s / (1 - s) of that chunk's time.
+        // With one step per chunk a decoding user got ~3 tokens per ~1.2 s chunk (one B70, Swift INT4 + MTP,
+        // a 44K-token prompt arriving: 83 -> 2.8 tok/s for 37 s).
+        static const double il_share = [] {
+            const char* v = std::getenv("GRIMOIRE_INTERLEAVE_SHARE");
+            const double s = v && *v ? std::atof(v) : 0.0;
+            return s > 0.0 ? std::min(s, 0.9) : 0.0; }();
+        // GRIMOIRE_INTERLEAVE_SHARE_MIN=<tokens> (default 8192): only prompts longer than this are held back; a short
+        // one goes in at full speed (two users sending 4K prompts together: with the share on the second prompt's
+        // intake fell 1,944 -> 1,346 tok/s for no decode gain worth it).
+        static const size_t il_share_min = [] {
+            const char* v = std::getenv("GRIMOIRE_INTERLEAVE_SHARE_MIN");
+            return v && *v ? size_t(std::max(0, std::atoi(v))) : size_t(8192); }();
+        static std::chrono::steady_clock::time_point il_end{};
+        static double il_ms = 0.0;
+        const bool il_turn = il_share <= 0.0 || active.empty() || il_ms <= 0.0 ||
+            (!prefilling.empty() && prefilling.front()->prompt.size() <= il_share_min) ||
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - il_end).count() >=
+                il_ms * il_share / (1.0 - il_share);
         // One chunk of the oldest interleaved admission (all of it when
         // nothing is decoding); its first token goes out when it completes.
-        if (!prefilling.empty()) {
+        if (!prefilling.empty() && il_turn) {
             auto j = prefilling.front();
             if (cancelled(j)) {
                 prefilling.erase(prefilling.begin());
@@ -25153,6 +25184,7 @@ void GrimoireScheduler::run() {
             } else {
                 try {
                     const size_t total = j->prompt.size();
+                    const auto il_t0 = std::chrono::steady_clock::now();
                     do {
                         const size_t len = std::min(size_t(il_chunk), total - size_t(j->pos));
                         const std::vector<int32_t> chunk(j->prompt.begin() + j->pos,
@@ -25160,6 +25192,11 @@ void GrimoireScheduler::run() {
                         e.admit_chunk(j->slot, j->pos, chunk);
                         j->pos += int(len);
                     } while (active.empty() && size_t(j->pos) < total);
+                    if (il_share > 0.0) {
+                        e.sync();           // the chunk's own time, not the next decode step's
+                        il_end = std::chrono::steady_clock::now();
+                        il_ms = std::chrono::duration<double, std::milli>(il_end - il_t0).count();
+                    }
                     if (size_t(j->pos) == total) {
                         prefilling.erase(prefilling.begin());
                         e.admit_end(j->slot);

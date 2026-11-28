@@ -595,7 +595,9 @@ at 2 or more, or disable MTP.
   `content` (`chat_template_kwargs: {"enable_thinking": false}` turns thinking off).
 - A long prompt that arrives while other requests are decoding is processed in chunks of 1,024
   tokens with the others' decoding in between (`GRIMOIRE_INTERLEAVE_CHUNK`, 0 = off): the others
-  pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.
+  pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.  Sampled requests (temperature > 0) are read
+  in chunks too (`GRIMOIRE_INTERLEAVE_SAMPLED=0` = one pass, as before): the chunks take different GEMM paths,
+  so a sampled answer can differ from the one-pass answer for the same seed and prompt.
 
 ### Models, downloads, launch flags and measured speed
 
