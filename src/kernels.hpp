@@ -240,6 +240,10 @@ sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const 
                                     sycl_bf16* h, int M,
                                     const std::vector<sycl::event>& deps = {});
 bool gemm_fast_supported(const QuantWeight& w, int M);
+// GRIMOIRE_I4A8 (the INT4 prompt GEMM as int8 x int8): compute W's rotated-domain row scales now instead of at the
+// first prompt call that takes that path.  1 = W takes the path (scales computed or already there), 0 = it does not.
+// Waits for the scales.  q must be the queue W's prompt GEMMs run on (the scales are cached per queue).
+int gemm_fast_i4a8_prepare(sycl::queue& q, const QuantWeight& w);
 sycl::event launch_gemm_fast(sycl::queue& q, const QuantWeight& w,
                              const sycl_bf16* x, float* y, int M,
                              const std::vector<sycl::event>& deps = {});

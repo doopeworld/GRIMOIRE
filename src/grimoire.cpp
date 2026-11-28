@@ -10470,6 +10470,29 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
                         n_seq_slots, n_seq_slots == 1 ? "" : "s", max_seq, double(kv_total) / gib);
     }
 
+    // I4A8 ROW SCALES AT LOAD (2026-11-23).  i4a8_scales_for() computes a weight's scales (max |W H| a row, one
+    // pass over the INT4 weight) the first time a prompt call of >= GRIMOIRE_I4A8_MIN_M rows meets it.  The server's
+    // warm-up prompts do not reach that path, so the first long request after a start paid it: MEASURED one B70,
+    // Swift INT4, 1 slot, ~4K-token prompts one at a time -- the first 3.73 s, the same length again 1.62 s; unitrace:
+    // 336 weights, i4a8_scales 1.70 s.  The same scales, computed here instead; answers unchanged.  One card only
+    // (TP / PP ranks convert their weights per chunk on their own queues).
+    if (!tp_ranked() && !pp_enabled()) {   // tp_ranked: both TP modes (tp_enabled() is false under Megatron TP)
+        const auto t0 = std::chrono::steady_clock::now();
+        int n = 0;
+        auto prep = [&](sycl::queue& lq, const DevQuant& w) { n += gemm_fast_i4a8_prepare(lq, w.w); };
+        auto prep_layer = [&](sycl::queue& lq, const LayerDev& d) {
+            for (const DevQuant* w : {&d.la_qkv, &d.la_z, &d.la_out, &d.la_ab, &d.la_all, &d.q_proj, &d.k_proj,
+                                      &d.v_proj, &d.qkv_proj, &d.o_proj, &d.o_gate, &d.sh_gu, &d.sh_gate, &d.sh_up,
+                                      &d.sh_down})
+                prep(lq, *w);
+        };
+        for (int i = 0; i < int(L.size()); ++i) prep_layer(qL(i), L[size_t(i)]);
+        if (mtp.ok) { prep(q, mtp.fc); prep_layer(q, mtp.L); }
+        if (n)
+            std::printf("  i4a8 row scales: %d weights at load, %.2f s\n", n,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+
     power_gov_init();
     acct(tm_heat_init());                 // GRIMOIRE_EXPERT_HEAT: spare expert slots
     {

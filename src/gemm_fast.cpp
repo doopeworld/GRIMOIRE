@@ -3900,6 +3900,17 @@ sycl::event launch_gemm_fast_residual(sycl::queue& q, const QuantWeight& w,
     return gemm_fast_run<2>(q, w, x, h, M, deps);
 }
 
+int gemm_fast_i4a8_prepare(sycl::queue& q, const QuantWeight& w) {
+#ifdef GRIMOIRE_WITH_ONEDNN
+    if (!w.payload || w.N <= 0 || w.K <= 0 || !i4a8_ok(w, i4a8_min_m())) return 0;
+    i4a8_scales_for(q, w);   // waits
+    return 1;
+#else
+    (void)q; (void)w;
+    return 0;
+#endif
+}
+
 bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {
     static const bool off = std::getenv("GRIMOIRE_NO_FUSED_SWIGLU") != nullptr;
     return !off && gemm_fast_supported(w, M) &&
