@@ -2006,7 +2006,11 @@ const char* kEffortLow =
 // turns with their <think> block, tool calls, grouped tool responses);
 // anything else keeps the legacy rendering above.
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
-                                           const ChatOptions& opt) const {
+                                           const ChatOptions& options) const {
+    // reasoning_effort "minimal" = thinking off: "low" is already the short thinking pass (kEffortLow), so nothing
+    // between it and no thinking exists in the template.  parse_completion_request maps it the same way.
+    ChatOptions opt = options;
+    if (opt.reasoning_effort == "minimal") { opt.enable_thinking = false; opt.reasoning_effort.clear(); }
     if(gemma4_bpe_){
         if(!opt.tools.empty())
             throw std::invalid_argument("gemma4 tool-call template is unsupported");
@@ -2068,7 +2072,14 @@ std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messa
         const ChatMessage& m = messages[i];
         std::string c = tmpl_trim(m.content);
         if (m.role == "system") {
-            if (i != 0) throw std::invalid_argument("System message must be at the beginning.");
+            // The checkpoint's template raises this itself (raise_exception for a system message that is not
+            // loop.first), so a later system message stays a 400 by default.  GRIMOIRE_SYSTEM_ANYWHERE=1 (opt-in, for
+            // agent clients that inject one mid-conversation) renders it in place as a plain system turn, as the
+            // legacy ChatML renderer above already does -- a prompt the model's own template never produces.
+            static const bool system_anywhere = [] { const char* v = std::getenv("GRIMOIRE_SYSTEM_ANYWHERE");
+                return v && *v && std::atoi(v) != 0; }();
+            if (i != 0 && !system_anywhere) throw std::invalid_argument("System message must be at the beginning.");
+            if (i != 0) out += "<|im_start|>system\n" + c + "<|im_end|>\n";
         } else if (m.role == "user") {
             out += "<|im_start|>user\n" + c + "<|im_end|>\n";
         } else if (m.role == "assistant") {

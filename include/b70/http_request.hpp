@@ -32,6 +32,34 @@ struct CompletionRequest {
     std::vector<Json> tools;   // OpenAI function tools, kept for argument typing
     SamplingOptions sampling;
     ChatOptions chat;          // template inputs: tools (tojson), thinking, effort
+    std::vector<std::string> stop;   // OpenAI stop strings (answer text only, not reasoning)
+};
+// OpenAI `stop`: text is held back while it could still be the start of a stop string; at the first match the
+// answer ends before it (the stop string is not returned).  Matching is on the decoded answer, so a stop string that
+// spans tokens is found.  Pieces in and out are whole UTF-8 characters.
+class StopFilter {
+    std::vector<std::string> stops;
+    std::string held;
+    size_t keep=0;
+    bool matched=false;
+public:
+    explicit StopFilter(const std::vector<std::string>& s):stops(s){for(const auto& x:stops)keep=std::max(keep,x.size()-1);}
+    bool active() const { return !stops.empty(); }
+    bool hit() const { return matched; }
+    // The text that can be sent now.
+    std::string push(const std::string& piece) {
+        if(matched)return {};
+        held+=piece;
+        size_t at=std::string::npos;
+        for(const auto& s:stops)at=std::min(at,held.find(s));
+        if(at!=std::string::npos){matched=true;std::string out=held.substr(0,at);held.clear();return out;}
+        if(held.size()<=keep)return {};
+        size_t cut=held.size()-keep;
+        while(cut>0&&(static_cast<unsigned char>(held[cut])&0xc0)==0x80)--cut;   // whole characters only
+        std::string out=held.substr(0,cut);held.erase(0,cut);return out;
+    }
+    // End of the answer without a match: the rest.
+    std::string flush() { std::string out; if(!matched)out.swap(held); return out; }
 };
 // A message's text: a string, an array of text parts, or null.
 inline std::string message_text(const Json& c) {
@@ -95,7 +123,15 @@ inline CompletionRequest parse_completion_request(const std::string& body, bool 
     r.sampling.validate();
     for(auto field:{"presence_penalty","frequency_penalty"})
         if(number(field,0)!=0)throw std::invalid_argument(std::string("unsupported nonzero ")+field);
-    for(auto field:{"stop","logprobs","response_format"}) {
+    if(const auto* s=j.find("stop");s&&s->kind!=Json::Kind::Null) {
+        auto add=[&](const Json& v){
+            if(v.kind!=Json::Kind::String)throw std::invalid_argument("stop must be a string or an array of strings");
+            if(!v.string.empty())r.stop.push_back(v.string);
+        };
+        if(s->kind==Json::Kind::Array){for(const auto& v:s->array)add(v);}else add(*s);
+        if(r.stop.size()>16)throw std::invalid_argument("at most 16 stop strings");
+    }
+    for(auto field:{"logprobs","response_format"}) {
         const auto* v=j.find(field);
         if(v && v->kind!=Json::Kind::Null && !(v->kind==Json::Kind::Boolean&&!v->boolean))
             throw std::invalid_argument(std::string("unsupported request field: ")+field);
@@ -132,6 +168,11 @@ inline CompletionRequest parse_completion_request(const std::string& body, bool 
         if(const auto* t=k->find("enable_thinking"); t && t->kind==Json::Kind::Boolean)r.chat.enable_thinking=t->boolean;
         if(const auto* e=k->find("reasoning_effort"); e && e->kind==Json::Kind::String)r.chat.reasoning_effort=e->string;
     }
+    // reasoning_effort "minimal" (OpenAI's level below "low"): the Qwen XML template's lowest level, "low", is already
+    // a short thinking pass (its "keep your thinking brief" system text), so the only thing below it is no thinking:
+    // minimal = enable_thinking false.  Set here, not only in the renderer, so the server's response decoder agrees
+    // that no <think> block is open.
+    if(r.chat.reasoning_effort=="minimal"){r.chat.enable_thinking=false;r.chat.reasoning_effort.clear();}
     const auto& messages=j.at("messages");
     if(messages.kind!=Json::Kind::Array || messages.array.empty())
         throw std::invalid_argument("messages must be a nonempty array");

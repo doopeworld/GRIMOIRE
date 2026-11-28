@@ -57,5 +57,20 @@ int main(){
     raw.push(7,emit);assert(content.substr(content.size()-3)=="\xef\xbf\xbd");
     const std::string original="line\n\t\"\\";
     assert(Json::parse("\""+json_escape(original)+"\"").text()==original);
+    // stop strings: across pieces, earliest of several, held-back text released at the end, UTF-8 kept whole
+    {
+        auto st=parse_completion_request(R"({"prompt":"x","stop":["END","\n\n",""]})",false);
+        assert(st.stop.size()==2&&st.stop[0]=="END");
+        assert(parse_completion_request(R"({"prompt":"x","stop":"###"})",false).stop.size()==1);
+        bad([]{parse_completion_request(R"({"prompt":"x","stop":[1]})",false);});
+        StopFilter f(st.stop);std::string got;
+        for(auto p:{"Hello E","N","D tail"})got+=f.push(p);
+        assert(f.hit()&&got=="Hello "&&f.flush().empty());
+        StopFilter g({"END"});got.clear();
+        for(auto p:{"caf","\xc3\xa9","EN"})got+=g.push(p);
+        got+=g.flush();assert(!g.hit()&&got=="caf\xc3\xa9" "EN");
+        StopFilter h({"xyz","b"});got=h.push("aab xyz");assert(h.hit()&&got=="aa");
+    }
+    std::cout<<"HTTP: stop strings PASS\n";
     std::cout<<"HTTP: strict JSON, text arrays, Unicode, token-aware Harmony and split UTF-8 PASS\n";
 }
