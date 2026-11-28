@@ -52,6 +52,8 @@ struct Plan {
     memory::desc dst({m,n},f16,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     attr.set_scales(DNNL_ARG_WEIGHTS,3,{gs,1},f16);
     attr.set_zero_points(DNNL_ARG_WEIGHTS,0,{},memory::data_type::s8);
     attr.set_fpmath_mode(bf16?fpmath_mode::bf16:fpmath_mode::f16,true);
@@ -104,6 +106,8 @@ struct MXPlan {
     memory::desc dst({m,n},memory::data_type::bf16,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     attr.set_scales(DNNL_ARG_WEIGHTS,3,{32,1},memory::data_type::e8m0);
     attr.set_fpmath_mode(fpmath_mode::bf16,true);
     return matmul::primitive_desc(e,src,wei,dst,attr);
@@ -147,6 +151,8 @@ struct BFPlan {
     memory::desc dst({m,n},memory::data_type::f32,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     return matmul::primitive_desc(e,src,wei,dst,attr);
   }
   memory wrap(const memory::desc& md,void* p){
@@ -187,6 +193,8 @@ struct F16Plan {
     memory::desc dst({m,n},memory::data_type::f16,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     return matmul::primitive_desc(e,src,wei,dst,attr);
   }
   memory wrap(const memory::desc& md,void* p){
@@ -249,6 +257,8 @@ struct SPlan {
     memory::desc dst({m,n},ft,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     attr.set_scales(DNNL_ARG_WEIGHTS,3,{gs,1},ft);
     attr.set_fpmath_mode(bf16?fpmath_mode::bf16:fpmath_mode::f16,true);
     return matmul::primitive_desc(e,src,wei,dst,attr);
@@ -339,6 +349,8 @@ struct W4A8Plan {
     memory::desc dst({m,n},memory::data_type::f32,memory::dims{n,1});
     primitive_attr attr;
     attr.set_scratchpad_mode(scratchpad_mode::user);
+    // as src/onednn_gemm.cpp: otherwise the reduction order can change between calls at some row counts
+    attr.set_deterministic(true);
     // src scales: per-row, one scale spanning all of k -- vLLM's
     // m1_sc.numel() == m branch.
     attr.set_scales(DNNL_ARG_SRC,(1<<0)+(1<<1),{1,k},memory::data_type::f32);

@@ -362,9 +362,10 @@ int main(int argc, char** argv) {
                     try {
                         b70::FinishReason finish;
                         std::vector<int32_t> out;
+                        int cached=0;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
                             tk.eos(),tk.eos2(),out,
-                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling);
+                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling,&cached);
                         if(connected)connected=decoder.finish(emit);
                         std::string reason=b70::finish_reason_name(finish);
                         if(connected && !decoder.tool_call_text().empty()) {
@@ -380,7 +381,8 @@ int main(int argc, char** argv) {
                             (chat?"\"delta\":{}":"\"text\":\"\"")+",\"finish_reason\":\""+
                             reason+"\"}],\"usage\":{\"prompt_tokens\":"+
                             std::to_string(ids.size())+",\"completion_tokens\":"+std::to_string(n)+
-                            ",\"total_tokens\":"+std::to_string(ids.size()+n)+"}}");
+                            ",\"total_tokens\":"+std::to_string(ids.size()+n)+
+                            ",\"prompt_tokens_details\":{\"cached_tokens\":"+std::to_string(cached)+"}}}");
                     } catch(const std::exception& ex) {
                         std::fprintf(stderr,"[stream error] %s\n",ex.what());
                         if(connected)send(error_json(ex.what(),"engine_error"));
@@ -391,9 +393,10 @@ int main(int argc, char** argv) {
         } else {
             b70::FinishReason finish;
             std::vector<int32_t> out;
+            int cached=0;
             // a stop ends this request at its next token (the scheduler then cancels the job)
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling);
+                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling,&cached);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
             if(chat&&!tools.empty())decoder.enable_tools();
@@ -417,7 +420,8 @@ int main(int argc, char** argv) {
             res.set_content("{\"id\":\"cmpl-"+request_id+"\",\"object\":\""+(chat?"chat.completion":"text_completion")+
                 "\",\"model\":\""+model+"\",\"choices\":[{\"index\":0,"+answer+",\"finish_reason\":\""+
                 reason+"\"}],\"usage\":{\"prompt_tokens\":"+std::to_string(ids.size())+
-                ",\"completion_tokens\":"+std::to_string(n)+",\"total_tokens\":"+std::to_string(ids.size()+n)+"}}","application/json");
+                ",\"completion_tokens\":"+std::to_string(n)+",\"total_tokens\":"+std::to_string(ids.size()+n)+
+                ",\"prompt_tokens_details\":{\"cached_tokens\":"+std::to_string(cached)+"}}}","application/json");
         }
     };
     svr.Post("/v1/chat/completions",[&](const httplib::Request& req,httplib::Response& res){handle(req,res,true);});

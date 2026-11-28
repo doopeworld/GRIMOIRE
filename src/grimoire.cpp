@@ -3471,6 +3471,7 @@ struct Grimoire {
     bool save_prefix(const std::vector<int32_t>& tokens, bool output_valid = true);
     int admit_sequence(const std::vector<int32_t>& prompt, const std::vector<bool>& busy,
                        size_t kv_tokens = 0);
+    int admit_reused = 0;   // prompt tokens the last admit_sequence() restored instead of prefilling (usage)
     int admit_pick_slot(const std::vector<int32_t>& prompt, const std::vector<bool>& busy, int& reused,
                         bool allow_full = true);
     bool interleave_ok() const;
@@ -12597,6 +12598,7 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         }
         sync();
         if(!draft_slots.empty()) q.memcpy(draft_slots[size_t(slot)].hidden,s.h,size_t(cfg.hidden)*sizeof(float)).wait();
+        admit_reused = reused;
         return slot;
     } catch (...) {
         if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
@@ -24761,6 +24763,7 @@ struct SchedJob {
     int budget = 0, eos = -1, eot = -1;
     // Scheduler-owned.
     int slot = -1, pos = 0, next = -1;
+    int cached = 0;                 // prompt tokens resumed from a prefix snapshot (usage.cached_tokens)
     std::vector<int32_t> hist;      // copy drafts: prompt + reply, built as the reply grows
     // copy drafts: share of verified copy tokens kept (running), and the copy proposed this step
     float copy_score = 0.6f;
@@ -24959,6 +24962,7 @@ void GrimoireScheduler::run() {
                     int done = 0;
                     j->slot = e.admit_begin(j->prompt, slot_busy, done, j->prompt.size() + size_t(j->budget));
                     j->pos = done;
+                    j->cached = done;
                     e.slot_sampling.at(size_t(j->slot))=j->sampling;
                     ++e.sampling_epoch.at(size_t(j->slot));
                     slot_busy[size_t(j->slot)] = true;
@@ -25074,12 +25078,17 @@ void GrimoireScheduler::run() {
                     }
                     std::vector<int32_t> out;
                     FinishReason r = FinishReason::Length;
+                    // usage.cached_tokens: generate_tokens() asks prefix_reuse() the same question first thing,
+                    // and a restore that went through moves the reuse counter
+                    const int predicted = e.prefix_reuse(j->prompt);
+                    const long reused_before = g_prefix_tokens_reused;
                     // grimoire_serve_generate broadcasts this callback's
                     // cancellation answer to every rank at emit boundaries.
                     // Workers leave the same request before another header
                     // can enter the control stream.
                     grimoire_serve_generate(e, j->prompt, j->budget, j->eos, out,
                         j->eot, [&](int32_t t){ return push(j,t); }, &r);
+                    j->cached = g_prefix_tokens_reused != reused_before ? predicted : 0;
                     retire(j, r, false);
                     continue;
                 }
@@ -25093,6 +25102,7 @@ void GrimoireScheduler::run() {
                                  active.size());
                 j->slot = slot;
                 j->pos  = e.pos;
+                j->cached = e.admit_reused;
                 e.slot_sampling.at(size_t(slot))=j->sampling;
                 ++e.sampling_epoch.at(size_t(slot));
                 j->next = e.argmax_token();
@@ -25401,8 +25411,9 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
         const std::vector<int32_t>& prompt, int n_predict, int eos_id,
         int eot_id, std::vector<int32_t>& out,
         const std::function<bool(int32_t)>& on_token, FinishReason* finish,
-        const SamplingOptions& sampling) {
+        const SamplingOptions& sampling, int* cached_tokens) {
     sampling.validate();
+    if (cached_tokens) *cached_tokens = 0;
     if(sampling.enabled()&&(sc.e.pp_enabled()||sc.e.tp_head_split||sc.e.dag||
                             sc.e.cfg.is_qwen4_exp||sc.e.cfg.is_muse||sc.e.cfg.is_k2||
                             sc.e.cfg.is_gemma4||sc.e.cfg.is_moe()||sc.e.cfg.lin_v_heads<=0))
@@ -25439,6 +25450,7 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
                 // request could be admitted into a slot still in use.
                 j->cv.wait(l, [&]{ return j->done; });
                 if (finish) *finish = FinishReason::Cancelled;
+                if (cached_tokens) *cached_tokens = j->cached;
                 return int(out.size());
             }
         }
@@ -25446,9 +25458,11 @@ int grimoire_scheduler_generate(GrimoireScheduler& sc,
     }
     const std::string err = j->error;
     const FinishReason r = j->reason;
+    const int cached = j->cached;
     l.unlock();
     if (!err.empty()) throw std::runtime_error(err);
     if (finish) *finish = r;
+    if (cached_tokens) *cached_tokens = cached;
     return int(out.size());
 }
 

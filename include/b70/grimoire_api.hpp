@@ -74,5 +74,6 @@ int grimoire_scheduler_width(GrimoireScheduler&);
 int grimoire_scheduler_generate(GrimoireScheduler&,
     const std::vector<int32_t>& prompt, int n_predict, int eos_id, int eot_id,
     std::vector<int32_t>& out, const std::function<bool(int32_t)>& on_token = {},
-    FinishReason* finish = nullptr, const SamplingOptions& sampling = {});
+    FinishReason* finish = nullptr, const SamplingOptions& sampling = {},
+    int* cached_tokens = nullptr);   // prompt tokens resumed from a prefix snapshot, not prefilled
 }
